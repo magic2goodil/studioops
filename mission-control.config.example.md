@@ -96,6 +96,8 @@ The app reads the first fenced `json mission-control-config` block in this file.
     ],
     "safetyRules": [
       "Do not deploy production without explicit approval.",
+      "Production deploys must run through GitHub Actions from the protected production branch and approved deploy owner, not ad hoc local SSH.",
+      "Production deployment automation must not use broad delete flags or remove production env files, databases, uploads, media, generated assets, logs, virtualenvs, backups, or production-only state.",
       "Do not send emails, push notifications, or external messages without explicit approval.",
       "Do not commit secrets, private keys, tokens, or private customer data."
     ]
@@ -156,7 +158,9 @@ The app reads the first fenced `json mission-control-config` block in this file.
         }
       ],
       "safetyRules": [
-        "Do not deploy production without explicit approval."
+        "Do not deploy production without explicit approval.",
+        "Production deploys must run through GitHub Actions from the protected production branch and approved deploy owner, not ad hoc local SSH.",
+        "Production deployment automation must not use broad delete flags or remove production env files, databases, uploads, media, generated assets, logs, virtualenvs, backups, or production-only state."
       ]
     }
   ]

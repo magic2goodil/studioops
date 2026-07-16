@@ -261,6 +261,9 @@ Default rules:
 - Avoid broad logging of PII.
 - Do not send notifications, emails, SMS, or external messages without explicit approval.
 - Do not deploy production without explicit approval.
+- Production deploys should run through the project's GitHub Actions deployment workflow, not ad hoc local SSH.
+- Real production deploy workflows should be gated to the protected production branch and approved owner/deployer actor.
+- Deployment work must preserve production state. Do not allow broad delete flags, stale-file deletion switches, or cleanup commands that can remove env files, databases, uploads, generated media, logs, virtualenvs, backups, or production-only runtime assets.
 
 Consent-sensitive features include:
 

@@ -28,6 +28,10 @@ Fail or send back the task when a material issue exists:
 - The PR is linked to several tasks without a clear primary task and per-task complete/partial notes.
 - Deployment or production-impacting work bypasses the feature branch, PR, validation, and configured CI/CD flow.
 - Production deploy automation is added before development auth/admin/legacy mutation surfaces are gated or removed.
+- Production deploy automation can mutate production from manual dispatch without an explicit emergency approval path.
+- Production deploy automation lacks protected branch, deploy-owner actor, or GitHub Environment gates.
+- Production deploy automation can delete production runtime files, uploaded media, generated assets, databases, env files, logs, virtualenvs, backups, or production-only state.
+- Production deployment docs encourage local SSH deploys as the normal path instead of GitHub Actions with audit history.
 - Sensitive data is logged, exposed, stored casually, or collected without explicit consent requirements.
 - Consent-sensitive features lack opt-in, opt-out/revocation, retention, or data-minimization behavior.
 - The work violates project-specific standards.
