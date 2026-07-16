@@ -52,6 +52,19 @@ The app reads the first fenced `json mission-control-config` block in this file.
     "validationCommands": [
       "npm run check"
     ],
+    "standards": [
+      "standards/engineering.md",
+      "standards/frontend.md",
+      "standards/styles.md",
+      "standards/javascript.md",
+      "standards/assets.md",
+      "standards/seo.md",
+      "standards/performance.md",
+      "standards/accessibility.md",
+      "standards/security-privacy.md",
+      "standards/testing.md",
+      "standards/review-checklist.md"
+    ],
     "safetyRules": [
       "Do not deploy production without explicit approval.",
       "Do not send emails, push notifications, or external messages without explicit approval.",
@@ -70,6 +83,19 @@ The app reads the first fenced `json mission-control-config` block in this file.
         "README.md",
         "AGENTS.md"
       ],
+      "standards": [
+        "standards/engineering.md",
+        "standards/frontend.md",
+        "standards/styles.md",
+        "standards/javascript.md",
+        "standards/assets.md",
+        "standards/seo.md",
+        "standards/performance.md",
+        "standards/accessibility.md",
+        "standards/security-privacy.md",
+        "standards/testing.md",
+        "standards/review-checklist.md"
+      ],
       "validationCommands": [
         "npm run check"
       ],
@@ -80,4 +106,3 @@ The app reads the first fenced `json mission-control-config` block in this file.
   ]
 }
 ```
-

@@ -20,6 +20,19 @@
         "README.md",
         "AGENTS.md"
       ],
+      "standards": [
+        "standards/engineering.md",
+        "standards/frontend.md",
+        "standards/styles.md",
+        "standards/javascript.md",
+        "standards/assets.md",
+        "standards/seo.md",
+        "standards/performance.md",
+        "standards/accessibility.md",
+        "standards/security-privacy.md",
+        "standards/testing.md",
+        "standards/review-checklist.md"
+      ],
       "safetyRules": [
         "Do not deploy production without explicit approval.",
         "Do not commit secrets or private customer data."

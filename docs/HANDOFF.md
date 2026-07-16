@@ -73,6 +73,7 @@ Required fields:
 - Expected outcome
 - Acceptance criteria
 - Visual attachments or context links when relevant
+- Referenced standards
 - Privacy and security notes when relevant
 - Suggested branch name when known
 - Linked pull request URL when known
@@ -126,6 +127,21 @@ If a full mockup contains multiple screens, prefer creating cropped image files 
 
 Image attachments should render inside the task detail page as clickable previews. They should expand in the page, not open a new browser window.
 
+## Responsive Design Standard
+
+UI and design tasks are mobile-first by default, but they are not mobile-only by default.
+
+When the user provides a mobile mockup, the task should still define expected behavior for:
+
+- mobile
+- tablet
+- desktop
+- wide desktop when relevant
+
+If tablet or desktop is out of scope, that must be stated explicitly in the task. Otherwise the builder is expected to infer a polished responsive layout that preserves the design intent across breakpoints.
+
+For redesign work, do not update only the mocked component while leaving the rest of the visible page in an obviously mismatched design state unless the task explicitly scopes a single component.
+
 ## Build Flow
 
 When the user says to build:
@@ -158,8 +174,9 @@ When asked to break a mockup into tasks:
 3. Group the work into coherent slices that one builder can finish on a feature branch.
 4. Create one Mission Control task per slice.
 5. Attach the relevant image crop or full mockup reference.
-6. Include the applicable product requirement, not just the visual appearance.
-7. Add acceptance criteria that cover functionality, responsive behavior, visual match, and validation.
+6. Include mobile, tablet, and desktop expectations for each visual slice.
+7. Include the applicable product requirement, not just the visual appearance.
+8. Add acceptance criteria that cover functionality, responsive behavior, visual match, and validation.
 8. Link each task back to the same project and original source image.
 
 For Event Horizon, useful slices include:

@@ -90,6 +90,19 @@ async function setup() {
       },
       defaults: {
         validationCommands: [],
+        standards: [
+          "standards/engineering.md",
+          "standards/frontend.md",
+          "standards/styles.md",
+          "standards/javascript.md",
+          "standards/assets.md",
+          "standards/seo.md",
+          "standards/performance.md",
+          "standards/accessibility.md",
+          "standards/security-privacy.md",
+          "standards/testing.md",
+          "standards/review-checklist.md",
+        ],
         safetyRules: [
           "Do not deploy production without explicit approval.",
           "Do not send emails, push notifications, or external messages without explicit approval.",
@@ -113,6 +126,7 @@ async function setup() {
         repoUrl: repoUrl.trim(),
         defaultBranch: "main",
         contextLinks: ["README.md", "AGENTS.md"],
+        standards: config.defaults.standards,
         validationCommands: validation.trim() ? [validation.trim()] : [],
         safetyRules: config.defaults.safetyRules,
       });
@@ -182,6 +196,7 @@ Task fields:
   --attachment                  Image, screenshot, mockup, URL, or reference path
   --branch                      Associated feature branch
   --pr-url                      Associated pull request URL
+  --standards                   Project standards, comma or newline separated
 `);
     return;
   }
@@ -232,6 +247,7 @@ Task fields:
       defaultBranch: args["default-branch"] || "main",
       validationCommands: args.validation,
       contextLinks: args.context,
+      standards: args.standards,
       safetyRules: args.safety,
     });
     console.log(`Added project ${project.id}: ${project.name}`);

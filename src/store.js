@@ -132,6 +132,7 @@ export async function addProject(input) {
     defaultBranch: String(input.defaultBranch || "main").trim(),
     validationCommands: normalizeList(input.validationCommands),
     contextLinks: normalizeList(input.contextLinks),
+    standards: normalizeList(input.standards),
     safetyRules: normalizeList(input.safetyRules),
     createdAt: now,
     updatedAt: now,
@@ -296,6 +297,7 @@ export function generatePrompt(state, taskId, role = "builder") {
   const validation = (project.validationCommands || []).map((item) => `- \`${item}\``).join("\n") || "- No validation command recorded.";
   const safety = (project.safetyRules || []).map((item) => `- ${item}`).join("\n") || "- No project-specific safety rules recorded.";
   const context = (project.contextLinks || []).map((item) => `- ${item}`).join("\n") || "- README.md";
+  const standards = (project.standards || []).map((item) => `- ${item}`).join("\n") || "- No project-specific standards recorded.";
 
   if (role === "reviewer") {
     return `You are the team-lead reviewer for Mission Control task ${task.id}.
@@ -326,10 +328,14 @@ ${criteria}
 Project safety rules:
 ${safety}
 
+Project standards:
+${standards}
+
 Review instructions:
 - Review as a senior engineer.
 - Lead with concrete findings ordered by severity.
 - Check scope, behavior, tests, security, privacy, and maintainability.
+- Check the listed project standards and fail the task for material violations.
 - Confirm whether the acceptance criteria are met.
 - Confirm the task has branch/PR context and builder notes when implementation work was done.
 - If it is not ready for the human owner, mark what needs to change.
@@ -347,6 +353,8 @@ Suggested branch: ${task.branchName || `codex/${project.key}-${task.id}-${slugif
 Before editing:
 - Read project context:
 ${context}
+- Read project standards:
+${standards}
 - Follow project safety rules:
 ${safety}
 
@@ -374,6 +382,7 @@ ${validation}
 Builder instructions:
 - Create or switch to the feature branch.
 - For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
+- For UI tasks, implement and verify mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.
 - Keep changes scoped to this task.
 - Do not commit secrets, private customer data, or unrelated refactors.
 - Run validation before reporting ready.

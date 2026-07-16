@@ -14,6 +14,7 @@ This first version is intentionally simple:
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
+- Includes default project standards for engineering, frontend, Sass/CSS, assets, SEO, performance, accessibility, security/privacy, testing, and review.
 
 ## Quick Start
 
@@ -120,11 +121,14 @@ node src/mission-control-cli.js prompt task_1 --role reviewer
 
 1. Capture idea as a task.
 2. Shape it with a user story, expected outcome, acceptance criteria, visual attachments, and safety notes.
-3. Builder Codex thread creates a feature branch and implements it.
-4. Builder runs validation, commits, pushes, links the branch/PR, leaves a task comment, and marks the task `builder_review`.
-5. Reviewer Codex thread reviews the branch.
-6. Reviewer sends it back as `needs_changes` or forwards it as `user_review`.
-7. Human owner approves, asks for changes, merges, or deploys.
+3. Attach project standards that the builder and reviewer must follow.
+4. Builder Codex thread creates a feature branch and implements it.
+5. Builder runs validation, commits, pushes, links the branch/PR, leaves a task comment, and marks the task `builder_review`.
+6. Reviewer Codex thread reviews the branch against acceptance criteria and standards.
+7. Reviewer sends it back as `needs_changes` or forwards it as `user_review`.
+8. Human owner approves, asks for changes, merges, or deploys.
+
+For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.
 
 ## Future Chat Handoff
 
@@ -158,6 +162,26 @@ Each project can store safety rules. Examples:
 - Do not send emails or notifications without explicit approval.
 - Treat PII, auth data, payment data, location data, and behavioral analytics as sensitive.
 - Use project-specific context files before editing.
+
+## Project Standards
+
+Each project can store standards files. These are injected into builder and reviewer prompts.
+
+Default standards live in [standards/](standards/):
+
+- engineering
+- frontend and responsive design
+- Sass/CSS
+- JavaScript
+- assets and icons
+- SEO
+- performance
+- accessibility
+- security/privacy
+- testing
+- review checklist
+
+For UI work, the default standard is mobile-first, not mobile-only: builders must account for mobile, tablet, and desktop unless the task explicitly scopes one breakpoint.
 
 ## Current Scope
 

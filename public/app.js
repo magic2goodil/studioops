@@ -207,6 +207,21 @@ function renderBranchPanel(task, project) {
   `;
 }
 
+function renderStandardsPanel(project) {
+  const standards = project?.standards || [];
+  return `
+    <section class="detail-section standards-section">
+      <div class="section-heading">
+        <h3>Project Standards</h3>
+        <span>${standards.length} file${standards.length === 1 ? "" : "s"}</span>
+      </div>
+      <div class="standards-list">
+        ${standards.map((item) => `<code>${escapeHtml(item)}</code>`).join("") || `<p class="muted-note">No standards attached to this project yet.</p>`}
+      </div>
+    </section>
+  `;
+}
+
 function renderComments(comments) {
   return `
     <section class="detail-section comments-section">
@@ -264,6 +279,7 @@ async function renderDetail() {
         ${fullTask.expectedOutcome ? `<h3>Expected Outcome</h3><p>${escapeHtml(fullTask.expectedOutcome)}</p>` : ""}
       </section>
       ${renderBranchPanel(fullTask, project)}
+      ${renderStandardsPanel(project)}
     </div>
     ${attachmentList(fullTask.attachments)}
     <h3>Task Link</h3>

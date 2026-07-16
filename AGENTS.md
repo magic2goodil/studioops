@@ -10,6 +10,8 @@ When working in this repository:
 - Keep generated task prompts clear enough to paste into a fresh Codex thread.
 - Use `docs/HANDOFF.md` when a user asks to create, build, review, or split work through Mission Control.
 - For non-trivial tasks, capture user story, expected outcome, acceptance criteria, visual attachments when relevant, and privacy/security notes before implementation.
+- Attach project standards to tasks and enforce them in builder/reviewer prompts.
+- For UI work, require mobile-first implementation plus tablet and desktop expectations unless a task explicitly scopes one breakpoint only.
 - Builder work should link the feature branch and PR on the task, then leave a task comment with changed files, validation, known gaps, and the PR URL.
 - Run `npm run check` before committing code changes.
 

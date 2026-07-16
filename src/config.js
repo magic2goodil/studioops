@@ -74,7 +74,7 @@ export function projectFromConfig(rawProject, defaults = {}) {
     defaultBranch: rawProject.defaultBranch || defaults.defaultBranch || "main",
     validationCommands: rawProject.validationCommands || defaults.validationCommands || [],
     contextLinks: rawProject.contextLinks || [],
+    standards: rawProject.standards || defaults.standards || [],
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
   };
 }
-

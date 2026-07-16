@@ -430,6 +430,21 @@ label {
   gap: 12px;
 }
 
+.standards-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.standards-list code {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: rgba(245, 247, 251, 0.78);
+  background: rgba(255, 255, 255, 0.055);
+  padding: 7px 10px;
+  font-size: 0.78rem;
+}
+
 .comment-list {
   display: grid;
   gap: 10px;
