@@ -37,6 +37,12 @@ For non-trivial work, identify the shared architecture before implementation:
 
 If several builders will work in parallel, the foundation task should define these boundaries first.
 
+## Production Change Gate
+
+Prefer admin-editable content and layout configuration over code changes for routine copy, images, panel ordering, visibility, and SEO metadata.
+
+Code changes should go through feature branches, validation, pull request review, and the project's configured deployment workflow. Do not treat direct production edits or one-off server changes as the normal release path.
+
 ## Comments
 
 - Comments should explain why a decision exists.

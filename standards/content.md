@@ -33,6 +33,34 @@ Common editable fields:
 
 Editable content should have sensible fallbacks, but fallback text must not hide missing configuration in production-like environments.
 
+## Authenticated CMS And Layout Builder
+
+The default goal for owned products is that routine content and page composition changes do not require a code push.
+
+When a page has editable marketing or product content, prefer an authenticated admin CMS model for:
+
+- hero eyebrow, headline, supporting copy, and CTA labels/URLs
+- hero/background images and share images
+- feature panels, cards, and repeated content blocks
+- section ordering
+- panel visibility and scheduling
+- trusted logos, testimonials, partner rows, and curated lists
+- SEO title, description, canonical URL, and Open Graph/Twitter metadata
+
+For pages with multiple sections, design the content model as a controlled layout builder rather than arbitrary HTML:
+
+- define allowed block types
+- define allowed fields per block
+- validate required fields before publish
+- store display order explicitly
+- support draft, preview, published, archived, and scheduled states where practical
+- record who changed content and when
+- keep reusable visual components in code while letting admins choose content, order, and configured variants
+
+Code should add new capabilities, block types, components, validations, and integrations. CMS edits should handle ordinary copy, images, ordering, and visibility changes.
+
+Never use an unauthenticated CMS endpoint. Admin content editing must be role-gated, audited, and protected with normal session/security controls.
+
 ## Dynamic Content
 
 When a mockup region is dynamic, define the source of truth.

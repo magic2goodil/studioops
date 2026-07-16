@@ -9,6 +9,8 @@ Fail or send back the task when a material issue exists:
 - A visual change only updates one breakpoint while leaving tablet or desktop broken.
 - A redesign updates one component but leaves the rest of the visible page in the old design without explicit scope.
 - Public content relies entirely on client-side JavaScript for meaningful HTML.
+- Routine marketing/page content was hard-coded when the project requires authenticated CMS editing.
+- Page sections, panels, or repeated content blocks cannot be reordered or managed through the agreed content model.
 - SEO metadata, canonical URLs, or structured data are missing for SEO-sensitive pages.
 - Images lack dimensions, aspect ratios, or appropriate lazy-loading behavior.
 - Async content causes avoidable layout shift.
@@ -19,6 +21,7 @@ Fail or send back the task when a material issue exists:
 - There are browser console errors.
 - The implementation ignores referenced mockups or visual attachments.
 - The PR lacks validation notes.
+- Deployment or production-impacting work bypasses the feature branch, PR, validation, and configured CI/CD flow.
 - Sensitive data is logged, exposed, stored casually, or collected without explicit consent requirements.
 - Consent-sensitive features lack opt-in, opt-out/revocation, retention, or data-minimization behavior.
 - The work violates project-specific standards.

@@ -17,6 +17,8 @@ Default standards:
 - `accessibility.md`
 - `security-privacy.md`
 - `testing.md`
+- `release-deployment.md`
+- `content.md`
 - `review-checklist.md`
 
 For visual work, the default expectation is mobile-first implementation with mobile, tablet, and desktop coverage. If a task is intentionally limited to one breakpoint, the task must say so explicitly.
