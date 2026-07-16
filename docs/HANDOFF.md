@@ -22,6 +22,12 @@ Task URLs use:
 http://127.0.0.1:4317/tasks/<task_id>
 ```
 
+Supervisor docs:
+
+```text
+docs/SUPERVISOR.md
+```
+
 Default local repo path for this machine:
 
 ```text
@@ -203,13 +209,15 @@ codex/<project-key>-<task-id>-<short-title>
 11. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
 12. Task moves to `builder_review`.
 13. Run `npm run automation-tick -- --project <project-key> --limit 10` or let the scheduled steward route the task.
-14. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.
-15. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
-16. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
-17. Reviewers record outcomes with `mission-control review <task-id> --stage backend|frontend|lead --outcome approved|skipped|changes_requested --body "..."`.
-18. A `changes_requested` outcome returns the task to `needs_changes` and assigns the builder.
-19. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review` and emits `owner_review_requested`.
-20. The human owner makes the final merge/deploy decision.
+14. Run `npm run supervisor -- --json` or let the scheduled supervisor report next builder/reviewer/owner actions across projects.
+15. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.
+16. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
+17. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
+18. Reviewers record outcomes with `mission-control review <task-id> --stage backend|frontend|lead --outcome approved|skipped|changes_requested --body "..."`.
+19. A `changes_requested` outcome returns the task to `needs_changes` and assigns the builder.
+20. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review` and emits `owner_review_requested`.
+21. The supervisor reports `notify_owner` for final human review.
+22. The human owner makes the final merge/deploy decision.
 
 Default PR rule:
 

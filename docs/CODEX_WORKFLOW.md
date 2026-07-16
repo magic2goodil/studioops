@@ -68,13 +68,25 @@ Run the steward manually with:
 npm run automation-tick -- --project dollos --limit 10
 ```
 
+Run the cross-project supervisor with:
+
+```bash
+npm run supervisor
+```
+
+or continuously:
+
+```bash
+npm run supervisor -- --watch --interval 300
+```
+
 Record review outcomes with:
 
 ```bash
 node src/mission-control-cli.js review task_123 --stage backend --outcome approved --body "Reviewed API and persistence."
 ```
 
-A scheduled runner can call the same tick command every few minutes. That runner should only route tasks and create or notify work items; it should not deploy production or merge PRs.
+A scheduled runner can call the same tick command every few minutes, then call the supervisor command to decide what builder, reviewer, or owner handoff action is next. That runner should only route tasks and create or notify work items; it should not deploy production or merge PRs.
 
 ## Reviewer
 

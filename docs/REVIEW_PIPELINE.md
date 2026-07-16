@@ -18,6 +18,18 @@ or directly:
 node src/mission-control-cli.js automation-tick --project dollos --limit 10
 ```
 
+For cross-project monitoring, run:
+
+```bash
+npm run supervisor
+```
+
+or keep it running:
+
+```bash
+npm run supervisor -- --watch --interval 300
+```
+
 The automation tick:
 
 - assigns `ready` or `queued` tasks to the builder by moving them to `in_progress`
@@ -26,6 +38,8 @@ The automation tick:
 - requires branch and PR links before reviewer routing
 - routes each `builder_review` task through backend, frontend, and lead review stages
 - records owner handoff by moving fully reviewed tasks to `user_review`
+
+The supervisor reports the next action across projects. It is read-oriented and safe to keep running because it does not merge, deploy, or send external notifications.
 
 Reviewers must record explicit outcomes:
 

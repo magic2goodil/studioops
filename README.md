@@ -12,6 +12,7 @@ This first version is intentionally simple:
 - Has a CLI for adding/listing tasks.
 - Generates builder and reviewer prompts you can hand to Codex.
 - Generates backend, frontend, and primary lead reviewer prompts.
+- Includes a supervisor loop for continuously reporting builder, reviewer, dependency, and owner-handoff actions across projects.
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
@@ -130,6 +131,18 @@ Run one workflow automation pass:
 npm run automation-tick -- --project dollos --limit 10
 ```
 
+Run the supervisor once:
+
+```bash
+npm run supervisor
+```
+
+Run the supervisor continuously:
+
+```bash
+npm run supervisor -- --watch --interval 300
+```
+
 Record a review outcome:
 
 ```bash
@@ -150,9 +163,12 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 10. Frontend reviewer records `approved`, `skipped`, or `changes_requested`.
 11. Primary lead reviewer records the final review outcome.
 12. Automation tick moves fully reviewed work to `user_review`.
-13. Human owner approves, asks for changes, merges, or deploys.
+13. The supervisor reports `notify_owner` for tasks that have reached the human gate.
+14. Human owner approves, asks for changes, merges, or deploys.
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
+
+For continuous coordination, see [docs/SUPERVISOR.md](docs/SUPERVISOR.md).
 
 For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.
 
@@ -220,6 +236,8 @@ For parallel builder work, the default standard is foundation-first. One builder
 ## Current Scope
 
 This repository now has a bounded workflow automation steward for assignment, dependency blocking/unblocking, review routing, review-cycle handling, and owner handoff.
+
+It also has a read-oriented supervisor command that can run every few minutes to report what builders, reviewers, or the human owner should do next across all projects.
 
 It still does not spawn Codex threads, open GitHub PRs, merge branches, deploy, or send external notifications by itself. Those should be built as the next runner layer on top of the existing `automation-tick`, review outcomes, and `owner_review_requested` events.
 

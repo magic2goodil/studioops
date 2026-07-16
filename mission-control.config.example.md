@@ -49,6 +49,15 @@ The app reads the first fenced `json mission-control-config` block in this file.
     "root": "~/Development"
   },
   "defaults": {
+    "supervisor": {
+      "intervalSeconds": 300,
+      "baseUrl": "http://127.0.0.1:4317",
+      "ownerNotificationStatus": "user_review",
+      "builderConcurrency": 1,
+      "reviewerConcurrency": 2,
+      "requireHumanMerge": true,
+      "requireGitHubActionsDeploy": true
+    },
     "validationCommands": [
       "npm run check"
     ],

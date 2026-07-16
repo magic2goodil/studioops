@@ -6,15 +6,17 @@
   "private": false,
   "license": "MIT",
   "bin": {
-    "mission-control": "./src/mission-control-cli.js"
+    "mission-control": "./src/mission-control-cli.js",
+    "mission-control-supervisor": "./src/mission-control-supervisor.js"
   },
   "scripts": {
     "setup": "node src/mission-control-cli.js setup",
     "start": "node src/server.js",
     "dev": "node src/server.js",
-    "check": "node --check src/config.js && node --check src/store.js && node --check src/server.js && node --check src/mission-control-cli.js && node --check public/app.js",
+    "check": "node --check src/config.js && node --check src/store.js && node --check src/supervisor.js && node --check src/server.js && node --check src/mission-control-cli.js && node --check src/mission-control-supervisor.js && node --check public/app.js",
     "import-config": "node src/mission-control-cli.js import-config",
     "automation-tick": "node src/mission-control-cli.js automation-tick",
+    "supervisor": "node src/mission-control-supervisor.js",
     "tasks": "node src/mission-control-cli.js tasks",
     "projects": "node src/mission-control-cli.js projects"
   },

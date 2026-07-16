@@ -13,6 +13,7 @@ import {
   readState,
   updateTask,
 } from "./store.js";
+import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
 import {
   expandHome,
   loadConfig,
@@ -91,6 +92,15 @@ async function setup() {
         root: workspaceRoot.trim() || "~/Development",
       },
       defaults: {
+        supervisor: {
+          intervalSeconds: 300,
+          baseUrl: "http://127.0.0.1:4317",
+          ownerNotificationStatus: "user_review",
+          builderConcurrency: 1,
+          reviewerConcurrency: 2,
+          requireHumanMerge: true,
+          requireGitHubActionsDeploy: true,
+        },
         validationCommands: [],
         standards: [
           "standards/engineering.md",
@@ -225,6 +235,7 @@ Commands:
   comment TASK_ID --body        Add a builder/reviewer comment
   review TASK_ID --stage        Record approved, skipped, or changes_requested
   automation-tick               Advance ready, blocked, and review tasks
+  supervisor                    Show next builder, reviewer, dependency, and owner actions
   prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, or lead-reviewer prompt
 
 Task fields:
@@ -240,6 +251,7 @@ Task fields:
 
 Automation:
   mission-control automation-tick --project dollos --limit 10
+  mission-control supervisor --json
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
 `);
     return;
@@ -394,6 +406,18 @@ Automation:
       return;
     }
     for (const action of result.actions) console.log(`- ${action}`);
+    return;
+  }
+
+  if (command === "supervisor") {
+    const state = await readState();
+    const report = createSupervisorReport(state, {
+      baseUrl: args["base-url"] || "http://127.0.0.1:4317",
+      includeWaiting: args.all || args["include-waiting"],
+      intervalSeconds: args.interval || args["interval-seconds"] || 300,
+    });
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatSupervisorReport(report));
     return;
   }
 
