@@ -1,4 +1,5 @@
 import { findTask, generatePrompt, mutateState } from "./store.js";
+import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_builder",
@@ -100,6 +101,47 @@ function activeCounts(state) {
   }, {});
 }
 
+function activeLaneProfiles(state, selected = []) {
+  const activeRuns = (state.runs || [])
+    .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
+    .map((run) => {
+      const task = findTask(state, run.taskId);
+      if (!task) return null;
+      const profile = laneProfile(task, run);
+      return {
+        id: run.id,
+        taskId: run.taskId,
+        projectId: run.projectId || task.projectId,
+        lane: profile.lane,
+        conflictGroup: profile.conflictGroup,
+      };
+    })
+    .filter(Boolean);
+
+  const selectedRuns = selected.map((item) => ({
+    id: item.action.id,
+    taskId: item.task.id,
+    projectId: item.task.projectId,
+    lane: item.profile.lane,
+    conflictGroup: item.profile.conflictGroup,
+  }));
+
+  return [...activeRuns, ...selectedRuns];
+}
+
+function findLaneConflict(state, selected, action, task) {
+  const profile = laneProfile(task, action);
+  const current = {
+    id: action.id,
+    taskId: task.id,
+    projectId: task.projectId,
+    lane: profile.lane,
+    conflictGroup: profile.conflictGroup,
+  };
+  const conflict = activeLaneProfiles(state, selected).find((item) => laneProfilesConflict(current, item));
+  return conflict ? { conflict, profile } : { conflict: null, profile };
+}
+
 function ownerPrompt(action) {
   return `Mission Control owner handoff requested.
 
@@ -137,6 +179,7 @@ function makeRun(state, task, action, options, now) {
   const role = action.role || (group === "owner" ? "owner" : "builder");
   const prompt = role === "owner" ? ownerPrompt(action) : generatePrompt(state, task.id, role);
   const threadId = action.threadId || (group === "reviewer" ? task.reviewerThreadId : task.assignedThreadId) || "";
+  const profile = laneProfile(task, action);
   return {
     id: nextId(state.runs, "run"),
     taskId: task.id,
@@ -146,6 +189,9 @@ function makeRun(state, task, action, options, now) {
     actionType: action.type,
     group,
     role,
+    lane: profile.lane,
+    conflictGroup: profile.conflictGroup,
+    fileScope: profile.fileScope,
     provider: options.provider || DEFAULTS.provider,
     status: dispatchStatusFor(action),
     prompt,
@@ -196,16 +242,24 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: `${group}_concurrency_limit` });
       continue;
     }
-    selected.push({ action, task, group });
+    const { conflict, profile } = findLaneConflict(state, selected, action, task);
+    if (conflict) {
+      skipped.push({ action, reason: `lane_conflict:${profile.conflictGroup}:${conflict.taskId || conflict.id}` });
+      continue;
+    }
+    selected.push({ action, task, group, profile });
     counts[group] = (counts[group] || 0) + 1;
   }
 
   return {
-    selected: selected.map(({ action, task, group }) => ({
+    selected: selected.map(({ action, task, group, profile }) => ({
       action,
       taskId: task.id,
       taskTitle: task.title,
       group,
+      lane: profile.lane,
+      conflictGroup: profile.conflictGroup,
+      fileScope: profile.fileScope,
     })),
     skipped: skipped.map(({ action, reason }) => ({
       actionId: action?.id || "",
@@ -291,6 +345,7 @@ export function formatDispatchReport(report) {
   for (const run of report.runs) {
     lines.push(`[${run.id}] ${run.actionType} -> ${run.role} (${run.status})`);
     lines.push(`  Task: ${run.taskId}`);
+    if (run.lane) lines.push(`  Lane: ${run.lane}${run.conflictGroup ? ` (${run.conflictGroup})` : ""}`);
     if (run.prUrl) lines.push(`  PR: ${run.prUrl}`);
     lines.push("");
   }
@@ -299,6 +354,7 @@ export function formatDispatchReport(report) {
     for (const item of report.selected) {
       lines.push(`[dry-run] ${item.action.type} -> ${item.action.role || "system"}`);
       lines.push(`  Task: ${item.taskId} ${item.taskTitle}`);
+      if (item.lane) lines.push(`  Lane: ${item.lane}${item.conflictGroup ? ` (${item.conflictGroup})` : ""}`);
       lines.push("");
     }
   }

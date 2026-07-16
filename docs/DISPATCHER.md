@@ -122,6 +122,21 @@ Queued and running runs count toward concurrency. Completed, failed, and cancell
 
 The dispatcher also deduplicates by task, role, action type, review cycle, and target status so the same task is not re-dispatched every five minutes.
 
+The dispatcher also attaches a work lane and file-scope hint to each builder/reviewer run. If a task does not explicitly set `lane` or `workAreas`, Mission Control infers the lane from task type, area, title, story, expected outcome, and reviewer role.
+
+Lane conflict rules:
+
+- backend and frontend can dispatch together for the same project
+- frontend and design conflict by default because they often share UI/CSS/assets
+- devops and project-wide work conflict with all same-project lanes
+- different projects can dispatch independently
+
+Tasks can be scoped manually:
+
+```bash
+node src/mission-control-cli.js update-task task_1 --lane backend --work-area "src/**,db/**"
+```
+
 ## Safety
 
 The dispatcher stops at the human owner gate.

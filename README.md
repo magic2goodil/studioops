@@ -16,6 +16,7 @@ This first version is intentionally simple:
 - Includes a steward tick for continuously routing task workflow state across projects.
 - Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
 - Includes a runner loop for consuming queued builder/reviewer runs with Codex CLI or the Codex SDK.
+- Runs builders/reviewers in isolated workspaces with lane-aware scheduling so backend, frontend, design, and devops work do not blindly collide.
 - Includes a notifier loop for local owner-review and failed-run notifications.
 - Includes a GitHub App manifest setup helper for Mission Control bot identities.
 - Keeps project safety rules and validation commands beside the task.

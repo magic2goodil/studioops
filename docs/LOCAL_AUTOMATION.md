@@ -88,4 +88,6 @@ It must not:
 - commit secrets or private data
 - bypass the human owner review gate
 
-The runner intentionally defaults to one active Codex run at a time. That keeps parallel agents from inventing competing architecture, Sass mixins, migrations, or data contracts in the same repository.
+The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
+
+Mission Control treats backend and frontend work as compatible by default. Design conflicts with frontend, and devops/project-wide work conflicts with other lanes in the same project. That keeps parallel agents from editing the same UI/CSS/deployment surface while still allowing a real team-style flow.

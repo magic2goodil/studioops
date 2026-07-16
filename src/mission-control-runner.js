@@ -57,6 +57,8 @@ async function optionsFrom(args) {
     limit: numberFrom(args.limit || args["max-runs"] || defaults.limit || defaults.maxRuns, DEFAULT_LIMIT),
     provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER || defaults.provider || defaults.runProvider,
     codexBin: args["codex-bin"] || defaults.codexBin,
+    useWorkspaces: args["no-workspace"] ? false : (args.workspaces || defaults.useWorkspaces || defaults.isolatedWorkspaces),
+    workspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
     timeoutMs: numberFrom(args["timeout-ms"] || defaults.timeoutMs, 0) || undefined,
     intervalSeconds: secondsFrom(
       args.interval || args["interval-seconds"] || defaults.intervalSeconds,
@@ -101,6 +103,8 @@ Usage:
   mission-control-runner --watch --interval 300 --limit 1
   mission-control-runner --watch --timeout-ms 7200000
   mission-control-runner --provider codex-sdk
+  mission-control-runner --workspace-root .mission-control/run-workspaces
+  mission-control-runner --no-workspace
   MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk mission-control-runner
   mission-control runner --project event-horizons-web --limit 1
 

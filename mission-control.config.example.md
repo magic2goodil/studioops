@@ -81,8 +81,10 @@ The app reads the first fenced `json mission-control-config` block in this file.
     },
     "runner": {
       "intervalSeconds": 300,
-      "limit": 1,
+      "limit": 3,
       "provider": "codex-cli",
+      "useWorkspaces": true,
+      "workspaceRoot": "~/.mission-control/run-workspaces",
       "timeoutMs": 7200000
     },
     "validationCommands": [

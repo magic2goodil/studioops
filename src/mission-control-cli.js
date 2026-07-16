@@ -121,8 +121,10 @@ async function setup() {
         },
         runner: {
           intervalSeconds: 300,
-          limit: 1,
+          limit: 3,
           provider: "codex-cli",
+          useWorkspaces: true,
+          workspaceRoot: "~/.mission-control/run-workspaces",
           timeoutMs: 7200000,
         },
         notifier: {
@@ -284,6 +286,8 @@ Task fields:
   --expected                    Expected outcome or feature behavior
   --criteria                    Acceptance criteria, comma or newline separated
   --attachment                  Image, screenshot, mockup, URL, or reference path
+  --lane                        Work lane: backend, frontend, design, devops, product
+  --work-area                   Expected file/work areas, comma or newline separated
   --branch                      Associated feature branch
   --pr-url                      Associated pull request URL
   --standards                   Project standards, comma or newline separated
@@ -411,6 +415,8 @@ Automation:
       priority: args.priority,
       type: args.type,
       area: args.area,
+      lane: args.lane,
+      workAreas: args["work-area"] || args["work-areas"],
       parentTaskId: args.parent || args["parent-task-id"] || args.epic,
       dependsOnTaskIds: args["depends-on"] || args.dependencies,
       userStory: args.story || args["user-story"],
@@ -436,6 +442,9 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "pr-url")) patch.prUrl = args["pr-url"];
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
     if (Object.prototype.hasOwnProperty.call(args, "type")) patch.type = args.type;
+    if (Object.prototype.hasOwnProperty.call(args, "lane")) patch.lane = args.lane;
+    if (Object.prototype.hasOwnProperty.call(args, "work-area")) patch.workAreas = args["work-area"];
+    if (Object.prototype.hasOwnProperty.call(args, "work-areas")) patch.workAreas = args["work-areas"];
     if (Object.prototype.hasOwnProperty.call(args, "priority")) patch.priority = args.priority;
     if (Object.prototype.hasOwnProperty.call(args, "parent")) patch.parentTaskId = args.parent;
     if (Object.prototype.hasOwnProperty.call(args, "parent-task-id")) patch.parentTaskId = args["parent-task-id"];
@@ -530,6 +539,8 @@ Automation:
       limit: args.limit || args["max-runs"],
       provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER,
       codexBin: args["codex-bin"],
+      useWorkspaces: args["no-workspace"] ? false : args.workspaces,
+      workspaceRoot: args["workspace-root"],
       timeoutMs: args["timeout-ms"],
     };
     if (args.plan || args["dry-run"] || args.dryRun) {

@@ -326,6 +326,8 @@ export async function addTask(input) {
       priority: String(input.priority || "medium").trim(),
       type: String(input.type || "feature").trim(),
       area: String(input.area || "").trim(),
+      lane: String(input.lane || "").trim(),
+      workAreas: normalizeList(input.workAreas || input.workArea || input["work-area"]),
       parentTaskId,
       dependsOnTaskIds,
       userStory: String(input.userStory || input.story || "").trim(),
@@ -371,6 +373,7 @@ export async function updateTask(taskId, patch) {
       "priority",
       "type",
       "area",
+      "lane",
       "parentTaskId",
       "userStory",
       "expectedOutcome",
@@ -392,6 +395,9 @@ export async function updateTask(taskId, patch) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, "dependsOnTaskIds")) {
       task.dependsOnTaskIds = normalizeList(patch.dependsOnTaskIds);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "workAreas")) {
+      task.workAreas = normalizeList(patch.workAreas);
     }
     validateTaskRelationships(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
     if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
@@ -983,6 +989,9 @@ Repository path: ${project.repoPath || "(not recorded)"}
 Feature branch: ${task.branchName || "(not recorded)"}
 PR: ${task.prUrl || "(not recorded)"}
 Task type: ${task.type || "task"}
+Work lane: ${task.lane || task.area || "(inferred by Mission Control)"}
+Work areas:
+${(task.workAreas || []).map((item) => `- ${item}`).join("\n") || "- Not explicitly scoped."}
 Review cycle: ${currentReviewCycle(task)}
 Parent epic/task: ${parent ? `${parent.id}: ${parent.title}` : "(none)"}
 
@@ -1051,6 +1060,9 @@ Repository path: ${project.repoPath || "(not recorded)"}
 Default branch: ${project.defaultBranch || "main"}
 Suggested branch: ${task.branchName || `codex/${project.key}-${task.id}-${slugify(task.title)}`}
 Task type: ${task.type || "task"}
+Work lane: ${task.lane || task.area || "(inferred by Mission Control)"}
+Work areas:
+${(task.workAreas || []).map((item) => `- ${item}`).join("\n") || "- Not explicitly scoped."}
 Review cycle: ${currentReviewCycle(task)}
 Parent epic/task: ${parent ? `${parent.id}: ${parent.title}` : "(none)"}
 
@@ -1097,6 +1109,7 @@ Builder instructions:
 - For data/backend tasks, consider query shape, indexes, pagination, migrations, and realistic data volume.
 - For location, auth, social, notification, behavioral analytics, personalization, AI training, or persuasion/coaching features, define the consent path, opt-out/revocation behavior, data minimization, and privacy notes before implementation.
 - Keep changes scoped to this task.
+- Keep changes inside the task's lane and work areas. If you need to touch files outside that scope, add a Mission Control comment and either create a dependent task or explain why the scope must expand.
 - Do not commit secrets, private customer data, or unrelated refactors.
 - Run validation before reporting ready.
 - Commit and push only if the user/project workflow asks for that.

@@ -142,3 +142,61 @@ node src/mission-control-cli.js run-prompt run_1
 The runner can create branches, validate work, commit, push, and open/update PRs when the task asks for that. It must not merge or deploy.
 
 Once reviewers and lead review pass, the task moves to `user_review`. The notifier then tells the human owner. That is the merge/deploy gate.
+
+## Isolated Workspaces
+
+By default, runner jobs execute in isolated per-run workspaces under:
+
+```text
+~/.mission-control/run-workspaces/
+```
+
+The runner prefers `git worktree` for a project branch. If the target branch is already checked out somewhere else, it falls back to an isolated local clone and points that clone's `origin` remote back to the real GitHub remote.
+
+This lets multiple builders and reviewers run at the same time without sharing one mutable checkout.
+
+Disable isolated workspaces only for debugging:
+
+```bash
+npm run runner -- --no-workspace
+```
+
+Use a custom workspace root:
+
+```bash
+npm run runner -- --workspace-root /path/to/mission-control-workspaces
+```
+
+The runner passes these environment variables to Codex:
+
+- `MISSION_CONTROL_WORKSPACE_PATH`
+- `MISSION_CONTROL_SOURCE_REPO_PATH`
+- `MISSION_CONTROL_WORK_LANE`
+
+## Work Lanes
+
+Mission Control assigns each run a lane:
+
+- `backend`
+- `frontend`
+- `design`
+- `devops`
+- `product`
+- `project-wide`
+
+Tasks can set this explicitly:
+
+```bash
+node src/mission-control-cli.js update-task task_1 --lane frontend --work-area "public/**,src/styles/**"
+```
+
+If no lane is set, Mission Control infers one from task type, area, title, story, expected outcome, and reviewer role.
+
+Dispatch and runner claim both enforce lane conflicts:
+
+- backend and frontend can run at the same time for one project
+- frontend and design conflict by default because they often share UI/CSS/assets
+- devops and lead/project-wide work conflict with all lanes for the same project
+- different projects can run independently
+
+This is intentionally conservative. Use explicit `--work-area` values when a future scheduler needs finer-grained file ownership.
