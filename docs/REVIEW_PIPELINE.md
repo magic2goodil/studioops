@@ -37,7 +37,27 @@ Mission Control uses staged review so the human owner only sees work after the b
 
 ## Reviewer Outcome Rules
 
-Reviewers should not silently fix builder work on the same branch unless the task explicitly asks for a reviewer-fix pass.
+Reviewers should not silently fix builder work on the same branch.
+
+Reviewers may make small, low-risk fixes directly when doing so clearly saves time and does not change product scope. Examples:
+
+- typo, copy, or comment corrections
+- obvious broken link or metadata fixes
+- tiny test/check fixes caused by the reviewed branch
+- narrow CSS/layout cleanup with no design decision hidden inside it
+- missing validation note, task comment, or PR body correction
+
+Reviewer fixes must be recorded in the task comments and PR notes.
+
+Reviewers should send work back to the builder when fixes are material, risky, ambiguous, or product-shaping. Examples:
+
+- schema or migration changes
+- auth, permissions, privacy, consent, PII, or payment behavior
+- data-loss or deployment behavior
+- broad refactors
+- redesigns or new components
+- changes that affect multiple tasks or widen PR scope
+- anything that would need user/product judgment
 
 Expected reviewer outcomes:
 
@@ -46,6 +66,7 @@ Expected reviewer outcomes:
 - Wrong scope: request a PR split or task split.
 - Incomplete acceptance criteria: move to `needs_changes`.
 - Missing review lane: move to the required review status, or document why the lane is not applicable.
+- Small reviewer fix made: commit the fix, comment with exactly what changed, then continue the review stage.
 
 ## One PR Versus Multiple Tasks
 

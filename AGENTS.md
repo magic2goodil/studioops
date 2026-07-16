@@ -19,6 +19,7 @@ When working in this repository:
 - Backend review is required for API, data, auth, analytics, queues, privacy/security, persistence, or deployment changes unless explicitly skipped in a task comment.
 - Frontend review is required for UI, CSS/Sass, frontend JS, content rendering, assets, SEO, accessibility, or public page changes unless explicitly skipped in a task comment.
 - Primary lead review is always required before work reaches the human owner.
+- Reviewers may make tiny low-risk fixes to save time, but they must document those fixes. Material, risky, ambiguous, or product-shaping fixes go back to the builder as `needs_changes`.
 - Run `npm run check` before committing code changes.
 
 ## Roles
