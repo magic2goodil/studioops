@@ -56,6 +56,7 @@ async function optionsFrom(args) {
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     limit: numberFrom(args.limit || args["max-runs"] || defaults.limit || defaults.maxRuns, DEFAULT_LIMIT),
     codexBin: args["codex-bin"] || defaults.codexBin,
+    timeoutMs: numberFrom(args["timeout-ms"] || defaults.timeoutMs, 0) || undefined,
     intervalSeconds: secondsFrom(
       args.interval || args["interval-seconds"] || defaults.intervalSeconds,
       DEFAULT_INTERVAL_SECONDS,
@@ -97,6 +98,7 @@ Usage:
   mission-control-runner --plan
   mission-control-runner
   mission-control-runner --watch --interval 300 --limit 1
+  mission-control-runner --watch --timeout-ms 7200000
   mission-control runner --project event-horizons-web --limit 1
 
 The runner claims queued builder/reviewer dispatch runs and launches Codex CLI

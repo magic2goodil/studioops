@@ -74,6 +74,14 @@ codex exec --cd <project-repo> --dangerously-bypass-approvals-and-sandbox --outp
 
 The prompt still forbids merging, production deploys, external messages, secrets, and unrelated changes. The sandbox is disabled so Codex can work across the registered project repo paths on the same machine.
 
+The runner supplies a developer-oriented `PATH` to child Codex sessions so LaunchAgent jobs can find tools installed by Homebrew, including `node`, `npm`, `gh`, and similar project tooling.
+
+Runs have a default two-hour timeout. Override it with:
+
+```bash
+npm run runner -- --timeout-ms 7200000
+```
+
 ## Output
 
 Runner logs are written to:

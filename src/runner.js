@@ -9,6 +9,12 @@ const RUN_OUTPUT_DIR = path.join(process.cwd(), "data", "run-outputs");
 const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
 const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
+const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_RUNNER_PATH = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
+].join(":");
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -223,6 +229,8 @@ export async function completeRun(runId, input = {}) {
 export async function runClaimedRun(run, input = {}) {
   await mkdir(RUN_OUTPUT_DIR, { recursive: true });
   const codexBin = input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || DEFAULT_CODEX_BIN;
+  const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
+  const timeoutMs = Math.max(60_000, Number(input.timeoutMs || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS || DEFAULT_RUN_TIMEOUT_MS));
   const outputPath = run.outputPath || path.join(RUN_OUTPUT_DIR, `${run.id}.log`);
   const lastMessagePath = run.lastMessagePath || path.join(RUN_OUTPUT_DIR, `${run.id}.last-message.md`);
   const log = createWriteStream(outputPath, { flags: "a" });
@@ -238,21 +246,40 @@ export async function runClaimedRun(run, input = {}) {
   ];
 
   return new Promise((resolve) => {
+    let settled = false;
     log.write(`Mission Control Runner started ${run.id} at ${new Date().toISOString()}\n`);
     log.write(`Command: ${codexBin} ${args.join(" ")}\n\n`);
+    log.write(`PATH: ${childPath}\n`);
+    log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
     const child = spawn(codexBin, args, {
       cwd: run.project.repoPath,
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
+        PATH: childPath,
         MISSION_CONTROL_RUN_ID: run.id,
         MISSION_CONTROL_TASK_ID: run.taskId,
       },
     });
 
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      log.write(`\nRunner timeout after ${Math.round(timeoutMs / 1000)}s. Sending SIGTERM to child process.\n`);
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!settled) {
+          log.write("\nRunner child did not exit after SIGTERM. Sending SIGKILL.\n");
+          child.kill("SIGKILL");
+        }
+      }, 10_000).unref();
+    }, timeoutMs);
+    timeout.unref();
+
     child.stdout.on("data", (chunk) => log.write(chunk));
     child.stderr.on("data", (chunk) => log.write(chunk));
     child.on("error", async (error) => {
+      settled = true;
+      clearTimeout(timeout);
       log.write(`\nRunner spawn error: ${error.message}\n`);
       log.end();
       const completed = await completeRun(run.id, {
@@ -265,6 +292,8 @@ export async function runClaimedRun(run, input = {}) {
       resolve(completed);
     });
     child.on("close", async (code) => {
+      settled = true;
+      clearTimeout(timeout);
       let notes = "";
       try {
         notes = (await readFile(lastMessagePath, "utf8")).trim();

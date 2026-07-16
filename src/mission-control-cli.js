@@ -123,6 +123,7 @@ async function setup() {
           intervalSeconds: 300,
           limit: 1,
           provider: "codex-cli",
+          timeoutMs: 7200000,
         },
         notifier: {
           intervalSeconds: 60,
@@ -521,6 +522,7 @@ Automation:
       project: args.project || args.projects,
       limit: args.limit || args["max-runs"],
       codexBin: args["codex-bin"],
+      timeoutMs: args["timeout-ms"],
     };
     if (args.plan || args["dry-run"] || args.dryRun) {
       const state = await readState();

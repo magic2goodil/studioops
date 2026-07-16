@@ -220,6 +220,13 @@ function renderAttachments(attachments) {
     : "- None recorded.";
 }
 
+function standardReference(item) {
+  const value = String(item || "").trim();
+  if (!value) return "";
+  if (path.isAbsolute(value) || /^[a-z]+:\/\//i.test(value)) return value;
+  return path.join(process.cwd(), value);
+}
+
 function normalizeReviewPipeline(value) {
   if (!Array.isArray(value)) return [];
   return value
@@ -814,7 +821,7 @@ export function generatePrompt(state, taskId, role = "builder") {
   const validation = (project.validationCommands || []).map((item) => `- \`${item}\``).join("\n") || "- No validation command recorded.";
   const safety = (project.safetyRules || []).map((item) => `- ${item}`).join("\n") || "- No project-specific safety rules recorded.";
   const context = (project.contextLinks || []).map((item) => `- ${item}`).join("\n") || "- README.md";
-  const standards = (project.standards || []).map((item) => `- ${item}`).join("\n") || "- No project-specific standards recorded.";
+  const standards = (project.standards || []).map((item) => `- ${standardReference(item)}`).join("\n") || "- No project-specific standards recorded.";
   const reviewStages = (project.reviewPipeline || []).length ? project.reviewPipeline : DEFAULT_REVIEW_PIPELINE;
   const reviewPipeline = reviewStages.length
     ? reviewStages
