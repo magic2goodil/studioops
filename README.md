@@ -14,7 +14,8 @@ This first version is intentionally simple:
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
-- Includes default project standards for engineering, frontend, Sass/CSS, assets, SEO, performance, accessibility, security/privacy, testing, and review.
+- Supports epic/task hierarchy and dependency links so broad work can be planned before builders start.
+- Includes default project standards for engineering, frontend, Sass/CSS, assets, content/IA, data/backend, mockup intake, SEO, performance, accessibility, security/privacy, testing, and review.
 - Includes design-system standards for reusable components, Storybook/component catalogs, Twig or equivalent templates, and Sass mixins/tokens.
 
 ## Quick Start
@@ -85,6 +86,8 @@ node src/mission-control-cli.js add-task \
   --expected "Users see the onboarding flow, then continue to auth." \
   --criteria "The first screen explains the value, Location and notification prompts are introduced before permission requests, npm run check passes" \
   --attachment "/absolute/path/to/mockup.png" \
+  --parent "task_10" \
+  --depends-on "task_7, task_8" \
   --branch "codex/myapp-task_2-add-onboarding-flow" \
   --status ready \
   --priority high
@@ -122,12 +125,14 @@ node src/mission-control-cli.js prompt task_1 --role reviewer
 
 1. Capture idea as a task.
 2. Shape it with a user story, expected outcome, acceptance criteria, visual attachments, and safety notes.
-3. Attach project standards that the builder and reviewer must follow.
-4. Builder Codex thread creates a feature branch and implements it.
-5. Builder runs validation, commits, pushes, links the branch/PR, leaves a task comment, and marks the task `builder_review`.
-6. Reviewer Codex thread reviews the branch against acceptance criteria and standards.
-7. Reviewer sends it back as `needs_changes` or forwards it as `user_review`.
-8. Human owner approves, asks for changes, merges, or deploys.
+3. For broad work, create epics and dependency links before assigning builders.
+4. For UI-heavy work, create a foundation/design-system task first so parallel builders share tokens, components, mixins, and responsive rules.
+5. Attach project standards that the builder and reviewer must follow.
+6. Builder Codex thread creates a feature branch and implements it.
+7. Builder runs validation, commits, pushes, links the branch/PR, leaves a task comment, and marks the task `builder_review`.
+8. Reviewer Codex thread reviews the branch against acceptance criteria and standards.
+9. Reviewer sends it back as `needs_changes` or forwards it as `user_review`.
+10. Human owner approves, asks for changes, merges, or deploys.
 
 For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.
 
@@ -176,6 +181,9 @@ Default standards live in [standards/](standards/):
 - Sass/CSS
 - JavaScript
 - assets and icons
+- content and information architecture
+- data and backend
+- mockup intake and design critique
 - SEO
 - performance
 - accessibility
@@ -186,6 +194,8 @@ Default standards live in [standards/](standards/):
 For UI work, the default standard is mobile-first, not mobile-only: builders must account for mobile, tablet, and desktop unless the task explicitly scopes one breakpoint.
 
 For component work, the default standard is reusable-by-design: a card, CTA, badge, modal, or form control should be built once as a component/template and reused across pages. Design artifacts should define responsive variants and component states before page implementation when practical.
+
+For parallel builder work, the default standard is foundation-first. One builder should define the shared design system, Sass API, data-access conventions, and performance expectations before several builders start implementing page slices. Reviewer prompts are expected to catch duplicate components, duplicate mixins, unindexed queries, and other “AI slop” signals before the work reaches the owner.
 
 ## Current Scope
 

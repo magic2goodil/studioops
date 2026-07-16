@@ -70,6 +70,22 @@
           <label>Project <select name="project" required></select></label>
           <label>Title <input name="title" placeholder="Build the thing" required></label>
           <label>Description <textarea name="description" rows="4" placeholder="What should happen?"></textarea></label>
+          <label>Type
+            <select name="type">
+              <option value="feature">Feature</option>
+              <option value="epic">Epic</option>
+              <option value="component">Component</option>
+              <option value="content-model">Content Model</option>
+              <option value="information-architecture">Information Architecture</option>
+              <option value="mockup-critique">Mockup Critique</option>
+              <option value="design">Design</option>
+              <option value="frontend">Frontend</option>
+              <option value="backend">Backend</option>
+              <option value="review">Review</option>
+            </select>
+          </label>
+          <label>Parent Epic/Task <input name="parentTaskId" placeholder="task_12"></label>
+          <label>Depends On <textarea name="dependsOnTaskIds" rows="2" placeholder="task_1, task_2"></textarea></label>
           <label>User Story <textarea name="userStory" rows="2" placeholder="As a customer, I want..."></textarea></label>
           <label>Expected Outcome <textarea name="expectedOutcome" rows="3" placeholder="What should be true when this is complete?"></textarea></label>
           <label>Visual Attachments <textarea name="attachments" rows="3" placeholder="One image path, screenshot, mockup URL, or reference per line"></textarea></label>

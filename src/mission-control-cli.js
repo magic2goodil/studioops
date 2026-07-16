@@ -97,6 +97,9 @@ async function setup() {
           "standards/styles.md",
           "standards/javascript.md",
           "standards/assets.md",
+          "standards/content.md",
+          "standards/data.md",
+          "standards/mockup-intake.md",
           "standards/seo.md",
           "standards/performance.md",
           "standards/accessibility.md",
@@ -108,6 +111,7 @@ async function setup() {
           "Do not deploy production without explicit approval.",
           "Do not send emails, push notifications, or external messages without explicit approval.",
           "Do not commit secrets, private keys, tokens, or private customer data.",
+          "Do not add sensitive data collection, training, personalization, or outbound messaging without clear consent and opt-out behavior.",
         ],
       },
       projects: [],
@@ -198,6 +202,8 @@ Task fields:
   --branch                      Associated feature branch
   --pr-url                      Associated pull request URL
   --standards                   Project standards, comma or newline separated
+  --parent                      Parent epic/task ID
+  --depends-on                  Dependency task IDs, comma or newline separated
 `);
     return;
   }
@@ -231,10 +237,12 @@ Task fields:
         id: task.id,
         project: project?.key || task.projectId,
         status: task.status,
+        type: task.type,
         priority: task.priority,
+        parent: task.parentTaskId || "",
         title: task.title,
       };
-    }), ["id", "project", "status", "priority", "title"]);
+    }), ["id", "project", "status", "type", "priority", "parent", "title"]);
     return;
   }
 
@@ -264,6 +272,8 @@ Task fields:
       priority: args.priority,
       type: args.type,
       area: args.area,
+      parentTaskId: args.parent || args["parent-task-id"] || args.epic,
+      dependsOnTaskIds: args["depends-on"] || args.dependencies,
       userStory: args.story || args["user-story"],
       expectedOutcome: args.expected || args["expected-outcome"],
       attachments: args.attachment || args.attachments,
@@ -286,6 +296,12 @@ Task fields:
     if (Object.prototype.hasOwnProperty.call(args, "pr")) patch.prUrl = args.pr;
     if (Object.prototype.hasOwnProperty.call(args, "pr-url")) patch.prUrl = args["pr-url"];
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
+    if (Object.prototype.hasOwnProperty.call(args, "type")) patch.type = args.type;
+    if (Object.prototype.hasOwnProperty.call(args, "priority")) patch.priority = args.priority;
+    if (Object.prototype.hasOwnProperty.call(args, "parent")) patch.parentTaskId = args.parent;
+    if (Object.prototype.hasOwnProperty.call(args, "parent-task-id")) patch.parentTaskId = args["parent-task-id"];
+    if (Object.prototype.hasOwnProperty.call(args, "depends-on")) patch.dependsOnTaskIds = args["depends-on"];
+    if (Object.prototype.hasOwnProperty.call(args, "dependencies")) patch.dependsOnTaskIds = args.dependencies;
     if (Object.prototype.hasOwnProperty.call(args, "story")) patch.userStory = args.story;
     if (Object.prototype.hasOwnProperty.call(args, "expected")) patch.expectedOutcome = args.expected;
     if (Object.prototype.hasOwnProperty.call(args, "criteria")) patch.acceptanceCriteria = args.criteria;

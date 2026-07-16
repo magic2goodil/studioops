@@ -3,6 +3,7 @@ node_modules/
 .env
 mission-control.config.md
 data/mission-control.json
+data/local-attachments/
 data/*.local.json
 data/*.tmp
 *.log

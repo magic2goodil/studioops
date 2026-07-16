@@ -56,12 +56,12 @@ function nextId(items, prefix) {
 }
 
 function normalizeList(value) {
-  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  if (Array.isArray(value)) return [...new Set(value.map(String).filter(Boolean))];
   if (!value) return [];
-  return String(value)
+  return [...new Set(String(value)
     .split(/\n|,/)
     .map((item) => item.trim())
-    .filter(Boolean);
+    .filter(Boolean))];
 }
 
 function inferAttachmentType(value) {
@@ -158,6 +158,9 @@ export async function addTask(input) {
   if (!VALID_STATUSES.has(status)) throw new Error(`Invalid status: ${status}`);
   const title = String(input.title || "").trim();
   if (!title) throw new Error("Task title is required.");
+  const parentTaskId = String(input.parentTaskId || input.parent || input.epic || "").trim();
+  const dependsOnTaskIds = normalizeList(input.dependsOnTaskIds || input.dependsOn || input.dependencies);
+  validateTaskRelationships(state, "", parentTaskId, dependsOnTaskIds);
   const task = {
     id: nextId(state.tasks, "task"),
     projectId: project.id,
@@ -167,6 +170,8 @@ export async function addTask(input) {
     priority: String(input.priority || "medium").trim(),
     type: String(input.type || "feature").trim(),
     area: String(input.area || "").trim(),
+    parentTaskId,
+    dependsOnTaskIds,
     userStory: String(input.userStory || input.story || "").trim(),
     expectedOutcome: String(input.expectedOutcome || input.expected || "").trim(),
     attachments: normalizeAttachments(input.attachments || input.attachment),
@@ -208,6 +213,7 @@ export async function updateTask(taskId, patch) {
     "priority",
     "type",
     "area",
+    "parentTaskId",
     "userStory",
     "expectedOutcome",
     "privacyNotes",
@@ -226,6 +232,10 @@ export async function updateTask(taskId, patch) {
   if (Object.prototype.hasOwnProperty.call(patch, "acceptanceCriteria")) {
     task.acceptanceCriteria = normalizeList(patch.acceptanceCriteria);
   }
+  if (Object.prototype.hasOwnProperty.call(patch, "dependsOnTaskIds")) {
+    task.dependsOnTaskIds = normalizeList(patch.dependsOnTaskIds);
+  }
+  validateTaskRelationships(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
   if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
     task.attachments = normalizeAttachments(patch.attachments);
   }
@@ -277,10 +287,31 @@ export function findTask(state, taskId) {
   return state.tasks.find((task) => task.id === taskId) || null;
 }
 
+function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds) {
+  if (parentTaskId) {
+    if (parentTaskId === taskId) throw new Error("A task cannot be its own parent.");
+    if (!findTask(state, parentTaskId)) throw new Error(`Unknown parent task: ${parentTaskId}`);
+    const seen = new Set([taskId]);
+    let currentParentId = parentTaskId;
+    while (currentParentId) {
+      if (seen.has(currentParentId)) throw new Error("Task parent relationship would create a cycle.");
+      seen.add(currentParentId);
+      currentParentId = findTask(state, currentParentId)?.parentTaskId || "";
+    }
+  }
+  for (const dependencyId of dependsOnTaskIds || []) {
+    if (dependencyId === taskId) throw new Error("A task cannot depend on itself.");
+    if (!findTask(state, dependencyId)) throw new Error(`Unknown dependency task: ${dependencyId}`);
+  }
+}
+
 export function taskWithProject(state, task) {
   return {
     ...task,
     project: state.projects.find((project) => project.id === task.projectId) || null,
+    parent: state.tasks.find((item) => item.id === task.parentTaskId) || null,
+    children: state.tasks.filter((item) => item.parentTaskId === task.id),
+    dependencies: state.tasks.filter((item) => (task.dependsOnTaskIds || []).includes(item.id)),
     comments: state.comments.filter((comment) => comment.taskId === task.id),
     runs: state.runs.filter((run) => run.taskId === task.id),
     reviews: state.reviews.filter((review) => review.taskId === task.id),
@@ -293,6 +324,12 @@ export function generatePrompt(state, taskId, role = "builder") {
   const project = findProject(state, task.projectId);
   if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
   const criteria = (task.acceptanceCriteria || []).map((item) => `- ${item}`).join("\n") || "- No acceptance criteria recorded yet.";
+  const parent = task.parentTaskId ? findTask(state, task.parentTaskId) : null;
+  const dependencies = (task.dependsOnTaskIds || [])
+    .map((id) => findTask(state, id))
+    .filter(Boolean)
+    .map((item) => `- ${item.id}: ${item.title}`)
+    .join("\n") || "- None recorded.";
   const attachments = renderAttachments(task.attachments);
   const validation = (project.validationCommands || []).map((item) => `- \`${item}\``).join("\n") || "- No validation command recorded.";
   const safety = (project.safetyRules || []).map((item) => `- ${item}`).join("\n") || "- No project-specific safety rules recorded.";
@@ -306,6 +343,8 @@ Project: ${project.name}
 Repository path: ${project.repoPath || "(not recorded)"}
 Feature branch: ${task.branchName || "(not recorded)"}
 PR: ${task.prUrl || "(not recorded)"}
+Task type: ${task.type || "task"}
+Parent epic/task: ${parent ? `${parent.id}: ${parent.title}` : "(none)"}
 
 Task:
 ${task.title}
@@ -322,6 +361,9 @@ ${task.expectedOutcome || "(not recorded)"}
 Visual/context attachments:
 ${attachments}
 
+Dependencies:
+${dependencies}
+
 Acceptance criteria:
 ${criteria}
 
@@ -336,6 +378,8 @@ Review instructions:
 - Lead with concrete findings ordered by severity.
 - Check scope, behavior, tests, security, privacy, and maintainability.
 - Check the listed project standards and fail the task for material violations.
+- For data/backend changes, check query shape, indexes, pagination, migrations, and privacy boundaries.
+- For consent-sensitive features, check opt-in, revocation, transparency, retention, and data minimization.
 - Confirm whether the acceptance criteria are met.
 - Confirm the task has branch/PR context and builder notes when implementation work was done.
 - If it is not ready for the human owner, mark what needs to change.
@@ -349,6 +393,8 @@ Project: ${project.name}
 Repository path: ${project.repoPath || "(not recorded)"}
 Default branch: ${project.defaultBranch || "main"}
 Suggested branch: ${task.branchName || `codex/${project.key}-${task.id}-${slugify(task.title)}`}
+Task type: ${task.type || "task"}
+Parent epic/task: ${parent ? `${parent.id}: ${parent.title}` : "(none)"}
 
 Before editing:
 - Read project context:
@@ -373,6 +419,9 @@ ${task.expectedOutcome || "(not recorded)"}
 Visual/context attachments:
 ${attachments}
 
+Dependencies:
+${dependencies}
+
 Acceptance criteria:
 ${criteria}
 
@@ -384,6 +433,8 @@ Builder instructions:
 - For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
 - For UI tasks, implement and verify mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.
 - For repeated UI, prefer shared components/templates and Sass tokens/mixins/classes over page-specific copies.
+- For data/backend tasks, consider query shape, indexes, pagination, migrations, and realistic data volume.
+- For location, auth, social, notification, behavioral analytics, personalization, AI training, or persuasion/coaching features, define the consent path, opt-out/revocation behavior, data minimization, and privacy notes before implementation.
 - Keep changes scoped to this task.
 - Do not commit secrets, private customer data, or unrelated refactors.
 - Run validation before reporting ready.

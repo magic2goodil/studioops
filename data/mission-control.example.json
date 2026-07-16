@@ -27,6 +27,9 @@
         "standards/styles.md",
         "standards/javascript.md",
         "standards/assets.md",
+        "standards/content.md",
+        "standards/data.md",
+        "standards/mockup-intake.md",
         "standards/seo.md",
         "standards/performance.md",
         "standards/accessibility.md",
@@ -36,7 +39,8 @@
       ],
       "safetyRules": [
         "Do not deploy production without explicit approval.",
-        "Do not commit secrets or private customer data."
+        "Do not commit secrets or private customer data.",
+        "Do not add sensitive data collection, training, personalization, or outbound messaging without clear consent and opt-out behavior."
       ],
       "createdAt": "2026-07-15T00:00:00.000Z",
       "updatedAt": "2026-07-15T00:00:00.000Z"
@@ -52,6 +56,8 @@
       "priority": "medium",
       "type": "chore",
       "area": "setup",
+      "parentTaskId": "",
+      "dependsOnTaskIds": [],
       "userStory": "As a project owner, I want to verify Mission Control works locally, so that I can coordinate Codex tasks from a durable board.",
       "expectedOutcome": "The local task board loads, the sample task is visible, and builder/reviewer prompts can be generated from the task detail.",
       "attachments": [],

@@ -41,6 +41,18 @@ Event Card
 - If one component must differ, create a documented variant instead of a one-off copy.
 - Changes to a shared component should happen in one source location and flow everywhere that component is used.
 
+## Parallel Builder Sequencing
+
+When multiple builders will implement screens from the same product or mockup:
+
+1. Create a foundation task first.
+2. Inventory reusable components, typography, spacing, colors, surfaces, map treatments, cards, buttons, charts, icons, and motion.
+3. Define the shared Sass/API/component locations before page work starts.
+4. Make page tasks depend on the foundation task.
+5. Run a frontend lead review before page work reaches human review.
+
+The frontend lead review should reject duplicate mixins, duplicate button systems, duplicate card systems, incompatible responsive rules, and page-specific styling that should have been a shared variant.
+
 ## Template Architecture
 
 - Prefer component templates for shared markup.
@@ -120,4 +132,4 @@ Reviewers should fail UI work when:
 - Sass mixins/tokens/classes are bypassed with page-specific hacks
 - the implementation does not map clearly to the supplied design artifact
 - Storybook or the component catalog exists but was not updated for a changed shared component
-
+- multiple builders created conflicting visual systems instead of using the foundation/component API

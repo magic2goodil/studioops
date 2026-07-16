@@ -24,6 +24,12 @@ For UI work, include mobile, tablet, and desktop expectations unless the user ex
 
 When a task touches repeated UI, plan the shared component/template first. Avoid creating page-specific copies of cards, buttons, badges, modals, or form controls.
 
+When several builders could work in parallel, create a foundation/design-system epic first. That epic should define shared components, Sass tokens/mixins/classes, responsive rules, data/API contracts, and review gates before page builders begin.
+
+For backend or persistence work, plan data ownership, query patterns, indexes, migrations, pagination, and privacy boundaries before implementation.
+
+For consent-sensitive work, plan opt-in, opt-out/revocation, data minimization, retention, and user-facing consent copy before implementation.
+
 ## Builder
 
 Use the generated builder prompt. The builder should:
@@ -44,10 +50,13 @@ Use the generated reviewer prompt. The reviewer should:
 1. Inspect the branch diff.
 2. Check acceptance criteria.
 3. Check referenced project standards.
-4. Verify validation.
-5. Lead with findings.
-6. Confirm the task has branch/PR context and builder notes.
-7. Mark the task `needs_changes` or `user_review`.
+4. Check reusable architecture instead of only visible output.
+5. Check database query shape, indexes, migrations, and privacy boundaries when data changes.
+6. Check consent and revocation behavior when sensitive data, personalization, notifications, location, or social presence are involved.
+7. Verify validation.
+8. Lead with findings.
+9. Confirm the task has branch/PR context and builder notes.
+10. Mark the task `needs_changes` or `user_review`.
 
 ## Human Owner
 

@@ -21,6 +21,21 @@
 - Keep naming explicit enough that a human maintainer can find and modify behavior later.
 - Avoid hidden global state.
 - Avoid copy-paste implementations of the same behavior in multiple places.
+- Avoid rushed "looks done" implementations that leave behind brittle structure, duplicated systems, slow queries, or unreviewed security/privacy decisions.
+
+## Architecture Gate
+
+For non-trivial work, identify the shared architecture before implementation:
+
+- reusable UI components and templates
+- Sass tokens, mixins, and component classes
+- data model and ownership
+- API contracts
+- background jobs or queues
+- caching and invalidation
+- security/privacy boundaries
+
+If several builders will work in parallel, the foundation task should define these boundaries first.
 
 ## Comments
 
@@ -37,4 +52,3 @@ Every builder closeout must record:
 - known gaps
 - branch and PR link when available
 - standards that were relevant to the change
-

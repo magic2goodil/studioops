@@ -13,11 +13,14 @@ Fail or send back the task when a material issue exists:
 - Images lack dimensions, aspect ratios, or appropriate lazy-loading behavior.
 - Async content causes avoidable layout shift.
 - Large datasets or page sections load eagerly without need.
+- Database queries are unbounded, unindexed, N+1-prone, or missing pagination.
+- Migrations, indexes, or data ownership are unclear for persistence changes.
 - API failures are invisible to users.
 - There are browser console errors.
 - The implementation ignores referenced mockups or visual attachments.
 - The PR lacks validation notes.
-- Sensitive data is logged, exposed, or stored casually.
+- Sensitive data is logged, exposed, stored casually, or collected without explicit consent requirements.
+- Consent-sensitive features lack opt-in, opt-out/revocation, retention, or data-minimization behavior.
 - The work violates project-specific standards.
 
 For UI work, reviewers should specifically ask:
@@ -27,3 +30,17 @@ For UI work, reviewers should specifically ask:
 - Was desktop verified?
 - Was the direct URL/refresh path verified?
 - Was the full visible page considered, not just the smallest component?
+
+For backend/data work, reviewers should specifically ask:
+
+- Are likely queries indexed?
+- Is pagination or result limiting in place?
+- Is the data model maintainable?
+- Are sensitive fields minimized and protected?
+
+For consent-sensitive work, reviewers should specifically ask:
+
+- Did the user explicitly opt in?
+- Can the user turn it off later?
+- Is the consent copy specific enough to understand?
+- Is business-facing analytics aggregated unless identity is truly required?

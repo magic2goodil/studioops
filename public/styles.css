@@ -311,6 +311,13 @@ label {
   padding: 18px;
 }
 
+.detail-section h4 {
+  margin: 0 0 8px;
+  color: var(--text);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+}
+
 .section-heading {
   display: flex;
   justify-content: space-between;
@@ -428,6 +435,37 @@ label {
 .branch-edit-grid {
   display: grid;
   gap: 12px;
+}
+
+.relationship-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.relationship-grid > div {
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 12px;
+}
+
+.relationship-edit-grid {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.task-link-list {
+  display: grid;
+  gap: 8px;
+}
+
+.task-mini-link {
+  display: block;
+  overflow-wrap: anywhere;
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(245, 247, 251, 0.88);
+  padding: 9px 10px;
 }
 
 .standards-list {

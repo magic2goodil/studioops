@@ -79,6 +79,20 @@ Required fields:
 - Linked pull request URL when known
 - Validation commands or test expectations
 
+For broad work, use hierarchy:
+
+- Epic: a page, major workflow, system foundation, or product area.
+- Task: one buildable slice that can fit on a feature branch.
+- Dependency: work that must be finished or reviewed before another task starts.
+
+For UI work with several builders, create a design-system/foundation epic first. Page builders should depend on that foundation instead of inventing new buttons, cards, mixins, typography, colors, or layout primitives in parallel.
+
+For backend/data work, include query shape, likely indexes, pagination/result limits, migration expectations, and data ownership.
+
+For consent-sensitive work, include the opt-in path, opt-out/revocation behavior, consent copy requirements, data minimization, retention expectations, and whether analytics must be aggregated.
+
+For marketing/public pages, include editable content regions, dynamic data regions, SEO fields, navigation routes, dropdown/subnav expectations, and whether visible mockup items map to confirmed product requirements or need product decisions.
+
 User story format:
 
 ```text
@@ -172,23 +186,25 @@ Twig is acceptable and preferred for PHP/Drupal-style projects when already avai
 When the user says to build:
 
 1. Create or update the Mission Control task.
-2. Set task status to `ready` or `queued`.
-3. Generate the builder prompt from Mission Control.
-4. If Codex thread tools are available, create a builder task/thread and send the prompt there.
-5. If thread tools are not available, provide the builder prompt and the Mission Control task link.
-6. Builder creates a feature branch using:
+2. Confirm parent epic and dependency links when this is part of larger work.
+3. If the task depends on foundation/design-system/data-access work, do not start the builder until that dependency is ready.
+4. Set task status to `ready` or `queued`.
+5. Generate the builder prompt from Mission Control.
+6. If Codex thread tools are available, create a builder task/thread and send the prompt there.
+7. If thread tools are not available, provide the builder prompt and the Mission Control task link.
+8. Builder creates a feature branch using:
 
 ```text
 codex/<project-key>-<task-id>-<short-title>
 ```
 
-7. Builder implements the change, validates it, commits, pushes, and opens a PR when the project workflow calls for it.
-8. Builder links the feature branch and PR on the task.
-9. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
-10. Task moves to `builder_review`.
-11. A reviewer pass checks acceptance criteria, tests, security, privacy, and scope.
-12. Reviewer moves the task to `needs_changes` or `user_review`.
-13. The human owner makes the final merge/deploy decision.
+9. Builder implements the change, validates it, commits, pushes, and opens a PR when the project workflow calls for it.
+10. Builder links the feature branch and PR on the task.
+11. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
+12. Task moves to `builder_review`.
+13. A reviewer pass checks acceptance criteria, tests, security, privacy, performance, maintainability, and scope.
+14. Reviewer moves the task to `needs_changes` or `user_review`.
+15. The human owner makes the final merge/deploy decision.
 
 ## Mockup Breakdown Flow
 
@@ -196,13 +212,19 @@ When asked to break a mockup into tasks:
 
 1. Inspect the full mockup first.
 2. Identify each screen, panel, state, and interaction.
-3. Group the work into coherent slices that one builder can finish on a feature branch.
-4. Create one Mission Control task per slice.
-5. Attach the relevant image crop or full mockup reference.
-6. Include mobile, tablet, and desktop expectations for each visual slice.
-7. Include the applicable product requirement, not just the visual appearance.
-8. Add acceptance criteria that cover functionality, responsive behavior, visual match, and validation.
-8. Link each task back to the same project and original source image.
+3. Create a foundation/design-system epic before page builders begin.
+4. Define the shared component inventory, Sass tokens/mixins/classes, fonts, spacing, cards, buttons, maps, charts, icons, image treatments, and motion language.
+5. Identify editable content, dynamic content, and hard-coded design-only elements.
+6. Audit navigation and subnavigation against the product requirements; create tasks for valid pages and call out placeholders or AI-invented items.
+7. Group the work into coherent slices that one builder can finish on a feature branch.
+8. Create one Mission Control task per slice.
+9. Attach the relevant image crop or full mockup reference.
+10. Include mobile, tablet, and desktop expectations for each visual slice.
+11. Include the applicable product requirement, not just the visual appearance.
+12. Add acceptance criteria that cover functionality, responsive behavior, visual match, reuse of shared components, editable/dynamic content, privacy/consent where relevant, and validation.
+13. Link each task back to the same project and original source image.
+
+The first implementation task after a mockup breakdown should usually be a foundation task. It prevents six parallel builders from creating six button systems, six card systems, or six incompatible Sass APIs.
 
 For Event Horizon, useful slices include:
 
@@ -229,6 +251,31 @@ Default rules:
 - Avoid broad logging of PII.
 - Do not send notifications, emails, SMS, or external messages without explicit approval.
 - Do not deploy production without explicit approval.
+
+Consent-sensitive features include:
+
+- background or precise location
+- push notifications, email, SMS, or other outbound messaging
+- social presence, friend visibility, check-ins, or "headed there" status
+- behavioral analytics tied to a user
+- personalization and inferred interest profiles
+- AI training, coaching, persuasion, hypnosis, or similar behavior-shaping experiences
+- third-party sharing, ads, or business-facing analytics derived from users
+
+Those tasks must say how consent is requested, what the user is told, how consent can be revoked, and what happens to already-collected data.
+
+## Anti-Slop Quality Standard
+
+Mission Control should prevent rushed AI output from becoming production architecture.
+
+Default rules:
+
+- Builders must read source files and project standards before editing.
+- Shared UI must be implemented through reusable components/templates and Sass tokens/mixins/classes.
+- Source Sass and source JavaScript should be edited, not only compiled/minified output.
+- Performance-sensitive database work must consider indexes, query shape, pagination, and explain/query-plan review where practical.
+- Large rewrites should be split into reviewable chunks with feature branches and PRs.
+- Reviewers should send work back when it looks complete visually but is brittle, duplicated, slow, inaccessible, insecure, or hard for a human to maintain.
 
 ## If Mission Control Is Not Running
 

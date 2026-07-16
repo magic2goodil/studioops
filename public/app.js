@@ -96,6 +96,16 @@ function branchUrl(project, branchName) {
   return `${repoUrl}/tree/${branch.split("/").map(encodeURIComponent).join("/")}`;
 }
 
+function taskLink(task) {
+  if (!task) return "";
+  return `<a class="task-mini-link" href="${escapeHtml(taskPath(task.id))}">${escapeHtml(task.id)} · ${escapeHtml(task.title)}</a>`;
+}
+
+function taskRelationshipList(tasks, emptyText) {
+  if (!tasks?.length) return `<p class="muted-note">${escapeHtml(emptyText)}</p>`;
+  return `<div class="task-link-list">${tasks.map((task) => taskLink(task)).join("")}</div>`;
+}
+
 function attachmentList(attachments) {
   if (!attachments?.length) return "";
   return `
@@ -171,18 +181,51 @@ function renderTasks() {
   const tasks = visibleTasks();
   taskBoard.innerHTML = tasks.map((task) => {
     const project = projectFor(task);
+    const childCount = state.tasks.filter((item) => item.parentTaskId === task.id).length;
+    const dependencyCount = (task.dependsOnTaskIds || []).length;
     return `
       <button type="button" class="task-card ${task.id === state.selectedTaskId ? "selected" : ""}" data-task-id="${escapeHtml(task.id)}">
         <div class="task-card-top">
           <span class="status ${escapeHtml(task.status)}">${escapeHtml(task.status)}</span>
-          <span class="priority">${escapeHtml(task.priority)}</span>
+          <span class="priority">${escapeHtml(task.type || task.priority || "task")}</span>
         </div>
         <h3>${escapeHtml(task.title)}</h3>
         <p>${escapeHtml(task.description || "No description yet.")}</p>
-        <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.type || "task")}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
+        <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${task.parentTaskId ? ` · parent ${escapeHtml(task.parentTaskId)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencyCount ? ` · ${dependencyCount} dep${dependencyCount === 1 ? "" : "s"}` : ""}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
       </button>
     `;
   }).join("") || `<p>No tasks match this view.</p>`;
+}
+
+function renderHierarchyPanel(task) {
+  const dependsOnValue = (task.dependsOnTaskIds || []).join(", ");
+  return `
+    <section class="detail-section hierarchy-section">
+      <div class="section-heading">
+        <h3>Epic & Dependencies</h3>
+        <span>${escapeHtml(task.type || "task")}</span>
+      </div>
+      <div class="relationship-grid">
+        <div>
+          <h4>Parent</h4>
+          ${task.parent ? taskLink(task.parent) : `<p class="muted-note">No parent epic/task linked.</p>`}
+        </div>
+        <div>
+          <h4>Children</h4>
+          ${taskRelationshipList(task.children || [], "No child tasks yet.")}
+        </div>
+        <div>
+          <h4>Depends On</h4>
+          ${taskRelationshipList(task.dependencies || [], "No dependencies recorded.")}
+        </div>
+      </div>
+      <div class="relationship-edit-grid">
+        <label>Parent Epic/Task <input name="detailParentTaskId" value="${escapeHtml(task.parentTaskId || "")}" placeholder="task_12"></label>
+        <label>Depends On <textarea name="detailDependsOnTaskIds" rows="2" placeholder="task_1, task_2">${escapeHtml(dependsOnValue)}</textarea></label>
+        <button type="button" data-action="save-relationships">Save Relationships</button>
+      </div>
+    </section>
+  `;
 }
 
 function renderBranchPanel(task, project) {
@@ -278,6 +321,7 @@ async function renderDetail() {
         ${fullTask.userStory ? `<h3>User Story</h3><p>${escapeHtml(fullTask.userStory)}</p>` : ""}
         ${fullTask.expectedOutcome ? `<h3>Expected Outcome</h3><p>${escapeHtml(fullTask.expectedOutcome)}</p>` : ""}
       </section>
+      ${renderHierarchyPanel(fullTask)}
       ${renderBranchPanel(fullTask, project)}
       ${renderStandardsPanel(project)}
     </div>
@@ -368,6 +412,19 @@ taskDetail.addEventListener("click", async (event) => {
       body: JSON.stringify({
         branchName: taskDetail.querySelector("[name='branchName']")?.value || "",
         prUrl: taskDetail.querySelector("[name='prUrl']")?.value || "",
+      }),
+    });
+    await loadState();
+    return;
+  }
+
+  const relationshipButton = event.target.closest("[data-action='save-relationships']");
+  if (relationshipButton && state.selectedTaskId) {
+    await api(`/api/tasks/${state.selectedTaskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        parentTaskId: taskDetail.querySelector("[name='detailParentTaskId']")?.value || "",
+        dependsOnTaskIds: taskDetail.querySelector("[name='detailDependsOnTaskIds']")?.value || "",
       }),
     });
     await loadState();
