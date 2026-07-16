@@ -12,6 +12,8 @@ This first version is intentionally simple:
 - Has a CLI for adding/listing tasks.
 - Generates builder and reviewer prompts you can hand to Codex.
 - Keeps project safety rules and validation commands beside the task.
+- Opens tasks at shareable URLs like `/tasks/task_1`.
+- Supports local image previews, feature branch links, PR links, and task comments.
 
 ## Quick Start
 
@@ -66,6 +68,7 @@ node src/mission-control-cli.js add-project \
   --key myapp \
   --name "My App" \
   --repo-path "/absolute/path/to/repo" \
+  --repo-url "https://github.com/owner/repo" \
   --default-branch main
 ```
 
@@ -80,8 +83,25 @@ node src/mission-control-cli.js add-task \
   --expected "Users see the onboarding flow, then continue to auth." \
   --criteria "The first screen explains the value, Location and notification prompts are introduced before permission requests, npm run check passes" \
   --attachment "/absolute/path/to/mockup.png" \
+  --branch "codex/myapp-task_2-add-onboarding-flow" \
   --status ready \
   --priority high
+```
+
+Link a branch or PR after the builder starts:
+
+```bash
+node src/mission-control-cli.js update-task task_2 \
+  --branch "codex/myapp-task_2-add-onboarding-flow" \
+  --pr-url "https://github.com/owner/repo/pull/123"
+```
+
+Add a builder note:
+
+```bash
+node src/mission-control-cli.js comment task_2 \
+  --author "Codex Builder" \
+  --body "Implemented onboarding and opened https://github.com/owner/repo/pull/123"
 ```
 
 Generate a Codex builder prompt:
@@ -101,7 +121,7 @@ node src/mission-control-cli.js prompt task_1 --role reviewer
 1. Capture idea as a task.
 2. Shape it with a user story, expected outcome, acceptance criteria, visual attachments, and safety notes.
 3. Builder Codex thread creates a feature branch and implements it.
-4. Builder runs validation, commits, pushes, and marks the task `builder_review`.
+4. Builder runs validation, commits, pushes, links the branch/PR, leaves a task comment, and marks the task `builder_review`.
 5. Reviewer Codex thread reviews the branch.
 6. Reviewer sends it back as `needs_changes` or forwards it as `user_review`.
 7. Human owner approves, asks for changes, merges, or deploys.

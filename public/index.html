@@ -18,7 +18,7 @@
       </div>
     </header>
 
-    <main class="layout">
+    <main id="appLayout" class="layout">
       <section class="panel project-panel">
         <div class="panel-header">
           <h2>Projects</h2>
@@ -30,6 +30,7 @@
           <label>Key <input name="key" placeholder="myapp" required></label>
           <label>Name <input name="name" placeholder="My App" required></label>
           <label>Repo Path <input name="repoPath" placeholder="/absolute/path/to/repo"></label>
+          <label>GitHub Repo URL <input name="repoUrl" placeholder="https://github.com/owner/repo"></label>
           <label>Validation <input name="validationCommands" placeholder="npm run check"></label>
           <button type="submit">Add Project</button>
         </form>
@@ -95,6 +96,15 @@
         <small></small>
       </article>
     </template>
+
+    <div id="imageModal" class="image-modal" hidden>
+      <div class="image-modal-backdrop" data-close-image-modal></div>
+      <figure class="image-modal-content">
+        <button class="image-modal-close" type="button" data-close-image-modal>Close</button>
+        <img id="imageModalImage" alt="">
+        <figcaption id="imageModalCaption"></figcaption>
+      </figure>
+    </div>
 
     <script src="/app.js" type="module"></script>
   </body>

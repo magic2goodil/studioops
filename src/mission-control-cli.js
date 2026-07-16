@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
+  addComment,
   addProject,
   addTask,
   generatePrompt,
@@ -169,7 +170,9 @@ Commands:
   tasks                         List tasks
   add-project --key --name      Add a project
   add-task --project --title    Add a task
+  update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Update task status
+  comment TASK_ID --body        Add a builder/reviewer comment
   prompt TASK_ID --role         Print builder or reviewer prompt
 
 Task fields:
@@ -177,6 +180,8 @@ Task fields:
   --expected                    Expected outcome or feature behavior
   --criteria                    Acceptance criteria, comma or newline separated
   --attachment                  Image, screenshot, mockup, URL, or reference path
+  --branch                      Associated feature branch
+  --pr-url                      Associated pull request URL
 `);
     return;
   }
@@ -248,8 +253,28 @@ Task fields:
       acceptanceCriteria: args.criteria,
       privacyNotes: args.privacy,
       securityNotes: args.security,
+      branchName: args.branch || args["branch-name"],
+      prUrl: args.pr || args["pr-url"],
     });
     console.log(`Added task ${task.id}: ${task.title}`);
+    return;
+  }
+
+  if (command === "update-task") {
+    const taskId = args._[1];
+    const patch = {};
+    if (Object.prototype.hasOwnProperty.call(args, "status")) patch.status = args.status;
+    if (Object.prototype.hasOwnProperty.call(args, "branch")) patch.branchName = args.branch;
+    if (Object.prototype.hasOwnProperty.call(args, "branch-name")) patch.branchName = args["branch-name"];
+    if (Object.prototype.hasOwnProperty.call(args, "pr")) patch.prUrl = args.pr;
+    if (Object.prototype.hasOwnProperty.call(args, "pr-url")) patch.prUrl = args["pr-url"];
+    if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
+    if (Object.prototype.hasOwnProperty.call(args, "story")) patch.userStory = args.story;
+    if (Object.prototype.hasOwnProperty.call(args, "expected")) patch.expectedOutcome = args.expected;
+    if (Object.prototype.hasOwnProperty.call(args, "criteria")) patch.acceptanceCriteria = args.criteria;
+    if (Object.prototype.hasOwnProperty.call(args, "attachment")) patch.attachments = args.attachment;
+    const task = await updateTask(taskId, patch);
+    console.log(`Updated ${task.id}: ${task.title}`);
     return;
   }
 
@@ -257,6 +282,13 @@ Task fields:
     const taskId = args._[1];
     const task = await updateTask(taskId, { status: args.status });
     console.log(`${task.id} -> ${task.status}`);
+    return;
+  }
+
+  if (command === "comment") {
+    const taskId = args._[1];
+    const comment = await addComment(taskId, args.body, args.author || "Codex Builder");
+    console.log(`Added comment ${comment.id} to ${taskId}`);
     return;
   }
 

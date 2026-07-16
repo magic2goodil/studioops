@@ -1,5 +1,5 @@
 import http from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { addComment, addProject, addTask, generatePrompt, readState, taskWithProject, updateTask } from "./store.js";
 import { loadConfig } from "./config.js";
@@ -14,7 +14,16 @@ const MIME_TYPES = {
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
 };
+
+const IMAGE_MIME_TYPES = new Map(
+  Object.entries(MIME_TYPES).filter(([, value]) => value.startsWith("image/")),
+);
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -57,8 +66,64 @@ async function serveStatic(req, res, url) {
     });
     res.end(data);
   } catch {
+    if (req.method === "GET" && !path.extname(requested)) {
+      const indexPath = path.join(PUBLIC_DIR, "index.html");
+      const indexHtml = await readFile(indexPath);
+      res.writeHead(200, {
+        "Content-Type": MIME_TYPES[".html"],
+        "Cache-Control": "no-store",
+      });
+      res.end(indexHtml);
+      return;
+    }
     sendText(res, 404, "Not found");
   }
+}
+
+async function serveLocalImage(res, url) {
+  const rawPath = url.searchParams.get("path");
+  if (!rawPath) {
+    sendJson(res, 400, { error: "Image path is required." });
+    return;
+  }
+  if (!["127.0.0.1", "localhost", "::1"].includes(HOST) && process.env.ALLOW_LOCAL_ATTACHMENTS !== "true") {
+    sendJson(res, 403, { error: "Local image serving is disabled unless the server is bound to localhost." });
+    return;
+  }
+  const localPath = rawPath.startsWith("file://") ? new URL(rawPath).pathname : rawPath;
+  if (!path.isAbsolute(localPath)) {
+    sendJson(res, 400, { error: "Only absolute local image paths can be previewed." });
+    return;
+  }
+  const filePath = path.resolve(localPath);
+  const ext = path.extname(filePath).toLowerCase();
+  const contentType = IMAGE_MIME_TYPES.get(ext);
+  if (!contentType) {
+    sendJson(res, 415, { error: "Only image attachments can be previewed." });
+    return;
+  }
+  let fileStat;
+  try {
+    fileStat = await stat(filePath);
+  } catch {
+    sendJson(res, 404, { error: "Image attachment was not found." });
+    return;
+  }
+  if (!fileStat.isFile()) {
+    sendJson(res, 404, { error: "Attachment is not a file." });
+    return;
+  }
+  if (fileStat.size > 20 * 1024 * 1024) {
+    sendJson(res, 413, { error: "Image attachment is too large to preview." });
+    return;
+  }
+  const data = await readFile(filePath);
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+  });
+  res.end(data);
 }
 
 async function handleApi(req, res, url) {
@@ -118,6 +183,11 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/attachments/local-image") {
+    await serveLocalImage(res, url);
+    return;
+  }
+
   sendJson(res, 404, { error: "API route not found." });
 }
 
@@ -137,4 +207,3 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`Codex Mission Control running at http://${HOST}:${PORT}`);
 });
-

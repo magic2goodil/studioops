@@ -331,6 +331,7 @@ Review instructions:
 - Lead with concrete findings ordered by severity.
 - Check scope, behavior, tests, security, privacy, and maintainability.
 - Confirm whether the acceptance criteria are met.
+- Confirm the task has branch/PR context and builder notes when implementation work was done.
 - If it is not ready for the human owner, mark what needs to change.
 - If it is ready, summarize validation and remaining risk clearly.
 `;
@@ -377,7 +378,8 @@ Builder instructions:
 - Do not commit secrets, private customer data, or unrelated refactors.
 - Run validation before reporting ready.
 - Commit and push only if the user/project workflow asks for that.
-- Report changed files, validation results, known gaps, and next review step.
+- Link the feature branch and pull request on the task when available.
+- Add a task comment with changed files, validation results, known gaps, PR link, and next review step.
 `;
 }
 

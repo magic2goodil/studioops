@@ -16,6 +16,12 @@ Local app URL when running:
 http://127.0.0.1:4317
 ```
 
+Task URLs use:
+
+```text
+http://127.0.0.1:4317/tasks/<task_id>
+```
+
 Default local repo path for this machine:
 
 ```text
@@ -69,6 +75,7 @@ Required fields:
 - Visual attachments or context links when relevant
 - Privacy and security notes when relevant
 - Suggested branch name when known
+- Linked pull request URL when known
 - Validation commands or test expectations
 
 User story format:
@@ -117,6 +124,8 @@ Supported attachment forms:
 
 If a full mockup contains multiple screens, prefer creating cropped image files for each task. If cropping is not practical, attach the full mockup and describe the exact region, screen, or component.
 
+Image attachments should render inside the task detail page as clickable previews. They should expand in the page, not open a new browser window.
+
 ## Build Flow
 
 When the user says to build:
@@ -133,10 +142,12 @@ codex/<project-key>-<task-id>-<short-title>
 ```
 
 7. Builder implements the change, validates it, commits, pushes, and opens a PR when the project workflow calls for it.
-8. Task moves to `builder_review`.
-9. A reviewer pass checks acceptance criteria, tests, security, privacy, and scope.
-10. Reviewer moves the task to `needs_changes` or `user_review`.
-11. The human owner makes the final merge/deploy decision.
+8. Builder links the feature branch and PR on the task.
+9. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
+10. Task moves to `builder_review`.
+11. A reviewer pass checks acceptance criteria, tests, security, privacy, and scope.
+12. Reviewer moves the task to `needs_changes` or `user_review`.
+13. The human owner makes the final merge/deploy decision.
 
 ## Mockup Breakdown Flow
 
@@ -211,4 +222,3 @@ Then generate a prompt:
 ```bash
 node src/mission-control-cli.js prompt task_123 --role builder
 ```
-

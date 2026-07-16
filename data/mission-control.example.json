@@ -11,7 +11,7 @@
       "name": "Demo Project",
       "description": "A sample project to show how Mission Control works.",
       "repoPath": "",
-      "repoUrl": "",
+      "repoUrl": "https://github.com/magic2goodil/codex-mission-control",
       "defaultBranch": "main",
       "validationCommands": [
         "npm run check"
@@ -48,7 +48,7 @@
       ],
       "privacyNotes": "",
       "securityNotes": "Keep sample data generic.",
-      "branchName": "",
+      "branchName": "main",
       "prUrl": "",
       "assignedAgentRole": "",
       "assignedThreadId": "",

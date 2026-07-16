@@ -28,7 +28,8 @@ Use the generated builder prompt. The builder should:
 3. Implement the task.
 4. Run validation.
 5. Commit and push only when asked or when the project workflow allows it.
-6. Add a run note with validation results and known gaps.
+6. Link the feature branch and PR on the Mission Control task.
+7. Add a task comment with changed files, validation results, known gaps, and the PR URL.
 
 ## Reviewer
 
@@ -38,7 +39,8 @@ Use the generated reviewer prompt. The reviewer should:
 2. Check acceptance criteria.
 3. Verify validation.
 4. Lead with findings.
-5. Mark the task `needs_changes` or `user_review`.
+5. Confirm the task has branch/PR context and builder notes.
+6. Mark the task `needs_changes` or `user_review`.
 
 ## Human Owner
 
