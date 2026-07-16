@@ -325,6 +325,7 @@ Default standards live in [standards/](standards/):
 - accessibility
 - security/privacy
 - testing
+- release/deployment
 - review checklist
 
 For UI work, the default standard is mobile-first, not mobile-only: builders must account for mobile, tablet, and desktop unless the task explicitly scopes one breakpoint.

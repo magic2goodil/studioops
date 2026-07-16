@@ -7,9 +7,12 @@ Production changes should move through reviewed pull requests.
 - Builders work on feature branches.
 - Validation runs before the branch is marked review-ready.
 - The user or reviewer approves the PR before merge.
-- Production deployment is triggered by merge to the configured production branch, normally `main` or `master`.
-- When the project owner requires owner-only deploys, production deployment must be gated to the configured owner GitHub actor and protected production branch.
-- Direct pushes to production branches should be avoided unless the project owner explicitly requests an emergency change.
+- Reviewed PRs merge into a protected integration branch, normally `main` or `master`.
+- Merging a PR, pushing a feature branch, or updating the protected integration branch must not deploy production by default. Those events should run validation, build artifacts, preview deploys, or staging deploys only.
+- Production deployment should require an explicit release or tag created after the reviewed code lands on the protected integration branch.
+- Release/tag deploy workflows must verify that the release commit is reachable from the protected integration branch before mutating production. If the commit is missing from that branch, the deploy must fail closed.
+- When the project owner requires owner-only deploys, production deployment must also be gated to the configured owner GitHub actor or allowed deployer list.
+- Direct pushes to integration or release branches should be avoided unless the project owner explicitly requests an emergency change.
 - Local SSH deploys are break-glass only. If one is used, record why, reconcile the exact production change back into Git, and follow with a normal reviewed deployment path.
 
 ## Content Versus Code
@@ -35,12 +38,13 @@ At minimum, CI should run:
 Production deploy workflows should:
 
 - run only after CI passes
-- run only from the configured production branch
-- trigger real production changes only from protected production branch pushes or merges, not from arbitrary local commands
-- make manual `workflow_dispatch` runs dry-run or preview-only unless the owner explicitly approves a separate emergency path
+- trigger real production changes only from explicit releases or tags, not from PR merges, integration branch pushes, feature branch pushes, or arbitrary local commands
+- verify that the release or tag commit is reachable from the protected integration branch before deploying
+- fail closed when the release/tag ref is missing, mutable in an unexpected way, or points at an unreviewed commit
+- make manual `workflow_dispatch` runs dry-run or preview-only unless the owner explicitly approves a separate emergency production path
 - fail closed unless the GitHub actor matches the configured deploy owner or allowed deployer list
+- use GitHub Environments or equivalent protection when available, especially for production
 - be deferred until development auth, admin mutation routes, legacy mutation/import routes, and other production-dangerous surfaces are gated or removed
-- use GitHub Environments or equivalent protection when available
 - require repository secrets/variables rather than hard-coded credentials
 - avoid printing secrets, tokens, connection strings, or private paths in logs
 - provide smoke checks after deploy

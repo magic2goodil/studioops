@@ -1038,6 +1038,7 @@ ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
 - For data/backend changes, check query shape, indexes, pagination, migrations, and privacy boundaries.
 - For frontend/UI changes, check responsive behavior, accessibility, visual hierarchy, component reuse, content editability, and browser console/runtime errors.
 - For consent-sensitive features, check opt-in, revocation, transparency, retention, and data minimization.
+- For deployment/release workflow changes, fail unsafe patterns where PR merges or integration branch pushes deploy production by default, release/tag deploys do not verify the commit is reachable from the protected integration branch, manual dispatch can mutate production without a dry-run/preview default and explicit emergency approval path, or production sync can broadly delete runtime state.
 - Confirm whether the acceptance criteria are met.
 - Confirm the task has branch/PR context and builder notes when implementation work was done.
 - Confirm whether this PR has one primary task or intentionally covers multiple tasks. If it covers multiple tasks, verify each linked task has clear complete/partial scope notes.
@@ -1108,6 +1109,7 @@ Builder instructions:
 - For repeated UI, prefer shared components/templates and Sass tokens/mixins/classes over page-specific copies.
 - For data/backend tasks, consider query shape, indexes, pagination, migrations, and realistic data volume.
 - For location, auth, social, notification, behavioral analytics, personalization, AI training, or persuasion/coaching features, define the consent path, opt-out/revocation behavior, data minimization, and privacy notes before implementation.
+- For deployment/release tasks, keep PR and protected integration branch workflows to validation, artifacts, previews, or staging by default; require production deployment to run only from explicit releases/tags with safety checks; verify the release/tag commit is reachable from the protected integration branch; make \`workflow_dispatch\` dry-run/preview unless explicitly approved for an emergency production path; and avoid broad delete/sync cleanup against production.
 - Keep changes scoped to this task.
 - Keep changes inside the task's lane and work areas. If you need to touch files outside that scope, add a Mission Control comment and either create a dependent task or explain why the scope must expand.
 - Do not commit secrets, private customer data, or unrelated refactors.

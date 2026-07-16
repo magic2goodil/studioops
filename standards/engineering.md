@@ -41,7 +41,7 @@ If several builders will work in parallel, the foundation task should define the
 
 Prefer admin-editable content and layout configuration over code changes for routine copy, images, panel ordering, visibility, and SEO metadata.
 
-Code changes should go through feature branches, validation, pull request review, and the project's configured deployment workflow. Do not treat direct production edits or one-off server changes as the normal release path.
+Code changes should go through feature branches, validation, pull request review, a protected integration branch, and the project's configured release/tag deployment workflow. PR merges and integration branch pushes should not deploy production by default. Do not treat direct production edits or one-off server changes as the normal release path.
 
 ## Comments
 
