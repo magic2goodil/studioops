@@ -109,10 +109,6 @@ function appManifest(app, baseUrl) {
   return {
     name: app.name,
     url: REPO_URL,
-    hook_attributes: {
-      url: `${baseUrl}/webhook/${app.key}`,
-      active: false,
-    },
     redirect_url: `${baseUrl}/callback`,
     callback_urls: [`${baseUrl}/callback`],
     description: app.description,
@@ -125,15 +121,6 @@ function appManifest(app, baseUrl) {
       metadata: "read",
       pull_requests: "write",
     },
-    default_events: [
-      "check_run",
-      "check_suite",
-      "issue_comment",
-      "pull_request",
-      "pull_request_review",
-      "pull_request_review_comment",
-      "push",
-    ],
     request_oauth_on_install: false,
     setup_on_update: false,
   };

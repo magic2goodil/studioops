@@ -55,7 +55,7 @@ The manifest requests:
 - `checks: read` and `actions: read` for CI/status inspection
 - `metadata: read`, required by GitHub Apps
 
-Webhooks are disabled by default. Mission Control can add webhook handling later if we want GitHub to actively push events into the local task board.
+Webhooks are not requested by default. Mission Control can add webhook handling later if we use a public endpoint or tunnel and want GitHub to actively push events into the local task board.
 
 ## Security
 
