@@ -42,6 +42,37 @@ The default interval is 300 seconds. For active local work, 60 seconds is reason
 npm run supervisor -- --watch --interval 60
 ```
 
+## Keep It Running On macOS
+
+A LaunchAgent example lives at:
+
+```text
+deploy/local/com.codex.mission-control.supervisor.plist.example
+```
+
+To install it:
+
+1. Copy it to `~/Library/LaunchAgents/com.codex.mission-control.supervisor.plist`.
+2. Replace `__NODE_PATH__`, `__MISSION_CONTROL_REPO__`, and `__LOG_DIR__`.
+3. Load it:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.codex.mission-control.supervisor.plist
+launchctl enable gui/$(id -u)/com.codex.mission-control.supervisor
+```
+
+Check status:
+
+```bash
+launchctl print gui/$(id -u)/com.codex.mission-control.supervisor
+```
+
+Stop it:
+
+```bash
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.codex.mission-control.supervisor.plist
+```
+
 ## What It Reports
 
 The supervisor emits active actions like:
