@@ -106,11 +106,13 @@ The supervisor is the outer orchestration view. It is safe to run continuously b
 Recommended loop for a Codex runner:
 
 1. Run `npm run automation-tick -- --limit 10`.
-2. Run `npm run supervisor -- --json`.
-3. For each `start_builder`, start or resume a builder thread with the `promptCommand`.
-4. For each `start_review` or `continue_review`, start or resume the matching reviewer thread with the `promptCommand`.
+2. Run `npm run dispatcher`.
+3. Let an external Codex-capable runner consume queued dispatch runs.
+4. For each builder/reviewer run, create or resume the matching worker thread with the stored prompt.
 5. For `notify_owner`, notify the human owner with the task URL and PR URL.
 6. Stop at the human owner gate. Do not merge or deploy automatically.
+
+See [DISPATCHER.md](DISPATCHER.md) for the durable runner layer.
 
 ## Configuration
 
@@ -132,7 +134,7 @@ Local config can set the supervisor defaults:
 }
 ```
 
-The concurrency values are policy hints for the future Codex thread runner. The current supervisor reports all eligible work and leaves actual thread scheduling to the runner using it.
+The concurrency values are policy hints for the dispatcher and any Codex-native runner layered on top of it.
 
 ## Human Gate
 

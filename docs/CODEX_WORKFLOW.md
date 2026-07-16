@@ -80,13 +80,20 @@ or continuously:
 npm run supervisor -- --watch --interval 300
 ```
 
+Preview and create dispatcher runs with:
+
+```bash
+npm run dispatcher -- --plan
+npm run dispatcher
+```
+
 Record review outcomes with:
 
 ```bash
 node src/mission-control-cli.js review task_123 --stage backend --outcome approved --body "Reviewed API and persistence."
 ```
 
-A scheduled runner can call the same tick command every few minutes, then call the supervisor command to decide what builder, reviewer, or owner handoff action is next. That runner should only route tasks and create or notify work items; it should not deploy production or merge PRs.
+A scheduled runner can call the same tick command every few minutes, then call the dispatcher command to create durable builder, reviewer, and owner handoff runs from supervisor actions. That runner should only route tasks and create or notify work items; it should not deploy production or merge PRs.
 
 ## Reviewer
 

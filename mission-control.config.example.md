@@ -58,6 +58,16 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "requireHumanMerge": true,
       "requireGitHubActionsDeploy": true
     },
+    "dispatcher": {
+      "intervalSeconds": 300,
+      "provider": "prompt-outbox",
+      "maxDispatchesPerSweep": 6,
+      "builderConcurrency": 3,
+      "reviewerConcurrency": 3,
+      "ownerConcurrency": 10,
+      "requireHumanMerge": true,
+      "requireGitHubActionsDeploy": true
+    },
     "validationCommands": [
       "npm run check"
     ],

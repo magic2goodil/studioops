@@ -35,6 +35,15 @@ const VALID_REVIEW_OUTCOMES = new Set([
   "skipped",
 ]);
 
+const VALID_RUN_STATUSES = new Set([
+  "queued",
+  "running",
+  "notified",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
 const DEPENDENCY_COMPLETE_STATUSES = new Set([
   "approved",
   "merged",
@@ -70,7 +79,7 @@ const DEFAULT_REVIEW_PIPELINE = [
   },
 ];
 
-export { DATA_FILE, VALID_STATUSES, VALID_REVIEW_OUTCOMES, DEFAULT_REVIEW_PIPELINE };
+export { DATA_FILE, VALID_STATUSES, VALID_REVIEW_OUTCOMES, VALID_RUN_STATUSES, DEFAULT_REVIEW_PIPELINE };
 
 export async function ensureDataFile() {
   await mkdir(DATA_DIR, { recursive: true });
@@ -130,7 +139,7 @@ async function releaseStateLock() {
   await rm(LOCK_DIR, { recursive: true, force: true });
 }
 
-async function mutateState(mutator) {
+export async function mutateState(mutator) {
   await acquireStateLock();
   try {
     const state = await readState();
@@ -500,6 +509,39 @@ export async function automationTick(input = {}) {
   });
 }
 
+export async function updateRun(runId, patch = {}) {
+  return mutateState(async (state) => {
+    state.runs = state.runs || [];
+    const run = state.runs.find((item) => item.id === runId);
+    if (!run) throw new Error(`Unknown run: ${runId}`);
+    if (patch.status && !VALID_RUN_STATUSES.has(patch.status)) {
+      throw new Error(`Invalid run status: ${patch.status}`);
+    }
+    const allowed = [
+      "status",
+      "threadId",
+      "notes",
+      "provider",
+    ];
+    for (const key of allowed) {
+      if (Object.prototype.hasOwnProperty.call(patch, key)) {
+        run[key] = String(patch[key] || "").trim();
+      }
+    }
+    run.updatedAt = new Date().toISOString();
+    state.events = state.events || [];
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "run_updated",
+      projectId: run.projectId || "",
+      taskId: run.taskId || "",
+      message: `${run.id} updated to ${run.status}`,
+      createdAt: run.updatedAt,
+    });
+    return run;
+  });
+}
+
 export function findProject(state, keyOrId) {
   if (!keyOrId) return null;
   return state.projects.find((project) => project.id === keyOrId || project.key === keyOrId) || null;
@@ -746,7 +788,7 @@ export function taskWithProject(state, task) {
     children: state.tasks.filter((item) => item.parentTaskId === task.id),
     dependencies: state.tasks.filter((item) => (task.dependsOnTaskIds || []).includes(item.id)),
     comments: state.comments.filter((comment) => comment.taskId === task.id),
-    runs: state.runs.filter((run) => run.taskId === task.id),
+    runs: (state.runs || []).filter((run) => run.taskId === task.id),
     reviews: state.reviews.filter((review) => review.taskId === task.id),
   };
 }

@@ -12,8 +12,10 @@ import {
   recordReview,
   readState,
   updateTask,
+  updateRun,
 } from "./store.js";
 import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
+import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
 import {
   expandHome,
   loadConfig,
@@ -98,6 +100,16 @@ async function setup() {
           ownerNotificationStatus: "user_review",
           builderConcurrency: 1,
           reviewerConcurrency: 2,
+          requireHumanMerge: true,
+          requireGitHubActionsDeploy: true,
+        },
+        dispatcher: {
+          intervalSeconds: 300,
+          provider: "prompt-outbox",
+          maxDispatchesPerSweep: 6,
+          builderConcurrency: 3,
+          reviewerConcurrency: 3,
+          ownerConcurrency: 10,
           requireHumanMerge: true,
           requireGitHubActionsDeploy: true,
         },
@@ -236,6 +248,10 @@ Commands:
   review TASK_ID --stage        Record approved, skipped, or changes_requested
   automation-tick               Advance ready, blocked, and review tasks
   supervisor                    Show next builder, reviewer, dependency, and owner actions
+  dispatcher                    Create durable dispatch runs from supervisor actions
+  runs                          List dispatch runs
+  run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
+  update-run RUN_ID             Update dispatch run status, thread ID, or notes
   prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, or lead-reviewer prompt
 
 Task fields:
@@ -252,6 +268,8 @@ Task fields:
 Automation:
   mission-control automation-tick --project dollos --limit 10
   mission-control supervisor --json
+  mission-control dispatcher --plan
+  mission-control runs --status queued
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
 `);
     return;
@@ -301,6 +319,41 @@ Automation:
         title: task.title,
       };
     }), ["id", "project", "status", "owner", "cycle", "type", "priority", "parent", "title"]);
+    return;
+  }
+
+  if (command === "runs") {
+    const state = await readState();
+    const projectFilter = args.project
+      ? state.projects.find((project) => project.id === args.project || project.key === args.project)
+      : null;
+    if (args.project && !projectFilter) throw new Error(`Unknown project: ${args.project}`);
+    const runs = (state.runs || [])
+      .filter((run) => !projectFilter || run.projectId === projectFilter.id)
+      .filter((run) => !args.status || run.status === args.status);
+    printTable(runs.map((run) => {
+      const task = state.tasks.find((item) => item.id === run.taskId);
+      const project = state.projects.find((item) => item.id === run.projectId);
+      return {
+        id: run.id,
+        project: project?.key || run.projectId,
+        task: run.taskId,
+        status: run.status,
+        role: run.role,
+        action: run.actionType,
+        thread: run.threadId || "",
+        title: task?.title || "",
+      };
+    }), ["id", "project", "task", "status", "role", "action", "thread", "title"]);
+    return;
+  }
+
+  if (command === "run-prompt") {
+    const state = await readState();
+    const runId = args._[1];
+    const run = (state.runs || []).find((item) => item.id === runId);
+    if (!run) throw new Error(`Unknown run: ${runId}`);
+    console.log(run.prompt || "");
     return;
   }
 
@@ -406,6 +459,53 @@ Automation:
       return;
     }
     for (const action of result.actions) console.log(`- ${action}`);
+    return;
+  }
+
+  if (command === "dispatcher" || command === "dispatch") {
+    const state = await readState();
+    const supervisor = createSupervisorReport(state, {
+      baseUrl: args["base-url"] || "http://127.0.0.1:4317",
+      intervalSeconds: args.interval || args["interval-seconds"] || 300,
+    });
+    const options = {
+      project: args.project || args.projects,
+      dryRun: args["dry-run"] || args.dryRun,
+      provider: args.provider || "prompt-outbox",
+      maxDispatchesPerSweep: args.limit || args["max-dispatches"],
+      builderConcurrency: args["builder-concurrency"],
+      reviewerConcurrency: args["reviewer-concurrency"],
+      ownerConcurrency: args["owner-concurrency"],
+    };
+    if (args.plan) {
+      const plan = planDispatches(state, supervisor.actions, options);
+      const report = {
+        generatedAt: supervisor.generatedAt,
+        dryRun: true,
+        runs: [],
+        selected: plan.selected,
+        skipped: plan.skipped,
+      };
+      if (args.json) console.log(JSON.stringify(report, null, 2));
+      else console.log(formatDispatchReport(report));
+      return;
+    }
+    const report = await dispatchSupervisorActions(supervisor.actions, options);
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatDispatchReport(report));
+    return;
+  }
+
+  if (command === "update-run") {
+    const runId = args._[1];
+    const patch = {};
+    if (Object.prototype.hasOwnProperty.call(args, "status")) patch.status = args.status;
+    if (Object.prototype.hasOwnProperty.call(args, "thread")) patch.threadId = args.thread;
+    if (Object.prototype.hasOwnProperty.call(args, "thread-id")) patch.threadId = args["thread-id"];
+    if (Object.prototype.hasOwnProperty.call(args, "notes")) patch.notes = args.notes;
+    if (Object.prototype.hasOwnProperty.call(args, "provider")) patch.provider = args.provider;
+    const run = await updateRun(runId, patch);
+    console.log(`Updated ${run.id}: ${run.status}`);
     return;
   }
 

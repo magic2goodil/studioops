@@ -10,6 +10,7 @@ When working in this repository:
 - Keep generated task prompts clear enough to paste into a fresh Codex thread.
 - Use `docs/HANDOFF.md` when a user asks to create, build, review, or split work through Mission Control.
 - Use `docs/SUPERVISOR.md` when a user asks for continuous coordination, scheduled checks, or what should move next across projects.
+- Use `docs/DISPATCHER.md` when a user asks Mission Control to actually queue builder, reviewer, or owner handoff work.
 - For non-trivial tasks, capture user story, expected outcome, acceptance criteria, visual attachments when relevant, and privacy/security notes before implementation.
 - Attach project standards to tasks and enforce them in builder/reviewer prompts.
 - For UI work, require mobile-first implementation plus tablet and desktop expectations unless a task explicitly scopes one breakpoint only.
@@ -23,6 +24,7 @@ When working in this repository:
 - Reviewers may make tiny low-risk fixes to save time, but they must document those fixes. Material, risky, ambiguous, or product-shaping fixes go back to the builder as `needs_changes`.
 - Run `npm run check` before committing code changes.
 - Use `npm run supervisor` for a read-only cross-project action sweep, or `npm run supervisor -- --watch --interval 300` for a continuous local loop. The supervisor must not merge, deploy, or send external notifications.
+- Use `npm run dispatcher -- --plan` to preview dispatches and `npm run dispatcher` to create durable dispatch runs. The dispatcher must not merge, deploy, or send external notifications.
 
 ## Roles
 

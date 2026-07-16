@@ -28,6 +28,12 @@ Supervisor docs:
 docs/SUPERVISOR.md
 ```
 
+Dispatcher docs:
+
+```text
+docs/DISPATCHER.md
+```
+
 Default local repo path for this machine:
 
 ```text
@@ -209,7 +215,7 @@ codex/<project-key>-<task-id>-<short-title>
 11. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
 12. Task moves to `builder_review`.
 13. Run `npm run automation-tick -- --project <project-key> --limit 10` or let the scheduled steward route the task.
-14. Run `npm run supervisor -- --json` or let the scheduled supervisor report next builder/reviewer/owner actions across projects.
+14. Run `npm run dispatcher -- --plan` to preview worker dispatches, or let the scheduled dispatcher create durable run records across projects.
 15. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.
 16. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
 17. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.

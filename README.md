@@ -13,6 +13,7 @@ This first version is intentionally simple:
 - Generates builder and reviewer prompts you can hand to Codex.
 - Generates backend, frontend, and primary lead reviewer prompts.
 - Includes a supervisor loop for continuously reporting builder, reviewer, dependency, and owner-handoff actions across projects.
+- Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
@@ -143,6 +144,18 @@ Run the supervisor continuously:
 npm run supervisor -- --watch --interval 300
 ```
 
+Preview dispatcher work:
+
+```bash
+npm run dispatcher -- --plan
+```
+
+Dispatch work into durable run records:
+
+```bash
+npm run dispatcher
+```
+
 Record a review outcome:
 
 ```bash
@@ -168,7 +181,7 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 
-For continuous coordination, see [docs/SUPERVISOR.md](docs/SUPERVISOR.md).
+For continuous coordination, see [docs/SUPERVISOR.md](docs/SUPERVISOR.md) and [docs/DISPATCHER.md](docs/DISPATCHER.md).
 
 For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.
 
@@ -238,6 +251,8 @@ For parallel builder work, the default standard is foundation-first. One builder
 This repository now has a bounded workflow automation steward for assignment, dependency blocking/unblocking, review routing, review-cycle handling, and owner handoff.
 
 It also has a read-oriented supervisor command that can run every few minutes to report what builders, reviewers, or the human owner should do next across all projects.
+
+The dispatcher consumes supervisor actions and creates durable run records with prompt snapshots. The default provider is `prompt-outbox`, which is intentionally vendor-neutral and ready for a Codex/native-thread runner to pick up.
 
 It still does not spawn Codex threads, open GitHub PRs, merge branches, deploy, or send external notifications by itself. Those should be built as the next runner layer on top of the existing `automation-tick`, review outcomes, and `owner_review_requested` events.
 
