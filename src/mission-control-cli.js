@@ -171,6 +171,12 @@ Commands:
   add-task --project --title    Add a task
   status TASK_ID --status       Update task status
   prompt TASK_ID --role         Print builder or reviewer prompt
+
+Task fields:
+  --story                       User story, such as "As a customer..."
+  --expected                    Expected outcome or feature behavior
+  --criteria                    Acceptance criteria, comma or newline separated
+  --attachment                  Image, screenshot, mockup, URL, or reference path
 `);
     return;
   }
@@ -236,6 +242,9 @@ Commands:
       priority: args.priority,
       type: args.type,
       area: args.area,
+      userStory: args.story || args["user-story"],
+      expectedOutcome: args.expected || args["expected-outcome"],
+      attachments: args.attachment || args.attachments,
       acceptanceCriteria: args.criteria,
       privacyNotes: args.privacy,
       securityNotes: args.security,
@@ -265,4 +274,3 @@ main().catch((error) => {
   console.error(`Error: ${error.message}`);
   process.exitCode = 1;
 });
-

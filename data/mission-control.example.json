@@ -38,6 +38,9 @@
       "priority": "medium",
       "type": "chore",
       "area": "setup",
+      "userStory": "As a project owner, I want to verify Mission Control works locally, so that I can coordinate Codex tasks from a durable board.",
+      "expectedOutcome": "The local task board loads, the sample task is visible, and builder/reviewer prompts can be generated from the task detail.",
+      "attachments": [],
       "acceptanceCriteria": [
         "The local app runs on 127.0.0.1:4317.",
         "A task can be created from the UI or CLI.",
@@ -59,4 +62,3 @@
   "runs": [],
   "reviews": []
 }
-

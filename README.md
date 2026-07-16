@@ -75,7 +75,11 @@ Add a task:
 node src/mission-control-cli.js add-task \
   --project myapp \
   --title "Add onboarding flow" \
+  --story "As a new user, I want onboarding to explain the product before auth." \
   --description "Create a first-pass onboarding screen and tests." \
+  --expected "Users see the onboarding flow, then continue to auth." \
+  --criteria "The first screen explains the value, Location and notification prompts are introduced before permission requests, npm run check passes" \
+  --attachment "/absolute/path/to/mockup.png" \
   --status ready \
   --priority high
 ```
@@ -95,12 +99,36 @@ node src/mission-control-cli.js prompt task_1 --role reviewer
 ## Intended Workflow
 
 1. Capture idea as a task.
-2. Shape it with acceptance criteria and safety notes.
+2. Shape it with a user story, expected outcome, acceptance criteria, visual attachments, and safety notes.
 3. Builder Codex thread creates a feature branch and implements it.
 4. Builder runs validation, commits, pushes, and marks the task `builder_review`.
 5. Reviewer Codex thread reviews the branch.
 6. Reviewer sends it back as `needs_changes` or forwards it as `user_review`.
 7. Human owner approves, asks for changes, merges, or deploys.
+
+## Future Chat Handoff
+
+For new or existing chats, point the assistant at:
+
+```text
+docs/HANDOFF.md
+```
+
+Useful phrases:
+
+```text
+Create a task for this in Mission Control and send me the link.
+```
+
+```text
+Build this through Mission Control.
+```
+
+```text
+Break this mockup into Mission Control tasks, one task per screen or functional slice.
+```
+
+The handoff standard requires a user story, problem description, expected outcome, acceptance criteria, visual attachments for UI or bug work, privacy/security notes when relevant, and a builder/reviewer workflow.
 
 ## Project Safety Rules
 

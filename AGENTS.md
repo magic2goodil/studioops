@@ -8,6 +8,8 @@ When working in this repository:
 - Treat project safety rules as first-class instructions.
 - Prefer small, reviewable branches.
 - Keep generated task prompts clear enough to paste into a fresh Codex thread.
+- Use `docs/HANDOFF.md` when a user asks to create, build, review, or split work through Mission Control.
+- For non-trivial tasks, capture user story, expected outcome, acceptance criteria, visual attachments when relevant, and privacy/security notes before implementation.
 - Run `npm run check` before committing code changes.
 
 ## Roles
@@ -27,4 +29,3 @@ Reviewer role:
 - Lead with findings.
 - Check acceptance criteria, tests, security, privacy, and scope.
 - Do not rubber-stamp incomplete work.
-

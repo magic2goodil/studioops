@@ -4,11 +4,20 @@ Mission Control is built around four roles.
 
 ## Intake
 
-Capture the user's idea as a task. Preserve nuance, but shape the work into acceptance criteria.
+Capture the user's idea as a task. Preserve nuance, but shape the work into a buildable ticket:
+
+- User story
+- Problem or description
+- Expected outcome
+- Acceptance criteria
+- Visual attachments for UI, design, or bug work
+- Privacy and security notes when relevant
+
+Use `docs/HANDOFF.md` as the standard for task intake and future-chat handoff.
 
 ## Planner
 
-Split broad tasks into branches small enough for one builder thread.
+Split broad tasks into branches small enough for one builder thread. For mockups, split by screen, panel, state, or interaction and attach the relevant image crop or reference to each task.
 
 ## Builder
 
@@ -34,4 +43,3 @@ Use the generated reviewer prompt. The reviewer should:
 ## Human Owner
 
 The human owner is the final product and merge authority.
-

@@ -64,6 +64,56 @@ function normalizeList(value) {
     .filter(Boolean);
 }
 
+function inferAttachmentType(value) {
+  return /\.(png|jpe?g|gif|webp|svg)$/i.test(String(value || "")) ? "image" : "reference";
+}
+
+function normalizeAttachments(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === "string") {
+          const trimmed = item.trim();
+          return {
+            label: trimmed,
+            url: trimmed,
+            type: inferAttachmentType(trimmed),
+            note: "",
+          };
+        }
+        const url = String(item.url || item.path || "").trim();
+        const label = String(item.label || url || "Attachment").trim();
+        return {
+          label,
+          url,
+          type: String(item.type || inferAttachmentType(url || label)).trim(),
+          note: String(item.note || "").trim(),
+        };
+      })
+      .filter((item) => item.label || item.url || item.note);
+  }
+
+  return normalizeList(value).map((item) => ({
+    label: item,
+    url: item,
+    type: inferAttachmentType(item),
+    note: "",
+  }));
+}
+
+function renderAttachments(attachments) {
+  return (attachments || []).length
+    ? attachments
+        .map((item) => {
+          const label = item.label || item.url || "Attachment";
+          const url = item.url && item.url !== label ? `: ${item.url}` : "";
+          const note = item.note ? ` - ${item.note}` : "";
+          return `- [${item.type || "reference"}] ${label}${url}${note}`;
+        })
+        .join("\n")
+    : "- None recorded.";
+}
+
 export async function addProject(input) {
   const state = await readState();
   const now = new Date().toISOString();
@@ -116,6 +166,9 @@ export async function addTask(input) {
     priority: String(input.priority || "medium").trim(),
     type: String(input.type || "feature").trim(),
     area: String(input.area || "").trim(),
+    userStory: String(input.userStory || input.story || "").trim(),
+    expectedOutcome: String(input.expectedOutcome || input.expected || "").trim(),
+    attachments: normalizeAttachments(input.attachments || input.attachment),
     acceptanceCriteria: normalizeList(input.acceptanceCriteria),
     privacyNotes: String(input.privacyNotes || "").trim(),
     securityNotes: String(input.securityNotes || "").trim(),
@@ -154,6 +207,8 @@ export async function updateTask(taskId, patch) {
     "priority",
     "type",
     "area",
+    "userStory",
+    "expectedOutcome",
     "privacyNotes",
     "securityNotes",
     "branchName",
@@ -169,6 +224,9 @@ export async function updateTask(taskId, patch) {
   }
   if (Object.prototype.hasOwnProperty.call(patch, "acceptanceCriteria")) {
     task.acceptanceCriteria = normalizeList(patch.acceptanceCriteria);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
+    task.attachments = normalizeAttachments(patch.attachments);
   }
   task.updatedAt = new Date().toISOString();
   state.events.push({
@@ -234,6 +292,7 @@ export function generatePrompt(state, taskId, role = "builder") {
   const project = findProject(state, task.projectId);
   if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
   const criteria = (task.acceptanceCriteria || []).map((item) => `- ${item}`).join("\n") || "- No acceptance criteria recorded yet.";
+  const attachments = renderAttachments(task.attachments);
   const validation = (project.validationCommands || []).map((item) => `- \`${item}\``).join("\n") || "- No validation command recorded.";
   const safety = (project.safetyRules || []).map((item) => `- ${item}`).join("\n") || "- No project-specific safety rules recorded.";
   const context = (project.contextLinks || []).map((item) => `- ${item}`).join("\n") || "- README.md";
@@ -251,6 +310,15 @@ ${task.title}
 
 Description:
 ${task.description || "(none)"}
+
+User story:
+${task.userStory || "(not recorded)"}
+
+Expected outcome:
+${task.expectedOutcome || "(not recorded)"}
+
+Visual/context attachments:
+${attachments}
 
 Acceptance criteria:
 ${criteria}
@@ -287,6 +355,15 @@ ${task.title}
 Description:
 ${task.description || "(none)"}
 
+User story:
+${task.userStory || "(not recorded)"}
+
+Expected outcome:
+${task.expectedOutcome || "(not recorded)"}
+
+Visual/context attachments:
+${attachments}
+
 Acceptance criteria:
 ${criteria}
 
@@ -295,6 +372,7 @@ ${validation}
 
 Builder instructions:
 - Create or switch to the feature branch.
+- For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
 - Keep changes scoped to this task.
 - Do not commit secrets, private customer data, or unrelated refactors.
 - Run validation before reporting ready.

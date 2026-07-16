@@ -53,6 +53,14 @@ a:hover {
   filter: brightness(1.08);
 }
 
+.plain-link {
+  display: block;
+  overflow-wrap: anywhere;
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(245, 247, 251, 0.86);
+}
+
 input,
 select,
 textarea {
@@ -256,6 +264,35 @@ label {
   margin: 14px 0;
 }
 
+.attachment-list {
+  display: grid;
+  gap: 10px;
+  margin: 10px 0 18px;
+}
+
+.attachment-item {
+  display: grid;
+  gap: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 12px;
+}
+
+.attachment-item strong {
+  color: var(--text);
+}
+
+.attachment-item span,
+.attachment-item code {
+  color: var(--muted);
+}
+
+.attachment-item code {
+  overflow-wrap: anywhere;
+  font-size: 0.78rem;
+}
+
 .prompt-box {
   white-space: pre-wrap;
   color: rgba(245, 247, 251, 0.78);
@@ -275,4 +312,3 @@ label {
     flex-direction: column;
   }
 }
-

@@ -38,10 +38,36 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function taskUrl(taskId) {
+  return `${window.location.origin}${window.location.pathname}#${encodeURIComponent(taskId)}`;
+}
+
+function attachmentList(attachments) {
+  if (!attachments?.length) return "";
+  return `
+    <h3>Visual Attachments</h3>
+    <div class="attachment-list">
+      ${attachments.map((item) => `
+        <div class="attachment-item">
+          <strong>${escapeHtml(item.label || item.url || "Attachment")}</strong>
+          <span>${escapeHtml(item.type || "reference")}${item.note ? ` · ${escapeHtml(item.note)}` : ""}</span>
+          ${item.url ? `<code>${escapeHtml(item.url)}</code>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
 async function loadState() {
   const data = await api("/api/state");
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
+  const hashTaskId = decodeURIComponent(window.location.hash.replace(/^#/, ""));
+  const linkedTask = hashTaskId ? state.tasks.find((task) => task.id === hashTaskId) : null;
+  if (linkedTask) {
+    state.selectedTaskId = linkedTask.id;
+    state.selectedProjectId = linkedTask.projectId;
+  }
   if (!state.selectedProjectId && state.projects[0]) state.selectedProjectId = state.projects[0].id;
   if (!state.selectedTaskId && state.tasks[0]) state.selectedTaskId = state.tasks[0].id;
   configStatus.textContent = data.configLoaded
@@ -87,7 +113,7 @@ function renderTasks() {
         </div>
         <h3>${escapeHtml(task.title)}</h3>
         <p>${escapeHtml(task.description || "No description yet.")}</p>
-        <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.type || "task")}</small>
+        <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.type || "task")}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
       </button>
     `;
   }).join("") || `<p>No tasks match this view.</p>`;
@@ -102,10 +128,16 @@ async function renderDetail() {
   const project = projectFor(task);
   const builderPrompt = await api(`/api/tasks/${task.id}/prompt?role=builder`);
   const reviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=reviewer`);
+  const link = taskUrl(task.id);
   taskDetail.innerHTML = `
     <div class="detail-title">${escapeHtml(task.title)}</div>
     <p>${escapeHtml(project?.name || "Unknown project")} · ${escapeHtml(task.status)} · ${escapeHtml(task.priority)}</p>
     <p>${escapeHtml(task.description || "No description yet.")}</p>
+    ${task.userStory ? `<h3>User Story</h3><p>${escapeHtml(task.userStory)}</p>` : ""}
+    ${task.expectedOutcome ? `<h3>Expected Outcome</h3><p>${escapeHtml(task.expectedOutcome)}</p>` : ""}
+    ${attachmentList(task.attachments)}
+    <h3>Task Link</h3>
+    <p><a class="plain-link" href="#${escapeHtml(task.id)}">${escapeHtml(link)}</a></p>
     <div class="detail-actions">
       <button type="button" data-status="ready">Ready</button>
       <button type="button" data-status="in_progress">In Progress</button>
@@ -133,6 +165,7 @@ projectList.addEventListener("click", (event) => {
   if (!button) return;
   state.selectedProjectId = button.dataset.projectId;
   state.selectedTaskId = visibleTasks()[0]?.id || "";
+  if (state.selectedTaskId) window.history.replaceState(null, "", `#${encodeURIComponent(state.selectedTaskId)}`);
   render();
 });
 
@@ -140,6 +173,7 @@ taskBoard.addEventListener("click", (event) => {
   const button = event.target.closest("[data-task-id]");
   if (!button) return;
   state.selectedTaskId = button.dataset.taskId;
+  window.history.replaceState(null, "", `#${encodeURIComponent(state.selectedTaskId)}`);
   render();
 });
 
@@ -181,6 +215,10 @@ refreshButton.addEventListener("click", () => {
   loadState().catch((error) => alert(error.message));
 });
 
+window.addEventListener("hashchange", () => {
+  loadState().catch((error) => alert(error.message));
+});
+
 statusFilter.addEventListener("change", () => {
   state.statusFilter = statusFilter.value;
   render();
@@ -189,4 +227,3 @@ statusFilter.addEventListener("change", () => {
 loadState().catch((error) => {
   document.body.innerHTML = `<main class="panel"><h1>Mission Control failed to load</h1><p>${escapeHtml(error.message)}</p></main>`;
 });
-
