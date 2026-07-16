@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expandHome, loadConfig } from "./config.js";
 
@@ -117,6 +117,34 @@ function parseJson(text, fallback = {}) {
   }
 }
 
+function isMissingPathError(error) {
+  return error?.code === "ENOENT" || error?.code === "ENOTDIR";
+}
+
+async function appDirectoryExists(appDir, key) {
+  try {
+    const appDirStat = await stat(appDir);
+    if (!appDirStat.isDirectory()) {
+      throw new Error(`GitHub App credentials path for ${key} is not a directory: ${appDir}`);
+    }
+    return true;
+  } catch (error) {
+    if (isMissingPathError(error)) return false;
+    throw error;
+  }
+}
+
+async function readCredentialFile(filePath, label) {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      throw new Error(`missing ${label}`);
+    }
+    throw new Error(`could not read ${label}: ${error.message}`);
+  }
+}
+
 async function githubJson(pathname, { method = "GET", token, body } = {}) {
   const response = await fetch(`${GITHUB_API_BASE}${pathname}`, {
     method,
@@ -195,9 +223,15 @@ async function safeLoadConfig() {
 
 async function loadAppAt(credentialsDir, key) {
   const appDir = path.join(credentialsDir, key);
+  if (!(await appDirectoryExists(appDir, key))) return null;
+
   try {
-    const app = parseJson(await readFile(path.join(appDir, "app.json"), "utf8"));
-    const privateKey = await readFile(path.join(appDir, "private-key.pem"), "utf8");
+    const appText = await readCredentialFile(path.join(appDir, "app.json"), "app.json");
+    const privateKey = await readCredentialFile(path.join(appDir, "private-key.pem"), "private-key.pem");
+    const app = JSON.parse(appText);
+    if (!app || typeof app !== "object" || Array.isArray(app)) {
+      throw new Error("app.json must contain an object");
+    }
     if (!app.appId) throw new Error("app.json is missing appId");
     return {
       ...app,
@@ -207,36 +241,43 @@ async function loadAppAt(credentialsDir, key) {
       privateKey,
       appDir,
     };
-  } catch {
-    return null;
+  } catch (error) {
+    throw new Error(`GitHub App credentials for ${key} are invalid: ${error.message}`);
   }
 }
 
 async function loadConfiguredApp(credentialsDir, role, appOptions = {}) {
   const roleMap = appOptions.roleMap && typeof appOptions.roleMap === "object" ? appOptions.roleMap : {};
   const defaultRole = String(appOptions.defaultRole || "default").trim();
-  const candidates = unique([
+  const mappedCandidates = unique([
     roleMap[role],
     roleMap[role.replace("-reviewer", "")],
-    role,
-    defaultRole,
-    "default",
   ]);
-
-  for (const key of candidates) {
+  for (const key of mappedCandidates) {
     const app = await loadAppAt(credentialsDir, key);
     if (app) return app;
+    throw new Error(`GitHub App credentials for role ${role} are mapped to ${key}, but ${path.join(credentialsDir, key)} was not found.`);
   }
+
+  const roleApp = await loadAppAt(credentialsDir, role);
+  if (roleApp) return roleApp;
 
   try {
     const entries = await readdir(credentialsDir, { withFileTypes: true });
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() || entry.name === defaultRole || entry.name === "default") continue;
+      if (entry.name === role) continue;
       const app = await loadAppAt(credentialsDir, entry.name);
       if (app && normalizeRole(app.role || app.key) === role) return app;
     }
-  } catch {
-    // The explicit error below is clearer than the filesystem error.
+  } catch (error) {
+    if (!isMissingPathError(error)) throw error;
+  }
+
+  const fallbackCandidates = unique([defaultRole, "default"]);
+  for (const key of fallbackCandidates) {
+    const app = await loadAppAt(credentialsDir, key);
+    if (app) return app;
   }
 
   throw new Error(
