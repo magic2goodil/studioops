@@ -9,6 +9,8 @@ Fail or send back the task when a material issue exists:
 - A visual change only updates one breakpoint while leaving tablet or desktop broken.
 - A redesign updates one component but leaves the rest of the visible page in the old design without explicit scope.
 - Public content relies entirely on client-side JavaScript for meaningful HTML.
+- Generated navigation or dropdown links point to missing routes or missing fragment IDs.
+- API-driven UI updates only hidden/non-visible markup while product copy claims that data is active.
 - Routine marketing/page content was hard-coded when the project requires authenticated CMS editing.
 - Page sections, panels, or repeated content blocks cannot be reordered or managed through the agreed content model.
 - SEO metadata, canonical URLs, or structured data are missing for SEO-sensitive pages.
@@ -16,13 +18,16 @@ Fail or send back the task when a material issue exists:
 - Async content causes avoidable layout shift.
 - Large datasets or page sections load eagerly without need.
 - Database queries are unbounded, unindexed, N+1-prone, or missing pagination.
+- Fresh database bootstrap fails or is not verified after base schema changes.
 - Migrations, indexes, or data ownership are unclear for persistence changes.
+- Production deploy automation runs bootstrap SQL as a migration or can ignore SQL failures.
 - API failures are invisible to users.
 - There are browser console errors.
 - The implementation ignores referenced mockups or visual attachments.
 - The PR lacks validation notes.
 - The PR is linked to several tasks without a clear primary task and per-task complete/partial notes.
 - Deployment or production-impacting work bypasses the feature branch, PR, validation, and configured CI/CD flow.
+- Production deploy automation is added before development auth/admin/legacy mutation surfaces are gated or removed.
 - Sensitive data is logged, exposed, stored casually, or collected without explicit consent requirements.
 - Consent-sensitive features lack opt-in, opt-out/revocation, retention, or data-minimization behavior.
 - The work violates project-specific standards.

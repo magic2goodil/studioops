@@ -42,6 +42,9 @@ If an index is intentionally skipped, record why.
 - Keep migrations reversible when practical.
 - Do not rewrite production history without explicit approval.
 - Include seed/sample data only when the task calls for it, and keep it clearly fake unless the user requests real imported data.
+- Verify fresh database bootstrap when changing base schema files. A green syntax check is not enough if a new index or query references columns that are only added by runtime schema patches.
+- Do not treat bootstrap SQL as a production migration. Production deployments should use explicit migration files or the project's migration tool.
+- Any deploy-time `psql` command must fail closed, for example with `-v ON_ERROR_STOP=1`.
 
 ## Performance Review
 

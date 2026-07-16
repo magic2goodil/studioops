@@ -34,11 +34,15 @@ Production deploy workflows should:
 
 - run only after CI passes
 - run only from the configured production branch
+- be deferred until development auth, admin mutation routes, legacy mutation/import routes, and other production-dangerous surfaces are gated or removed
 - use GitHub Environments or equivalent protection when available
 - require repository secrets/variables rather than hard-coded credentials
 - avoid printing secrets, tokens, connection strings, or private paths in logs
 - provide smoke checks after deploy
 - fail closed when required secrets are missing
+- fail closed when schema or migration steps fail
+
+Deployment automation should not be added just because it is easy to write YAML. A reviewer should send it back if the application being deployed is not production-safe yet.
 
 ## Rollback And Audit
 

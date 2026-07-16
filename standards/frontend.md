@@ -45,6 +45,14 @@ Every async interface must define:
 - error state
 - retry path when appropriate
 
+Async or API-driven UI is not implemented if it only updates hidden markup. If an API powers a visible product claim, the reviewed page must expose that data in the active experience or explicitly document that the API is staged for later work.
+
+## Navigation And Links
+
+Every generated or CMS-managed link must resolve to a real route, a real element ID on the page, or an explicitly disabled/non-clickable state.
+
+Fragment links should be verified after rendering. Do not ship dropdowns or generated nav with broken `#section` targets.
+
 ## Visual Verification
 
 UI tasks must include visual verification notes for mobile, tablet, and desktop. Screenshots are preferred when practical.
