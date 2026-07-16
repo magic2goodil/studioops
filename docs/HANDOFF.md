@@ -34,6 +34,12 @@ Dispatcher docs:
 docs/DISPATCHER.md
 ```
 
+Steward docs:
+
+```text
+docs/STEWARD.md
+```
+
 Runner docs:
 
 ```text
@@ -226,7 +232,7 @@ codex/<project-key>-<task-id>-<short-title>
 10. Builder links the feature branch and PR on the task.
 11. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
 12. Task moves to `builder_review`.
-13. Run `npm run automation-tick -- --project <project-key> --limit 10` or let the scheduled steward route the task.
+13. Run `npm run automation-tick -- --project <project-key> --limit 10` or let the scheduled steward route the task across projects.
 14. Run `npm run dispatcher -- --plan` to preview worker dispatches, or let the scheduled dispatcher create durable run records across projects.
 15. Run `npm run runner -- --plan` to preview queued builder/reviewer work, or let the scheduled runner execute queued Codex work.
 16. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.

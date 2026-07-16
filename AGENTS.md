@@ -9,6 +9,7 @@ When working in this repository:
 - Prefer small, reviewable branches.
 - Keep generated task prompts clear enough to paste into a fresh Codex thread.
 - Use `docs/HANDOFF.md` when a user asks to create, build, review, or split work through Mission Control.
+- Use `docs/STEWARD.md` when a user asks for scheduled workflow routing or status advancement across projects.
 - Use `docs/SUPERVISOR.md` when a user asks for continuous coordination, scheduled checks, or what should move next across projects.
 - Use `docs/DISPATCHER.md` when a user asks Mission Control to actually queue builder, reviewer, or owner handoff work.
 - Use `docs/RUNNER.md` when a user asks Mission Control to execute queued builder/reviewer runs through Codex CLI.
@@ -26,6 +27,7 @@ When working in this repository:
 - Reviewers may make tiny low-risk fixes to save time, but they must document those fixes. Material, risky, ambiguous, or product-shaping fixes go back to the builder as `needs_changes`.
 - Run `npm run check` before committing code changes.
 - Use `npm run supervisor` for a read-only cross-project action sweep, or `npm run supervisor -- --watch --interval 300` for a continuous local loop. The supervisor must not merge, deploy, or send external notifications.
+- Use `npm run automation-tick -- --limit 50` for one workflow-routing pass. The scheduled steward LaunchAgent runs that command every few minutes across all projects.
 - Use `npm run dispatcher -- --plan` to preview dispatches and `npm run dispatcher` to create durable dispatch runs. The dispatcher must not merge, deploy, or send external notifications.
 - Use `npm run runner -- --plan` to preview queued builder/reviewer work and `npm run runner` to let Codex CLI execute one queued run. The runner must not merge or deploy and must stop at the human owner gate.
 - Use `npm run notifier -- --plan` to preview local notifications and `npm run notifier` to send owner/failure notifications. The notifier must not approve, merge, deploy, or send app/customer-facing messages.

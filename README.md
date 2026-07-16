@@ -13,6 +13,7 @@ This first version is intentionally simple:
 - Generates builder and reviewer prompts you can hand to Codex.
 - Generates backend, frontend, and primary lead reviewer prompts.
 - Includes a supervisor loop for continuously reporting builder, reviewer, dependency, and owner-handoff actions across projects.
+- Includes a steward tick for continuously routing task workflow state across projects.
 - Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
 - Includes a runner loop for consuming queued builder/reviewer runs with Codex CLI.
 - Includes a notifier loop for local owner-review and failed-run notifications.
@@ -134,6 +135,8 @@ Run one workflow automation pass:
 npm run automation-tick -- --project dollos --limit 10
 ```
 
+The local LaunchAgent steward runs the same workflow tick on a schedule for every registered project.
+
 Run the supervisor once:
 
 ```bash
@@ -207,7 +210,7 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 
-For continuous coordination, see [docs/SUPERVISOR.md](docs/SUPERVISOR.md), [docs/DISPATCHER.md](docs/DISPATCHER.md), [docs/RUNNER.md](docs/RUNNER.md), and [docs/NOTIFIER.md](docs/NOTIFIER.md).
+For continuous coordination, see [docs/STEWARD.md](docs/STEWARD.md), [docs/SUPERVISOR.md](docs/SUPERVISOR.md), [docs/DISPATCHER.md](docs/DISPATCHER.md), [docs/RUNNER.md](docs/RUNNER.md), and [docs/NOTIFIER.md](docs/NOTIFIER.md).
 
 For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.
 

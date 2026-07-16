@@ -68,6 +68,12 @@ Run the steward manually with:
 npm run automation-tick -- --project dollos --limit 10
 ```
 
+The scheduled steward LaunchAgent runs this periodically for every registered project:
+
+```bash
+npm run automation-tick -- --limit 50
+```
+
 Run the cross-project supervisor with:
 
 ```bash

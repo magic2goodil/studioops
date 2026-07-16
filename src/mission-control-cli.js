@@ -105,6 +105,10 @@ async function setup() {
           requireHumanMerge: true,
           requireGitHubActionsDeploy: true,
         },
+        steward: {
+          intervalSeconds: 300,
+          limit: 50,
+        },
         dispatcher: {
           intervalSeconds: 300,
           provider: "prompt-outbox",
