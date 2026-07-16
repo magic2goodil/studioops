@@ -302,7 +302,9 @@ async function renderDetail() {
   const fullTask = detail.task;
   const project = fullTask.project || projectFor(task);
   const builderPrompt = await api(`/api/tasks/${task.id}/prompt?role=builder`);
-  const reviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=reviewer`);
+  const backendReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=backend-reviewer`);
+  const frontendReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=frontend-reviewer`);
+  const leadReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=lead-reviewer`);
   const link = taskUrl(task.id);
   const isFullPage = Boolean(state.routeTaskId);
   taskDetail.innerHTML = `
@@ -332,14 +334,22 @@ async function renderDetail() {
       <button type="button" data-status="ready">Ready</button>
       <button type="button" data-status="in_progress">In Progress</button>
       <button type="button" data-status="builder_review">Builder Review</button>
+      <button type="button" data-status="backend_review">Backend Review</button>
+      <button type="button" data-status="frontend_review">Frontend Review</button>
+      <button type="button" data-status="lead_review">Lead Review</button>
+      <button type="button" data-status="needs_changes">Needs Changes</button>
       <button type="button" data-status="user_review">User Review</button>
       <button type="button" data-status="done">Done</button>
     </div>
     ${renderComments(fullTask.comments || [])}
     <h3>Builder Prompt</h3>
     <div class="prompt-box">${escapeHtml(builderPrompt.prompt)}</div>
-    <h3>Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(reviewerPrompt.prompt)}</div>
+    <h3>Backend Reviewer Prompt</h3>
+    <div class="prompt-box">${escapeHtml(backendReviewerPrompt.prompt)}</div>
+    <h3>Frontend Reviewer Prompt</h3>
+    <div class="prompt-box">${escapeHtml(frontendReviewerPrompt.prompt)}</div>
+    <h3>Primary Lead Reviewer Prompt</h3>
+    <div class="prompt-box">${escapeHtml(leadReviewerPrompt.prompt)}</div>
   `;
 }
 

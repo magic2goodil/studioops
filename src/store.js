@@ -13,6 +13,9 @@ const VALID_STATUSES = new Set([
   "in_progress",
   "blocked",
   "builder_review",
+  "backend_review",
+  "frontend_review",
+  "lead_review",
   "needs_changes",
   "user_review",
   "approved",
@@ -22,7 +25,34 @@ const VALID_STATUSES = new Set([
   "closed",
 ]);
 
-export { DATA_FILE, VALID_STATUSES };
+const DEFAULT_REVIEW_PIPELINE = [
+  {
+    key: "backend",
+    label: "Backend Review",
+    role: "backend-reviewer",
+    status: "backend_review",
+    required: true,
+    description: "Review API contracts, persistence, auth, privacy, security, migrations, and deployment risk.",
+  },
+  {
+    key: "frontend",
+    label: "Frontend Review",
+    role: "frontend-reviewer",
+    status: "frontend_review",
+    required: true,
+    description: "Review UI/UX, responsiveness, accessibility, design-system reuse, content editability, and browser health.",
+  },
+  {
+    key: "lead",
+    label: "Primary Lead Review",
+    role: "lead-reviewer",
+    status: "lead_review",
+    required: true,
+    description: "Review product fit, architecture, reviewer findings, PR/task scope, and readiness for the human owner.",
+  },
+];
+
+export { DATA_FILE, VALID_STATUSES, DEFAULT_REVIEW_PIPELINE };
 
 export async function ensureDataFile() {
   await mkdir(DATA_DIR, { recursive: true });
@@ -114,6 +144,20 @@ function renderAttachments(attachments) {
     : "- None recorded.";
 }
 
+function normalizeReviewPipeline(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((stage) => ({
+      key: String(stage.key || "").trim(),
+      label: String(stage.label || stage.key || "").trim(),
+      role: String(stage.role || stage.key || "").trim(),
+      status: String(stage.status || "").trim(),
+      required: stage.required !== false,
+      description: String(stage.description || "").trim(),
+    }))
+    .filter((stage) => stage.key && stage.role);
+}
+
 export async function addProject(input) {
   const state = await readState();
   const now = new Date().toISOString();
@@ -134,6 +178,7 @@ export async function addProject(input) {
     contextLinks: normalizeList(input.contextLinks),
     standards: normalizeList(input.standards),
     safetyRules: normalizeList(input.safetyRules),
+    reviewPipeline: normalizeReviewPipeline(input.reviewPipeline),
     createdAt: now,
     updatedAt: now,
   };
@@ -335,9 +380,16 @@ export function generatePrompt(state, taskId, role = "builder") {
   const safety = (project.safetyRules || []).map((item) => `- ${item}`).join("\n") || "- No project-specific safety rules recorded.";
   const context = (project.contextLinks || []).map((item) => `- ${item}`).join("\n") || "- README.md";
   const standards = (project.standards || []).map((item) => `- ${item}`).join("\n") || "- No project-specific standards recorded.";
+  const reviewStages = (project.reviewPipeline || []).length ? project.reviewPipeline : DEFAULT_REVIEW_PIPELINE;
+  const reviewPipeline = reviewStages.length
+    ? reviewStages
+        .map((stage) => `- ${stage.label || stage.key} (${stage.role})${stage.required ? "" : " optional"}: ${stage.description || stage.status || "No description recorded."}`)
+        .join("\n")
+    : "- Builder review -> domain review when relevant -> lead review -> user review.";
 
-  if (role === "reviewer") {
-    return `You are the team-lead reviewer for Mission Control task ${task.id}.
+  if (role !== "builder") {
+    const reviewerProfile = reviewerProfileForRole(role);
+    return `You are the ${reviewerProfile.label} for Mission Control task ${task.id}.
 
 Project: ${project.name}
 Repository path: ${project.repoPath || "(not recorded)"}
@@ -373,15 +425,22 @@ ${safety}
 Project standards:
 ${standards}
 
+Review pipeline:
+${reviewPipeline}
+
 Review instructions:
-- Review as a senior engineer.
+- Review as a senior engineer in the ${reviewerProfile.domain} lane.
 - Lead with concrete findings ordered by severity.
-- Check scope, behavior, tests, security, privacy, and maintainability.
+- Focus especially on:
+${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
+- Still check scope, behavior, tests, security, privacy, and maintainability.
 - Check the listed project standards and fail the task for material violations.
 - For data/backend changes, check query shape, indexes, pagination, migrations, and privacy boundaries.
+- For frontend/UI changes, check responsive behavior, accessibility, visual hierarchy, component reuse, content editability, and browser console/runtime errors.
 - For consent-sensitive features, check opt-in, revocation, transparency, retention, and data minimization.
 - Confirm whether the acceptance criteria are met.
 - Confirm the task has branch/PR context and builder notes when implementation work was done.
+- Confirm whether this PR has one primary task or intentionally covers multiple tasks. If it covers multiple tasks, verify each linked task has clear complete/partial scope notes.
 - If it is not ready for the human owner, mark what needs to change.
 - If it is ready, summarize validation and remaining risk clearly.
 `;
@@ -442,6 +501,44 @@ Builder instructions:
 - Link the feature branch and pull request on the task when available.
 - Add a task comment with changed files, validation results, known gaps, PR link, and next review step.
 `;
+}
+
+function reviewerProfileForRole(role) {
+  const normalized = String(role || "reviewer").toLowerCase().replaceAll("_", "-");
+  if (normalized.includes("backend")) {
+    return {
+      label: "backend reviewer",
+      domain: "backend/data/security",
+      focus: [
+        "API contracts and error handling",
+        "data model ownership, migrations, indexes, pagination, and query shape",
+        "auth/session handling, PII protection, secrets, consent, and auditability",
+        "background jobs, queues, deployment impact, and operational risk",
+      ],
+    };
+  }
+  if (normalized.includes("frontend")) {
+    return {
+      label: "frontend reviewer",
+      domain: "frontend/product UI",
+      focus: [
+        "mockup fidelity, visual hierarchy, spacing, typography, and interaction quality",
+        "mobile, tablet, desktop, direct URL refresh, and no horizontal overflow",
+        "component reuse, Sass/design-system consistency, content editability, and no one-off UI copies",
+        "accessibility, semantic HTML, loading/empty/error states, and browser console health",
+      ],
+    };
+  }
+  return {
+    label: "primary team lead reviewer",
+    domain: "product/architecture/release",
+    focus: [
+      "acceptance criteria, product intent, scope control, and user-facing risk",
+      "whether backend and frontend reviews are complete or explicitly waived",
+      "cross-cutting architecture, security/privacy posture, deployment safety, and rollback path",
+      "whether the PR should move to user review, needs changes, or be split into smaller PRs",
+    ],
+  };
 }
 
 function slugify(value) {

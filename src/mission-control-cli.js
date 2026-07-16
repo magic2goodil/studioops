@@ -105,7 +105,34 @@ async function setup() {
           "standards/accessibility.md",
           "standards/security-privacy.md",
           "standards/testing.md",
+          "standards/release-deployment.md",
           "standards/review-checklist.md",
+        ],
+        reviewPipeline: [
+          {
+            key: "backend",
+            label: "Backend Review",
+            role: "backend-reviewer",
+            status: "backend_review",
+            required: true,
+            description: "Review API contracts, persistence, auth, privacy, security, migrations, and deployment risk.",
+          },
+          {
+            key: "frontend",
+            label: "Frontend Review",
+            role: "frontend-reviewer",
+            status: "frontend_review",
+            required: true,
+            description: "Review UI/UX, responsiveness, accessibility, design-system reuse, content editability, and browser health.",
+          },
+          {
+            key: "lead",
+            label: "Primary Lead Review",
+            role: "lead-reviewer",
+            status: "lead_review",
+            required: true,
+            description: "Review product fit, architecture, reviewer findings, PR/task scope, and readiness for the human owner.",
+          },
         ],
         safetyRules: [
           "Do not deploy production without explicit approval.",
@@ -192,7 +219,7 @@ Commands:
   update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Update task status
   comment TASK_ID --body        Add a builder/reviewer comment
-  prompt TASK_ID --role         Print builder or reviewer prompt
+  prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, or lead-reviewer prompt
 
 Task fields:
   --story                       User story, such as "As a customer..."

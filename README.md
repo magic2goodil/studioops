@@ -2,7 +2,7 @@
 
 Codex Mission Control is a local-first task board for coordinating Codex work across multiple projects.
 
-It is designed for a workflow where you say an idea once, capture it as a task, send it to a builder branch, have a reviewer pass inspect it, and only then kick it to the human owner for final review.
+It is designed for a workflow where you say an idea once, capture it as a task, send it to a builder branch, run backend/frontend/lead reviewer passes as applicable, and only then kick it to the human owner for final review.
 
 This first version is intentionally simple:
 
@@ -11,6 +11,7 @@ This first version is intentionally simple:
 - Has a browser task board.
 - Has a CLI for adding/listing tasks.
 - Generates builder and reviewer prompts you can hand to Codex.
+- Generates backend, frontend, and primary lead reviewer prompts.
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
@@ -118,7 +119,9 @@ node src/mission-control-cli.js prompt task_1 --role builder
 Generate a reviewer prompt:
 
 ```bash
-node src/mission-control-cli.js prompt task_1 --role reviewer
+node src/mission-control-cli.js prompt task_1 --role backend-reviewer
+node src/mission-control-cli.js prompt task_1 --role frontend-reviewer
+node src/mission-control-cli.js prompt task_1 --role lead-reviewer
 ```
 
 ## Intended Workflow
@@ -130,9 +133,13 @@ node src/mission-control-cli.js prompt task_1 --role reviewer
 5. Attach project standards that the builder and reviewer must follow.
 6. Builder Codex thread creates a feature branch and implements it.
 7. Builder runs validation, commits, pushes, links the branch/PR, leaves a task comment, and marks the task `builder_review`.
-8. Reviewer Codex thread reviews the branch against acceptance criteria and standards.
-9. Reviewer sends it back as `needs_changes` or forwards it as `user_review`.
-10. Human owner approves, asks for changes, merges, or deploys.
+8. Backend reviewer runs for backend/data/auth/privacy/deploy surfaces, or explicitly comments that backend review is not applicable.
+9. Frontend reviewer runs for UI/CSS/frontend/content/accessibility surfaces, or explicitly comments that frontend review is not applicable.
+10. Primary lead reviewer checks product fit, architecture, scope, prior review findings, and readiness for the owner.
+11. Any reviewer can send it back as `needs_changes`; only lead review should move it to `user_review`.
+12. Human owner approves, asks for changes, merges, or deploys.
+
+Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 
 For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.
 

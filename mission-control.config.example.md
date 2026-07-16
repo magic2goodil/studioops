@@ -52,6 +52,32 @@ The app reads the first fenced `json mission-control-config` block in this file.
     "validationCommands": [
       "npm run check"
     ],
+    "reviewPipeline": [
+      {
+        "key": "backend",
+        "label": "Backend Review",
+        "role": "backend-reviewer",
+        "status": "backend_review",
+        "required": true,
+        "description": "Review API contracts, persistence, indexes, auth, privacy, security, migrations, and deployment risk."
+      },
+      {
+        "key": "frontend",
+        "label": "Frontend Review",
+        "role": "frontend-reviewer",
+        "status": "frontend_review",
+        "required": true,
+        "description": "Review UI/UX, responsiveness, accessibility, design-system reuse, content editability, and browser health."
+      },
+      {
+        "key": "lead",
+        "label": "Primary Lead Review",
+        "role": "lead-reviewer",
+        "status": "lead_review",
+        "required": true,
+        "description": "Review product fit, architecture, cross-cutting risk, prior reviewer findings, PR/task scope, and readiness for the human owner."
+      }
+    ],
     "standards": [
       "standards/engineering.md",
       "standards/design-system.md",
@@ -64,6 +90,8 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "standards/accessibility.md",
       "standards/security-privacy.md",
       "standards/testing.md",
+      "standards/release-deployment.md",
+      "standards/content.md",
       "standards/review-checklist.md"
     ],
     "safetyRules": [
@@ -100,6 +128,32 @@ The app reads the first fenced `json mission-control-config` block in this file.
       ],
       "validationCommands": [
         "npm run check"
+      ],
+      "reviewPipeline": [
+        {
+          "key": "backend",
+          "label": "Backend Review",
+          "role": "backend-reviewer",
+          "status": "backend_review",
+          "required": true,
+          "description": "Required when backend, data, auth, privacy, API, analytics, queues, or deployment behavior changes."
+        },
+        {
+          "key": "frontend",
+          "label": "Frontend Review",
+          "role": "frontend-reviewer",
+          "status": "frontend_review",
+          "required": true,
+          "description": "Required when UI, UX, frontend assets, content rendering, responsiveness, or accessibility changes."
+        },
+        {
+          "key": "lead",
+          "label": "Primary Lead Review",
+          "role": "lead-reviewer",
+          "status": "lead_review",
+          "required": true,
+          "description": "Always required before a task moves to user_review."
+        }
       ],
       "safetyRules": [
         "Do not deploy production without explicit approval."

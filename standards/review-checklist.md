@@ -21,6 +21,7 @@ Fail or send back the task when a material issue exists:
 - There are browser console errors.
 - The implementation ignores referenced mockups or visual attachments.
 - The PR lacks validation notes.
+- The PR is linked to several tasks without a clear primary task and per-task complete/partial notes.
 - Deployment or production-impacting work bypasses the feature branch, PR, validation, and configured CI/CD flow.
 - Sensitive data is logged, exposed, stored casually, or collected without explicit consent requirements.
 - Consent-sensitive features lack opt-in, opt-out/revocation, retention, or data-minimization behavior.

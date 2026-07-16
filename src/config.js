@@ -76,5 +76,6 @@ export function projectFromConfig(rawProject, defaults = {}) {
     contextLinks: rawProject.contextLinks || [],
     standards: rawProject.standards || defaults.standards || [],
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
+    reviewPipeline: rawProject.reviewPipeline || defaults.reviewPipeline || [],
   };
 }

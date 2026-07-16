@@ -202,9 +202,19 @@ codex/<project-key>-<task-id>-<short-title>
 10. Builder links the feature branch and PR on the task.
 11. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
 12. Task moves to `builder_review`.
-13. A reviewer pass checks acceptance criteria, tests, security, privacy, performance, maintainability, and scope.
-14. Reviewer moves the task to `needs_changes` or `user_review`.
-15. The human owner makes the final merge/deploy decision.
+13. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, add a comment explicitly skipping backend review.
+14. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, add a comment explicitly skipping frontend review.
+15. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
+16. Any reviewer can move the task to `needs_changes` with concrete findings for the builder.
+17. Only the primary team lead should move the task to `user_review`.
+18. The human owner makes the final merge/deploy decision.
+
+Default PR rule:
+
+- One PR should have one primary Mission Control task.
+- Related tasks can be referenced in the PR body or task comments.
+- Do not mark several independent tasks `user_review` from one PR unless the PR satisfies each task's acceptance criteria.
+- If one foundation PR intentionally covers several related tasks, add comments to each linked task saying whether the PR completes it or only partially advances it.
 
 ## Mockup Breakdown Flow
 

@@ -43,9 +43,25 @@ Use the generated builder prompt. The builder should:
 7. Link the feature branch and PR on the Mission Control task.
 8. Add a task comment with changed files, validation results, known gaps, and the PR URL.
 
+## Review Pipeline
+
+Use `docs/REVIEW_PIPELINE.md` for the canonical staged review flow.
+
+Default task flow:
+
+1. Builder moves work to `builder_review`.
+2. Backend reviewer moves it to `backend_review`, `needs_changes`, or the next applicable review stage.
+3. Frontend reviewer moves it to `frontend_review`, `needs_changes`, or the next applicable review stage.
+4. Primary team lead reviewer moves it to `lead_review`, `needs_changes`, or `user_review`.
+5. Human owner reviews only after `user_review`.
+
+Backend and frontend review can be explicitly skipped only when that lane has no relevant surface. The skip must be recorded as a task comment.
+
+Default PR rule: one PR should have one primary Mission Control task. Related tasks can be referenced, but they should not all be moved to `user_review` unless the PR satisfies each task's acceptance criteria.
+
 ## Reviewer
 
-Use the generated reviewer prompt. The reviewer should:
+Use the generated domain reviewer prompts. The reviewer should:
 
 1. Inspect the branch diff.
 2. Check acceptance criteria.
@@ -56,8 +72,8 @@ Use the generated reviewer prompt. The reviewer should:
 7. Verify validation.
 8. Lead with findings.
 9. Confirm the task has branch/PR context and builder notes.
-10. Mark the task `needs_changes` or `user_review`.
+10. Mark the task `needs_changes`, move it to the next review stage, or document why a review lane is skipped.
 
 ## Human Owner
 
-The human owner is the final product and merge authority.
+The human owner is the final product and merge authority. Tasks should reach the human owner only after backend/frontend review has been completed or explicitly skipped and the primary team lead has marked the work `user_review`.
