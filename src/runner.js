@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { findProject, mutateState } from "./store.js";
@@ -9,6 +9,7 @@ const RUN_OUTPUT_DIR = path.join(process.cwd(), "data", "run-outputs");
 const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
 const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
+const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
@@ -33,6 +34,12 @@ function normalizeList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeProvider(value) {
+  const provider = String(value || "codex-cli").trim();
+  if (!provider || provider === "prompt-outbox") return "codex-cli";
+  return SUPPORTED_PROVIDERS.has(provider) ? provider : "codex-cli";
 }
 
 function projectAllowed(run, project, options) {
@@ -160,7 +167,7 @@ export async function claimRuns(input = {}) {
       }
 
       run.status = "running";
-      run.provider = input.provider || "codex-cli";
+      run.provider = normalizeProvider(input.provider || run.provider);
       run.startedAt = now;
       run.completedAt = "";
       run.exitCode = "";
@@ -182,7 +189,7 @@ export async function claimRuns(input = {}) {
         message: `${run.id} claimed by Mission Control runner`,
         createdAt: now,
       });
-      await appendTaskComment(state, run, `${run.id} started by Mission Control Runner using Codex CLI.`, now);
+      await appendTaskComment(state, run, `${run.id} started by Mission Control Runner using ${run.provider}.`, now);
       claimed.push({
         ...run,
         project,
@@ -226,7 +233,137 @@ export async function completeRun(runId, input = {}) {
   });
 }
 
-export async function runClaimedRun(run, input = {}) {
+async function persistRunThread(run, threadId) {
+  if (!threadId || run.threadId === threadId) return;
+  run.threadId = threadId;
+  await mutateState(async (state) => {
+    state.runs = state.runs || [];
+    state.tasks = state.tasks || [];
+    state.events = state.events || [];
+    const now = new Date().toISOString();
+    const liveRun = state.runs.find((item) => item.id === run.id);
+    if (liveRun) {
+      liveRun.threadId = threadId;
+      liveRun.updatedAt = now;
+    }
+    const task = state.tasks.find((item) => item.id === run.taskId);
+    if (task) {
+      if (run.group === "reviewer") task.reviewerThreadId = threadId;
+      else task.assignedThreadId = threadId;
+      task.updatedAt = now;
+    }
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "run_thread_linked",
+      projectId: run.projectId,
+      taskId: run.taskId,
+      message: `${run.id} linked to Codex thread ${threadId}`,
+      createdAt: now,
+    });
+  });
+}
+
+function sdkThreadOptions(run, input = {}) {
+  return {
+    workingDirectory: run.project.repoPath,
+    sandboxMode: input.sandboxMode || "danger-full-access",
+    approvalPolicy: input.approvalPolicy || "never",
+    networkAccessEnabled: input.networkAccessEnabled ?? true,
+    ...(input.model ? { model: input.model } : {}),
+    ...(input.modelReasoningEffort ? { modelReasoningEffort: input.modelReasoningEffort } : {}),
+    ...(input.webSearchMode ? { webSearchMode: input.webSearchMode } : {}),
+  };
+}
+
+function sdkClientOptions(input = {}) {
+  const codexPathOverride = input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || DEFAULT_CODEX_BIN;
+  const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
+  const env = {
+    ...process.env,
+    PATH: childPath,
+  };
+  return {
+    codexPathOverride,
+    env,
+  };
+}
+
+async function runClaimedRunWithSdk(run, input = {}) {
+  await mkdir(RUN_OUTPUT_DIR, { recursive: true });
+  const timeoutMs = Math.max(60_000, Number(input.timeoutMs || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS || DEFAULT_RUN_TIMEOUT_MS));
+  const outputPath = run.outputPath || path.join(RUN_OUTPUT_DIR, `${run.id}.log`);
+  const lastMessagePath = run.lastMessagePath || path.join(RUN_OUTPUT_DIR, `${run.id}.last-message.md`);
+  const log = createWriteStream(outputPath, { flags: "a" });
+  const prompt = runnerPrompt(run, run.project);
+  const controller = new AbortController();
+  let finalResponse = "";
+  let exitCode = 0;
+  let status = "completed";
+  let notes = "";
+
+  const timeout = setTimeout(() => {
+    log.write(`\nRunner timeout after ${Math.round(timeoutMs / 1000)}s. Aborting Codex SDK turn.\n`);
+    controller.abort();
+  }, timeoutMs);
+  timeout.unref();
+
+  try {
+    log.write(`Mission Control SDK Runner started ${run.id} at ${new Date().toISOString()}\n`);
+    log.write(`Provider: codex-sdk\n`);
+    log.write(`Repo: ${run.project.repoPath}\n`);
+    log.write(`Existing thread: ${run.threadId || "(new thread)"}\n`);
+    log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
+
+    const { Codex } = await import("@openai/codex-sdk");
+    const codex = new Codex(sdkClientOptions(input));
+    const options = sdkThreadOptions(run, input);
+    const thread = run.threadId
+      ? codex.resumeThread(run.threadId, options)
+      : codex.startThread(options);
+    const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
+
+    for await (const event of events) {
+      log.write(`${JSON.stringify(event)}\n`);
+      if (event.type === "thread.started") {
+        await persistRunThread(run, event.thread_id);
+      } else if (event.type === "item.completed" && event.item?.type === "agent_message") {
+        finalResponse = event.item.text || "";
+      } else if (event.type === "turn.failed") {
+        throw new Error(event.error?.message || "Codex SDK turn failed");
+      } else if (event.type === "error") {
+        throw new Error(event.message || "Codex SDK stream failed");
+      }
+    }
+
+    if (thread.id) await persistRunThread(run, thread.id);
+    notes = finalResponse.trim();
+    await writeFile(lastMessagePath, notes, "utf8");
+  } catch (error) {
+    status = "failed";
+    exitCode = error?.name === "AbortError" ? "timeout" : "sdk_error";
+    notes = error?.message || String(error);
+    log.write(`\nCodex SDK runner error: ${notes}\n`);
+    try {
+      await writeFile(lastMessagePath, notes, "utf8");
+    } catch {
+      // Keep the run failure intact even if the summary file cannot be written.
+    }
+  } finally {
+    clearTimeout(timeout);
+    log.write(`\nMission Control SDK Runner finished ${run.id} at ${new Date().toISOString()} with status ${status}\n`);
+    log.end();
+  }
+
+  return completeRun(run.id, {
+    status,
+    exitCode,
+    outputPath,
+    lastMessagePath,
+    notes,
+  });
+}
+
+async function runClaimedRunWithCli(run, input = {}) {
   await mkdir(RUN_OUTPUT_DIR, { recursive: true });
   const codexBin = input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || DEFAULT_CODEX_BIN;
   const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
@@ -315,6 +452,12 @@ export async function runClaimedRun(run, input = {}) {
   });
 }
 
+export async function runClaimedRun(run, input = {}) {
+  const provider = normalizeProvider(input.provider || run.provider);
+  if (provider === "codex-sdk") return runClaimedRunWithSdk(run, input);
+  return runClaimedRunWithCli(run, input);
+}
+
 export async function runQueuedRuns(input = {}) {
   const claimed = await claimRuns(input);
   const results = [];
@@ -362,6 +505,8 @@ export function formatRunnerPlan(plan) {
     lines.push(`  Project: ${run.project?.key || run.projectId}`);
     lines.push(`  Task: ${run.taskId}`);
     lines.push(`  Repo: ${run.project?.repoPath || "(missing)"}`);
+    lines.push(`  Provider: ${normalizeProvider(run.provider)}`);
+    if (run.threadId) lines.push(`  Thread: ${run.threadId}`);
     lines.push("");
   }
   const skippedSummary = (plan.skipped || []).reduce((counts, item) => {

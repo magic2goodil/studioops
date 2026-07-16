@@ -136,6 +136,7 @@ function makeRun(state, task, action, options, now) {
   const group = runGroupFor(action);
   const role = action.role || (group === "owner" ? "owner" : "builder");
   const prompt = role === "owner" ? ownerPrompt(action) : generatePrompt(state, task.id, role);
+  const threadId = action.threadId || (group === "reviewer" ? task.reviewerThreadId : task.assignedThreadId) || "";
   return {
     id: nextId(state.runs, "run"),
     taskId: task.id,
@@ -153,7 +154,7 @@ function makeRun(state, task, action, options, now) {
     taskUrl: action.taskUrl || "",
     branchName: action.branchName || "",
     prUrl: action.prUrl || "",
-    threadId: "",
+    threadId,
     notes: "",
     createdAt: now,
     updatedAt: now,

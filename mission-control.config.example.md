@@ -68,6 +68,12 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "requireHumanMerge": true,
       "requireGitHubActionsDeploy": true
     },
+    "runner": {
+      "intervalSeconds": 300,
+      "limit": 1,
+      "provider": "codex-cli",
+      "timeoutMs": 7200000
+    },
     "validationCommands": [
       "npm run check"
     ],

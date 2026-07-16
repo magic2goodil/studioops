@@ -8,7 +8,7 @@ The always-on stack includes:
 - `steward`: advances workflow state and review routing every few minutes
 - `supervisor`: reports next actions across projects
 - `dispatcher`: creates durable builder, reviewer, and owner-handoff runs
-- `runner`: launches queued builder/reviewer runs with Codex CLI
+- `runner`: launches queued builder/reviewer runs with a Codex provider
 - `notifier`: sends local owner-review and failure notifications
 
 ## Install
@@ -41,6 +41,14 @@ node src/mission-control-cli.js runs
 npm run runner -- --plan
 npm run dispatcher -- --plan
 ```
+
+The runner defaults to `codex-cli`. To test SDK-backed Codex threads:
+
+```bash
+npm run runner -- --provider codex-sdk --limit 1
+```
+
+To make LaunchAgent runs use the SDK provider, set `defaults.runner.provider` to `codex-sdk` in `mission-control.config.md`, then restart the local agents.
 
 ## Uninstall
 

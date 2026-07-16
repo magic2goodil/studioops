@@ -272,7 +272,7 @@ Commands:
   automation-tick               Advance ready, blocked, and review tasks
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
-  runner                        Run queued builder/reviewer dispatches with Codex CLI
+  runner                        Run queued builder/reviewer dispatches with Codex
   notifier                      Send local owner/failure notifications
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
@@ -295,6 +295,7 @@ Automation:
   mission-control supervisor --json
   mission-control dispatcher --plan
   mission-control runner --plan
+  mission-control runner --provider codex-sdk
   mission-control notifier --plan
   mission-control runs --status queued
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
@@ -527,6 +528,7 @@ Automation:
     const options = {
       project: args.project || args.projects,
       limit: args.limit || args["max-runs"],
+      provider: args.provider,
       codexBin: args["codex-bin"],
       timeoutMs: args["timeout-ms"],
     };

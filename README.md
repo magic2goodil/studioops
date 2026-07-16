@@ -15,7 +15,7 @@ This first version is intentionally simple:
 - Includes a supervisor loop for continuously reporting builder, reviewer, dependency, and owner-handoff actions across projects.
 - Includes a steward tick for continuously routing task workflow state across projects.
 - Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
-- Includes a runner loop for consuming queued builder/reviewer runs with Codex CLI.
+- Includes a runner loop for consuming queued builder/reviewer runs with Codex CLI or the Codex SDK.
 - Includes a notifier loop for local owner-review and failed-run notifications.
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
@@ -201,10 +201,16 @@ Preview queued Codex runner work:
 npm run runner -- --plan
 ```
 
-Run the next queued builder/reviewer dispatch with Codex CLI:
+Run the next queued builder/reviewer dispatch with Codex:
 
 ```bash
 npm run runner
+```
+
+Use the SDK-backed provider when you want Mission Control to store and resume Codex thread IDs:
+
+```bash
+npm run runner -- --provider codex-sdk
 ```
 
 Preview owner/failure notifications:
@@ -319,6 +325,6 @@ It also has a read-oriented supervisor command that can run every few minutes to
 
 The dispatcher consumes supervisor actions and creates durable run records with prompt snapshots. The default provider is `prompt-outbox`, which is intentionally vendor-neutral and ready for a Codex/native-thread runner to pick up.
 
-The included runner consumes queued builder/reviewer runs and launches the local Codex CLI against the target project repository. Builder and reviewer prompts allow branch creation, validation, commits, pushes, and PR creation when the task requires it, while still forbidding production deploys, merges, secrets, external messages, and bypassing the human owner gate.
+The included runner consumes queued builder/reviewer runs and launches Codex against the target project repository. The default `codex-cli` provider shells out to the local Codex CLI. The optional `codex-sdk` provider uses `@openai/codex-sdk`, streams structured events, stores returned Codex thread IDs, and resumes those threads on later task runs. Builder and reviewer prompts allow branch creation, validation, commits, pushes, and PR creation when the task requires it, while still forbidding production deploys, merges, secrets, external messages, and bypassing the human owner gate.
 
-The next logical layer is richer GitHub integration and native Codex thread/action integration, but the local CLI runner is already enough to execute queued work on a developer machine.
+The next logical layer is richer GitHub integration and deeper native Codex task/action integration, but the local runner is already enough to execute queued work on a developer machine.

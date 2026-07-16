@@ -55,6 +55,7 @@ async function optionsFrom(args) {
   return {
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     limit: numberFrom(args.limit || args["max-runs"] || defaults.limit || defaults.maxRuns, DEFAULT_LIMIT),
+    provider: args.provider || defaults.provider || defaults.runProvider,
     codexBin: args["codex-bin"] || defaults.codexBin,
     timeoutMs: numberFrom(args["timeout-ms"] || defaults.timeoutMs, 0) || undefined,
     intervalSeconds: secondsFrom(
@@ -99,11 +100,12 @@ Usage:
   mission-control-runner
   mission-control-runner --watch --interval 300 --limit 1
   mission-control-runner --watch --timeout-ms 7200000
+  mission-control-runner --provider codex-sdk
   mission-control runner --project event-horizons-web --limit 1
 
-The runner claims queued builder/reviewer dispatch runs and launches Codex CLI
-against the target project repository. It does not merge PRs, deploy production,
-or bypass the human owner gate.
+The runner claims queued builder/reviewer dispatch runs and launches a Codex
+provider against the target project repository. Providers: codex-cli, codex-sdk.
+It does not merge PRs, deploy production, or bypass the human owner gate.
 `);
     return;
   }
