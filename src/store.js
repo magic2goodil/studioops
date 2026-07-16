@@ -35,6 +35,11 @@ const VALID_REVIEW_OUTCOMES = new Set([
   "skipped",
 ]);
 
+const REVIEW_COMPLETE_OUTCOMES = new Set([
+  "approved",
+  "skipped",
+]);
+
 const VALID_RUN_STATUSES = new Set([
   "queued",
   "running",
@@ -79,7 +84,20 @@ const DEFAULT_REVIEW_PIPELINE = [
   },
 ];
 
-export { DATA_FILE, VALID_STATUSES, VALID_REVIEW_OUTCOMES, VALID_RUN_STATUSES, DEFAULT_REVIEW_PIPELINE };
+const DEFAULT_REVIEW_POLICY = {
+  maxBuilderReviewCycles: 2,
+  reviewerMayFixSmallIssues: true,
+  leadOwnsFinalDecisionAtLimit: true,
+};
+
+export {
+  DATA_FILE,
+  VALID_STATUSES,
+  VALID_REVIEW_OUTCOMES,
+  VALID_RUN_STATUSES,
+  DEFAULT_REVIEW_PIPELINE,
+  DEFAULT_REVIEW_POLICY,
+};
 
 export async function ensureDataFile() {
   await mkdir(DATA_DIR, { recursive: true });
@@ -241,6 +259,15 @@ function normalizeReviewPipeline(value) {
     .filter((stage) => stage.key && stage.role);
 }
 
+function normalizeReviewPolicy(value = {}) {
+  const maxCycles = Number(value.maxBuilderReviewCycles ?? value.maxReviewCycles ?? DEFAULT_REVIEW_POLICY.maxBuilderReviewCycles);
+  return {
+    maxBuilderReviewCycles: Number.isFinite(maxCycles) ? Math.max(1, Math.floor(maxCycles)) : DEFAULT_REVIEW_POLICY.maxBuilderReviewCycles,
+    reviewerMayFixSmallIssues: value.reviewerMayFixSmallIssues !== false,
+    leadOwnsFinalDecisionAtLimit: value.leadOwnsFinalDecisionAtLimit !== false,
+  };
+}
+
 export async function addProject(input) {
   return mutateState(async (state) => {
     const now = new Date().toISOString();
@@ -262,6 +289,7 @@ export async function addProject(input) {
       standards: normalizeList(input.standards),
       safetyRules: normalizeList(input.safetyRules),
       reviewPipeline: normalizeReviewPipeline(input.reviewPipeline),
+      reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
       createdAt: now,
       updatedAt: now,
     };
@@ -447,10 +475,7 @@ export async function recordReview(taskId, input = {}) {
       createdAt: now,
     });
     if (outcome === "changes_requested") {
-      task.status = "needs_changes";
-      task.assignedAgentRole = "builder";
-      task.reviewerThreadId = "";
-      task.updatedAt = now;
+      const actions = routeChangesRequestedInState(state, task, project, stage, now, "Mission Control Automation", []);
       state.events.push({
         id: nextId(state.events, "event"),
         type: "review_changes_requested",
@@ -459,7 +484,7 @@ export async function recordReview(taskId, input = {}) {
         message: `${stage.label || stage.key} requested changes for ${task.title}`,
         createdAt: now,
       });
-      return { review, actions: [`${task.id}: changes requested, returned to builder`] };
+      return { review, actions };
     }
     const actions = advanceTaskWorkflowInState(state, task, {
       now,
@@ -592,6 +617,10 @@ function reviewStagesForProject(project) {
   return (project.reviewPipeline || []).length ? project.reviewPipeline : DEFAULT_REVIEW_PIPELINE;
 }
 
+export function reviewPolicyForProject(project) {
+  return normalizeReviewPolicy(project?.reviewPolicy || {});
+}
+
 function findReviewStage(stages, value) {
   const normalized = String(value || "").toLowerCase().replaceAll("_", "-");
   return stages.find((stage) => {
@@ -615,6 +644,43 @@ function latestReviewForStage(state, task, stage) {
     .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
     .filter((review) => review.stageKey === stage.key || review.status === stage.status || review.role === stage.role)
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
+}
+
+function isLeadReviewStage(stage) {
+  const key = String(stage?.key || "").toLowerCase();
+  const role = String(stage?.role || "").toLowerCase();
+  return key === "lead" || role.includes("lead");
+}
+
+function leadReviewStageForProject(project) {
+  const stages = reviewStagesForProject(project);
+  return stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
+}
+
+function reviewCycleAtLimit(project, task) {
+  return currentReviewCycle(task) >= reviewPolicyForProject(project).maxBuilderReviewCycles;
+}
+
+function changeRequestedReviewsForCycle(state, task) {
+  return (state.reviews || [])
+    .filter((review) => review.taskId === task.id)
+    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
+    .filter((review) => review.outcome === "changes_requested");
+}
+
+function leadReviewCompleteForCycle(state, task, project) {
+  const leadStage = leadReviewStageForProject(project);
+  if (!leadStage) return false;
+  const latestReview = latestReviewForStage(state, task, leadStage);
+  return latestReview && REVIEW_COMPLETE_OUTCOMES.has(latestReview.outcome);
+}
+
+function shouldEscalateChangesToLead(project, task, stage) {
+  const policy = reviewPolicyForProject(project);
+  return policy.leadOwnsFinalDecisionAtLimit
+    && reviewCycleAtLimit(project, task)
+    && !isLeadReviewStage(stage)
+    && leadReviewStageForProject(project);
 }
 
 function dependencyTasks(state, task) {
@@ -661,6 +727,72 @@ function setTaskWorkflowState(state, task, patch, now) {
     message: `Task moved to ${task.status}: ${task.title}`,
     createdAt: now,
   });
+}
+
+function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLabel = "ready for owner review") {
+  if (task.status !== "user_review" || task.assignedAgentRole !== "owner") {
+    setTaskWorkflowState(state, task, {
+      status: "user_review",
+      assignedAgentRole: "owner",
+      reviewerThreadId: "",
+    }, now);
+  }
+  addAutomationComment(state, task, body, now, author);
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "owner_review_requested",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title} is ready for human owner review.`,
+    createdAt: now,
+  });
+  actions.push(`${task.id}: ${actionLabel}`);
+  return actions;
+}
+
+function routeChangesRequestedInState(state, task, project, stage, now, author, actions) {
+  const policy = reviewPolicyForProject(project);
+  const stageLabel = stage.label || stage.key;
+
+  if (policy.leadOwnsFinalDecisionAtLimit && reviewCycleAtLimit(project, task)) {
+    const leadStage = leadReviewStageForProject(project);
+    if (leadStage && !isLeadReviewStage(stage)) {
+      setTaskWorkflowState(state, task, {
+        status: leadStage.status,
+        assignedAgentRole: leadStage.role,
+        reviewerThreadId: "",
+      }, now);
+      addAutomationComment(
+        state,
+        task,
+        `${stageLabel} requested changes on review cycle ${currentReviewCycle(task)}, which reached the configured ${policy.maxBuilderReviewCycles}-cycle builder review limit. Routing to ${leadStage.label || leadStage.key} for final decision instead of sending this back into another builder loop.`,
+        now,
+        author,
+      );
+      actions.push(`${task.id}: review cycle limit reached, routed to ${leadStage.role}`);
+      return actions;
+    }
+
+    if (isLeadReviewStage(stage)) {
+      return moveTaskToOwnerReview(
+        state,
+        task,
+        now,
+        author,
+        `${stageLabel} requested changes after the configured ${policy.maxBuilderReviewCycles}-cycle builder review limit. Human owner review is required for the final call; this was not auto-approved.`,
+        actions,
+        "lead requested human owner decision after review limit",
+      );
+    }
+  }
+
+  setTaskWorkflowState(state, task, {
+    status: "needs_changes",
+    assignedAgentRole: "builder",
+    reviewerThreadId: "",
+  }, now);
+  actions.push(`${task.id}: returned to builder after ${stage.key} review`);
+  return actions;
 }
 
 function advanceTaskWorkflowInState(state, task, options = {}) {
@@ -741,13 +873,7 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
       return actions;
     }
     if (latestReview.outcome === "changes_requested") {
-      setTaskWorkflowState(state, task, {
-        status: "needs_changes",
-        assignedAgentRole: "builder",
-        reviewerThreadId: "",
-      }, now);
-      actions.push(`${task.id}: returned to builder after ${currentStage.key} review`);
-      return actions;
+      return routeChangesRequestedInState(state, task, project, currentStage, now, author, actions);
     }
     return routeToNextReviewStage(state, task, stages, now, author, actions);
   }
@@ -756,8 +882,28 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
 }
 
 function routeToNextReviewStage(state, task, stages, now, author, actions) {
+  const project = findProject(state, task.projectId);
+  if (
+    project
+    && reviewCycleAtLimit(project, task)
+    && changeRequestedReviewsForCycle(state, task).length
+    && leadReviewCompleteForCycle(state, task, project)
+  ) {
+    return moveTaskToOwnerReview(
+      state,
+      task,
+      now,
+      author,
+      "Lead review finalized this task after the configured review-cycle limit. Human owner review is requested with any residual risk captured in review comments.",
+      actions,
+    );
+  }
+
   for (const stage of stages) {
     const latestReview = latestReviewForStage(state, task, stage);
+    if (latestReview?.outcome === "changes_requested" && project && shouldEscalateChangesToLead(project, task, stage)) {
+      return routeChangesRequestedInState(state, task, project, stage, now, author, actions);
+    }
     if (!latestReview || latestReview.outcome === "changes_requested") {
       if (task.status !== stage.status || task.assignedAgentRole !== stage.role) {
         setTaskWorkflowState(state, task, {
@@ -773,21 +919,14 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
   }
 
   if (task.status !== "user_review") {
-    setTaskWorkflowState(state, task, {
-      status: "user_review",
-      assignedAgentRole: "owner",
-      reviewerThreadId: "",
-    }, now);
-    addAutomationComment(state, task, "All required review stages for this cycle are complete. Human owner review is requested.", now, author);
-    state.events.push({
-      id: nextId(state.events, "event"),
-      type: "owner_review_requested",
-      projectId: task.projectId,
-      taskId: task.id,
-      message: `${task.title} is ready for human owner review.`,
-      createdAt: now,
-    });
-    actions.push(`${task.id}: ready for owner review`);
+    moveTaskToOwnerReview(
+      state,
+      task,
+      now,
+      author,
+      "All required review stages for this cycle are complete. Human owner review is requested.",
+      actions,
+    );
   }
   return actions;
 }
@@ -823,11 +962,17 @@ export function generatePrompt(state, taskId, role = "builder") {
   const context = (project.contextLinks || []).map((item) => `- ${item}`).join("\n") || "- README.md";
   const standards = (project.standards || []).map((item) => `- ${standardReference(item)}`).join("\n") || "- No project-specific standards recorded.";
   const reviewStages = (project.reviewPipeline || []).length ? project.reviewPipeline : DEFAULT_REVIEW_PIPELINE;
+  const reviewPolicy = reviewPolicyForProject(project);
   const reviewPipeline = reviewStages.length
     ? reviewStages
         .map((stage) => `- ${stage.label || stage.key} (${stage.role})${stage.required ? "" : " optional"}: ${stage.description || stage.status || "No description recorded."}`)
         .join("\n")
     : "- Builder review -> domain review when relevant -> lead review -> user review.";
+  const reviewPolicyText = [
+    `- Maximum routine builder review cycles: ${reviewPolicy.maxBuilderReviewCycles}`,
+    `- Reviewers may fix small deterministic issues directly: ${reviewPolicy.reviewerMayFixSmallIssues ? "yes" : "no"}`,
+    `- Lead owns final decision at the cycle limit: ${reviewPolicy.leadOwnsFinalDecisionAtLimit ? "yes" : "no"}`,
+  ].join("\n");
 
   if (role !== "builder") {
     const reviewerProfile = reviewerProfileForRole(role);
@@ -871,6 +1016,9 @@ ${standards}
 Review pipeline:
 ${reviewPipeline}
 
+Review loop policy:
+${reviewPolicyText}
+
 Review instructions:
 - Review as a senior engineer in the ${reviewerProfile.domain} lane.
 - Lead with concrete findings ordered by severity.
@@ -884,6 +1032,11 @@ ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
 - Confirm whether the acceptance criteria are met.
 - Confirm the task has branch/PR context and builder notes when implementation work was done.
 - Confirm whether this PR has one primary task or intentionally covers multiple tasks. If it covers multiple tasks, verify each linked task has clear complete/partial scope notes.
+- If you find small deterministic issues and the project policy allows reviewer fixes, fix them directly on the PR branch, run relevant validation, comment with exactly what changed, then continue the review.
+- Use \`changes_requested\` only for material, risky, ambiguous, security/privacy-sensitive, or product-shaping problems that should not be quietly fixed inside review.
+- Do not create an endless builder-review loop. If this is review cycle ${reviewPolicy.maxBuilderReviewCycles} or later, routine bounce-backs are exhausted.
+- At or beyond the review-cycle limit, non-lead reviewers should record \`changes_requested\` only for material unresolved issues; Mission Control will route the task to lead review for the final decision.
+- At or beyond the review-cycle limit, the lead reviewer should make the final call: fix and approve, approve with residual risk documented, or hand the task to the human owner if it is unsafe or genuinely blocked. Do not send it back for another routine builder pass.
 - Record the result with \`mission-control review ${task.id} --stage ${reviewerProfile.stageHint} --outcome approved|skipped|changes_requested --body "..."\`
 - Use \`changes_requested\` for material issues and include concrete findings.
 - Use \`skipped\` only when this review lane truly has no relevant surface.
@@ -908,6 +1061,9 @@ ${context}
 ${standards}
 - Follow project safety rules:
 ${safety}
+
+Review loop policy:
+${reviewPolicyText}
 
 Task:
 ${task.title}

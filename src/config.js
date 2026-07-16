@@ -77,5 +77,6 @@ export function projectFromConfig(rawProject, defaults = {}) {
     standards: rawProject.standards || defaults.standards || [],
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
     reviewPipeline: rawProject.reviewPipeline || defaults.reviewPipeline || [],
+    reviewPolicy: rawProject.reviewPolicy || defaults.reviewPolicy || {},
   };
 }

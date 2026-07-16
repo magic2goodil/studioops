@@ -131,6 +131,11 @@ async function setup() {
           limit: 10,
         },
         validationCommands: [],
+        reviewPolicy: {
+          maxBuilderReviewCycles: 2,
+          reviewerMayFixSmallIssues: true,
+          leadOwnsFinalDecisionAtLimit: true,
+        },
         standards: [
           "standards/engineering.md",
           "standards/design-system.md",
@@ -204,6 +209,7 @@ async function setup() {
         standards: config.defaults.standards,
         validationCommands: validation.trim() ? [validation.trim()] : [],
         safetyRules: config.defaults.safetyRules,
+        reviewPolicy: config.defaults.reviewPolicy,
       });
     }
 

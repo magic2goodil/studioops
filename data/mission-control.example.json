@@ -16,6 +16,11 @@
       "validationCommands": [
         "npm run check"
       ],
+      "reviewPolicy": {
+        "maxBuilderReviewCycles": 2,
+        "reviewerMayFixSmallIssues": true,
+        "leadOwnsFinalDecisionAtLimit": true
+      },
       "contextLinks": [
         "README.md",
         "AGENTS.md"

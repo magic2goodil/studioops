@@ -239,7 +239,7 @@ codex/<project-key>-<task-id>-<short-title>
 17. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
 18. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
 19. Reviewers record outcomes with `mission-control review <task-id> --stage backend|frontend|lead --outcome approved|skipped|changes_requested --body "..."`.
-20. A `changes_requested` outcome returns the task to `needs_changes` and assigns the builder.
+20. A first routine `changes_requested` outcome returns the task to `needs_changes` and assigns the builder. At the configured review-cycle limit, non-lead `changes_requested` routes to lead review instead of another builder loop.
 21. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review` and emits `owner_review_requested`.
 22. The supervisor reports `notify_owner` for final human review.
 23. The notifier sends a local owner-review notification.

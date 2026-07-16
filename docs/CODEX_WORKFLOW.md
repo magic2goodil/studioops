@@ -60,6 +60,8 @@ Default automated task flow:
 
 Backend and frontend review can be explicitly skipped only when that lane has no relevant surface. The skip must be recorded as a review outcome with a reason.
 
+Reviewers should fix small deterministic issues directly when project policy allows it, then document the fix and continue the review. Material issues use `changes_requested`. The default review policy allows two routine builder review cycles; after that, non-lead change requests route to the primary lead reviewer for the final automation decision instead of creating another builder-review loop.
+
 Default PR rule: one PR should have one primary Mission Control task. Related tasks can be referenced, but they should not all be moved to `user_review` unless the PR satisfies each task's acceptance criteria.
 
 Run the steward manually with:
@@ -128,7 +130,8 @@ Use the generated domain reviewer prompts. The reviewer should:
 7. Verify validation.
 8. Lead with findings.
 9. Confirm the task has branch/PR context and builder notes.
-10. Record `approved`, `skipped`, or `changes_requested` with the review command or task detail form.
+10. Fix small deterministic issues directly when allowed and document those commits.
+11. Record `approved`, `skipped`, or `changes_requested` with the review command or task detail form.
 
 ## Human Owner
 

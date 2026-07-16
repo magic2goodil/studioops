@@ -71,6 +71,11 @@ The app reads the first fenced `json mission-control-config` block in this file.
     "validationCommands": [
       "npm run check"
     ],
+    "reviewPolicy": {
+      "maxBuilderReviewCycles": 2,
+      "reviewerMayFixSmallIssues": true,
+      "leadOwnsFinalDecisionAtLimit": true
+    },
     "reviewPipeline": [
       {
         "key": "backend",
@@ -150,6 +155,11 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "validationCommands": [
         "npm run check"
       ],
+      "reviewPolicy": {
+        "maxBuilderReviewCycles": 2,
+        "reviewerMayFixSmallIssues": true,
+        "leadOwnsFinalDecisionAtLimit": true
+      },
       "reviewPipeline": [
         {
           "key": "backend",

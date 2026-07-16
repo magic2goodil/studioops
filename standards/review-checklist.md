@@ -36,6 +36,13 @@ Fail or send back the task when a material issue exists:
 - Consent-sensitive features lack opt-in, opt-out/revocation, retention, or data-minimization behavior.
 - The work violates project-specific standards.
 
+Do not use review as an endless polish loop:
+
+- Fix small deterministic issues directly when the project review policy allows it.
+- Document reviewer-made commits in the task and PR.
+- Reserve `changes_requested` for material, risky, ambiguous, security/privacy-sensitive, or product-shaping issues.
+- After the configured routine review-cycle limit, route unresolved non-lead findings to lead review for a final automation decision instead of sending the task back to the builder again.
+
 For UI work, reviewers should specifically ask:
 
 - Was mobile verified?

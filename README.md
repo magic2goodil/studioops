@@ -210,6 +210,8 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 
+Default review-loop rule: reviewers may fix small deterministic issues directly and document the fix. Material issues get `changes_requested`, but routine builder-review ping-pong is capped at two cycles; after that, non-lead change requests route to the primary lead for the final automation decision.
+
 For continuous coordination, see [docs/STEWARD.md](docs/STEWARD.md), [docs/SUPERVISOR.md](docs/SUPERVISOR.md), [docs/DISPATCHER.md](docs/DISPATCHER.md), [docs/RUNNER.md](docs/RUNNER.md), and [docs/NOTIFIER.md](docs/NOTIFIER.md).
 
 For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.

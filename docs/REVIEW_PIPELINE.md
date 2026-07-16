@@ -82,13 +82,14 @@ Each time a builder moves work into `builder_review`, Mission Control increments
    - Any reviewer or the human owner can send the work back.
    - The task should include a comment with concrete requested changes.
    - Builder fixes the same branch/PR unless the reviewer asks for a split PR.
+   - At the configured review-cycle limit, unresolved non-lead findings route to lead review instead of another routine builder pass.
 
 8. `done`
    - Work is merged/deployed or intentionally closed.
 
 ## Reviewer Outcome Rules
 
-Reviewers should not silently fix builder work on the same branch.
+Reviewers should not silently change builder work. When they fix something directly, it must be intentional, small, and documented on the task and PR.
 
 Reviewers may make small, low-risk fixes directly when doing so clearly saves time and does not change product scope. Examples:
 
@@ -114,11 +115,34 @@ Expected reviewer outcomes:
 
 - No issues: record an `approved` review outcome with reviewed scope, validation reviewed, residual risk, and next status.
 - No relevant surface: record a `skipped` review outcome with the reason the lane does not apply.
-- Issues found: record a `changes_requested` review outcome with findings; Mission Control returns the task to `needs_changes` and assigns the builder.
+- Issues found: record a `changes_requested` review outcome with findings. Mission Control returns the task to `needs_changes` and assigns the builder unless the task has reached the configured review-cycle limit, in which case unresolved non-lead findings route to lead review.
 - Wrong scope: request a PR split or task split.
 - Incomplete acceptance criteria: record `changes_requested`.
 - Missing review lane: let automation route to the required review status, or record a `skipped` outcome when the lane truly does not apply.
 - Small reviewer fix made: commit the fix, comment with exactly what changed, then continue the review stage.
+
+## Review Loop Limits
+
+Default policy: Mission Control allows two routine builder review cycles.
+
+The first material `changes_requested` outcome returns the task to `needs_changes` and assigns the builder to update the same branch/PR unless the reviewer asks for a split.
+
+At the configured cycle limit, Mission Control stops normal builder-review ping-pong:
+
+- Non-lead reviewers still record `changes_requested` for material unresolved issues, but Mission Control routes the task to `lead_review` instead of back to the builder.
+- The primary lead reviewer makes the final automation decision for that cycle.
+- The lead should fix small deterministic issues directly when practical, approve with residual risk documented when acceptable, or send the task to human owner review when it is unsafe or genuinely blocked.
+- A lead `changes_requested` outcome at the cycle limit requests human owner review instead of starting another routine builder pass.
+
+Projects can override the default with:
+
+```json
+"reviewPolicy": {
+  "maxBuilderReviewCycles": 2,
+  "reviewerMayFixSmallIssues": true,
+  "leadOwnsFinalDecisionAtLimit": true
+}
+```
 
 ## One PR Versus Multiple Tasks
 

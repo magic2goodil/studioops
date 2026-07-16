@@ -1,4 +1,4 @@
-import { DEFAULT_REVIEW_PIPELINE } from "./store.js";
+import { DEFAULT_REVIEW_PIPELINE, reviewPolicyForProject } from "./store.js";
 
 const COMPLETE_STATUSES = new Set(["approved", "merged", "deployed", "done", "closed"]);
 const BUILDABLE_STATUSES = new Set(["ready", "queued"]);
@@ -54,11 +54,47 @@ function latestReviewForStage(state, task, stage) {
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
 }
 
+function isLeadReviewStage(stage) {
+  const key = String(stage?.key || "").toLowerCase();
+  const role = String(stage?.role || "").toLowerCase();
+  return key === "lead" || role.includes("lead");
+}
+
+function leadReviewStageForProject(project) {
+  const stages = stagesForProject(project);
+  return stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
+}
+
+function reviewCycleAtLimit(project, task) {
+  return currentReviewCycle(task) >= reviewPolicyForProject(project).maxBuilderReviewCycles;
+}
+
+function changeRequestedReviewsForCycle(state, task) {
+  return (state.reviews || [])
+    .filter((review) => review.taskId === task.id)
+    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
+    .filter((review) => review.outcome === "changes_requested");
+}
+
+function leadReviewCompleteForCycle(state, task, project) {
+  const leadStage = leadReviewStageForProject(project);
+  if (!leadStage) return false;
+  const latest = latestReviewForStage(state, task, leadStage);
+  return latest && REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
+}
+
 function stageForStatus(project, status) {
   return stagesForProject(project).find((stage) => stage.status === status) || null;
 }
 
 function nextOpenReviewStage(state, project, task) {
+  if (
+    reviewCycleAtLimit(project, task)
+    && changeRequestedReviewsForCycle(state, task).length
+  ) {
+    if (leadReviewCompleteForCycle(state, task, project)) return null;
+    return leadReviewStageForProject(project);
+  }
   return stagesForProject(project).find((stage) => {
     const latest = latestReviewForStage(state, task, stage);
     return !latest || !REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
@@ -191,6 +227,23 @@ function taskActions(state, task, options = {}) {
       })];
     }
     if (latest.outcome === "changes_requested") {
+      const policy = reviewPolicyForProject(project);
+      if (policy.leadOwnsFinalDecisionAtLimit && reviewCycleAtLimit(project, task)) {
+        const leadStage = leadReviewStageForProject(project);
+        if (leadStage && !isLeadReviewStage(currentStage)) {
+          return [actionBase(state, task, "start_review", leadStage.role, `${currentStage.label || currentStage.key} requested changes at the ${policy.maxBuilderReviewCycles}-cycle review limit; route to lead for final decision.`, {
+            ...options,
+            stage: leadStage,
+            nextStatus: leadStage.status,
+          })];
+        }
+        if (isLeadReviewStage(currentStage)) {
+          return [actionBase(state, task, "notify_owner", "owner", `${currentStage.label || currentStage.key} requested changes after the ${policy.maxBuilderReviewCycles}-cycle review limit; human owner decision is required.`, {
+            ...options,
+            nextStatus: "user_review",
+          })];
+        }
+      }
       return [actionBase(state, task, "return_to_builder", "builder", `${currentStage.label || currentStage.key} requested changes.`, {
         ...options,
         nextStatus: "needs_changes",
