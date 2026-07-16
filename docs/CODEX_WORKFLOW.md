@@ -117,6 +117,8 @@ node src/mission-control-cli.js review task_123 --stage backend --outcome approv
 
 A scheduled automation stack can call the tick command every few minutes, then let the dispatcher create durable builder, reviewer, and owner handoff runs, the runner execute queued Codex builder/reviewer work, and the notifier alert the human owner when review or failures need attention. The stack should not deploy production or merge PRs.
 
+For macOS always-on setup, see [LOCAL_AUTOMATION.md](LOCAL_AUTOMATION.md).
+
 ## Reviewer
 
 Use the generated domain reviewer prompts. The reviewer should:

@@ -44,6 +44,40 @@ No external database is required. The app writes to `data/mission-control.json`.
 
 The setup wizard writes `mission-control.config.md`, which is ignored by Git. It asks about your GitHub owner, local workspace, AI tools, and first project. It checks GitHub CLI and SSH readiness, but it does not ask for or store private SSH keys.
 
+## Always-On Local Automation
+
+On macOS, install the local web UI, steward, supervisor, dispatcher, runner, and notifier as user LaunchAgents:
+
+```bash
+npm run install-agents
+```
+
+By default the web UI binds to localhost only:
+
+```text
+http://127.0.0.1:4317
+```
+
+To view it from another device on your local network, install with an explicit network bind:
+
+```bash
+MISSION_CONTROL_HOST=0.0.0.0 MISSION_CONTROL_PORT=4317 npm run install-agents
+```
+
+Check status:
+
+```bash
+npm run status-agents
+```
+
+Remove the LaunchAgents:
+
+```bash
+npm run uninstall-agents
+```
+
+The installer writes user LaunchAgents under `~/Library/LaunchAgents` and logs under `data/launch-agents/`. It does not install system services, ask for sudo, merge PRs, deploy production, or store private keys.
+
 ## CLI
 
 List projects:
@@ -285,6 +319,6 @@ It also has a read-oriented supervisor command that can run every few minutes to
 
 The dispatcher consumes supervisor actions and creates durable run records with prompt snapshots. The default provider is `prompt-outbox`, which is intentionally vendor-neutral and ready for a Codex/native-thread runner to pick up.
 
-It still does not spawn Codex threads, open GitHub PRs, merge branches, deploy, or send external notifications by itself. Those should be built as the next runner layer on top of the existing `automation-tick`, review outcomes, and `owner_review_requested` events.
+The included runner consumes queued builder/reviewer runs and launches the local Codex CLI against the target project repository. Builder and reviewer prompts allow branch creation, validation, commits, pushes, and PR creation when the task requires it, while still forbidding production deploys, merges, secrets, external messages, and bypassing the human owner gate.
 
-The next logical layer is GitHub integration and Codex thread/action integration.
+The next logical layer is richer GitHub integration and native Codex thread/action integration, but the local CLI runner is already enough to execute queued work on a developer machine.
