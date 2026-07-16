@@ -23,6 +23,9 @@ const detailHeading = document.querySelector(".detail-panel .panel-header h2");
 const imageModal = document.querySelector("#imageModal");
 const imageModalImage = document.querySelector("#imageModalImage");
 const imageModalCaption = document.querySelector("#imageModalCaption");
+const taskModal = document.querySelector("#taskModal");
+const taskModalBody = document.querySelector("#taskModalBody");
+const taskModalOpenLink = document.querySelector("#taskModalOpenLink");
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -56,6 +59,10 @@ function taskPath(taskId) {
 
 function taskUrl(taskId) {
   return `${window.location.origin}${taskPath(taskId)}`;
+}
+
+function taskById(taskId) {
+  return state.tasks.find((task) => task.id === taskId) || null;
 }
 
 function routeTaskId() {
@@ -97,14 +104,34 @@ function branchUrl(project, branchName) {
   return `${repoUrl}/tree/${branch.split("/").map(encodeURIComponent).join("/")}`;
 }
 
-function taskLink(task) {
+function taskSummaryMeta(task) {
+  const project = projectFor(task);
+  const owner = workflowOwner(task);
+  return [
+    project?.key || "unknown",
+    task.status || "unknown",
+    task.type || "",
+    owner ? `owner: ${owner}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function taskReferenceCard(task) {
   if (!task) return "";
-  return `<a class="task-mini-link" href="${escapeHtml(taskPath(task.id))}">${escapeHtml(task.id)} · ${escapeHtml(task.title)}</a>`;
+  return `
+    <article class="task-reference-card">
+      <button type="button" class="task-reference-main" data-task-preview-id="${escapeHtml(task.id)}">
+        <span class="task-id-pill">${escapeHtml(task.id)}</span>
+        <strong>${escapeHtml(task.title)}</strong>
+        <small>${escapeHtml(taskSummaryMeta(task))}</small>
+      </button>
+      <a class="task-reference-open" href="${escapeHtml(taskPath(task.id))}" aria-label="Open ${escapeHtml(task.id)} full page">Open</a>
+    </article>
+  `;
 }
 
 function taskRelationshipList(tasks, emptyText) {
   if (!tasks?.length) return `<p class="muted-note">${escapeHtml(emptyText)}</p>`;
-  return `<div class="task-link-list">${tasks.map((task) => taskLink(task)).join("")}</div>`;
+  return `<div class="task-link-list">${tasks.map((task) => taskReferenceCard(task)).join("")}</div>`;
 }
 
 function workflowOwner(task) {
@@ -264,17 +291,19 @@ function renderTasks() {
   taskBoard.innerHTML = tasks.map((task) => {
     const project = projectFor(task);
     const childCount = state.tasks.filter((item) => item.parentTaskId === task.id).length;
-    const dependencyCount = (task.dependsOnTaskIds || []).length;
+    const dependencies = (task.dependsOnTaskIds || []).map(taskById).filter(Boolean);
+    const parent = task.parentTaskId ? taskById(task.parentTaskId) : null;
     return `
       <button type="button" class="task-card ${task.id === state.selectedTaskId ? "selected" : ""}" data-task-id="${escapeHtml(task.id)}">
         <div class="task-card-top">
-          <span class="status ${escapeHtml(task.status)}">${escapeHtml(task.status)}</span>
+          <span class="task-id-pill">${escapeHtml(task.id)}</span>
           <span class="priority">${escapeHtml(task.type || task.priority || "task")}</span>
         </div>
+        <span class="status ${escapeHtml(task.status)}">${escapeHtml(task.status)}</span>
         <h3>${escapeHtml(task.title)}</h3>
         <p>${escapeHtml(task.description || "No description yet.")}</p>
         <span class="workflow-owner">${escapeHtml(workflowGate(task))}${task.reviewCycle ? ` · cycle ${escapeHtml(task.reviewCycle)}` : ""}</span>
-        <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${task.parentTaskId ? ` · parent ${escapeHtml(task.parentTaskId)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencyCount ? ` · ${dependencyCount} dep${dependencyCount === 1 ? "" : "s"}` : ""}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
+        <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${parent ? ` · parent ${escapeHtml(parent.id)} ${escapeHtml(parent.title)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencies.length ? ` · depends on ${dependencies.map((item) => `${item.id} ${item.title}`).join(", ")}` : ""}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
       </button>
     `;
   }).join("") || `<p>No tasks match this view.</p>`;
@@ -291,7 +320,7 @@ function renderHierarchyPanel(task) {
       <div class="relationship-grid">
         <div>
           <h4>Parent</h4>
-          ${task.parent ? taskLink(task.parent) : `<p class="muted-note">No parent epic/task linked.</p>`}
+          ${task.parent ? taskReferenceCard(task.parent) : `<p class="muted-note">No parent epic/task linked.</p>`}
         </div>
         <div>
           <h4>Children</h4>
@@ -303,8 +332,9 @@ function renderHierarchyPanel(task) {
         </div>
       </div>
       <div class="relationship-edit-grid">
-        <label>Parent Epic/Task <input name="detailParentTaskId" value="${escapeHtml(task.parentTaskId || "")}" placeholder="task_12"></label>
-        <label>Depends On <textarea name="detailDependsOnTaskIds" rows="2" placeholder="task_1, task_2">${escapeHtml(dependsOnValue)}</textarea></label>
+        <h4>Edit Relationship IDs</h4>
+        <label>Parent Epic/Task ID <input name="detailParentTaskId" value="${escapeHtml(task.parentTaskId || "")}" placeholder="task_12"></label>
+        <label>Depends On Task IDs <textarea name="detailDependsOnTaskIds" rows="2" placeholder="task_1, task_2">${escapeHtml(dependsOnValue)}</textarea></label>
         <button type="button" data-action="save-relationships">Save Relationships</button>
       </div>
     </section>
@@ -394,6 +424,7 @@ async function renderDetail() {
     ${isFullPage ? `<button class="back-link" type="button" data-action="back-to-board">Back to board</button>` : ""}
     <div class="detail-hero">
       <div>
+        <span class="task-id-pill hero-task-id">${escapeHtml(fullTask.id)}</span>
         <div class="detail-title">${escapeHtml(fullTask.title)}</div>
         <p>${escapeHtml(project?.name || "Unknown project")} · ${escapeHtml(fullTask.status)} · ${escapeHtml(fullTask.priority)}</p>
       </div>
@@ -466,6 +497,47 @@ function closeImageModal() {
   document.body.classList.remove("modal-open");
 }
 
+async function openTaskModal(taskId) {
+  const detail = await api(`/api/tasks/${encodeURIComponent(taskId)}/detail`);
+  const task = detail.task;
+  const project = task.project || projectFor(task);
+  taskModalOpenLink.href = taskPath(task.id);
+  taskModalBody.innerHTML = `
+    <div class="task-modal-hero">
+      <span class="task-id-pill">${escapeHtml(task.id)}</span>
+      <h2 id="taskModalTitle">${escapeHtml(task.title)}</h2>
+      <p>${escapeHtml(project?.name || "Unknown project")} · ${escapeHtml(task.status)} · ${escapeHtml(task.priority || "medium")}</p>
+    </div>
+    <div class="task-modal-grid">
+      <section>
+        <h3>Description</h3>
+        <p>${escapeHtml(task.description || "No description recorded.")}</p>
+      </section>
+      <section>
+        <h3>Current Owner</h3>
+        <p>${escapeHtml(workflowGate(task))}</p>
+      </section>
+      <section>
+        <h3>Parent</h3>
+        ${task.parent ? taskReferenceCard(task.parent) : `<p class="muted-note">No parent linked.</p>`}
+      </section>
+      <section>
+        <h3>Depends On</h3>
+        ${taskRelationshipList(task.dependencies || [], "No dependencies recorded.")}
+      </section>
+    </div>
+  `;
+  taskModal.hidden = false;
+  document.body.classList.add("modal-open");
+}
+
+function closeTaskModal() {
+  taskModal.hidden = true;
+  taskModalBody.innerHTML = "";
+  taskModalOpenLink.href = "/";
+  document.body.classList.remove("modal-open");
+}
+
 projectList.addEventListener("click", (event) => {
   const button = event.target.closest("[data-project-id]");
   if (!button) return;
@@ -485,6 +557,12 @@ taskBoard.addEventListener("click", (event) => {
 });
 
 taskDetail.addEventListener("click", async (event) => {
+  const taskPreviewButton = event.target.closest("[data-task-preview-id]");
+  if (taskPreviewButton) {
+    await openTaskModal(taskPreviewButton.dataset.taskPreviewId);
+    return;
+  }
+
   const backButton = event.target.closest("[data-action='back-to-board']");
   if (backButton) {
     state.routeTaskId = "";
@@ -616,6 +694,17 @@ window.addEventListener("popstate", () => {
 
 imageModal.addEventListener("click", (event) => {
   if (event.target.closest("[data-close-image-modal]")) closeImageModal();
+});
+
+taskModal.addEventListener("click", async (event) => {
+  if (event.target.closest("[data-close-task-modal]")) {
+    closeTaskModal();
+    return;
+  }
+  const taskPreviewButton = event.target.closest("[data-task-preview-id]");
+  if (taskPreviewButton) {
+    await openTaskModal(taskPreviewButton.dataset.taskPreviewId);
+  }
 });
 
 window.addEventListener("keydown", (event) => {

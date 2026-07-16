@@ -132,6 +132,17 @@
       </figure>
     </div>
 
+    <div id="taskModal" class="task-modal" hidden>
+      <div class="task-modal-backdrop" data-close-task-modal></div>
+      <section class="task-modal-content" aria-modal="true" role="dialog" aria-labelledby="taskModalTitle">
+        <div class="task-modal-actions">
+          <a id="taskModalOpenLink" href="/">Open full page</a>
+          <button class="task-modal-close" type="button" data-close-task-modal>Close</button>
+        </div>
+        <div id="taskModalBody"></div>
+      </section>
+    </div>
+
     <script src="/app.js" type="module"></script>
   </body>
 </html>

@@ -231,13 +231,28 @@ h2 {
 }
 
 .status,
-.priority {
+.priority,
+.task-id-pill {
   border-radius: 999px;
   padding: 5px 8px;
   background: var(--soft);
   color: var(--muted);
   font-size: 0.78rem;
   font-weight: 800;
+}
+
+.task-id-pill {
+  display: inline-flex;
+  width: fit-content;
+  border: 1px solid rgba(95, 140, 255, 0.24);
+  color: rgba(245, 247, 251, 0.92);
+  background: rgba(95, 140, 255, 0.14);
+}
+
+.task-card .status {
+  display: inline-flex;
+  width: fit-content;
+  margin-bottom: 10px;
 }
 
 .status.ready,
@@ -309,6 +324,10 @@ label {
   font-size: clamp(1.45rem, 3vw, 2.55rem);
   line-height: 1.05;
   font-weight: 900;
+}
+
+.hero-task-id {
+  margin-bottom: 10px;
 }
 
 .detail-grid {
@@ -536,18 +555,50 @@ label {
   margin-top: 16px;
 }
 
-.task-link-list {
-  display: grid;
-  gap: 8px;
+.relationship-edit-grid h4 {
+  margin: 4px 0 0;
 }
 
-.task-mini-link {
-  display: block;
-  overflow-wrap: anywhere;
+.task-link-list {
+  display: grid;
+  gap: 10px;
+}
+
+.task-reference-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.task-reference-main {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  min-width: 0;
+  text-align: left;
   border-color: rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.06);
   color: rgba(245, 247, 251, 0.88);
-  padding: 9px 10px;
+  padding: 10px;
+}
+
+.task-reference-main strong,
+.task-reference-main small {
+  overflow-wrap: anywhere;
+}
+
+.task-reference-main small {
+  color: var(--muted);
+}
+
+.task-reference-open {
+  display: grid;
+  place-items: center;
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(245, 247, 251, 0.86);
+  padding: 10px 12px;
 }
 
 .standards-list {
@@ -613,11 +664,13 @@ label {
   font-size: 0.82rem;
 }
 
-.image-modal[hidden] {
+.image-modal[hidden],
+.task-modal[hidden] {
   display: none;
 }
 
-.image-modal {
+.image-modal,
+.task-modal {
   position: fixed;
   inset: 0;
   z-index: 50;
@@ -626,14 +679,16 @@ label {
   padding: 28px;
 }
 
-.image-modal-backdrop {
+.image-modal-backdrop,
+.task-modal-backdrop {
   position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.72);
   backdrop-filter: blur(18px);
 }
 
-.image-modal-content {
+.image-modal-content,
+.task-modal-content {
   position: relative;
   z-index: 1;
   display: grid;
@@ -648,6 +703,13 @@ label {
   padding: 14px;
 }
 
+.task-modal-content {
+  width: min(860px, 94vw);
+  max-height: 90vh;
+  overflow: auto;
+  padding: 18px;
+}
+
 .image-modal-content img {
   max-width: 100%;
   max-height: 78vh;
@@ -656,7 +718,8 @@ label {
   background: rgba(255, 255, 255, 0.04);
 }
 
-.image-modal-close {
+.image-modal-close,
+.task-modal-close {
   justify-self: end;
   background: rgba(255, 255, 255, 0.08);
 }
@@ -664,6 +727,34 @@ label {
 .image-modal-content figcaption {
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+.task-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.task-modal-hero h2 {
+  margin: 10px 0 6px;
+  color: var(--text);
+  font-size: clamp(1.35rem, 4vw, 2.2rem);
+}
+
+.task-modal-hero p {
+  color: var(--muted);
+}
+
+.task-modal-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.task-modal-grid section {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.045);
+  padding: 14px;
 }
 
 @media (max-width: 1100px) {

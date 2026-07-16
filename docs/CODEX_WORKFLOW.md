@@ -49,7 +49,7 @@ Use `docs/REVIEW_PIPELINE.md` for the canonical staged review flow.
 
 Default automated task flow:
 
-1. Automation tick assigns `ready` or `queued` tasks to a builder by moving them to `in_progress`.
+1. The dispatcher turns `ready` or `queued` tasks into durable builder runs and moves them to `in_progress`.
 2. Builder implements, validates, links branch/PR, comments with changed files and validation, then moves work to `builder_review`.
 3. Automation tick verifies branch/PR intake and routes to the next review lane.
 4. Backend reviewer records `approved`, `skipped`, or `changes_requested`.
@@ -68,7 +68,7 @@ Run the steward manually with:
 npm run automation-tick -- --project dollos --limit 10
 ```
 
-The scheduled steward LaunchAgent runs this periodically for every registered project:
+The scheduled steward LaunchAgent runs this periodically for every registered project. It routes dependencies/reviews but intentionally leaves `ready` and `queued` tasks available for the dispatcher:
 
 ```bash
 npm run automation-tick -- --limit 50

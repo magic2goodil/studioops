@@ -4,6 +4,7 @@ node_modules/
 mission-control.config.md
 data/mission-control.json
 data/local-attachments/
+data/run-outputs/
 data/*.local.json
 data/*.tmp
 *.log

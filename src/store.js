@@ -690,13 +690,6 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   }
 
   if (["ready", "queued"].includes(task.status)) {
-    setTaskWorkflowState(state, task, {
-      status: "in_progress",
-      assignedAgentRole: "builder",
-      reviewerThreadId: "",
-    }, now);
-    addAutomationComment(state, task, "Assigned to builder. Builder should implement, validate, push a branch/PR, link it here, and move the task to builder_review.", now, author);
-    actions.push(`${task.id}: assigned to builder`);
     return actions;
   }
 
