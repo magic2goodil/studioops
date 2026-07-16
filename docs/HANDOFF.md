@@ -34,6 +34,18 @@ Dispatcher docs:
 docs/DISPATCHER.md
 ```
 
+Runner docs:
+
+```text
+docs/RUNNER.md
+```
+
+Notifier docs:
+
+```text
+docs/NOTIFIER.md
+```
+
 Default local repo path for this machine:
 
 ```text
@@ -201,9 +213,9 @@ When the user says to build:
 2. Confirm parent epic and dependency links when this is part of larger work.
 3. If the task depends on foundation/design-system/data-access work, do not start the builder until that dependency is ready.
 4. Set task status to `ready` or `queued`.
-5. Generate the builder prompt from Mission Control.
-6. If Codex thread tools are available, create a builder task/thread and send the prompt there.
-7. If thread tools are not available, provide the builder prompt and the Mission Control task link.
+5. Let the scheduled dispatcher create a durable builder run, or run `npm run dispatcher`.
+6. Let the scheduled runner consume the queued builder/reviewer run, or run `npm run runner`.
+7. If automated runner support is unavailable, generate the builder prompt from Mission Control and hand it to a Codex builder task/thread.
 8. Builder creates a feature branch using:
 
 ```text
@@ -216,14 +228,16 @@ codex/<project-key>-<task-id>-<short-title>
 12. Task moves to `builder_review`.
 13. Run `npm run automation-tick -- --project <project-key> --limit 10` or let the scheduled steward route the task.
 14. Run `npm run dispatcher -- --plan` to preview worker dispatches, or let the scheduled dispatcher create durable run records across projects.
-15. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.
-16. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
-17. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
-18. Reviewers record outcomes with `mission-control review <task-id> --stage backend|frontend|lead --outcome approved|skipped|changes_requested --body "..."`.
-19. A `changes_requested` outcome returns the task to `needs_changes` and assigns the builder.
-20. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review` and emits `owner_review_requested`.
-21. The supervisor reports `notify_owner` for final human review.
-22. The human owner makes the final merge/deploy decision.
+15. Run `npm run runner -- --plan` to preview queued builder/reviewer work, or let the scheduled runner execute queued Codex work.
+16. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.
+17. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
+18. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
+19. Reviewers record outcomes with `mission-control review <task-id> --stage backend|frontend|lead --outcome approved|skipped|changes_requested --body "..."`.
+20. A `changes_requested` outcome returns the task to `needs_changes` and assigns the builder.
+21. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review` and emits `owner_review_requested`.
+22. The supervisor reports `notify_owner` for final human review.
+23. The notifier sends a local owner-review notification.
+24. The human owner makes the final merge/deploy decision.
 
 Default PR rule:
 

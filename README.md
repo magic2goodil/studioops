@@ -14,6 +14,8 @@ This first version is intentionally simple:
 - Generates backend, frontend, and primary lead reviewer prompts.
 - Includes a supervisor loop for continuously reporting builder, reviewer, dependency, and owner-handoff actions across projects.
 - Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
+- Includes a runner loop for consuming queued builder/reviewer runs with Codex CLI.
+- Includes a notifier loop for local owner-review and failed-run notifications.
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
@@ -156,6 +158,30 @@ Dispatch work into durable run records:
 npm run dispatcher
 ```
 
+Preview queued Codex runner work:
+
+```bash
+npm run runner -- --plan
+```
+
+Run the next queued builder/reviewer dispatch with Codex CLI:
+
+```bash
+npm run runner
+```
+
+Preview owner/failure notifications:
+
+```bash
+npm run notifier -- --plan
+```
+
+Send local macOS notifications for owner/failure handoffs:
+
+```bash
+npm run notifier
+```
+
 Record a review outcome:
 
 ```bash
@@ -181,7 +207,7 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 
-For continuous coordination, see [docs/SUPERVISOR.md](docs/SUPERVISOR.md) and [docs/DISPATCHER.md](docs/DISPATCHER.md).
+For continuous coordination, see [docs/SUPERVISOR.md](docs/SUPERVISOR.md), [docs/DISPATCHER.md](docs/DISPATCHER.md), [docs/RUNNER.md](docs/RUNNER.md), and [docs/NOTIFIER.md](docs/NOTIFIER.md).
 
 For UI work, the default standards require mobile-first implementation plus mobile, tablet, and desktop verification. If only one breakpoint is intended, the task must say so explicitly.
 

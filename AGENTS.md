@@ -11,6 +11,8 @@ When working in this repository:
 - Use `docs/HANDOFF.md` when a user asks to create, build, review, or split work through Mission Control.
 - Use `docs/SUPERVISOR.md` when a user asks for continuous coordination, scheduled checks, or what should move next across projects.
 - Use `docs/DISPATCHER.md` when a user asks Mission Control to actually queue builder, reviewer, or owner handoff work.
+- Use `docs/RUNNER.md` when a user asks Mission Control to execute queued builder/reviewer runs through Codex CLI.
+- Use `docs/NOTIFIER.md` when a user asks Mission Control to notify them when owner review or failures need attention.
 - For non-trivial tasks, capture user story, expected outcome, acceptance criteria, visual attachments when relevant, and privacy/security notes before implementation.
 - Attach project standards to tasks and enforce them in builder/reviewer prompts.
 - For UI work, require mobile-first implementation plus tablet and desktop expectations unless a task explicitly scopes one breakpoint only.
@@ -25,6 +27,8 @@ When working in this repository:
 - Run `npm run check` before committing code changes.
 - Use `npm run supervisor` for a read-only cross-project action sweep, or `npm run supervisor -- --watch --interval 300` for a continuous local loop. The supervisor must not merge, deploy, or send external notifications.
 - Use `npm run dispatcher -- --plan` to preview dispatches and `npm run dispatcher` to create durable dispatch runs. The dispatcher must not merge, deploy, or send external notifications.
+- Use `npm run runner -- --plan` to preview queued builder/reviewer work and `npm run runner` to let Codex CLI execute one queued run. The runner must not merge or deploy and must stop at the human owner gate.
+- Use `npm run notifier -- --plan` to preview local notifications and `npm run notifier` to send owner/failure notifications. The notifier must not approve, merge, deploy, or send app/customer-facing messages.
 
 ## Roles
 

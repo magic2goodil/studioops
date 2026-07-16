@@ -67,6 +67,8 @@ This is intentional for the open-source project:
 - it does not hard-code one AI vendor
 - it gives Codex, Claude, Antigravity, or another runner the same durable work packet
 
+Mission Control also includes a local Codex CLI runner. It consumes queued builder/reviewer runs created by the dispatcher and executes the stored prompt inside the target project repo. See [RUNNER.md](RUNNER.md).
+
 When a native thread API is available, it should plug in at the provider boundary by:
 
 1. reading queued runs

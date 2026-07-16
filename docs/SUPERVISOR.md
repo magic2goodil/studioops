@@ -107,12 +107,12 @@ Recommended loop for a Codex runner:
 
 1. Run `npm run automation-tick -- --limit 10`.
 2. Run `npm run dispatcher`.
-3. Let an external Codex-capable runner consume queued dispatch runs.
-4. For each builder/reviewer run, create or resume the matching worker thread with the stored prompt.
-5. For `notify_owner`, notify the human owner with the task URL and PR URL.
+3. Let `mission-control-runner` consume queued builder/reviewer dispatch runs.
+4. Let `mission-control-notifier` send local notifications for owner handoff and failed runs.
+5. For `notify_owner`, the human owner reviews the task URL and PR URL.
 6. Stop at the human owner gate. Do not merge or deploy automatically.
 
-See [DISPATCHER.md](DISPATCHER.md) for the durable runner layer.
+See [DISPATCHER.md](DISPATCHER.md), [RUNNER.md](RUNNER.md), and [NOTIFIER.md](NOTIFIER.md) for the durable automation layers.
 
 ## Configuration
 

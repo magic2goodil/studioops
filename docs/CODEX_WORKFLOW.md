@@ -87,13 +87,27 @@ npm run dispatcher -- --plan
 npm run dispatcher
 ```
 
+Preview and execute queued builder/reviewer runs with:
+
+```bash
+npm run runner -- --plan
+npm run runner
+```
+
+Preview and send local owner/failure notifications with:
+
+```bash
+npm run notifier -- --plan
+npm run notifier
+```
+
 Record review outcomes with:
 
 ```bash
 node src/mission-control-cli.js review task_123 --stage backend --outcome approved --body "Reviewed API and persistence."
 ```
 
-A scheduled runner can call the same tick command every few minutes, then call the dispatcher command to create durable builder, reviewer, and owner handoff runs from supervisor actions. That runner should only route tasks and create or notify work items; it should not deploy production or merge PRs.
+A scheduled automation stack can call the tick command every few minutes, then let the dispatcher create durable builder, reviewer, and owner handoff runs, the runner execute queued Codex builder/reviewer work, and the notifier alert the human owner when review or failures need attention. The stack should not deploy production or merge PRs.
 
 ## Reviewer
 

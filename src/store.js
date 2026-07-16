@@ -522,6 +522,18 @@ export async function updateRun(runId, patch = {}) {
       "threadId",
       "notes",
       "provider",
+      "outputPath",
+      "lastMessagePath",
+      "startedAt",
+      "completedAt",
+      "exitCode",
+      "runnerPid",
+      "externalNotifiedAt",
+      "failureNotifiedAt",
+      "notificationStatus",
+      "notificationChannel",
+      "notificationError",
+      "notificationFailedAt",
     ];
     for (const key of allowed) {
       if (Object.prototype.hasOwnProperty.call(patch, key)) {

@@ -16,6 +16,8 @@ import {
 } from "./store.js";
 import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
 import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
+import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
+import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import {
   expandHome,
   loadConfig,
@@ -112,6 +114,16 @@ async function setup() {
           ownerConcurrency: 10,
           requireHumanMerge: true,
           requireGitHubActionsDeploy: true,
+        },
+        runner: {
+          intervalSeconds: 300,
+          limit: 1,
+          provider: "codex-cli",
+        },
+        notifier: {
+          intervalSeconds: 60,
+          channel: "macos",
+          limit: 10,
         },
         validationCommands: [],
         standards: [
@@ -249,6 +261,8 @@ Commands:
   automation-tick               Advance ready, blocked, and review tasks
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
+  runner                        Run queued builder/reviewer dispatches with Codex CLI
+  notifier                      Send local owner/failure notifications
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
@@ -269,6 +283,8 @@ Automation:
   mission-control automation-tick --project dollos --limit 10
   mission-control supervisor --json
   mission-control dispatcher --plan
+  mission-control runner --plan
+  mission-control notifier --plan
   mission-control runs --status queued
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
 `);
@@ -493,6 +509,36 @@ Automation:
     const report = await dispatchSupervisorActions(supervisor.actions, options);
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(formatDispatchReport(report));
+    return;
+  }
+
+  if (command === "runner" || command === "run") {
+    const options = {
+      project: args.project || args.projects,
+      limit: args.limit || args["max-runs"],
+      codexBin: args["codex-bin"],
+    };
+    if (args.plan || args["dry-run"] || args.dryRun) {
+      const state = await readState();
+      const plan = planRunnableRuns(state, options);
+      if (args.json) console.log(JSON.stringify(plan, null, 2));
+      else console.log(formatRunnerPlan(plan));
+      return;
+    }
+    const report = await runQueuedRuns(options);
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatRunnerReport(report));
+    return;
+  }
+
+  if (command === "notifier" || command === "notify") {
+    const report = await sendPendingNotifications({
+      project: args.project || args.projects,
+      limit: args.limit || args["max-notifications"],
+      dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
+    });
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatNotificationReport(report));
     return;
   }
 
