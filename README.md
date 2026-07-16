@@ -23,7 +23,7 @@ This first version is intentionally simple:
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
 - Supports epic/task hierarchy and dependency links so broad work can be planned before builders start.
-- Includes default project standards for engineering, frontend, Sass/CSS, assets, content/IA, data/backend, mockup intake, SEO, performance, accessibility, security/privacy, testing, and review.
+- Includes default project standards for engineering, frontend, Sass/CSS, assets, content/IA, data/backend, mockup intake, SEO, performance, accessibility, security/privacy, testing, release/deployment, and review.
 - Includes design-system standards for reusable components, Storybook/component catalogs, Twig or equivalent templates, and Sass mixins/tokens.
 
 ## Quick Start
