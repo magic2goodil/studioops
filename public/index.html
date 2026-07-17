@@ -13,6 +13,7 @@
         <h1>Codex Mission Control</h1>
       </div>
       <div class="topbar-actions">
+        <button id="newTaskButton" type="button">New Task</button>
         <button id="automationButton" type="button">Run Automation Tick</button>
         <button id="refreshButton" type="button">Refresh</button>
         <a href="https://github.com/magic2goodil/codex-mission-control" target="_blank" rel="noreferrer">GitHub</a>
@@ -79,7 +80,7 @@
         <div id="taskDetail" class="task-detail">
           <p>Select a task to view prompts and review metadata.</p>
         </div>
-        <form id="taskForm" class="stacked-form">
+        <form id="taskForm" class="stacked-form" aria-label="Add Mission Control task">
           <h3>Add Task</h3>
           <label>Project <select name="project" required></select></label>
           <label>Title <input name="title" placeholder="Build the thing" required></label>
