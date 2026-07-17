@@ -92,7 +92,17 @@ The app reads the first fenced `json mission-control-config` block in this file.
     },
     "qaIntegration": {
       "intervalSeconds": 300,
-      "validationTimeoutMs": 600000
+      "validationTimeoutMs": 600000,
+      "syncDefaultBranchIntoIntegration": false,
+      "localPreview": {
+        "enabled": false,
+        "checkoutPath": "",
+        "branch": "",
+        "stashDirty": false,
+        "createIfMissing": false,
+        "postUpdateCommands": [],
+        "restartLaunchAgents": []
+      }
     },
     "selfUpdate": {
       "intervalSeconds": 300,
@@ -184,6 +194,22 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "defaultBranch": "main",
       "trustLeadApprovals": false,
       "integrationBranch": "qa/integration",
+      "qaIntegration": {
+        "syncDefaultBranchIntoIntegration": true,
+        "localPreview": {
+          "enabled": true,
+          "checkoutPath": "~/.mission-control/qa-workspaces/example/example-clean",
+          "branch": "qa/integration",
+          "stashDirty": true,
+          "createIfMissing": true,
+          "postUpdateCommands": [
+            "npm run check"
+          ],
+          "restartLaunchAgents": [
+            "com.example.local-preview"
+          ]
+        }
+      },
       "contextLinks": [
         "README.md",
         "AGENTS.md"

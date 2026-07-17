@@ -18,6 +18,18 @@
       "validationCommands": [
         "npm run check"
       ],
+      "qaIntegration": {
+        "syncDefaultBranchIntoIntegration": false,
+        "localPreview": {
+          "enabled": false,
+          "checkoutPath": "",
+          "branch": "",
+          "stashDirty": false,
+          "createIfMissing": false,
+          "postUpdateCommands": [],
+          "restartLaunchAgents": []
+        }
+      },
       "reviewPolicy": {
         "maxBuilderReviewCycles": 2,
         "reviewerMayFixSmallIssues": true,

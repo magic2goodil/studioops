@@ -106,6 +106,11 @@ export function projectFromConfig(rawProject, defaults = {}) {
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
     reviewPipeline: rawProject.reviewPipeline || defaults.reviewPipeline || [],
     reviewPolicy,
+    qaIntegration: {
+      ...(defaults.qaIntegration || {}),
+      ...(rawProject.qaIntegration || {}),
+    },
+    localQaPreview: rawProject.localQaPreview || rawProject.qaIntegration?.localPreview || null,
     trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
     integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),
   };

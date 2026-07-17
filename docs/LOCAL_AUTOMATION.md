@@ -83,6 +83,28 @@ The worker refuses `main`, `master`, `production`, and the configured default br
 
 QA integration requires the registered project checkout to have an `origin` remote. It aborts merge conflicts, records comments on affected tasks, runs validation commands from the isolated workspace, and only then pushes the non-production integration branch to that remote. Reports and task comments include the workspace path and strategy used for the run. It does not merge PRs, deploy, force-push, or checkout the registered project repoPath.
 
+Projects can also opt into keeping their QA branch and local preview checkout current:
+
+```json
+{
+  "qaIntegration": {
+    "syncDefaultBranchIntoIntegration": true,
+    "localPreview": {
+      "enabled": true,
+      "checkoutPath": "~/.mission-control/qa-workspaces/myapp/myapp-clean",
+      "branch": "qa/integration",
+      "stashDirty": true,
+      "postUpdateCommands": ["npm run check"],
+      "restartLaunchAgents": ["com.example.myapp.local"]
+    }
+  }
+}
+```
+
+`syncDefaultBranchIntoIntegration` merges the latest configured default branch into the non-production QA branch before task PR heads are integrated. This is useful after the owner merges a PR to `main`: the QA branch catches up on the next sweep instead of leaving the local preview stale.
+
+`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, Mission Control preserves them in a Git stash before fast-forwarding. `restartLaunchAgents` is intended for local preview servers only.
+
 ## Self Update
 
 Mission Control can update its own local checkout after a control-plane PR is merged to `origin/main`:

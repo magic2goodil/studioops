@@ -125,6 +125,36 @@ function booleanOption(value, fallback = false) {
   return fallback;
 }
 
+function qaIntegrationConfig(projectPlan) {
+  return projectPlan.qaIntegration || {};
+}
+
+function localQaPreviewConfig(projectPlan) {
+  const config = projectPlan.localQaPreview
+    || qaIntegrationConfig(projectPlan).localPreview
+    || qaIntegrationConfig(projectPlan).localQaPreview
+    || {};
+  const enabled = booleanOption(config.enabled, false);
+  if (!enabled) return { enabled: false };
+  return {
+    enabled: true,
+    checkoutPath: resolveWorkspaceRoot(config.checkoutPath || config.path || projectPlan.repoPath),
+    branch: normalizeBranchName(config.branch || projectPlan.integrationBranch),
+    createIfMissing: booleanOption(config.createIfMissing, false),
+    stashDirty: booleanOption(config.stashDirty, false),
+    postUpdateCommands: normalizeList(config.postUpdateCommands || config.commands),
+    restartLaunchAgents: normalizeList(config.restartLaunchAgents || config.agents),
+  };
+}
+
+function syncDefaultBranchEnabled(projectPlan) {
+  const config = qaIntegrationConfig(projectPlan);
+  return booleanOption(
+    config.syncDefaultBranchIntoIntegration ?? config.syncDefaultBranch,
+    false,
+  );
+}
+
 function isGitHubRepoUrl(value) {
   const raw = String(value || "").trim();
   return /^https:\/\/github\.com\//i.test(raw)
@@ -387,6 +417,228 @@ async function conflictFiles(repoPath) {
   return result.output ? result.output.split("\n").map((item) => item.trim()).filter(Boolean) : [];
 }
 
+async function branchHead(repoPath, ref, options = {}) {
+  const result = await git(repoPath, ["rev-parse", "--verify", ref], { ...options, allowFailure: true });
+  return result.ok ? result.output.trim() : "";
+}
+
+async function mergeDefaultBranchIntoIntegration(repoPath, projectPlan, options = {}) {
+  const baseBranch = normalizeBranchName(projectPlan.defaultBranch || "main");
+  const fetch = await git(repoPath, ["fetch", "origin", `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`], { ...options, allowFailure: true });
+  if (!fetch.ok) {
+    return {
+      ok: false,
+      status: "blocked",
+      output: `Could not fetch default branch origin/${baseBranch}: ${truncateOutput(fetch.output)}`,
+    };
+  }
+
+  const before = await branchHead(repoPath, "HEAD", options);
+  const remoteDefaultRef = `refs/remotes/origin/${baseBranch}`;
+  const ancestor = await git(repoPath, ["merge-base", "--is-ancestor", remoteDefaultRef, "HEAD"], { ...options, allowFailure: true });
+  if (ancestor.ok) {
+    return {
+      ok: true,
+      status: "unchanged",
+      changed: false,
+      output: `Integration branch already contains origin/${baseBranch}.`,
+    };
+  }
+
+  const merge = await git(repoPath, ["merge", "--no-ff", "--no-edit", remoteDefaultRef], { ...options, allowFailure: true });
+  if (!merge.ok) {
+    const conflicts = await conflictFiles(repoPath);
+    await git(repoPath, ["merge", "--abort"], { ...options, allowFailure: true });
+    return {
+      ok: false,
+      status: "conflict",
+      conflicts,
+      output: truncateOutput(merge.output),
+    };
+  }
+
+  const after = await branchHead(repoPath, "HEAD", options);
+  return {
+    ok: true,
+    status: "merged",
+    changed: before && after && before !== after,
+    output: truncateOutput(merge.output || `Merged origin/${baseBranch}.`),
+  };
+}
+
+function unsafePreviewPathReason(value) {
+  if (!value || !path.isAbsolute(value)) return "Local QA preview checkoutPath must be an absolute path.";
+  const parsed = path.parse(value);
+  const normalized = path.resolve(value);
+  const unsafe = new Set([
+    parsed.root,
+    path.join(parsed.root, "Users"),
+    path.join(parsed.root, "tmp"),
+    path.join(parsed.root, "var"),
+    path.join(parsed.root, "opt"),
+    path.join(parsed.root, "home"),
+  ]);
+  return unsafe.has(normalized) ? `Local QA preview checkoutPath is too broad: ${normalized}` : "";
+}
+
+async function ensureLocalQaPreviewCheckout(projectPlan, preview, options = {}) {
+  const checkoutPath = preview.checkoutPath;
+  const pathReason = unsafePreviewPathReason(checkoutPath);
+  if (pathReason) return { ok: false, output: pathReason };
+
+  const workTree = await git(checkoutPath, ["rev-parse", "--show-toplevel"], { ...options, allowFailure: true });
+  if (workTree.ok) return { ok: true, created: false };
+  if (!preview.createIfMissing) {
+    return {
+      ok: false,
+      output: `Local QA preview checkout does not exist or is not a Git work tree: ${checkoutPath}`,
+    };
+  }
+
+  await mkdir(path.dirname(checkoutPath), { recursive: true });
+  const clone = await runCommand("git", ["clone", "--shared", "--no-tags", projectPlan.repoPath, checkoutPath], {
+    timeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
+    allowFailure: true,
+    ...options,
+  });
+  if (!clone.ok) {
+    return {
+      ok: false,
+      output: `Could not create local QA preview checkout: ${truncateOutput(clone.output)}`,
+    };
+  }
+
+  const originUrl = await git(projectPlan.repoPath, ["remote", "get-url", "origin"], { ...options, allowFailure: true });
+  if (originUrl.ok && originUrl.output.trim()) {
+    await configureWorkspaceOrigin(projectPlan.repoPath, checkoutPath, originUrl.output);
+  }
+  return { ok: true, created: true };
+}
+
+async function syncLocalQaPreview(projectPlan, options = {}) {
+  const preview = localQaPreviewConfig(projectPlan);
+  const result = {
+    enabled: preview.enabled,
+    status: preview.enabled ? "skipped" : "disabled",
+    checkoutPath: preview.checkoutPath || "",
+    branch: preview.branch || "",
+    before: "",
+    after: "",
+    stashed: false,
+    created: false,
+    output: "",
+    commands: [],
+    restartResults: [],
+  };
+  if (!preview.enabled) return result;
+  if (!preview.branch) {
+    result.status = "blocked";
+    result.output = "Local QA preview branch is not configured.";
+    return result;
+  }
+
+  const gitOptions = { env: options.env, secrets: options.secrets };
+  const ensured = await ensureLocalQaPreviewCheckout(projectPlan, preview, gitOptions);
+  result.created = Boolean(ensured.created);
+  if (!ensured.ok) {
+    result.status = "blocked";
+    result.output = ensured.output;
+    return result;
+  }
+
+  const dirty = await git(preview.checkoutPath, ["status", "--porcelain"], { ...gitOptions, allowFailure: true });
+  if (!dirty.ok) {
+    result.status = "blocked";
+    result.output = `Could not inspect local QA preview checkout: ${truncateOutput(dirty.output)}`;
+    return result;
+  }
+  if (dirty.output.trim()) {
+    if (!preview.stashDirty) {
+      result.status = "blocked";
+      result.output = "Local QA preview checkout has uncommitted changes. Enable localQaPreview.stashDirty or clean the checkout before syncing.";
+      return result;
+    }
+    const stash = await git(preview.checkoutPath, ["stash", "push", "-u", "-m", `Mission Control local QA preview sync ${new Date().toISOString()}`], { ...gitOptions, allowFailure: true });
+    if (!stash.ok) {
+      result.status = "blocked";
+      result.output = `Could not stash local QA preview changes: ${truncateOutput(stash.output)}`;
+      return result;
+    }
+    result.stashed = true;
+  }
+
+  const fetch = await git(preview.checkoutPath, ["fetch", "origin", `refs/heads/${preview.branch}:refs/remotes/origin/${preview.branch}`], { ...gitOptions, allowFailure: true });
+  if (!fetch.ok) {
+    result.status = "blocked";
+    result.output = `Could not fetch local QA preview branch origin/${preview.branch}: ${truncateOutput(fetch.output)}`;
+    return result;
+  }
+
+  const currentBranch = await currentBranchName(preview.checkoutPath);
+  if (currentBranch !== preview.branch) {
+    const hasLocal = await localBranchExists(preview.checkoutPath, preview.branch, gitOptions);
+    const checkoutArgs = hasLocal
+      ? ["checkout", preview.branch]
+      : ["checkout", "-b", preview.branch, `refs/remotes/origin/${preview.branch}`];
+    const checkout = await git(preview.checkoutPath, checkoutArgs, { ...gitOptions, allowFailure: true });
+    if (!checkout.ok) {
+      result.status = "blocked";
+      result.output = `Could not check out local QA preview branch ${preview.branch}: ${truncateOutput(checkout.output)}`;
+      return result;
+    }
+  }
+
+  result.before = await branchHead(preview.checkoutPath, "HEAD", gitOptions);
+  const fastForward = await git(preview.checkoutPath, ["merge", "--ff-only", `refs/remotes/origin/${preview.branch}`], { ...gitOptions, allowFailure: true });
+  if (!fastForward.ok) {
+    result.status = "blocked";
+    result.output = `Local QA preview checkout cannot fast-forward to origin/${preview.branch}: ${truncateOutput(fastForward.output)}`;
+    return result;
+  }
+  result.after = await branchHead(preview.checkoutPath, "HEAD", gitOptions);
+
+  for (const command of preview.postUpdateCommands) {
+    const commandResult = await runCommand("sh", ["-lc", command], {
+      cwd: preview.checkoutPath,
+      env: options.env,
+      secrets: options.secrets,
+      timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
+      allowFailure: true,
+    });
+    const item = {
+      command,
+      ok: commandResult.ok,
+      output: truncateOutput(commandResult.output),
+    };
+    result.commands.push(item);
+    if (!item.ok) {
+      result.status = "post_update_failed";
+      result.output = `Local QA preview post-update command failed: ${command}`;
+      return result;
+    }
+  }
+
+  const uid = String(os.userInfo().uid);
+  for (const label of preview.restartLaunchAgents) {
+    const restart = await runCommand("launchctl", ["kickstart", "-k", `gui/${uid}/${label}`], {
+      allowFailure: true,
+      timeoutMs: 15_000,
+      ...gitOptions,
+    });
+    result.restartResults.push({
+      label,
+      status: restart.ok ? "restarted" : "failed",
+      output: truncateOutput(restart.output),
+    });
+  }
+
+  result.status = result.before && result.after && result.before !== result.after ? "updated" : "current";
+  result.output = result.status === "updated"
+    ? `Local QA preview updated to ${result.after}.`
+    : "Local QA preview already current.";
+  return result;
+}
+
 async function mergeTaskSource(repoPath, task, options = {}) {
   const source = await fetchTaskSource(repoPath, task, options);
   if (!source.ok) {
@@ -472,6 +724,9 @@ export function planQaIntegrations(state, input = {}) {
         repoPath: project.repoPath || "",
         repoUrl: project.repoUrl || "",
         defaultBranch: project.defaultBranch || "main",
+        qaIntegration: project.qaIntegration || {},
+        localQaPreview: project.localQaPreview || null,
+        syncDefaultBranchIntoIntegration: syncDefaultBranchEnabled(project),
         trustLeadApprovals: trustEnabled,
         eligible: projectUsesTrustLeadQa(project),
         skipReason: trustEnabled ? safetyError : "trustLeadApprovals is disabled.",
@@ -536,9 +791,13 @@ async function integrateProject(projectPlan, options = {}) {
     sourceRepoPath: repoPath,
     workspacePath: "",
     workspaceStrategy: "",
+    defaultBranchSync: null,
+    localQaPreview: null,
   };
+  const shouldSyncDefaultBranch = syncDefaultBranchEnabled(projectPlan);
+  const shouldSyncLocalPreview = localQaPreviewConfig(projectPlan).enabled;
 
-  if (!projectPlan.tasks.length) {
+  if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && !shouldSyncLocalPreview) {
     result.status = "no_tasks";
     return result;
   }
@@ -553,6 +812,15 @@ async function integrateProject(projectPlan, options = {}) {
       source: sourceLabel(task),
       output: result.output,
     }));
+    return result;
+  }
+
+  if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && shouldSyncLocalPreview) {
+    result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
+    result.status = result.localQaPreview.status === "blocked" || result.localQaPreview.status === "post_update_failed"
+      ? "preview_blocked"
+      : "preview_ready";
+    result.output = result.localQaPreview.output;
     return result;
   }
 
@@ -572,6 +840,20 @@ async function integrateProject(projectPlan, options = {}) {
     const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     preparedHead = preparedCommit.output.trim();
 
+    let branchChanged = false;
+    if (shouldSyncDefaultBranch) {
+      result.defaultBranchSync = await mergeDefaultBranchIntoIntegration(executionRepoPath, projectPlan, gitOptions);
+      if (!result.defaultBranchSync.ok) {
+        result.status = result.defaultBranchSync.status || "blocked";
+        result.output = result.defaultBranchSync.output;
+        result.tasks = result.tasks.length
+          ? result.tasks
+          : allTaskResults(projectPlan.tasks, result.status, result.output);
+        return result;
+      }
+      branchChanged = Boolean(result.defaultBranchSync.changed);
+    }
+
     const mergedTasks = [];
     for (const task of projectPlan.tasks) {
       const taskResult = await mergeTaskSource(executionRepoPath, task, gitOptions);
@@ -579,8 +861,26 @@ async function integrateProject(projectPlan, options = {}) {
       if (taskResult.status === "merged") mergedTasks.push(taskResult);
     }
 
-    if (!mergedTasks.length) {
+    const failedTaskMerge = result.tasks.find((task) => task.status !== "merged");
+    if (failedTaskMerge) {
+      result.status = failedTaskMerge.status === "conflict" ? "conflict" : "blocked";
+      result.output = failedTaskMerge.output || `QA integration stopped before push because ${failedTaskMerge.taskId} could not be merged.`;
+      return result;
+    }
+
+    if (!mergedTasks.length && !branchChanged) {
       result.status = result.tasks.some((task) => task.status === "conflict") ? "conflict" : "blocked";
+      if (!projectPlan.tasks.length) {
+        result.status = "no_changes";
+        result.output = result.defaultBranchSync?.output || "No QA integration changes were needed.";
+        if (shouldSyncLocalPreview) {
+          result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
+          result.output = appendOutput(result.output, result.localQaPreview.output);
+          if (result.localQaPreview.status === "blocked" || result.localQaPreview.status === "post_update_failed") {
+            result.status = "preview_blocked";
+          }
+        }
+      }
       return result;
     }
 
@@ -616,6 +916,13 @@ async function integrateProject(projectPlan, options = {}) {
     result.output = truncateOutput(push.output || `Pushed ${projectPlan.integrationBranch}.`);
     pushed = true;
     for (const task of mergedTasks) task.status = "ready";
+    if (shouldSyncLocalPreview) {
+      result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
+      result.output = appendOutput(result.output, result.localQaPreview.output);
+      if (result.localQaPreview.status === "blocked" || result.localQaPreview.status === "post_update_failed") {
+        result.status = "preview_blocked";
+      }
+    }
     return result;
   } catch (error) {
     result.status = "blocked";
@@ -670,14 +977,34 @@ function workspaceSummary(result) {
   return `\n\nWorkspace: ${result.workspacePath}${strategy}`;
 }
 
+function localPreviewSummary(result) {
+  const preview = result.localQaPreview;
+  if (!preview?.enabled) return "";
+  const lines = [
+    "",
+    "",
+    `Local QA preview: ${preview.status}`,
+    `- Checkout: ${preview.checkoutPath || "(not configured)"}`,
+    `- Branch: ${preview.branch || result.integrationBranch || "(not configured)"}`,
+  ];
+  if (preview.after) lines.push(`- Commit: ${preview.after}`);
+  if (preview.stashed) lines.push("- Local changes were stashed before sync.");
+  for (const item of preview.restartResults || []) {
+    lines.push(`- Restart ${item.label}: ${item.status}`);
+  }
+  if (preview.output) lines.push(`- Note: ${preview.output}`);
+  return lines.join("\n");
+}
+
 function commentForTask(projectResult, taskResult) {
   const branchLine = projectResult.integrationBranchUrl
     ? `\n\nIntegration branch: ${projectResult.integrationBranchUrl}`
     : `\n\nIntegration branch: ${projectResult.integrationBranch}`;
   const workspaceLine = workspaceSummary(projectResult);
+  const previewLine = localPreviewSummary(projectResult);
 
   if (taskResult.status === "ready") {
-    return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
+    return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}${previewLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
   }
 
   if (taskResult.status === "conflict") {
@@ -697,7 +1024,7 @@ function commentForTask(projectResult, taskResult) {
     return `QA integration could not update ${projectResult.integrationBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
-  return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}`;
+  return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}`;
 }
 
 function taskPatchForResult(projectResult, taskResult, now) {
@@ -709,6 +1036,7 @@ function taskPatchForResult(projectResult, taskResult, now) {
     integrationSource: taskResult.source || "",
     integrationWorkspacePath: projectResult.workspacePath || "",
     integrationWorkspaceStrategy: projectResult.workspaceStrategy || "",
+    localQaPreview: projectResult.localQaPreview || null,
     integrationUpdatedAt: now,
     integrationConflictFiles: taskResult.conflicts || [],
     integrationValidation: {
@@ -779,7 +1107,10 @@ export async function runQaIntegration(input = {}) {
 
   const results = [];
   for (const projectPlan of plan.projects) {
-    if (!projectPlan.tasks.length) continue;
+    const hasProjectWork = projectPlan.tasks.length
+      || projectPlan.syncDefaultBranchIntoIntegration
+      || localQaPreviewConfig(projectPlan).enabled;
+    if (!hasProjectWork) continue;
     if (!projectPlan.eligible) {
       await recordIneligibleProject(projectPlan);
       results.push({
@@ -839,6 +1170,18 @@ export function formatQaIntegrationReport(report) {
     if (!project.eligible) lines.push(`  Skipped: ${project.skipReason || project.output || "not eligible"}`);
     else if (project.status) lines.push(`  Status: ${project.status}`);
     if (project.output) lines.push(`  Note: ${project.output}`);
+    if (project.defaultBranchSync) {
+      lines.push(`  Default branch sync: ${project.defaultBranchSync.status}${project.defaultBranchSync.changed ? " (changed)" : ""}`);
+      if (project.defaultBranchSync.conflicts?.length) {
+        lines.push(`    Conflicts: ${project.defaultBranchSync.conflicts.join(", ")}`);
+      }
+    }
+    if (project.localQaPreview?.enabled) {
+      lines.push(`  Local QA preview: ${project.localQaPreview.status || "configured"} ${project.localQaPreview.checkoutPath || ""}`.trimEnd());
+      for (const item of project.localQaPreview.restartResults || []) {
+        lines.push(`    Restart ${item.label}: ${item.status}`);
+      }
+    }
     for (const task of project.tasks || []) {
       const taskId = task.taskId || task.id;
       lines.push(`  - ${taskId}: ${task.status || task.integrationStatus || "pending"} ${task.title || ""}`.trimEnd());
