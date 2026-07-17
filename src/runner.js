@@ -25,6 +25,8 @@ const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
 const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
+const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "blocked"]);
+const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
@@ -90,6 +92,46 @@ function findRunnableLaneConflict(state, run, extraRuns = []) {
   return activeLaneContexts(state, extraRuns).find((item) => laneProfilesConflict(current, item)) || null;
 }
 
+function staleRunReason(state, run) {
+  const task = findTask(state, run.taskId);
+  if (!task) return "task_missing";
+
+  if (run.actionType === "qa_integration_blocked") {
+    if (task.status !== "qa_review") return `task_status_changed:${task.status || "unknown"}`;
+    if (!BLOCKED_QA_INTEGRATION_STATUSES.has(task.integrationStatus)) {
+      return `qa_integration_status_changed:${task.integrationStatus || "unknown"}`;
+    }
+    if (run.integrationStatus && run.integrationStatus !== task.integrationStatus) {
+      return `qa_integration_status_changed:${run.integrationStatus}->${task.integrationStatus}`;
+    }
+    return "";
+  }
+
+  if (["start_builder", "start_builder_fix", "return_to_builder"].includes(run.actionType)) {
+    if (task.status !== "in_progress") return `task_status_changed:${task.status || "unknown"}`;
+    if (task.assignedAgentRole && task.assignedAgentRole !== run.role) {
+      return `assignee_changed:${task.assignedAgentRole}`;
+    }
+    return "";
+  }
+
+  if (run.actionType === "unblock_task") {
+    if (!["queued", "in_progress"].includes(task.status)) return `task_status_changed:${task.status || "unknown"}`;
+    return "";
+  }
+
+  if (["start_review", "continue_review"].includes(run.actionType)) {
+    if (!String(task.status || "").includes("review")) return `task_status_changed:${task.status || "unknown"}`;
+    if (task.status === "qa_review" || task.status === "user_review") return `task_status_changed:${task.status}`;
+    if (task.assignedAgentRole && task.assignedAgentRole !== run.role) {
+      return `assignee_changed:${task.assignedAgentRole}`;
+    }
+    return "";
+  }
+
+  return "";
+}
+
 function booleanOption(value, fallback = true) {
   if (value === undefined || value === null || value === "") return fallback;
   if (typeof value === "boolean") return value;
@@ -109,6 +151,22 @@ function slugify(value) {
 
 function branchNameForRun(run) {
   return String(run.branchName || `codex/${run.project?.key || run.projectId}-${run.taskId || run.id}`).trim();
+}
+
+function isBranchWriterRun(run) {
+  return run.group === "builder" && BRANCH_WRITER_ACTIONS.has(run.actionType);
+}
+
+export function branchReuseSafetyReason(run, pr) {
+  if (!isBranchWriterRun(run) || !run.prUrl || !pr) return "";
+  const state = String(pr.state || "").toUpperCase();
+  if (!state || state === "OPEN") return "";
+
+  const branch = branchNameForRun(run);
+  if (pr.headRefName && pr.headRefName !== branch) return "";
+
+  const status = pr.mergedAt ? `merged at ${pr.mergedAt}` : state.toLowerCase();
+  return `Refusing to reuse ${branch}: linked PR ${pr.url || run.prUrl} is ${status}. Create a new feature branch and PR before launching another builder run.`;
 }
 
 function resolveWorkspaceRoot(value) {
@@ -143,6 +201,31 @@ async function gitOutput(args, options = {}) {
   } catch {
     return "";
   }
+}
+
+async function readLinkedPrState(run, env) {
+  if (!run.prUrl || !isBranchWriterRun(run)) return null;
+  try {
+    const result = await execFileAsync("gh", ["pr", "view", run.prUrl, "--json", "state,mergedAt,headRefName,url"], {
+      cwd: run.project.repoPath,
+      env,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    return JSON.parse(result.stdout || "{}");
+  } catch {
+    return null;
+  }
+}
+
+async function assertBranchReuseIsSafe(run, env, log) {
+  const pr = await readLinkedPrState(run, env);
+  if (!pr) return;
+  const reason = branchReuseSafetyReason(run, pr);
+  if (!reason) return;
+  log.write(`${reason}\n`);
+  await recordUnsafeBranchReuse(run, reason);
+  throw new Error(reason);
 }
 
 async function remoteBranchExists(repoPath, branch) {
@@ -226,6 +309,7 @@ async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
   await mkdir(path.dirname(workspacePath), { recursive: true });
   await safeRemoveWorkspace(workspacePath, workspaceRoot);
   await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000, env: gitEnv });
+  await assertBranchReuseIsSafe(run, gitEnv, log);
 
   const startRef = await remoteBranchExists(run.project.repoPath, branch)
     ? `origin/${branch}`
@@ -284,6 +368,11 @@ export function planRunnableRuns(state, input = {}) {
     }
     if (!projectAllowed(run, project, input)) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "project_filter" });
+      continue;
+    }
+    const staleReason = staleRunReason(state, run);
+    if (staleReason) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: `stale_run:${staleReason}` });
       continue;
     }
     if (!project?.repoPath) {
@@ -375,6 +464,33 @@ async function appendTaskComment(state, run, body, now, author = "Mission Contro
   });
 }
 
+async function recordUnsafeBranchReuse(run, reason) {
+  const now = new Date().toISOString();
+  await mutateState(async (state) => {
+    state.events = state.events || [];
+    const task = findTask(state, run.taskId);
+    if (task) {
+      task.status = "needs_changes";
+      task.assignedAgentRole = "builder";
+      task.updatedAt = now;
+    }
+    await appendTaskComment(
+      state,
+      run,
+      `${run.id} blocked before launch: ${reason}`,
+      now,
+    );
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "branch_reuse_blocked",
+      projectId: run.projectId,
+      taskId: run.taskId,
+      message: `${run.id} blocked stale branch reuse`,
+      createdAt: now,
+    });
+  });
+}
+
 export async function claimRuns(input = {}) {
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
   return mutateState(async (state) => {
@@ -394,6 +510,24 @@ export async function claimRuns(input = {}) {
       if (!RUNNABLE_STATUSES.has(run.status)) continue;
       if (!RUNNABLE_GROUPS.has(run.group)) continue;
       if (!projectAllowed(run, project, input)) continue;
+      const staleReason = staleRunReason(state, run);
+      if (staleReason) {
+        run.status = "cancelled";
+        run.exitCode = staleReason;
+        run.completedAt = now;
+        run.updatedAt = now;
+        const message = `${run.id} cancelled before launch because its queued action is stale: ${staleReason}.`;
+        await appendTaskComment(state, run, message, now);
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: "run_cancelled",
+          projectId: run.projectId,
+          taskId: run.taskId,
+          message,
+          createdAt: now,
+        });
+        continue;
+      }
       const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
       if (laneConflict) continue;
       if (!project?.repoPath) {
