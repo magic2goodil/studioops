@@ -15,6 +15,7 @@ const projectForm = document.querySelector("#projectForm");
 const taskForm = document.querySelector("#taskForm");
 const projectSettings = document.querySelector("#projectSettings");
 const qaReviewPanel = document.querySelector("#qaReviewPanel");
+const newTaskButton = document.querySelector("#newTaskButton");
 const automationButton = document.querySelector("#automationButton");
 const refreshButton = document.querySelector("#refreshButton");
 const statusFilter = document.querySelector("#statusFilter");
@@ -309,6 +310,11 @@ function projectFor(task) {
   return state.projects.find((project) => project.id === task.projectId) || null;
 }
 
+function activeProjectForNewTask() {
+  const selectedTask = taskById(state.selectedTaskId || state.routeTaskId);
+  return projectFor(selectedTask) || selectedProject() || state.projects[0] || null;
+}
+
 function visibleTasks() {
   return state.tasks.filter((task) => {
     if (state.selectedProjectId && task.projectId !== state.selectedProjectId) return false;
@@ -328,6 +334,8 @@ function renderProjects() {
 
   const select = taskForm.elements.project;
   select.innerHTML = state.projects.map((project) => `<option value="${escapeHtml(project.key)}">${escapeHtml(project.name)}</option>`).join("");
+  const activeProject = activeProjectForNewTask();
+  if (activeProject) select.value = activeProject.key;
   renderProjectSettings();
   renderQaReviewPanel();
 }
@@ -876,6 +884,15 @@ taskForm.addEventListener("submit", async (event) => {
   taskForm.reset();
   if (result.task?.id) window.history.pushState(null, "", taskPath(result.task.id));
   await loadState();
+});
+
+newTaskButton.addEventListener("click", () => {
+  const activeProject = activeProjectForNewTask();
+  if (activeProject) taskForm.elements.project.value = activeProject.key;
+  taskForm.scrollIntoView({ behavior: "smooth", block: "start" });
+  taskForm.classList.add("form-highlight");
+  window.setTimeout(() => taskForm.classList.remove("form-highlight"), 1400);
+  taskForm.elements.title.focus({ preventScroll: true });
 });
 
 refreshButton.addEventListener("click", () => {

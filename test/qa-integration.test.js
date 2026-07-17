@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -70,6 +70,95 @@ test("review policy Trust Leads settings override stale top-level mirrors", () =
   );
   assert.equal(imported.reviewPolicy.trustLeadApprovals, true);
   assert.equal(imported.reviewPolicy.integrationBranch, "qa/imported");
+});
+
+test("validation commands use the QA integration PATH override", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-path-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  const fakeBin = path.join(root, "fake-bin");
+  const fakeCheck = path.join(fakeBin, "mc-qa-check");
+
+  try {
+    await mkdir(fakeBin, { recursive: true });
+    await writeFile(fakeCheck, "#!/bin/sh\nexit 0\n", "utf8");
+    await chmod(fakeCheck, 0o755);
+
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
+    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    await git(repoPath, ["push", "origin", "main"]);
+    await git(repoPath, ["push", "origin", "main:qa/integration"]);
+
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "app.txt"), "feature\n", "utf8");
+    await git(repoPath, ["commit", "-am", "feature"]);
+    await git(repoPath, ["push", "origin", "feature/task"]);
+    await git(repoPath, ["checkout", "main"]);
+
+    await mkdir(path.join(root, "data"), { recursive: true });
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+      meta: {},
+      projects: [
+        {
+          id: "project_1",
+          key: "demo",
+          name: "Demo",
+          repoPath,
+          repoUrl: "",
+          defaultBranch: "main",
+          validationCommands: ["mc-qa-check"],
+          reviewPolicy: {
+            trustLeadApprovals: true,
+            integrationBranch: "qa/integration",
+          },
+        },
+      ],
+      tasks: [
+        {
+          id: "task_1",
+          projectId: "project_1",
+          title: "Feature task",
+          status: "qa_review",
+          branchName: "feature/task",
+          prUrl: "",
+        },
+      ],
+      comments: [],
+      events: [],
+      reviews: [],
+      runs: [],
+    }, null, 2)}\n`, "utf8");
+
+    const script = `
+      import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      const report = await runQaIntegration({});
+      console.log(JSON.stringify(report));
+    `;
+    const systemPath = "/usr/bin:/bin:/usr/sbin:/sbin";
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: root,
+      env: {
+        PATH: systemPath,
+        MISSION_CONTROL_QA_INTEGRATION_PATH: `${fakeBin}:${systemPath}`,
+      },
+    });
+    const report = JSON.parse(runResult.stdout.trim());
+
+    assert.equal(report.projects[0].status, "ready");
+    assert.equal(report.projects[0].tasks[0].status, "ready");
+
+    const state = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8"));
+    assert.equal(state.tasks[0].integrationStatus, "ready");
+    assert.equal(state.tasks[0].integrationValidation.commands[0].ok, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("failed validation rolls the local integration branch back to its prepared head", async () => {
