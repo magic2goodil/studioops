@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { extractConfigJson, projectFromConfig } from "../src/config.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { DEFAULT_REVIEW_PIPELINE, generatePrompt } from "../src/store.js";
 import { laneProfile } from "../src/work-lanes.js";
@@ -105,4 +107,23 @@ test("accessibility reviewer runs use the frontend lane profile", () => {
 
   assert.equal(profile.lane, "frontend");
   assert.equal(profile.conflictGroup, "frontend-surface");
+});
+
+test("example config imports accessibility review before lead review", async () => {
+  const markdown = await readFile("mission-control.config.example.md", "utf8");
+  const config = extractConfigJson(markdown);
+
+  assert.equal(config.githubApps.roleMap["accessibility-reviewer"], "default");
+  assert.deepEqual(
+    config.defaults.reviewPipeline.map((stage) => stage.key),
+    ["backend", "frontend", "accessibility", "lead"],
+  );
+
+  const project = projectFromConfig(config.projects[0], config.defaults);
+  assert.deepEqual(
+    project.reviewPipeline.map((stage) => stage.key),
+    ["backend", "frontend", "accessibility", "lead"],
+  );
+  assert.equal(project.reviewPipeline[2].status, "accessibility_review");
+  assert.equal(project.reviewPipeline[2].role, "accessibility-reviewer");
 });
