@@ -93,9 +93,10 @@ test("clean self-update dry-run detects origin/main ahead and live run fast-forw
     assert.deepEqual(dryRun.restartAgentLabels, DEFAULT_RESTART_AGENT_LABELS);
     assert.equal(await git(fixture.repoPath, ["rev-parse", "main"]), before);
 
+    const applyState = emptyState();
     const applied = await runSelfUpdate({
       repoPath: fixture.repoPath,
-      state: emptyState(),
+      state: applyState,
       restartAgents: false,
       record: false,
       notify: false,
@@ -104,9 +105,45 @@ test("clean self-update dry-run detects origin/main ahead and live run fast-forw
     assert.equal(applied.status, "updated");
     assert.equal(applied.previousCommit, before);
     assert.equal(applied.currentCommit, remote);
+    assert.ok(applied.selfUpdateLease.id);
+    assert.equal(applyState.meta.selfUpdateLease, undefined);
     assert.equal(await git(fixture.repoPath, ["rev-parse", "main"]), remote);
     assert.equal(applied.restartResults.length, DEFAULT_RESTART_AGENT_LABELS.length);
     assert.equal(applied.restartResults[0].status, "skipped");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("self-update refuses to run while another self-update lease is active", async () => {
+  const fixture = await createFixture();
+  try {
+    const before = await git(fixture.repoPath, ["rev-parse", "main"]);
+    await commitFile(fixture.writerPath, "app.txt", "remote\n", "remote update");
+    await git(fixture.writerPath, ["push", "origin", "main"]);
+
+    const state = emptyState();
+    state.meta.selfUpdateLease = {
+      id: "lease_1",
+      startedAt: "2026-07-17T21:00:00.000Z",
+      expiresAt: "2026-07-17T21:10:00.000Z",
+      repoPath: fixture.repoPath,
+      branch: "main",
+      remoteRef: "origin/main",
+    };
+
+    const report = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state,
+      restartAgents: false,
+      record: false,
+      notify: false,
+      nowMs: Date.parse("2026-07-17T21:01:00.000Z"),
+    });
+
+    assert.equal(report.status, "blocked_self_update_in_progress");
+    assert.equal(report.selfUpdateLease.id, "lease_1");
+    assert.equal(await git(fixture.repoPath, ["rev-parse", "main"]), before);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

@@ -1,6 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
+import {
+  activeSelfUpdateLease,
+  createSelfUpdateLease,
+  DEFAULT_SELF_UPDATE_LEASE_MS,
+} from "./self-update-lease.js";
 import { mutateState, readState } from "./store.js";
 
 const execFileAsync = promisify(execFile);
@@ -17,7 +22,7 @@ const DEFAULT_RESTART_AGENT_LABELS = [
   "com.codex.mission-control.qa-integration",
 ];
 
-export { DEFAULT_RESTART_AGENT_LABELS, DEFAULT_STALE_RUN_MS };
+export { DEFAULT_RESTART_AGENT_LABELS, DEFAULT_STALE_RUN_MS, DEFAULT_SELF_UPDATE_LEASE_MS };
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -142,6 +147,62 @@ export function classifyActiveRuns(state, input = {}) {
   }
 
   return { blocking, stale };
+}
+
+async function mutateSelfUpdateState(input, mutator) {
+  if (input.state) return mutator(input.state);
+  return mutateState(mutator);
+}
+
+async function acquireSelfUpdateLease(plan, input = {}) {
+  return mutateSelfUpdateState(input, async (state) => {
+    state.meta = state.meta || {};
+    const activeLease = activeSelfUpdateLease(state, input);
+    if (activeLease) {
+      return {
+        acquired: false,
+        status: "blocked_self_update_in_progress",
+        canUpdate: false,
+        selfUpdateLease: activeLease,
+        reason: `Another Mission Control self-update is already in progress until ${activeLease.expiresAt}.`,
+      };
+    }
+
+    const activeRuns = classifyActiveRuns(state, input);
+    if (activeRuns.blocking.length) {
+      return {
+        acquired: false,
+        status: "blocked_active_runs",
+        canUpdate: false,
+        activeRunBlockers: activeRuns.blocking,
+        staleActiveRuns: activeRuns.stale,
+        reason: `${activeRuns.blocking.length} builder/reviewer run(s) are still active.`,
+      };
+    }
+
+    const lease = createSelfUpdateLease({
+      ...input,
+      repoPath: plan.repoPath,
+      branch: plan.branch,
+      remoteRef: plan.remoteRef,
+    });
+    state.meta.selfUpdateLease = lease;
+
+    return {
+      acquired: true,
+      selfUpdateLease: lease,
+      activeRunBlockers: [],
+      staleActiveRuns: activeRuns.stale,
+    };
+  });
+}
+
+async function releaseSelfUpdateLease(lease, input = {}) {
+  if (!lease?.id) return;
+  await mutateSelfUpdateState(input, async (state) => {
+    const current = state?.meta?.selfUpdateLease;
+    if (current?.id === lease.id) delete state.meta.selfUpdateLease;
+  });
 }
 
 async function inspectGitRepository(input = {}) {
@@ -474,23 +535,56 @@ export async function runSelfUpdate(input = {}) {
     return blockedReport;
   }
 
-  await git(["merge", "--ff-only", plan.remoteRef], { cwd: plan.repoPath, timeout: input.mergeTimeoutMs || 300_000 });
-  const currentCommit = await git(["rev-parse", `refs/heads/${plan.branch}`], { cwd: plan.repoPath });
-  const updatedReport = {
-    ...plan,
-    status: "updated",
-    canUpdate: false,
-    updated: true,
-    previousCommit: plan.localCommit,
-    currentCommit,
-    reason: `Fast-forwarded ${plan.branch} to ${shortCommit(currentCommit)}.`,
-  };
+  const leaseResult = await acquireSelfUpdateLease(plan, input);
+  if (!leaseResult.acquired) {
+    const blockedReport = {
+      ...plan,
+      ...leaseResult,
+      dryRun: false,
+      canUpdate: false,
+    };
+    delete blockedReport.acquired;
+    blockedReport.notification = await sendSelfUpdateNotification(blockedReport, input);
+    blockedReport.record = await recordSelfUpdateResult(blockedReport, input);
+    return blockedReport;
+  }
 
-  updatedReport.restartResults = await restartLaunchAgents(plan.restartAgentLabels, input);
-  updatedReport.notification = await sendSelfUpdateNotification(updatedReport, input);
-  updatedReport.record = await recordSelfUpdateResult(updatedReport, input);
+  try {
+    const finalPlan = {
+      ...(await planSelfUpdate({ ...input, dryRun: false })),
+      selfUpdateLease: leaseResult.selfUpdateLease,
+    };
 
-  return updatedReport;
+    if (!finalPlan.canUpdate) {
+      const blockedReport = {
+        ...finalPlan,
+        canUpdate: false,
+      };
+      blockedReport.notification = await sendSelfUpdateNotification(blockedReport, input);
+      blockedReport.record = await recordSelfUpdateResult(blockedReport, input);
+      return blockedReport;
+    }
+
+    await git(["merge", "--ff-only", finalPlan.remoteRef], { cwd: finalPlan.repoPath, timeout: input.mergeTimeoutMs || 300_000 });
+    const currentCommit = await git(["rev-parse", `refs/heads/${finalPlan.branch}`], { cwd: finalPlan.repoPath });
+    const updatedReport = {
+      ...finalPlan,
+      status: "updated",
+      canUpdate: false,
+      updated: true,
+      previousCommit: finalPlan.localCommit,
+      currentCommit,
+      reason: `Fast-forwarded ${finalPlan.branch} to ${shortCommit(currentCommit)}.`,
+    };
+
+    updatedReport.restartResults = await restartLaunchAgents(finalPlan.restartAgentLabels, input);
+    updatedReport.notification = await sendSelfUpdateNotification(updatedReport, input);
+    updatedReport.record = await recordSelfUpdateResult(updatedReport, input);
+
+    return updatedReport;
+  } finally {
+    await releaseSelfUpdateLease(leaseResult.selfUpdateLease, input);
+  }
 }
 
 export function formatSelfUpdateReport(report) {

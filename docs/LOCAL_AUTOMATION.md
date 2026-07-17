@@ -106,6 +106,8 @@ Running builder/reviewer runs are ignored only when they are stale, such as a mi
 - `com.codex.mission-control.notifier`
 - `com.codex.mission-control.qa-integration`
 
+During an applied update, Mission Control records a short-lived self-update lease in local state. The runner checks that lease before claiming queued builder/reviewer work, so queued runs wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
+
 Use `mission-control.config.md` `defaults.selfUpdate` or CLI flags such as `--branch`, `--remote`, `--stale-run-ms`, `--task`, `--notify`, and `--no-restart` to tune local behavior. `--task` records a Mission Control comment on that task; all material non-dry-run outcomes are recorded as Mission Control events.
 
 ## Uninstall

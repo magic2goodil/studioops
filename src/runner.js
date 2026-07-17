@@ -14,6 +14,7 @@ import {
   prepareGitHubAppAuth,
   redactSecrets,
 } from "./github-app-auth.js";
+import { activeSelfUpdateLease } from "./self-update-lease.js";
 import { findProject, findTask, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 
@@ -355,6 +356,7 @@ export function planRunnableRuns(state, input = {}) {
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
   const activeCount = (state.runs || []).filter((run) => ACTIVE_STATUSES.has(run.status)).length;
   const available = Math.max(0, limit - activeCount);
+  const selfUpdateLease = activeSelfUpdateLease(state, input);
   const runnable = [];
   const skipped = [];
   const plannedRuns = [];
@@ -364,6 +366,10 @@ export function planRunnableRuns(state, input = {}) {
     if (!RUNNABLE_STATUSES.has(run.status)) continue;
     if (!RUNNABLE_GROUPS.has(run.group)) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "not_runner_group" });
+      continue;
+    }
+    if (selfUpdateLease) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: `self_update_in_progress:${selfUpdateLease.id}` });
       continue;
     }
     if (!projectAllowed(run, project, input)) {
@@ -493,7 +499,11 @@ async function recordUnsafeBranchReuse(run, reason) {
 
 export async function claimRuns(input = {}) {
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+
+  return mutate(async (state) => {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
@@ -501,6 +511,7 @@ export async function claimRuns(input = {}) {
     const activeCount = state.runs.filter((run) => ACTIVE_STATUSES.has(run.status)).length;
     const available = Math.max(0, limit - activeCount);
     if (available <= 0) return [];
+    if (activeSelfUpdateLease(state, input)) return [];
 
     const claimed = [];
     const plannedRuns = [];

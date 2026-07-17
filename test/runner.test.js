@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { branchReuseSafetyReason, planRunnableRuns } from "../src/runner.js";
+import { branchReuseSafetyReason, claimRuns, planRunnableRuns } from "../src/runner.js";
 
 function fixtureState(taskPatch = {}, runPatch = {}) {
   return {
@@ -90,6 +90,41 @@ test("active builder runs created by dispatch remain runnable after task status 
   assert.equal(report.runnable.length, 1);
   assert.equal(report.runnable[0].id, "run_1");
   assert.equal(report.skipped.length, 0);
+});
+
+test("runner does not plan or claim runs while self-update lease is active", async () => {
+  const state = fixtureState(
+    {
+      status: "in_progress",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+    },
+    {
+      actionType: "start_builder",
+      integrationStatus: "",
+    },
+  );
+  state.meta = {
+    selfUpdateLease: {
+      id: "lease_1",
+      startedAt: "2026-07-17T21:00:00.000Z",
+      expiresAt: "2026-07-17T21:10:00.000Z",
+      repoPath: "/tmp/mission-control",
+      branch: "main",
+      remoteRef: "origin/main",
+    },
+  };
+
+  const report = planRunnableRuns(state, { limit: 1, nowMs: Date.parse("2026-07-17T21:01:00.000Z") });
+
+  assert.equal(report.runnable.length, 0);
+  assert.equal(report.skipped.length, 1);
+  assert.equal(report.skipped[0].reason, "self_update_in_progress:lease_1");
+
+  const claimed = await claimRuns({ state, limit: 1, nowMs: Date.parse("2026-07-17T21:01:00.000Z") });
+
+  assert.deepEqual(claimed, []);
+  assert.equal(state.runs[0].status, "queued");
 });
 
 test("builder runs may continue writing to open linked PR branches", () => {
