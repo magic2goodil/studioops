@@ -10,6 +10,13 @@ import {
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
+import {
+  cleanupGitHubAppAuth,
+  githubAppAuthEnv,
+  githubAppAuthSecrets,
+  prepareGitHubAppAuth,
+  redactSecrets,
+} from "./github-app-auth.js";
 import { mutateState, readState } from "./store.js";
 
 const execFileAsync = promisify(execFile);
@@ -28,6 +35,7 @@ function childEnv(options = {}) {
   return {
     ...process.env,
     PATH: options.path || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH || DEFAULT_QA_INTEGRATION_PATH,
+    ...(options.env || {}),
   };
 }
 
@@ -54,6 +62,19 @@ function truncateOutput(value, limit = MAX_OUTPUT_CHARS) {
   const text = String(value || "").trim();
   if (text.length <= limit) return text;
   return `${text.slice(0, limit)}\n...[truncated]`;
+}
+
+function normalizeSecrets(...values) {
+  const secrets = [];
+  for (const value of values) {
+    if (Array.isArray(value)) secrets.push(...value);
+    else if (value) secrets.push(value);
+  }
+  return [...new Set(secrets.map(String).filter(Boolean))];
+}
+
+function redactCommandOutput(value, options = {}) {
+  return redactSecrets(value, normalizeSecrets(options.secrets));
 }
 
 function normalizeBranchName(value) {
@@ -95,6 +116,51 @@ function sourceLabel(task) {
   return task.prUrl || task.branchName || "unlinked PR";
 }
 
+function booleanOption(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (value === undefined || value === null || value === "") return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function isGitHubRepoUrl(value) {
+  const raw = String(value || "").trim();
+  return /^https:\/\/github\.com\//i.test(raw)
+    || /^git@github\.com:/i.test(raw)
+    || /^ssh:\/\/git@github\.com\//i.test(raw);
+}
+
+function qaIntegrationAuthEnabled(projectPlan, input = {}) {
+  return booleanOption(
+    input.githubAppAuth ?? process.env.MISSION_CONTROL_QA_GITHUB_APP_AUTH,
+    isGitHubRepoUrl(projectPlan.repoUrl),
+  );
+}
+
+async function prepareQaIntegrationAuth(projectPlan, input = {}) {
+  if (!qaIntegrationAuthEnabled(projectPlan, input)) return null;
+  const role = input.githubAppRole || input.githubAppAuthRole || "qa-integration-worker";
+  return prepareGitHubAppAuth(
+    {
+      id: `qa_${projectPlan.projectId || projectPlan.projectKey || "project"}`,
+      role,
+      project: {
+        id: projectPlan.projectId,
+        key: projectPlan.projectKey,
+        name: projectPlan.projectName,
+        repoPath: projectPlan.repoPath,
+        repoUrl: projectPlan.repoUrl,
+      },
+    },
+    {
+      ...input,
+      githubAppDefaultRole: input.githubAppDefaultRole || "builder",
+    },
+  );
+}
+
 async function runCommand(command, args, options = {}) {
   try {
     const result = await execFileAsync(command, args, {
@@ -103,18 +169,23 @@ async function runCommand(command, args, options = {}) {
       timeout: Number(options.timeoutMs || COMMAND_TIMEOUT_MS),
       maxBuffer: 10 * 1024 * 1024,
     });
+    const stdout = redactCommandOutput(result.stdout || "", options);
+    const stderr = redactCommandOutput(result.stderr || "", options);
     return {
       ok: true,
-      stdout: result.stdout || "",
-      stderr: result.stderr || "",
-      output: `${result.stdout || ""}${result.stderr || ""}`.trim(),
+      stdout,
+      stderr,
+      output: `${stdout}${stderr}`.trim(),
     };
   } catch (error) {
-    const output = `${error.stdout || ""}${error.stderr || error.message || ""}`.trim();
+    const stdout = redactCommandOutput(error.stdout || "", options);
+    const stderr = redactCommandOutput(error.stderr || "", options);
+    const message = redactCommandOutput(error.message || "", options);
+    const output = `${stdout}${stderr || message}`.trim();
     const result = {
       ok: false,
-      stdout: error.stdout || "",
-      stderr: error.stderr || "",
+      stdout,
+      stderr,
       output,
       error,
     };
@@ -216,23 +287,23 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
   }
 }
 
-async function localBranchExists(repoPath, branchName) {
+async function localBranchExists(repoPath, branchName, options = {}) {
   const result = await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], { allowFailure: true });
   return result.ok;
 }
 
-async function remoteBranchExists(repoPath, branchName) {
-  const fetchResult = await git(repoPath, ["fetch", "origin", `refs/heads/${branchName}:refs/remotes/origin/${branchName}`], { allowFailure: true });
+async function remoteBranchExists(repoPath, branchName, options = {}) {
+  const fetchResult = await git(repoPath, ["fetch", "origin", `refs/heads/${branchName}:refs/remotes/origin/${branchName}`], { ...options, allowFailure: true });
   if (fetchResult.ok) return true;
   const result = await git(repoPath, ["rev-parse", "--verify", `refs/remotes/origin/${branchName}`], { allowFailure: true });
   return result.ok;
 }
 
-async function prepareIntegrationBranch(repoPath, project, branchName) {
+async function prepareIntegrationBranch(repoPath, project, branchName, options = {}) {
   await git(repoPath, ["check-ref-format", "--branch", branchName]);
 
-  const hasLocalBranch = await localBranchExists(repoPath, branchName);
-  const hasRemoteBranch = await remoteBranchExists(repoPath, branchName);
+  const hasLocalBranch = await localBranchExists(repoPath, branchName, options);
+  const hasRemoteBranch = await remoteBranchExists(repoPath, branchName, options);
 
   if (hasLocalBranch) {
     await git(repoPath, ["checkout", branchName]);
@@ -251,7 +322,7 @@ async function prepareIntegrationBranch(repoPath, project, branchName) {
   }
 
   const baseBranch = normalizeBranchName(project.defaultBranch || "main");
-  const baseFetch = await git(repoPath, ["fetch", "origin", `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`], { allowFailure: true });
+  const baseFetch = await git(repoPath, ["fetch", "origin", `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`], { ...options, allowFailure: true });
   if (!baseFetch.ok) {
     throw new Error(`Could not fetch default branch origin/${baseBranch} to create ${branchName}: ${baseFetch.output}`);
   }
@@ -278,7 +349,7 @@ async function resetPreparedIntegrationBranch(repoPath, branchName, preparedHead
   return git(repoPath, ["reset", "--keep", preparedHead], { allowFailure: true });
 }
 
-async function fetchTaskSource(repoPath, task) {
+async function fetchTaskSource(repoPath, task, options = {}) {
   const localRef = `refs/mission-control/tasks/${safeRefSegment(task.id)}`;
   const branchName = normalizeBranchName(task.branchName);
   const errors = [];
@@ -286,7 +357,7 @@ async function fetchTaskSource(repoPath, task) {
   if (branchName) {
     const branchFormat = await git(repoPath, ["check-ref-format", "--branch", branchName], { allowFailure: true });
     if (branchFormat.ok) {
-      const branchFetch = await git(repoPath, ["fetch", "origin", `refs/heads/${branchName}:${localRef}`], { allowFailure: true });
+      const branchFetch = await git(repoPath, ["fetch", "origin", `refs/heads/${branchName}:${localRef}`], { ...options, allowFailure: true });
       if (branchFetch.ok) {
         return { ok: true, ref: localRef, label: branchName, fetchOutput: branchFetch.output };
       }
@@ -298,7 +369,7 @@ async function fetchTaskSource(repoPath, task) {
 
   const prNumber = prNumberFromUrl(task.prUrl);
   if (prNumber) {
-    const prFetch = await git(repoPath, ["fetch", "origin", `refs/pull/${prNumber}/head:${localRef}`], { allowFailure: true });
+    const prFetch = await git(repoPath, ["fetch", "origin", `refs/pull/${prNumber}/head:${localRef}`], { ...options, allowFailure: true });
     if (prFetch.ok) {
       return { ok: true, ref: localRef, label: `pull/${prNumber}`, fetchOutput: prFetch.output };
     }
@@ -316,8 +387,8 @@ async function conflictFiles(repoPath) {
   return result.output ? result.output.split("\n").map((item) => item.trim()).filter(Boolean) : [];
 }
 
-async function mergeTaskSource(repoPath, task) {
-  const source = await fetchTaskSource(repoPath, task);
+async function mergeTaskSource(repoPath, task, options = {}) {
+  const source = await fetchTaskSource(repoPath, task, options);
   if (!source.ok) {
     return {
       taskId: task.id,
@@ -356,6 +427,8 @@ async function runValidationCommands(repoPath, commands, options) {
   for (const command of commands) {
     const result = await runCommand("sh", ["-lc", command], {
       cwd: repoPath,
+      env: options.env,
+      secrets: options.secrets,
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
       allowFailure: true,
     });
@@ -493,14 +566,15 @@ async function integrateProject(projectPlan, options = {}) {
     result.workspacePath = workspace.workspacePath;
     result.workspaceStrategy = workspace.strategy;
 
-    const prepared = await prepareIntegrationBranch(executionRepoPath, project, projectPlan.integrationBranch);
+    const gitOptions = { env: options.env, secrets: options.secrets };
+    const prepared = await prepareIntegrationBranch(executionRepoPath, project, projectPlan.integrationBranch, gitOptions);
     result.output = prepared;
     const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     preparedHead = preparedCommit.output.trim();
 
     const mergedTasks = [];
     for (const task of projectPlan.tasks) {
-      const taskResult = await mergeTaskSource(executionRepoPath, task);
+      const taskResult = await mergeTaskSource(executionRepoPath, task, gitOptions);
       result.tasks.push(taskResult);
       if (taskResult.status === "merged") mergedTasks.push(taskResult);
     }
@@ -530,7 +604,7 @@ async function integrateProject(projectPlan, options = {}) {
     const commit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     result.commit = commit.output.trim();
 
-    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${projectPlan.integrationBranch}`], { allowFailure: true });
+    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${projectPlan.integrationBranch}`], { ...gitOptions, allowFailure: true });
     if (!push.ok) {
       result.status = "push_failed";
       result.output = `Non-force push to ${projectPlan.integrationBranch} failed. The remote branch may have changed; rerun QA integration after fetching/reconciling it.\n${truncateOutput(push.output)}`;
@@ -566,6 +640,21 @@ async function integrateProject(projectPlan, options = {}) {
       }
     }
   }
+}
+
+function authFailureProjectResult(projectPlan, error) {
+  const output = `GitHub App auth failed for QA integration: ${error.message}`;
+  return {
+    ...projectPlan,
+    tasks: allTaskResults(projectPlan.tasks, "blocked", output),
+    status: "blocked",
+    output: truncateOutput(output),
+    commit: "",
+    validation: [],
+    sourceRepoPath: projectPlan.repoPath || "",
+    workspacePath: "",
+    workspaceStrategy: "",
+  };
 }
 
 function validationSummary(result) {
@@ -700,7 +789,21 @@ export async function runQaIntegration(input = {}) {
       });
       continue;
     }
-    const result = await integrateProject(projectPlan, input);
+    let authContext = null;
+    let result = null;
+    try {
+      authContext = await prepareQaIntegrationAuth(projectPlan, input);
+      const secrets = normalizeSecrets(input.secrets, githubAppAuthSecrets(authContext));
+      result = await integrateProject(projectPlan, {
+        ...input,
+        env: githubAppAuthEnv(authContext, input.env || {}),
+        secrets,
+      });
+    } catch (error) {
+      result = authFailureProjectResult(projectPlan, error);
+    } finally {
+      await cleanupGitHubAppAuth(authContext);
+    }
     await recordProjectResult(result);
     results.push(result);
   }

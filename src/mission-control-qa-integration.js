@@ -46,6 +46,10 @@ async function optionsFrom(args) {
     task: args.task || args.tasks || args["task-id"],
     dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
     validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
+    githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || defaults.githubAppAuth),
+    githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir,
+    githubAppRole: args["github-app-role"] || defaults.githubAppRole,
+    githubAppDefaultRole: args["github-app-default-role"] || defaults.githubAppDefaultRole,
     intervalSeconds: secondsFrom(
       args.interval || args["interval-seconds"] || defaults.intervalSeconds,
       DEFAULT_INTERVAL_SECONDS,
@@ -87,10 +91,15 @@ Usage:
   mission-control-qa-integration --project myapp
   mission-control-qa-integration --watch --interval 300
   mission-control qa-integrate --plan
+  mission-control qa-integrate --github-apps-dir .mission-control/github-apps
 
 The worker merges qa_review task PR heads into a project's configured
 non-production integrationBranch only when trustLeadApprovals is enabled. It
 does not merge PRs to production, deploy, or force-push.
+
+For GitHub repositories, the worker uses short-lived GitHub App installation
+tokens by default. If no dedicated qa-integration-worker app exists, it falls
+back to the builder app identity.
 `);
     return;
   }
