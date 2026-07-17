@@ -77,7 +77,9 @@ npm run qa-integrate -- --plan
 npm run qa-integrate -- --project myapp
 ```
 
-The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It also refuses dirty local worktrees, aborts merge conflicts, records comments on affected tasks, runs validation commands, and only then pushes the non-production integration branch. It does not merge PRs, deploy, or force-push.
+The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It prepares each QA bundle in an isolated workspace under `~/.mission-control/qa-workspaces/` by default, so the registered project checkout can stay on the owner's active branch with local changes. Override the workspace root with `MISSION_CONTROL_QA_WORKSPACE_ROOT` when needed, but keep it outside the registered project checkout.
+
+QA integration requires the registered project checkout to have an `origin` remote. It aborts merge conflicts, records comments on affected tasks, runs validation commands from the isolated workspace, and only then pushes the non-production integration branch to that remote. Reports and task comments include the workspace path and strategy used for the run. It does not merge PRs, deploy, force-push, or checkout the registered project repoPath.
 
 ## Uninstall
 

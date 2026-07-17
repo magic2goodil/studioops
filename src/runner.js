@@ -26,6 +26,7 @@ const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "blocked"]);
+const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
@@ -152,6 +153,22 @@ function branchNameForRun(run) {
   return String(run.branchName || `codex/${run.project?.key || run.projectId}-${run.taskId || run.id}`).trim();
 }
 
+function isBranchWriterRun(run) {
+  return run.group === "builder" && BRANCH_WRITER_ACTIONS.has(run.actionType);
+}
+
+export function branchReuseSafetyReason(run, pr) {
+  if (!isBranchWriterRun(run) || !run.prUrl || !pr) return "";
+  const state = String(pr.state || "").toUpperCase();
+  if (!state || state === "OPEN") return "";
+
+  const branch = branchNameForRun(run);
+  if (pr.headRefName && pr.headRefName !== branch) return "";
+
+  const status = pr.mergedAt ? `merged at ${pr.mergedAt}` : state.toLowerCase();
+  return `Refusing to reuse ${branch}: linked PR ${pr.url || run.prUrl} is ${status}. Create a new feature branch and PR before launching another builder run.`;
+}
+
 function resolveWorkspaceRoot(value) {
   const raw = String(value || DEFAULT_WORKSPACE_ROOT);
   if (raw === "~") return os.homedir();
@@ -184,6 +201,31 @@ async function gitOutput(args, options = {}) {
   } catch {
     return "";
   }
+}
+
+async function readLinkedPrState(run, env) {
+  if (!run.prUrl || !isBranchWriterRun(run)) return null;
+  try {
+    const result = await execFileAsync("gh", ["pr", "view", run.prUrl, "--json", "state,mergedAt,headRefName,url"], {
+      cwd: run.project.repoPath,
+      env,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    return JSON.parse(result.stdout || "{}");
+  } catch {
+    return null;
+  }
+}
+
+async function assertBranchReuseIsSafe(run, env, log) {
+  const pr = await readLinkedPrState(run, env);
+  if (!pr) return;
+  const reason = branchReuseSafetyReason(run, pr);
+  if (!reason) return;
+  log.write(`${reason}\n`);
+  await recordUnsafeBranchReuse(run, reason);
+  throw new Error(reason);
 }
 
 async function remoteBranchExists(repoPath, branch) {
@@ -267,6 +309,7 @@ async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
   await mkdir(path.dirname(workspacePath), { recursive: true });
   await safeRemoveWorkspace(workspacePath, workspaceRoot);
   await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000, env: gitEnv });
+  await assertBranchReuseIsSafe(run, gitEnv, log);
 
   const startRef = await remoteBranchExists(run.project.repoPath, branch)
     ? `origin/${branch}`
@@ -418,6 +461,33 @@ async function appendTaskComment(state, run, body, now, author = "Mission Contro
     author,
     body,
     createdAt: now,
+  });
+}
+
+async function recordUnsafeBranchReuse(run, reason) {
+  const now = new Date().toISOString();
+  await mutateState(async (state) => {
+    state.events = state.events || [];
+    const task = findTask(state, run.taskId);
+    if (task) {
+      task.status = "needs_changes";
+      task.assignedAgentRole = "builder";
+      task.updatedAt = now;
+    }
+    await appendTaskComment(
+      state,
+      run,
+      `${run.id} blocked before launch: ${reason}`,
+      now,
+    );
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "branch_reuse_blocked",
+      projectId: run.projectId,
+      taskId: run.taskId,
+      message: `${run.id} blocked stale branch reuse`,
+      createdAt: now,
+    });
   });
 }
 

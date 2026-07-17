@@ -78,7 +78,8 @@ Each time a builder moves work into `builder_review`, Mission Control increments
 
 6. `qa_review`
    - Optional Trust Leads gate for projects with `trustLeadApprovals: true` and a safe `integrationBranch`.
-   - The QA integration worker merges lead-approved PR heads into the configured non-production integration branch, runs validation commands, and records conflicts or validation failures back on the task.
+   - The QA integration worker prepares an isolated workspace for the project, merges lead-approved PR heads into the configured non-production integration branch, runs validation commands, and records conflicts or validation failures back on the task.
+   - The registered project `repoPath` remains on the owner's active branch with its existing dirty or clean state; QA reports and task comments show the isolated workspace path used for the run.
    - This branch must not be `main`, `master`, `production`, or the project default branch.
    - The human owner should test the full QA bundle locally before approving production.
    - This is not production approval.
