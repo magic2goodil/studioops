@@ -13,7 +13,9 @@ import {
 import {
   cleanupGitHubAppAuth,
   githubAppAuthEnv,
+  githubAppAuthSecrets,
   prepareGitHubAppAuth,
+  redactSecrets,
 } from "./github-app-auth.js";
 import { mutateState, readState } from "./store.js";
 
@@ -60,6 +62,19 @@ function truncateOutput(value, limit = MAX_OUTPUT_CHARS) {
   const text = String(value || "").trim();
   if (text.length <= limit) return text;
   return `${text.slice(0, limit)}\n...[truncated]`;
+}
+
+function normalizeSecrets(...values) {
+  const secrets = [];
+  for (const value of values) {
+    if (Array.isArray(value)) secrets.push(...value);
+    else if (value) secrets.push(value);
+  }
+  return [...new Set(secrets.map(String).filter(Boolean))];
+}
+
+function redactCommandOutput(value, options = {}) {
+  return redactSecrets(value, normalizeSecrets(options.secrets));
 }
 
 function normalizeBranchName(value) {
@@ -154,18 +169,23 @@ async function runCommand(command, args, options = {}) {
       timeout: Number(options.timeoutMs || COMMAND_TIMEOUT_MS),
       maxBuffer: 10 * 1024 * 1024,
     });
+    const stdout = redactCommandOutput(result.stdout || "", options);
+    const stderr = redactCommandOutput(result.stderr || "", options);
     return {
       ok: true,
-      stdout: result.stdout || "",
-      stderr: result.stderr || "",
-      output: `${result.stdout || ""}${result.stderr || ""}`.trim(),
+      stdout,
+      stderr,
+      output: `${stdout}${stderr}`.trim(),
     };
   } catch (error) {
-    const output = `${error.stdout || ""}${error.stderr || error.message || ""}`.trim();
+    const stdout = redactCommandOutput(error.stdout || "", options);
+    const stderr = redactCommandOutput(error.stderr || "", options);
+    const message = redactCommandOutput(error.message || "", options);
+    const output = `${stdout}${stderr || message}`.trim();
     const result = {
       ok: false,
-      stdout: error.stdout || "",
-      stderr: error.stderr || "",
+      stdout,
+      stderr,
       output,
       error,
     };
@@ -408,6 +428,7 @@ async function runValidationCommands(repoPath, commands, options) {
     const result = await runCommand("sh", ["-lc", command], {
       cwd: repoPath,
       env: options.env,
+      secrets: options.secrets,
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
       allowFailure: true,
     });
@@ -545,7 +566,7 @@ async function integrateProject(projectPlan, options = {}) {
     result.workspacePath = workspace.workspacePath;
     result.workspaceStrategy = workspace.strategy;
 
-    const gitOptions = { env: options.env };
+    const gitOptions = { env: options.env, secrets: options.secrets };
     const prepared = await prepareIntegrationBranch(executionRepoPath, project, projectPlan.integrationBranch, gitOptions);
     result.output = prepared;
     const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
@@ -772,9 +793,11 @@ export async function runQaIntegration(input = {}) {
     let result = null;
     try {
       authContext = await prepareQaIntegrationAuth(projectPlan, input);
+      const secrets = normalizeSecrets(input.secrets, githubAppAuthSecrets(authContext));
       result = await integrateProject(projectPlan, {
         ...input,
-        env: githubAppAuthEnv(authContext, {}),
+        env: githubAppAuthEnv(authContext, input.env || {}),
+        secrets,
       });
     } catch (error) {
       result = authFailureProjectResult(projectPlan, error);
