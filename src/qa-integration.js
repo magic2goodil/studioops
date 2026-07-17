@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -14,6 +16,8 @@ const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 120_000;
 const VALIDATION_TIMEOUT_MS = 10 * 60_000;
 const MAX_OUTPUT_CHARS = 4_000;
+const WORKSPACE_COMMAND_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_QA_WORKSPACE_ROOT = path.join(os.homedir(), ".mission-control", "qa-workspaces");
 const DEFAULT_QA_INTEGRATION_PATH = [
   "/opt/homebrew/bin",
   "/usr/local/bin",
@@ -63,6 +67,25 @@ function safeRefSegment(value) {
   return String(value || "task").replace(/[^A-Za-z0-9._-]/g, "-");
 }
 
+function workspaceSegment(value) {
+  return safeRefSegment(value)
+    .toLowerCase()
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 72) || "workspace";
+}
+
+function resolveWorkspaceRoot(value) {
+  const raw = String(value || DEFAULT_QA_WORKSPACE_ROOT);
+  if (raw === "~") return os.homedir();
+  if (raw.startsWith("~/")) return path.join(os.homedir(), raw.slice(2));
+  return path.resolve(raw);
+}
+
+function pathContains(parentPath, childPath) {
+  const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function prNumberFromUrl(value) {
   const match = String(value || "").match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/i);
   return match ? match[1] : "";
@@ -109,18 +132,88 @@ function git(repoPath, args, options = {}) {
   });
 }
 
-async function currentCheckout(repoPath) {
-  const branch = await git(repoPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], { allowFailure: true });
-  if (branch.ok && branch.output) return { branch: branch.output.trim() };
-  const head = await git(repoPath, ["rev-parse", "--verify", "HEAD"]);
-  return { head: head.output.trim() };
+async function safeRemoveWorkspace(workspacePath, workspaceRoot) {
+  const relative = path.relative(workspaceRoot, workspacePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Refusing to remove unsafe QA workspace path: ${workspacePath}`);
+  }
+  await rm(workspacePath, { recursive: true, force: true });
 }
 
-async function restoreCheckout(repoPath, original) {
-  if (!original?.branch && !original?.head) return;
-  const currentBranch = await git(repoPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], { allowFailure: true });
-  if (original.branch && currentBranch.ok && currentBranch.output.trim() === original.branch) return;
-  await git(repoPath, ["checkout", original.branch || original.head], { allowFailure: true });
+async function copyGitConfigValue(sourceRepoPath, workspacePath, key) {
+  const value = await git(sourceRepoPath, ["config", "--get", key], { allowFailure: true });
+  if (!value.ok || !value.output.trim()) return;
+  await git(workspacePath, ["config", key, value.output.trim()]);
+}
+
+async function copyGitIdentity(sourceRepoPath, workspacePath) {
+  await copyGitConfigValue(sourceRepoPath, workspacePath, "user.name");
+  await copyGitConfigValue(sourceRepoPath, workspacePath, "user.email");
+}
+
+async function configureWorkspaceOrigin(sourceRepoPath, workspacePath, originUrl) {
+  const fetchUrl = String(originUrl || "").trim();
+  await git(workspacePath, ["remote", "set-url", "origin", fetchUrl]);
+
+  const pushUrlResult = await git(sourceRepoPath, ["remote", "get-url", "--push", "--all", "origin"], { allowFailure: true });
+  const pushUrls = pushUrlResult.ok
+    ? pushUrlResult.output.split("\n").map((item) => item.trim()).filter(Boolean)
+    : [];
+  if (pushUrls.length === 0 || (pushUrls.length === 1 && pushUrls[0] === fetchUrl)) return;
+
+  await git(workspacePath, ["remote", "set-url", "--push", "origin", pushUrls[0]]);
+  for (const pushUrl of pushUrls.slice(1)) {
+    await git(workspacePath, ["remote", "set-url", "--add", "--push", "origin", pushUrl]);
+  }
+}
+
+async function seedLocalBranchFromSourceClone(workspacePath, branchName) {
+  if (!branchName || await localBranchExists(workspacePath, branchName)) return;
+  const clonedSourceRef = `refs/remotes/origin/${branchName}`;
+  const sourceBranch = await git(workspacePath, ["rev-parse", "--verify", clonedSourceRef], { allowFailure: true });
+  if (!sourceBranch.ok) return;
+  await git(workspacePath, ["branch", branchName, clonedSourceRef], { allowFailure: true });
+}
+
+async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(
+    options.qaWorkspaceRoot
+      || options.workspaceRoot
+      || process.env.MISSION_CONTROL_QA_WORKSPACE_ROOT,
+  );
+  if (pathContains(sourceRepoPath, workspaceRoot)) {
+    throw new Error(`QA workspace root must be outside the registered project repoPath: ${workspaceRoot}`);
+  }
+
+  const originUrl = await git(sourceRepoPath, ["remote", "get-url", "origin"], { allowFailure: true });
+  if (!originUrl.ok || !originUrl.output.trim()) {
+    throw new Error("Project repoPath must have an origin remote before QA integration can fetch source branches or push integration updates.");
+  }
+
+  const projectSegment = workspaceSegment(projectPlan.projectKey || projectPlan.projectId || "project");
+  const branchSegment = workspaceSegment(projectPlan.integrationBranch || "qa");
+  const workspaceParent = path.join(workspaceRoot, projectSegment);
+
+  await mkdir(workspaceParent, { recursive: true });
+  const workspacePath = await mkdtemp(path.join(workspaceParent, `${branchSegment}-`));
+
+  try {
+    await runCommand("git", ["clone", "--shared", "--no-tags", sourceRepoPath, workspacePath], {
+      timeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
+    });
+    await seedLocalBranchFromSourceClone(workspacePath, projectPlan.integrationBranch);
+    await configureWorkspaceOrigin(sourceRepoPath, workspacePath, originUrl.output);
+    await copyGitIdentity(sourceRepoPath, workspacePath);
+    return {
+      executionRepoPath: workspacePath,
+      workspacePath,
+      workspaceRoot,
+      strategy: "isolated_clone",
+    };
+  } catch (error) {
+    await safeRemoveWorkspace(workspacePath, workspaceRoot);
+    throw error;
+  }
 }
 
 async function localBranchExists(repoPath, branchName) {
@@ -367,6 +460,9 @@ async function integrateProject(projectPlan, options = {}) {
     output: "",
     commit: "",
     validation: [],
+    sourceRepoPath: repoPath,
+    workspacePath: "",
+    workspaceStrategy: "",
   };
 
   if (!projectPlan.tasks.length) {
@@ -387,27 +483,24 @@ async function integrateProject(projectPlan, options = {}) {
     return result;
   }
 
-  let original = null;
+  let workspace = null;
+  let executionRepoPath = "";
   let preparedHead = "";
   let pushed = false;
   try {
-    original = await currentCheckout(repoPath);
-    const worktreeStatus = await git(repoPath, ["status", "--porcelain"]);
-    if (worktreeStatus.output) {
-      result.status = "blocked";
-      result.output = `Project worktree has uncommitted changes. QA integration will not overwrite local work.\n${truncateOutput(worktreeStatus.output)}`;
-      result.tasks = allTaskResults(projectPlan.tasks, "blocked", result.output);
-      return result;
-    }
+    workspace = await prepareQaWorkspace(repoPath, projectPlan, options);
+    executionRepoPath = workspace.executionRepoPath;
+    result.workspacePath = workspace.workspacePath;
+    result.workspaceStrategy = workspace.strategy;
 
-    const prepared = await prepareIntegrationBranch(repoPath, project, projectPlan.integrationBranch);
+    const prepared = await prepareIntegrationBranch(executionRepoPath, project, projectPlan.integrationBranch);
     result.output = prepared;
-    const preparedCommit = await git(repoPath, ["rev-parse", "--verify", "HEAD"]);
+    const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     preparedHead = preparedCommit.output.trim();
 
     const mergedTasks = [];
     for (const task of projectPlan.tasks) {
-      const taskResult = await mergeTaskSource(repoPath, task);
+      const taskResult = await mergeTaskSource(executionRepoPath, task);
       result.tasks.push(taskResult);
       if (taskResult.status === "merged") mergedTasks.push(taskResult);
     }
@@ -425,7 +518,7 @@ async function integrateProject(projectPlan, options = {}) {
       return result;
     }
 
-    result.validation = await runValidationCommands(repoPath, validationCommands, options);
+    result.validation = await runValidationCommands(executionRepoPath, validationCommands, options);
     const failedValidation = result.validation.find((item) => !item.ok);
     if (failedValidation) {
       result.status = "validation_failed";
@@ -434,10 +527,10 @@ async function integrateProject(projectPlan, options = {}) {
       return result;
     }
 
-    const commit = await git(repoPath, ["rev-parse", "--verify", "HEAD"]);
+    const commit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     result.commit = commit.output.trim();
 
-    const push = await git(repoPath, ["push", "origin", `HEAD:refs/heads/${projectPlan.integrationBranch}`], { allowFailure: true });
+    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${projectPlan.integrationBranch}`], { allowFailure: true });
     if (!push.ok) {
       result.status = "push_failed";
       result.output = `Non-force push to ${projectPlan.integrationBranch} failed. The remote branch may have changed; rerun QA integration after fetching/reconciling it.\n${truncateOutput(push.output)}`;
@@ -456,8 +549,8 @@ async function integrateProject(projectPlan, options = {}) {
     result.tasks = result.tasks.length ? result.tasks : allTaskResults(projectPlan.tasks, "blocked", error.message);
     return result;
   } finally {
-    if (preparedHead && !pushed) {
-      const reset = await resetPreparedIntegrationBranch(repoPath, projectPlan.integrationBranch, preparedHead);
+    if (preparedHead && !pushed && executionRepoPath) {
+      const reset = await resetPreparedIntegrationBranch(executionRepoPath, projectPlan.integrationBranch, preparedHead);
       if (!reset.ok) {
         result.output = appendOutput(
           result.output,
@@ -465,7 +558,13 @@ async function integrateProject(projectPlan, options = {}) {
         );
       }
     }
-    await restoreCheckout(repoPath, original);
+    if (workspace?.workspacePath) {
+      try {
+        await safeRemoveWorkspace(workspace.workspacePath, workspace.workspaceRoot);
+      } catch (error) {
+        result.output = appendOutput(result.output, `Cleanup warning: ${error.message}`);
+      }
+    }
   }
 }
 
@@ -476,33 +575,40 @@ function validationSummary(result) {
     .join("\n");
 }
 
+function workspaceSummary(result) {
+  if (!result.workspacePath) return "";
+  const strategy = result.workspaceStrategy ? ` (${result.workspaceStrategy})` : "";
+  return `\n\nWorkspace: ${result.workspacePath}${strategy}`;
+}
+
 function commentForTask(projectResult, taskResult) {
   const branchLine = projectResult.integrationBranchUrl
     ? `\n\nIntegration branch: ${projectResult.integrationBranchUrl}`
     : `\n\nIntegration branch: ${projectResult.integrationBranch}`;
+  const workspaceLine = workspaceSummary(projectResult);
 
   if (taskResult.status === "ready") {
-    return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
+    return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
   }
 
   if (taskResult.status === "conflict") {
     const files = taskResult.conflicts?.length ? taskResult.conflicts.map((file) => `- ${file}`).join("\n") : "- Git did not report conflicted file names.";
-    return `QA integration blocked: merging ${taskResult.source} into ${projectResult.integrationBranch} produced conflicts. No changes were pushed.\n\nConflicts:\n${files}\n\nUpdate the PR branch or resolve the conflict, then rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
+    return `QA integration blocked: merging ${taskResult.source} into ${projectResult.integrationBranch} produced conflicts. No changes were pushed.${workspaceLine}\n\nConflicts:\n${files}\n\nUpdate the PR branch or resolve the conflict, then rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
   }
 
   if (taskResult.status === "validation_failed") {
-    return `QA integration validation failed after merging ${taskResult.source} into ${projectResult.integrationBranch}. No changes were pushed.${branchLine}\n\nValidation:\n${validationSummary(projectResult)}`;
+    return `QA integration validation failed after merging ${taskResult.source} into ${projectResult.integrationBranch}. No changes were pushed.${branchLine}${workspaceLine}\n\nValidation:\n${validationSummary(projectResult)}`;
   }
 
   if (taskResult.status === "validation_missing") {
-    return `QA integration paused after merging ${taskResult.source}: the project has no validationCommands configured, so Mission Control did not push or mark the QA bundle ready. Add validation commands and rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
+    return `QA integration paused after merging ${taskResult.source}: the project has no validationCommands configured, so Mission Control did not push or mark the QA bundle ready.${workspaceLine}\n\nAdd validation commands and rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
   }
 
   if (taskResult.status === "push_failed") {
-    return `QA integration could not update ${projectResult.integrationBranch} with ${taskResult.source}. No force push was attempted.\n\n${projectResult.output}`;
+    return `QA integration could not update ${projectResult.integrationBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
-  return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}`;
+  return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}`;
 }
 
 function taskPatchForResult(projectResult, taskResult, now) {
@@ -512,6 +618,8 @@ function taskPatchForResult(projectResult, taskResult, now) {
     integrationBranchUrl: projectResult.integrationBranchUrl,
     integrationCommit: taskResult.status === "ready" ? projectResult.commit : "",
     integrationSource: taskResult.source || "",
+    integrationWorkspacePath: projectResult.workspacePath || "",
+    integrationWorkspaceStrategy: projectResult.workspaceStrategy || "",
     integrationUpdatedAt: now,
     integrationConflictFiles: taskResult.conflicts || [],
     integrationValidation: {
@@ -621,6 +729,10 @@ export function formatQaIntegrationReport(report) {
     lines.push(`[${project.projectKey}] ${project.projectName || project.projectKey}`);
     lines.push(`  QA branch: ${project.integrationBranch || "(not configured)"}`);
     if (project.integrationBranchUrl) lines.push(`  Link: ${project.integrationBranchUrl}`);
+    if (project.workspacePath) {
+      const strategy = project.workspaceStrategy ? ` (${project.workspaceStrategy})` : "";
+      lines.push(`  Workspace: ${project.workspacePath}${strategy}`);
+    }
     if (!project.eligible) lines.push(`  Skipped: ${project.skipReason || project.output || "not eligible"}`);
     else if (project.status) lines.push(`  Status: ${project.status}`);
     if (project.output) lines.push(`  Note: ${project.output}`);
