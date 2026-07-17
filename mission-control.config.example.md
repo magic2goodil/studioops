@@ -85,7 +85,13 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "provider": "codex-cli",
       "useWorkspaces": true,
       "workspaceRoot": "~/.mission-control/run-workspaces",
-      "timeoutMs": 7200000
+      "timeoutMs": 7200000,
+      "githubAppAuth": true,
+      "githubAppCredentialsDir": ".mission-control/github-apps"
+    },
+    "qaIntegration": {
+      "intervalSeconds": 300,
+      "validationTimeoutMs": 600000
     },
     "validationCommands": [
       "npm run check"
@@ -93,8 +99,13 @@ The app reads the first fenced `json mission-control-config` block in this file.
     "reviewPolicy": {
       "maxBuilderReviewCycles": 2,
       "reviewerMayFixSmallIssues": true,
-      "leadOwnsFinalDecisionAtLimit": true
+      "leadOwnsFinalDecisionAtLimit": true,
+      "trustLeadApprovals": false,
+      "qaReviewerRole": "qa-reviewer",
+      "integrationBranch": ""
     },
+    "trustLeadApprovals": false,
+    "integrationBranch": "",
     "reviewPipeline": [
       {
         "key": "backend",
@@ -155,6 +166,8 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "repoPath": "~/Development/example",
       "repoUrl": "git@github.com:your-github-user-or-org/example.git",
       "defaultBranch": "main",
+      "trustLeadApprovals": false,
+      "integrationBranch": "qa/integration",
       "contextLinks": [
         "README.md",
         "AGENTS.md"
@@ -180,7 +193,10 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "reviewPolicy": {
         "maxBuilderReviewCycles": 2,
         "reviewerMayFixSmallIssues": true,
-        "leadOwnsFinalDecisionAtLimit": true
+        "leadOwnsFinalDecisionAtLimit": true,
+        "trustLeadApprovals": false,
+        "qaReviewerRole": "qa-reviewer",
+        "integrationBranch": "qa/example"
       },
       "reviewPipeline": [
         {
@@ -205,7 +221,7 @@ The app reads the first fenced `json mission-control-config` block in this file.
           "role": "lead-reviewer",
           "status": "lead_review",
           "required": true,
-          "description": "Always required before a task moves to user_review."
+          "description": "Always required before a task moves to qa_review or user_review."
         }
       ],
       "safetyRules": [

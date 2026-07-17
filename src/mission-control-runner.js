@@ -60,6 +60,10 @@ async function optionsFrom(args) {
     useWorkspaces: args["no-workspace"] ? false : (args.workspaces || defaults.useWorkspaces || defaults.isolatedWorkspaces),
     workspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
     timeoutMs: numberFrom(args["timeout-ms"] || defaults.timeoutMs, 0) || undefined,
+    githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || process.env.MISSION_CONTROL_GITHUB_APP_AUTH || defaults.githubAppAuth),
+    githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir || config?.githubApps?.credentialsDir,
+    githubAppRoleMap: config?.githubApps?.roleMap,
+    githubAppDefaultRole: config?.githubApps?.defaultRole,
     intervalSeconds: secondsFrom(
       args.interval || args["interval-seconds"] || defaults.intervalSeconds,
       DEFAULT_INTERVAL_SECONDS,
@@ -105,12 +109,16 @@ Usage:
   mission-control-runner --provider codex-sdk
   mission-control-runner --workspace-root .mission-control/run-workspaces
   mission-control-runner --no-workspace
+  mission-control-runner --github-apps-dir .mission-control/github-apps
+  mission-control-runner --no-github-app-auth
   MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk mission-control-runner
   mission-control runner --project event-horizons-web --limit 1
 
 The runner claims queued builder/reviewer dispatch runs and launches a Codex
 provider against the target project repository. Providers: codex-cli, codex-sdk.
-It does not merge PRs, deploy production, or bypass the human owner gate.
+It uses GitHub App installation tokens by default for GitHub push, PR, and
+review/comment activity. It does not merge PRs, deploy production, or bypass
+the human owner gate.
 `);
     return;
   }

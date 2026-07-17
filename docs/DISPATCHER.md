@@ -8,7 +8,8 @@ It can:
 
 - create builder runs for `start_builder`, `start_builder_fix`, and `return_to_builder`
 - create reviewer runs for `start_review` and `continue_review`
-- create owner handoff notifications for `notify_owner`
+- create owner handoff notifications for `notify_owner`, `notify_qa_review`, and validated `qa_bundle_ready` Trust Leads QA bundles
+- route `qa_integration_blocked` work back to a builder remediation run instead of leaving blocked QA bundles silent
 - update task status and assignment so work is not dispatched repeatedly
 - store a prompt snapshot on each run
 - enforce builder, reviewer, and owner handoff concurrency
@@ -16,10 +17,20 @@ It can:
 It does not:
 
 - merge PRs
+- update QA integration branches
 - deploy production
 - send external notifications
 - delete production files
 - silently approve work
+
+The QA integration worker is a separate local command:
+
+```bash
+npm run qa-integrate -- --plan
+npm run qa-integrate
+```
+
+The dispatcher may show `run_qa_integration` in supervisor output, but it does not dispatch that action to Codex. The integration worker performs the Git merge, validation, and non-force push for opted-in Trust Leads projects.
 
 ## Run A Plan
 
@@ -141,4 +152,4 @@ node src/mission-control-cli.js update-task task_1 --lane backend --work-area "s
 
 The dispatcher stops at the human owner gate.
 
-It may create an owner handoff run, but it must not merge, deploy, or mark final approval. Production deployment still belongs to the human owner and the project-specific protected GitHub Actions workflow.
+It may create an owner or QA handoff run, but it must not merge, deploy, or mark final approval. Production deployment still belongs to the human owner and the project-specific protected GitHub Actions workflow.

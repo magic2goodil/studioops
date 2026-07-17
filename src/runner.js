@@ -4,6 +4,16 @@ import path from "node:path";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  cleanupGitHubAppAuth,
+  createSecretRedactor,
+  formatGitHubAppAuthForLog,
+  formatGitHubAppAuthForPrompt,
+  githubAppAuthEnv,
+  githubAppAuthSecrets,
+  prepareGitHubAppAuth,
+  redactSecrets,
+} from "./github-app-auth.js";
 import { findProject, findTask, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 
@@ -111,6 +121,7 @@ function resolveWorkspaceRoot(value) {
 async function git(args, options = {}) {
   const result = await execFileAsync("git", args, {
     cwd: options.cwd,
+    env: options.env || process.env,
     timeout: options.timeout || 120_000,
     maxBuffer: options.maxBuffer || 20 * 1024 * 1024,
   });
@@ -169,7 +180,7 @@ async function persistRunWorkspace(run, workspace) {
   });
 }
 
-async function createWorktreeWorkspace(run, workspacePath, branch, startRef, log) {
+async function createWorktreeWorkspace(run, workspacePath, branch, startRef, log, gitEnv) {
   const repoPath = run.project.repoPath;
   const hasLocalBranch = await localBranchExists(repoPath, branch);
   const inUse = hasLocalBranch && await branchCheckedOut(repoPath, branch);
@@ -178,24 +189,25 @@ async function createWorktreeWorkspace(run, workspacePath, branch, startRef, log
   }
 
   if (hasLocalBranch) {
-    await git(["worktree", "add", workspacePath, branch], { cwd: repoPath });
+    await git(["worktree", "add", workspacePath, branch], { cwd: repoPath, env: gitEnv });
   } else {
-    await git(["worktree", "add", "-b", branch, workspacePath, startRef], { cwd: repoPath });
+    await git(["worktree", "add", "-b", branch, workspacePath, startRef], { cwd: repoPath, env: gitEnv });
   }
   log.write(`Workspace strategy: git worktree\n`);
 }
 
-async function createCloneWorkspace(run, workspacePath, branch, startRef, log) {
+async function createCloneWorkspace(run, workspacePath, branch, startRef, log, gitEnv) {
   const repoPath = run.project.repoPath;
   const originUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
-  await git(["clone", "--shared", "--no-tags", repoPath, workspacePath], { cwd: process.cwd(), timeout: 300_000 });
-  if (originUrl) await git(["remote", "set-url", "origin", originUrl], { cwd: workspacePath });
-  await git(["fetch", "origin", "--prune"], { cwd: workspacePath, timeout: 300_000 });
-  await git(["checkout", "-B", branch, startRef], { cwd: workspacePath });
+  await git(["clone", "--shared", "--no-tags", repoPath, workspacePath], { cwd: process.cwd(), timeout: 300_000, env: gitEnv });
+  if (originUrl) await git(["remote", "set-url", "origin", originUrl], { cwd: workspacePath, env: gitEnv });
+  await git(["fetch", "origin", "--prune"], { cwd: workspacePath, timeout: 300_000, env: gitEnv });
+  await git(["checkout", "-B", branch, startRef], { cwd: workspacePath, env: gitEnv });
   log.write(`Workspace strategy: isolated clone fallback\n`);
 }
 
-async function prepareRunWorkspace(run, input = {}, log) {
+async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
+  const gitEnv = githubAppAuthEnv(authContext, process.env);
   const enabled = booleanOption(input.useWorkspaces ?? input.workspaces ?? process.env.MISSION_CONTROL_USE_WORKSPACES, true);
   if (!enabled) {
     return {
@@ -213,7 +225,7 @@ async function prepareRunWorkspace(run, input = {}, log) {
 
   await mkdir(path.dirname(workspacePath), { recursive: true });
   await safeRemoveWorkspace(workspacePath, workspaceRoot);
-  await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000 });
+  await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000, env: gitEnv });
 
   const startRef = await remoteBranchExists(run.project.repoPath, branch)
     ? `origin/${branch}`
@@ -226,7 +238,7 @@ async function prepareRunWorkspace(run, input = {}, log) {
   log.write(`Start ref: ${startRef}\n`);
 
   try {
-    await createWorktreeWorkspace(run, workspacePath, branch, startRef, log);
+    await createWorktreeWorkspace(run, workspacePath, branch, startRef, log, gitEnv);
     const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "worktree" };
     await persistRunWorkspace(run, workspace);
     return workspace;
@@ -234,7 +246,7 @@ async function prepareRunWorkspace(run, input = {}, log) {
     log.write(`Worktree preparation fell back to clone: ${error.message}\n`);
     await safeRemoveWorkspace(workspacePath, workspaceRoot);
     await mkdir(path.dirname(workspacePath), { recursive: true });
-    await createCloneWorkspace(run, workspacePath, branch, startRef, log);
+    await createCloneWorkspace(run, workspacePath, branch, startRef, log, gitEnv);
     const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "clone" };
     await persistRunWorkspace(run, workspace);
     return workspace;
@@ -304,7 +316,7 @@ export function planRunnableRuns(state, input = {}) {
   };
 }
 
-function runnerPrompt(run, project) {
+function runnerPrompt(run, project, authContext = null) {
   const missionControlCli = path.join(process.cwd(), "src", "mission-control-cli.js");
   const taskUrl = run.taskUrl || `http://127.0.0.1:4317/tasks/${run.taskId}`;
   const sourceRepoPath = project?.sourceRepoPath || project?.repoPath || "(not recorded)";
@@ -327,6 +339,8 @@ Run details:
 - Task URL: ${taskUrl}
 - Branch: ${run.branchName || "(not recorded)"}
 - PR: ${run.prUrl || "(not recorded)"}
+
+${formatGitHubAppAuthForPrompt(authContext)}
 
 Mission Control CLI:
 \`node ${missionControlCli}\`
@@ -505,13 +519,13 @@ function sdkThreadOptions(run, input = {}) {
   };
 }
 
-function sdkClientOptions(input = {}) {
+function sdkClientOptions(input = {}, authContext = null) {
   const codexPathOverride = input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || DEFAULT_CODEX_BIN;
   const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
-  const env = {
+  const env = githubAppAuthEnv(authContext, {
     ...process.env,
     PATH: childPath,
-  };
+  });
   return {
     codexPathOverride,
     env,
@@ -530,6 +544,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
   let status = "completed";
   let notes = "";
   let executionRun = run;
+  let authContext = null;
 
   const timeout = setTimeout(() => {
     log.write(`\nRunner timeout after ${Math.round(timeoutMs / 1000)}s. Aborting Codex SDK turn.\n`);
@@ -540,15 +555,17 @@ async function runClaimedRunWithSdk(run, input = {}) {
   try {
     log.write(`Mission Control SDK Runner started ${run.id} at ${new Date().toISOString()}\n`);
     log.write(`Provider: codex-sdk\n`);
-    const workspace = await prepareRunWorkspace(run, input, log);
+    authContext = await prepareGitHubAppAuth(run, input);
+    log.write(formatGitHubAppAuthForLog(authContext));
+    const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);
-    const prompt = runnerPrompt(executionRun, executionRun.project);
+    const prompt = runnerPrompt(executionRun, executionRun.project, authContext);
     log.write(`Repo: ${executionRun.project.repoPath}\n`);
     log.write(`Existing thread: ${run.threadId || "(new thread)"}\n`);
     log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
 
     const { Codex } = await import("@openai/codex-sdk");
-    const codex = new Codex(sdkClientOptions(input));
+    const codex = new Codex(sdkClientOptions(input, authContext));
     const options = sdkThreadOptions(executionRun, input);
     const thread = run.threadId
       ? codex.resumeThread(run.threadId, options)
@@ -556,7 +573,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
 
     for await (const event of events) {
-      log.write(`${JSON.stringify(event)}\n`);
+      log.write(`${redactSecrets(JSON.stringify(event), githubAppAuthSecrets(authContext))}\n`);
       if (event.type === "thread.started") {
         await persistRunThread(run, event.thread_id);
       } else if (event.type === "item.completed" && event.item?.type === "agent_message") {
@@ -569,12 +586,12 @@ async function runClaimedRunWithSdk(run, input = {}) {
     }
 
     if (thread.id) await persistRunThread(run, thread.id);
-    notes = finalResponse.trim();
+    notes = redactSecrets(finalResponse.trim(), githubAppAuthSecrets(authContext));
     await writeFile(lastMessagePath, notes, "utf8");
   } catch (error) {
     status = "failed";
     exitCode = error?.name === "AbortError" ? "timeout" : "sdk_error";
-    notes = error?.message || String(error);
+    notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
     log.write(`\nCodex SDK runner error: ${notes}\n`);
     try {
       await writeFile(lastMessagePath, notes, "utf8");
@@ -585,6 +602,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     clearTimeout(timeout);
     log.write(`\nMission Control SDK Runner finished ${run.id} at ${new Date().toISOString()} with status ${status}\n`);
     log.end();
+    await cleanupGitHubAppAuth(authContext);
   }
 
   return completeRun(run.id, {
@@ -606,14 +624,18 @@ async function runClaimedRunWithCli(run, input = {}) {
   const log = createWriteStream(outputPath, { flags: "a" });
   let executionRun = run;
   let prompt = "";
+  let authContext = null;
   try {
-    const workspace = await prepareRunWorkspace(run, input, log);
+    authContext = await prepareGitHubAppAuth(run, input);
+    log.write(formatGitHubAppAuthForLog(authContext));
+    const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);
-    prompt = runnerPrompt(executionRun, executionRun.project);
+    prompt = runnerPrompt(executionRun, executionRun.project, authContext);
   } catch (error) {
-    const notes = error?.message || String(error);
+    const notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
     log.write(`\nWorkspace preparation failed: ${notes}\n`);
     log.end();
+    await cleanupGitHubAppAuth(authContext);
     try {
       await writeFile(lastMessagePath, notes, "utf8");
     } catch {
@@ -639,6 +661,9 @@ async function runClaimedRunWithCli(run, input = {}) {
 
   return new Promise((resolve) => {
     let settled = false;
+    const secrets = githubAppAuthSecrets(authContext);
+    const stdoutRedactor = createSecretRedactor(secrets);
+    const stderrRedactor = createSecretRedactor(secrets);
     log.write(`Mission Control Runner started ${run.id} at ${new Date().toISOString()}\n`);
     log.write(`Command: ${codexBin} ${args.join(" ")}\n\n`);
     log.write(`PATH: ${childPath}\n`);
@@ -649,7 +674,7 @@ async function runClaimedRunWithCli(run, input = {}) {
     const child = spawn(codexBin, args, {
       cwd: executionRun.project.repoPath,
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
+      env: githubAppAuthEnv(authContext, {
         ...process.env,
         PATH: childPath,
         MISSION_CONTROL_RUN_ID: run.id,
@@ -657,7 +682,7 @@ async function runClaimedRunWithCli(run, input = {}) {
         MISSION_CONTROL_WORKSPACE_PATH: executionRun.project.repoPath,
         MISSION_CONTROL_SOURCE_REPO_PATH: executionRun.project.sourceRepoPath || run.project.repoPath,
         MISSION_CONTROL_WORK_LANE: run.lane || "",
-      },
+      }),
     });
 
     const timeout = setTimeout(() => {
@@ -673,19 +698,23 @@ async function runClaimedRunWithCli(run, input = {}) {
     }, timeoutMs);
     timeout.unref();
 
-    child.stdout.on("data", (chunk) => log.write(chunk));
-    child.stderr.on("data", (chunk) => log.write(chunk));
+    child.stdout.on("data", (chunk) => stdoutRedactor.write(chunk, (text) => log.write(text)));
+    child.stderr.on("data", (chunk) => stderrRedactor.write(chunk, (text) => log.write(text)));
     child.on("error", async (error) => {
       settled = true;
       clearTimeout(timeout);
-      log.write(`\nRunner spawn error: ${error.message}\n`);
+      stdoutRedactor.flush((text) => log.write(text));
+      stderrRedactor.flush((text) => log.write(text));
+      const notes = redactSecrets(error.message, secrets);
+      log.write(`\nRunner spawn error: ${notes}\n`);
       log.end();
+      await cleanupGitHubAppAuth(authContext);
       const completed = await completeRun(run.id, {
         status: "failed",
         exitCode: "spawn_error",
         outputPath,
         lastMessagePath,
-        notes: error.message,
+        notes,
       });
       resolve(completed);
     });
@@ -694,12 +723,16 @@ async function runClaimedRunWithCli(run, input = {}) {
       clearTimeout(timeout);
       let notes = "";
       try {
-        notes = (await readFile(lastMessagePath, "utf8")).trim();
+        notes = redactSecrets((await readFile(lastMessagePath, "utf8")).trim(), secrets);
+        if (notes) await writeFile(lastMessagePath, notes, "utf8");
       } catch {
         notes = "";
       }
+      stdoutRedactor.flush((text) => log.write(text));
+      stderrRedactor.flush((text) => log.write(text));
       log.write(`\nMission Control Runner finished ${run.id} at ${new Date().toISOString()} with code ${code}\n`);
       log.end();
+      await cleanupGitHubAppAuth(authContext);
       const completed = await completeRun(run.id, {
         status: code === 0 ? "completed" : "failed",
         exitCode: code,

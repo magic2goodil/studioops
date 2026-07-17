@@ -7,6 +7,9 @@ const DISPATCHABLE_ACTIONS = new Set([
   "return_to_builder",
   "start_review",
   "continue_review",
+  "qa_bundle_ready",
+  "qa_integration_blocked",
+  "notify_qa_review",
   "notify_owner",
   "unblock_task",
 ]);
@@ -43,7 +46,12 @@ function normalizeList(value) {
 
 function runGroupFor(action) {
   const role = String(action.role || "").toLowerCase();
-  if (action.type === "notify_owner" || role === "owner") return "owner";
+  if (
+    action.type === "notify_owner"
+    || action.type === "notify_qa_review"
+    || action.type === "qa_bundle_ready"
+    || role === "owner"
+  ) return "owner";
   if (role.includes("review")) return "reviewer";
   return "builder";
 }
@@ -55,13 +63,13 @@ function concurrencyLimitFor(group, options) {
 }
 
 function dispatchStatusFor(action) {
-  if (action.type === "notify_owner") return "notified";
+  if (["notify_owner", "notify_qa_review", "qa_bundle_ready"].includes(action.type)) return "notified";
   if (action.type === "unblock_task") return "queued";
   return "queued";
 }
 
 function taskStatusFor(action) {
-  if (action.type === "notify_owner") return "";
+  if (["notify_owner", "notify_qa_review", "qa_bundle_ready", "qa_integration_blocked"].includes(action.type)) return "";
   if (action.type === "unblock_task") return "queued";
   if (action.type === "start_builder" || action.type === "start_builder_fix" || action.type === "return_to_builder") {
     return "in_progress";
@@ -71,14 +79,16 @@ function taskStatusFor(action) {
 
 function dispatchKeyFor(task, action) {
   const cycle = Number(task.reviewCycle || 0);
-  const status = action.type === "notify_owner" ? "owner" : String(action.nextStatus || task.status || "");
+  const status = ["notify_owner", "notify_qa_review", "qa_bundle_ready", "qa_integration_blocked"].includes(action.type)
+    ? action.type
+    : String(action.nextStatus || task.status || "");
   return `${task.id}:${cycle}:${action.type}:${action.role || "system"}:${status}`;
 }
 
 function activeRunMatches(run, action, task) {
   if (run.taskId !== task.id) return false;
-  if (action.type === "notify_owner") {
-    return run.actionType === "notify_owner" && !FINAL_RUN_STATUSES.has(run.status);
+  if (["notify_owner", "notify_qa_review", "qa_bundle_ready"].includes(action.type)) {
+    return run.actionType === action.type && !FINAL_RUN_STATUSES.has(run.status);
   }
   if (!ACTIVE_RUN_STATUSES.has(run.status)) return false;
   if (run.role !== action.role) return false;
@@ -143,6 +153,29 @@ function findLaneConflict(state, selected, action, task) {
 }
 
 function ownerPrompt(action) {
+  if (action.type === "notify_qa_review" || action.type === "qa_bundle_ready") {
+    return `Mission Control local QA review requested.
+
+Project: ${action.projectName}
+Task: ${action.taskId} - ${action.taskTitle}
+Task URL: ${action.taskUrl}
+Feature branch: ${action.branchName || "(not recorded)"}
+Pull request: ${action.prUrl || "(not recorded)"}
+Integration branch: ${action.integrationBranch || "(not configured)"}
+
+Reason:
+${action.reason}
+
+Local QA decision needed:
+- Pull or build the non-production review/integration branch for this project.
+- Visually test the task against its acceptance criteria and attached mockups.
+- Review all tasks in the QA Review list for this project before approving production.
+- If it fails local QA, move the task to needs_changes with concrete notes.
+- If it passes local QA, approve/merge according to the protected project release workflow.
+- Do not deploy production without explicit owner approval.
+`;
+  }
+
   return `Mission Control owner handoff requested.
 
 Project: ${action.projectName}
@@ -161,7 +194,40 @@ Human owner decision needed:
 `;
 }
 
+function qaIntegrationBlockedPrompt(action) {
+  return `Mission Control QA integration remediation requested.
+
+Project: ${action.projectName}
+Task: ${action.taskId} - ${action.taskTitle}
+Task URL: ${action.taskUrl}
+Feature branch: ${action.branchName || "(not recorded)"}
+Pull request: ${action.prUrl || "(not recorded)"}
+Integration branch: ${action.integrationBranch || "(not configured)"}
+Integration status: ${action.integrationStatus || "(not recorded)"}
+
+Reason:
+${action.reason}
+
+Remediation expectations:
+- Inspect the task comments and QA integration logs for the exact blocker.
+- Fix the blocker in the safest narrow way available.
+- For dirty worktrees, preserve unrelated local/user files; move them aside or use an isolated clean checkout rather than deleting them.
+- For merge conflicts, update the feature branch or integration source branch without squashing unrelated merged work.
+- For validation failures, fix the actual failing code or test configuration.
+- Rerun the relevant validation and QA integration command when safe:
+  ${action.integrationCommand || "npm run qa-integrate"}
+- Leave a Mission Control comment explaining the change, validation result, and next state.
+- Do not merge PRs, deploy production, or remove unrelated production files.
+`;
+}
+
 function dispatchComment(run, action) {
+  if (action.type === "notify_qa_review" || action.type === "qa_bundle_ready") {
+    return `Local QA review notification queued as dispatch ${run.id}. Trust Leads accepted the lead review decision; this task is ready for non-production visual QA.${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
+  }
+  if (action.type === "qa_integration_blocked") {
+    return `QA integration remediation queued as dispatch ${run.id}. Mission Control found a blocker before owner QA and routed it back to a builder.${action.integrationStatus ? `\n\nIntegration status: ${action.integrationStatus}` : ""}${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
+  }
   if (action.type === "notify_owner") {
     return `Owner review notification queued as dispatch ${run.id}. Task is ready for final human review.${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
   }
@@ -177,7 +243,9 @@ function projectAllowed(action, options) {
 function makeRun(state, task, action, options, now) {
   const group = runGroupFor(action);
   const role = action.role || (group === "owner" ? "owner" : "builder");
-  const prompt = role === "owner" ? ownerPrompt(action) : generatePrompt(state, task.id, role);
+  const prompt = action.type === "qa_integration_blocked"
+    ? qaIntegrationBlockedPrompt(action)
+    : role === "owner" ? ownerPrompt(action) : generatePrompt(state, task.id, role);
   const threadId = action.threadId || (group === "reviewer" ? task.reviewerThreadId : task.assignedThreadId) || "";
   const profile = laneProfile(task, action);
   return {
@@ -200,6 +268,9 @@ function makeRun(state, task, action, options, now) {
     taskUrl: action.taskUrl || "",
     branchName: action.branchName || "",
     prUrl: action.prUrl || "",
+    integrationBranch: action.integrationBranch || "",
+    integrationBranchUrl: action.integrationBranchUrl || "",
+    integrationStatus: action.integrationStatus || "",
     threadId,
     notes: "",
     createdAt: now,

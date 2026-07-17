@@ -1,7 +1,7 @@
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordReview, taskWithProject, updateTask } from "./store.js";
+import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
 import { loadConfig } from "./config.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
@@ -145,6 +145,12 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (projectMatch && req.method === "PATCH") {
+    sendJson(res, 200, { project: await updateProject(projectMatch[1], await readJsonBody(req)) });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/tasks") {
     sendJson(res, 201, { task: await addTask(await readJsonBody(req)) });
     return;
@@ -171,6 +177,24 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/automation/tick") {
     sendJson(res, 200, await automationTick(await readJsonBody(req)));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/qa/review-list") {
+    const state = await readState();
+    const projectFilter = url.searchParams.get("project") || "";
+    const project = projectFilter
+      ? state.projects.find((item) => item.id === projectFilter || item.key === projectFilter)
+      : null;
+    if (projectFilter && !project) {
+      sendJson(res, 404, { error: "Project not found." });
+      return;
+    }
+    const tasks = state.tasks
+      .filter((task) => task.status === "qa_review")
+      .filter((task) => !project || task.projectId === project.id)
+      .map((task) => taskWithProject(state, task));
+    sendJson(res, 200, { generatedAt: new Date().toISOString(), project: project || null, tasks });
     return;
   }
 

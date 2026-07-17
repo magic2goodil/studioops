@@ -11,6 +11,7 @@ import {
   generatePrompt,
   recordReview,
   readState,
+  updateProject,
   updateTask,
   updateRun,
 } from "./store.js";
@@ -18,6 +19,8 @@ import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js"
 import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
+import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
+import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
 import {
   expandHome,
   loadConfig,
@@ -127,6 +130,10 @@ async function setup() {
           workspaceRoot: "~/.mission-control/run-workspaces",
           timeoutMs: 7200000,
         },
+        qaIntegration: {
+          intervalSeconds: 300,
+          validationTimeoutMs: 600000,
+        },
         notifier: {
           intervalSeconds: 60,
           channel: "macos",
@@ -137,7 +144,12 @@ async function setup() {
           maxBuilderReviewCycles: 2,
           reviewerMayFixSmallIssues: true,
           leadOwnsFinalDecisionAtLimit: true,
+          trustLeadApprovals: false,
+          qaReviewerRole: "qa-reviewer",
+          integrationBranch: "",
         },
+        trustLeadApprovals: false,
+        integrationBranch: "",
         standards: [
           "standards/engineering.md",
           "standards/design-system.md",
@@ -214,6 +226,8 @@ async function setup() {
         validationCommands: validation.trim() ? [validation.trim()] : [],
         safetyRules: config.defaults.safetyRules,
         reviewPolicy: config.defaults.reviewPolicy,
+        trustLeadApprovals: false,
+        integrationBranch: "",
       });
     }
 
@@ -268,6 +282,7 @@ Commands:
   projects                      List projects
   tasks                         List tasks, optionally --project key and --status value
   add-project --key --name      Add a project
+  update-project PROJECT        Update project settings and Trust Leads policy
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Update task status
@@ -277,11 +292,13 @@ Commands:
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
+  qa-integrate                  Merge lead-approved PR heads into QA integration branches
   notifier                      Send local owner/failure notifications
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
   prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, or lead-reviewer prompt
+  qa-list                       List tasks waiting for local QA review
 
 Task fields:
   --story                       User story, such as "As a customer..."
@@ -293,6 +310,10 @@ Task fields:
   --branch                      Associated feature branch
   --pr-url                      Associated pull request URL
   --standards                   Project standards, comma or newline separated
+  --trust-leads                 Route lead-approved work to QA integration and review
+  --trust-lead-approvals        Alias for --trust-leads
+  --no-trust-leads              Disable Trust Leads for a project
+  --integration-branch          Non-production branch used for QA integration bundles
   --parent                      Parent epic/task ID
   --depends-on                  Dependency task IDs, comma or newline separated
 
@@ -302,6 +323,7 @@ Automation:
   mission-control dispatcher --plan
   mission-control runner --plan
   mission-control runner --provider codex-sdk
+  mission-control qa-integrate --plan
   mission-control notifier --plan
   mission-control runs --status queued
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
@@ -326,7 +348,35 @@ Automation:
       key: project.key,
       name: project.name,
       repo: project.repoPath || project.repoUrl,
-    })), ["id", "key", "name", "repo"]);
+      trustLeads: project.reviewPolicy?.trustLeadApprovals ? "yes" : "no",
+      integrationBranch: project.reviewPolicy?.integrationBranch || "",
+    })), ["id", "key", "name", "repo", "trustLeads", "integrationBranch"]);
+    return;
+  }
+
+  if (command === "qa-list") {
+    const state = await readState();
+    const projectFilter = args.project
+      ? state.projects.find((project) => project.id === args.project || project.key === args.project)
+      : null;
+    if (args.project && !projectFilter) throw new Error(`Unknown project: ${args.project}`);
+    const tasks = state.tasks
+      .filter((task) => task.status === "qa_review")
+      .filter((task) => !projectFilter || task.projectId === projectFilter.id);
+    printTable(tasks.map((task) => {
+      const project = state.projects.find((item) => item.id === task.projectId);
+      const integrationBranch = task.integrationBranch || integrationBranchName(project);
+      const integrationLink = task.integrationBranchUrl || branchWebUrl(project, integrationBranch);
+      return {
+        id: task.id,
+        project: project?.key || task.projectId,
+        integrationBranch,
+        integrationLink,
+        branch: task.branchName || "",
+        pr: task.prUrl || "",
+        title: task.title,
+      };
+    }), ["id", "project", "integrationBranch", "integrationLink", "branch", "pr", "title"]);
     return;
   }
 
@@ -392,6 +442,10 @@ Automation:
   }
 
   if (command === "add-project") {
+    const trustLeadApprovals = args["no-trust-leads"]
+      ? false
+      : args["trust-lead-approvals"] || args.trustLeadApprovals || args["trust-leads"];
+    const integrationBranch = args["integration-branch"] || args.integrationBranch || "";
     const project = await addProject({
       key: args.key,
       name: args.name,
@@ -403,8 +457,38 @@ Automation:
       contextLinks: args.context,
       standards: args.standards,
       safetyRules: args.safety,
+      reviewPolicy: {
+        trustLeadApprovals,
+        integrationBranch,
+      },
+      trustLeadApprovals,
+      integrationBranch,
     });
     console.log(`Added project ${project.id}: ${project.name}`);
+    return;
+  }
+
+  if (command === "update-project") {
+    const projectId = args._[1] || args.project;
+    const patch = {};
+    if (Object.prototype.hasOwnProperty.call(args, "name")) patch.name = args.name;
+    if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
+    if (Object.prototype.hasOwnProperty.call(args, "repo-path")) patch.repoPath = expandHome(args["repo-path"] || "");
+    if (Object.prototype.hasOwnProperty.call(args, "repo-url")) patch.repoUrl = args["repo-url"];
+    if (Object.prototype.hasOwnProperty.call(args, "default-branch")) patch.defaultBranch = args["default-branch"];
+    if (Object.prototype.hasOwnProperty.call(args, "validation")) patch.validationCommands = args.validation;
+    if (Object.prototype.hasOwnProperty.call(args, "context")) patch.contextLinks = args.context;
+    if (Object.prototype.hasOwnProperty.call(args, "standards")) patch.standards = args.standards;
+    if (Object.prototype.hasOwnProperty.call(args, "safety")) patch.safetyRules = args.safety;
+    const reviewPolicy = {};
+    if (Object.prototype.hasOwnProperty.call(args, "trust-leads")) reviewPolicy.trustLeadApprovals = true;
+    if (Object.prototype.hasOwnProperty.call(args, "trust-lead-approvals")) reviewPolicy.trustLeadApprovals = args["trust-lead-approvals"];
+    if (Object.prototype.hasOwnProperty.call(args, "no-trust-leads")) reviewPolicy.trustLeadApprovals = false;
+    if (Object.prototype.hasOwnProperty.call(args, "qa-reviewer-role")) reviewPolicy.qaReviewerRole = args["qa-reviewer-role"];
+    if (Object.prototype.hasOwnProperty.call(args, "integration-branch")) reviewPolicy.integrationBranch = args["integration-branch"];
+    if (Object.keys(reviewPolicy).length) patch.reviewPolicy = reviewPolicy;
+    const project = await updateProject(projectId, patch);
+    console.log(`Updated project ${project.id}: ${project.name}`);
     return;
   }
 
@@ -544,6 +628,8 @@ Automation:
       useWorkspaces: args["no-workspace"] ? false : args.workspaces,
       workspaceRoot: args["workspace-root"],
       timeoutMs: args["timeout-ms"],
+      githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
+      githubAppCredentialsDir: args["github-apps-dir"],
     };
     if (args.plan || args["dry-run"] || args.dryRun) {
       const state = await readState();
@@ -566,6 +652,26 @@ Automation:
     });
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(formatNotificationReport(report));
+    return;
+  }
+
+  if (command === "qa-integrate" || command === "qa-integration") {
+    const options = {
+      project: args.project || args.projects,
+      task: args.task || args.tasks || args["task-id"],
+      dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
+      validationTimeoutMs: args["validation-timeout-ms"],
+    };
+    if (args.plan || args["dry-run"] || args.dryRun) {
+      const state = await readState();
+      const plan = planQaIntegrations(state, options);
+      if (args.json) console.log(JSON.stringify(plan, null, 2));
+      else console.log(formatQaIntegrationReport(plan));
+      return;
+    }
+    const report = await runQaIntegration(options);
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatQaIntegrationReport(report));
     return;
   }
 

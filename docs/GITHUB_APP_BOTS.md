@@ -28,6 +28,8 @@ Credentials are written locally under:
 
 That directory is ignored by git.
 
+The runner uses GitHub App auth by default for builder and reviewer runs. If credentials are missing, invalid, or not installed on the target repository, the run fails before Codex starts. This prevents a worker from falling back to your personal `gh` login or SSH identity for bot-authored PR work.
+
 ## Separate Role Apps
 
 If you want GitHub to show different bot actors for different automation roles, run:
@@ -70,14 +72,77 @@ The setup helper stores:
 
 Private keys and secrets are written with owner-only file permissions where the operating system supports that.
 
-## Remaining Integration Step
+## Runtime Auth
 
-Creating the app registration is only the identity foundation.
+When the runner claims a builder or reviewer run, it:
 
-For future PRs to appear as the bot, Mission Control must also use the app installation token when it:
+- reads the role's app metadata from `.mission-control/github-apps/`
+- signs a GitHub App JWT with the local private key
+- resolves the app installation for the run's `github.com` repository
+- creates a repository-scoped installation token with only the role permissions needed for branch, PR, comment, and review activity
+- passes the token to child Codex runs as `GH_TOKEN` and `GITHUB_TOKEN` so `gh pr create`, comments, and reviews use the app identity
+- passes the token to `git` through `GIT_ASKPASS`, not through command arguments or remote URLs
+- rewrites GitHub SSH remotes to HTTPS for the child process only, so `git push origin ...` uses HTTPS without changing persistent remotes
+- redacts the installation token from runner logs and last-message files if a child process prints it
 
-- pushes branches over HTTPS
-- creates pull requests
-- posts comments or reviews
+Installation tokens are short-lived. GitHub controls the final expiry, and Mission Control rejects expired token responses.
 
-If Codex uses your local SSH key or your `gh auth` login, GitHub will still attribute PRs to you.
+## Role Mapping
+
+With `npm run setup-github-app`, all roles use `.mission-control/github-apps/default/`.
+
+With `npm run setup-github-role-apps`, Mission Control looks for these directories:
+
+- `builder`
+- `backend-reviewer`
+- `frontend-reviewer`
+- `lead-reviewer`
+
+You can override the mapping in `mission-control.config.md`:
+
+```json
+"githubApps": {
+  "credentialsDir": ".mission-control/github-apps",
+  "defaultRole": "default",
+  "roleMap": {
+    "builder": "default",
+    "backend-reviewer": "backend-reviewer",
+    "frontend-reviewer": "frontend-reviewer",
+    "lead-reviewer": "lead-reviewer"
+  }
+}
+```
+
+## Runner Options
+
+Use the default app directory:
+
+```bash
+npm run runner
+```
+
+Use a different app directory:
+
+```bash
+npm run runner -- --github-apps-dir /absolute/path/to/github-apps
+```
+
+Disable app auth only for local experiments that will not push, create PRs, or comment as a bot:
+
+```bash
+npm run runner -- --no-github-app-auth
+```
+
+Disabling app auth means GitHub operations may use the user's local credentials. Do not use that mode for automation runs that should be bot-authored.
+
+## Rotation
+
+To rotate a private key:
+
+1. Open the GitHub App settings page from the app's `app.json` or `install-url.txt`.
+2. Generate a new private key in GitHub.
+3. Replace only the matching local `private-key.pem` file under `.mission-control/github-apps/<role>/`.
+4. Keep file permissions owner-only, for example `chmod 600 .mission-control/github-apps/<role>/private-key.pem`.
+5. Delete the old private key in GitHub after a runner sweep succeeds with the new key.
+
+If an app is compromised or no longer needed, uninstall it from the repository and remove the matching local directory under `.mission-control/github-apps/`.

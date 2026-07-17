@@ -116,6 +116,40 @@ Runs have a default two-hour timeout. Override it with:
 npm run runner -- --timeout-ms 7200000
 ```
 
+## GitHub App Bot Auth
+
+Builder and reviewer runs use GitHub App installation tokens by default for GitHub operations. The runner fails before launch when app credentials are missing, invalid, or not installed on the target repository.
+
+Credentials live outside git under:
+
+```text
+.mission-control/github-apps/
+```
+
+The runner maps roles to app identities using `mission-control.config.md` `githubApps.roleMap`, or these default directories:
+
+- `default`
+- `builder`
+- `backend-reviewer`
+- `frontend-reviewer`
+- `lead-reviewer`
+
+For each claimed run, Mission Control mints a short-lived repository-scoped installation token, configures `GH_TOKEN`/`GITHUB_TOKEN` for GitHub CLI calls, configures `GIT_ASKPASS` for HTTPS pushes, and rewrites GitHub SSH remotes to HTTPS only inside the runner child process. Tokens are not written into git remotes or command arguments, and runner logs redact them if a child process prints one.
+
+Use a custom app directory:
+
+```bash
+npm run runner -- --github-apps-dir /absolute/path/to/github-apps
+```
+
+Disable app auth only for local experiments that will not push or create bot-authored GitHub activity:
+
+```bash
+npm run runner -- --no-github-app-auth
+```
+
+See [GitHub App Bots](GITHUB_APP_BOTS.md) for setup and rotation.
+
 ## Output
 
 Runner logs are written to:
@@ -141,7 +175,7 @@ node src/mission-control-cli.js run-prompt run_1
 
 The runner can create branches, validate work, commit, push, and open/update PRs when the task asks for that. It must not merge or deploy.
 
-Once reviewers and lead review pass, the task moves to `user_review`. The notifier then tells the human owner. That is the merge/deploy gate.
+Once reviewers and lead review pass, the task moves to `user_review`, or to `qa_review` when Trust Leads is enabled. The notifier then tells the human owner. That is the local QA or merge/deploy gate; production still requires explicit owner approval.
 
 ## Isolated Workspaces
 

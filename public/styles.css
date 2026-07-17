@@ -168,6 +168,75 @@ h2 {
   margin-bottom: 20px;
 }
 
+.project-settings,
+.qa-review-panel {
+  margin-bottom: 20px;
+}
+
+.project-settings-form,
+.qa-review-list {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.045);
+  padding: 14px;
+}
+
+.project-settings-form {
+  display: grid;
+  gap: 12px;
+}
+
+.project-settings-form h3,
+.qa-review-list h3 {
+  margin-bottom: 0;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.checkbox-row input {
+  width: auto;
+}
+
+.qa-review-items {
+  display: grid;
+  gap: 10px;
+}
+
+.qa-review-item {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid rgba(95, 140, 255, 0.22);
+  border-radius: 12px;
+  background: rgba(95, 140, 255, 0.08);
+}
+
+.qa-review-item button {
+  display: grid;
+  width: 100%;
+  gap: 6px;
+  text-align: left;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.qa-review-item button:hover {
+  filter: none;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.qa-review-item strong {
+  color: var(--text);
+}
+
+.qa-review-item small {
+  color: var(--muted);
+}
+
 .project-item,
 .task-card,
 .prompt-box {
@@ -216,6 +285,28 @@ h2 {
 
 .task-card {
   text-align: left;
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
+.task-card-main {
+  display: grid;
+  justify-items: start;
+  width: 100%;
+  min-height: 100%;
+  border: 0;
+  border-radius: 18px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 14px;
+}
+
+.task-card-main:hover {
+  background: rgba(255, 255, 255, 0.04);
+  filter: none;
 }
 
 .task-card.selected {
@@ -261,6 +352,11 @@ h2 {
   background: var(--green);
 }
 
+.status.qa_review {
+  color: #061018;
+  background: linear-gradient(135deg, var(--blue), var(--green));
+}
+
 .status.needs_changes,
 .status.blocked {
   color: #18070b;
@@ -274,6 +370,49 @@ h2 {
 .status.in_progress {
   color: #120d05;
   background: var(--amber);
+}
+
+.status.qa_review {
+  color: #061024;
+  background: #7fb4ff;
+}
+
+.qa-card-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px 14px 12px;
+}
+
+.qa-card-meta span,
+.qa-card-meta a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.76rem;
+  font-weight: 850;
+}
+
+.qa-card-meta span {
+  color: var(--muted);
+}
+
+.qa-card-meta a,
+.inline-link {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #9fc6ff;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.qa-card-meta a:hover,
+.inline-link:hover {
+  filter: none;
+  color: var(--text);
 }
 
 .stacked-form {
@@ -536,6 +675,32 @@ label {
 .branch-edit-grid {
   display: grid;
   gap: 12px;
+}
+
+.conflict-list,
+.validation-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.conflict-list strong,
+.validation-list strong {
+  width: 100%;
+  color: var(--text);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.conflict-list code,
+.validation-list code {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: rgba(245, 247, 251, 0.82);
+  background: rgba(255, 255, 255, 0.055);
+  padding: 7px 10px;
+  font-size: 0.78rem;
 }
 
 .relationship-grid {

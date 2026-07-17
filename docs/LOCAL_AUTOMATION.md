@@ -9,6 +9,7 @@ The always-on stack includes:
 - `supervisor`: reports next actions across projects
 - `dispatcher`: creates durable builder, reviewer, and owner-handoff runs
 - `runner`: launches queued builder/reviewer runs with a Codex provider
+- `qa-integration`: merges `qa_review` PR heads into opted-in non-production integration branches after validation
 - `notifier`: sends local owner-review and failure notifications
 
 ## Install
@@ -40,6 +41,7 @@ npm run status-agents
 node src/mission-control-cli.js runs
 npm run runner -- --plan
 npm run dispatcher -- --plan
+npm run qa-integrate -- --plan
 ```
 
 The runner defaults to `codex-cli`. To test SDK-backed Codex threads:
@@ -55,6 +57,27 @@ For an ad hoc shell or service override, set:
 ```bash
 MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk
 ```
+
+## QA Integration
+
+Trust Leads QA integration is opt-in per project:
+
+```json
+{
+  "trustLeadApprovals": true,
+  "integrationBranch": "qa/integration",
+  "validationCommands": ["npm run check"]
+}
+```
+
+When review automation moves a lead-approved task to `qa_review`, run:
+
+```bash
+npm run qa-integrate -- --plan
+npm run qa-integrate -- --project myapp
+```
+
+The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It also refuses dirty local worktrees, aborts merge conflicts, records comments on affected tasks, runs validation commands, and only then pushes the non-production integration branch. It does not merge PRs, deploy, or force-push.
 
 ## Uninstall
 
@@ -86,7 +109,7 @@ It must not:
 - deploy production
 - send customer-facing messages
 - commit secrets or private data
-- bypass the human owner review gate
+- bypass the human owner review or Trust Leads QA gate
 
 The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
 

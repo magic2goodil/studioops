@@ -13,13 +13,18 @@
       "repoPath": "",
       "repoUrl": "https://github.com/magic2goodil/codex-mission-control",
       "defaultBranch": "main",
+      "trustLeadApprovals": false,
+      "integrationBranch": "",
       "validationCommands": [
         "npm run check"
       ],
       "reviewPolicy": {
         "maxBuilderReviewCycles": 2,
         "reviewerMayFixSmallIssues": true,
-        "leadOwnsFinalDecisionAtLimit": true
+        "leadOwnsFinalDecisionAtLimit": true,
+        "trustLeadApprovals": false,
+        "qaReviewerRole": "qa-reviewer",
+        "integrationBranch": ""
       },
       "contextLinks": [
         "README.md",
