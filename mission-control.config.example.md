@@ -89,6 +89,10 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "githubAppAuth": true,
       "githubAppCredentialsDir": ".mission-control/github-apps"
     },
+    "qaIntegration": {
+      "intervalSeconds": 300,
+      "validationTimeoutMs": 600000
+    },
     "validationCommands": [
       "npm run check"
     ],
@@ -100,6 +104,8 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "qaReviewerRole": "qa-reviewer",
       "integrationBranch": ""
     },
+    "trustLeadApprovals": false,
+    "integrationBranch": "",
     "reviewPipeline": [
       {
         "key": "backend",
@@ -160,6 +166,8 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "repoPath": "~/Development/example",
       "repoUrl": "git@github.com:your-github-user-or-org/example.git",
       "defaultBranch": "main",
+      "trustLeadApprovals": false,
+      "integrationBranch": "qa/integration",
       "contextLinks": [
         "README.md",
         "AGENTS.md"

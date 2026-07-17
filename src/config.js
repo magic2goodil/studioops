@@ -2,6 +2,7 @@ import { access, readFile, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { integrationBranchName, trustLeadApprovalsEnabled } from "./integration-policy.js";
 
 export const CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "mission-control.config.example.md";
@@ -64,6 +65,10 @@ export async function writeConfig(config, rootDir = process.cwd()) {
   return configPath;
 }
 
+function hasOwnValue(item, key) {
+  return Object.prototype.hasOwnProperty.call(item || {}, key);
+}
+
 export function projectFromConfig(rawProject, defaults = {}) {
   return {
     key: rawProject.key,
@@ -78,5 +83,9 @@ export function projectFromConfig(rawProject, defaults = {}) {
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
     reviewPipeline: rawProject.reviewPipeline || defaults.reviewPipeline || [],
     reviewPolicy: rawProject.reviewPolicy || defaults.reviewPolicy || {},
+    trustLeadApprovals: hasOwnValue(rawProject, "trustLeadApprovals")
+      ? trustLeadApprovalsEnabled(rawProject)
+      : trustLeadApprovalsEnabled(defaults),
+    integrationBranch: integrationBranchName(rawProject) || integrationBranchName(defaults),
   };
 }

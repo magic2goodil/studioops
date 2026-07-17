@@ -1,4 +1,11 @@
 import { DEFAULT_REVIEW_PIPELINE, reviewPolicyForProject } from "./store.js";
+import {
+  branchWebUrl,
+  integrationBranchName,
+  integrationBranchSafetyError,
+  projectUsesTrustLeadQa,
+  trustLeadApprovalsEnabled,
+} from "./integration-policy.js";
 
 const COMPLETE_STATUSES = new Set(["approved", "merged", "deployed", "done", "closed"]);
 const BUILDABLE_STATUSES = new Set(["ready", "queued"]);
@@ -121,6 +128,7 @@ function projectSummary(state, project) {
 
 function actionBase(state, task, type, role, reason, options = {}) {
   const project = projectForTask(state, task);
+  const integrationBranch = task.integrationBranch || options.integrationBranch || integrationBranchName(project);
   return {
     id: `${task.id}:${type}`,
     type,
@@ -136,16 +144,44 @@ function actionBase(state, task, type, role, reason, options = {}) {
     taskUrl: taskUrl(options.baseUrl, task),
     branchName: task.branchName || "",
     prUrl: task.prUrl || "",
-    promptCommand: role && role !== "owner" ? promptCommand(task, role) : "",
+    integrationBranch,
+    integrationBranchUrl: task.integrationBranchUrl || branchWebUrl(project, integrationBranch),
+    integrationStatus: task.integrationStatus || "",
+    promptCommand: role && role !== "owner" && !String(role).includes("integration-worker") ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
+    integrationCommand: options.integrationCommand || "",
     nextStatus: options.nextStatus || "",
-    integrationBranch: options.integrationBranch || "",
     dependencies: dependenciesForTask(state, task).map((dependency) => ({
       id: dependency.id,
       status: dependency.status,
       title: dependency.title,
     })),
   };
+}
+
+function reviewCompleteAction(state, task, project, reason, options = {}) {
+  if (projectUsesTrustLeadQa(project)) {
+    return actionBase(state, task, "run_qa_integration", "qa-integration-worker", reason, {
+      ...options,
+      nextStatus: "qa_review",
+      integrationCommand: `npm run qa-integrate -- --project ${project.key}`,
+    });
+  }
+
+  if (trustLeadApprovalsEnabled(project)) {
+    const safetyReason = integrationBranchSafetyError(project);
+    if (safetyReason) {
+      return actionBase(state, task, "notify_owner", "owner", `${reason} Trust Leads QA integration is not eligible: ${safetyReason}`, {
+        ...options,
+        nextStatus: "user_review",
+      });
+    }
+  }
+
+  return actionBase(state, task, "notify_owner", "owner", reason, {
+    ...options,
+    nextStatus: "user_review",
+  });
 }
 
 function taskActions(state, task, options = {}) {
@@ -206,18 +242,7 @@ function taskActions(state, task, options = {}) {
     }
     const nextStage = nextOpenReviewStage(state, project, task);
     if (!nextStage) {
-      const policy = reviewPolicyForProject(project);
-      if (policy.trustLeadApprovals) {
-        return [actionBase(state, task, "notify_qa_review", "owner", "All review stages are complete and Trust Leads is enabled; local QA review should be requested.", {
-          ...options,
-          nextStatus: "qa_review",
-          integrationBranch: policy.integrationBranch || "",
-        })];
-      }
-      return [actionBase(state, task, "notify_owner", "owner", "All review stages are complete; owner review should be requested.", {
-        ...options,
-        nextStatus: "user_review",
-      })];
+      return [reviewCompleteAction(state, task, project, "All review stages are complete.", options)];
     }
     return [actionBase(state, task, "start_review", nextStage.role, `Ready for ${nextStage.label || nextStage.key}.`, {
       ...options,
@@ -266,25 +291,22 @@ function taskActions(state, task, options = {}) {
         nextStatus: nextStage.status,
       })];
     }
-    const policy = reviewPolicyForProject(project);
-    if (policy.trustLeadApprovals) {
-      return [actionBase(state, task, "notify_qa_review", "owner", "All review stages are complete and Trust Leads is enabled; local QA review should be requested.", {
-        ...options,
-        nextStatus: "qa_review",
-        integrationBranch: policy.integrationBranch || "",
-      })];
-    }
-    return [actionBase(state, task, "notify_owner", "owner", "All review stages are complete; owner review should be requested.", {
-      ...options,
-      nextStatus: "user_review",
-    })];
+    return [reviewCompleteAction(state, task, project, "All review stages are complete.", options)];
   }
 
   if (task.status === "qa_review") {
-    const policy = reviewPolicyForProject(project);
-    return [actionBase(state, task, "notify_qa_review", "owner", "Lead-approved task is ready for local QA review before production approval.", {
+    if (!projectUsesTrustLeadQa(project)) {
+      return [actionBase(state, task, "qa_integration_config_error", "owner", `QA review is waiting, but the project integration branch is not eligible: ${integrationBranchSafetyError(project) || "Trust Leads QA integration is disabled."}`, options)];
+    }
+    if (task.integrationStatus === "ready") {
+      return [actionBase(state, task, "qa_bundle_ready", "owner", "QA integration branch is validated and ready for local owner testing.", options)];
+    }
+    if (["conflict", "validation_failed", "push_failed", "blocked"].includes(task.integrationStatus)) {
+      return [actionBase(state, task, "qa_integration_blocked", "builder", `QA integration is blocked with status ${task.integrationStatus}. Review task comments and update the PR branch before rerunning integration.`, options)];
+    }
+    return [actionBase(state, task, "run_qa_integration", "qa-integration-worker", "Task is lead-approved and waiting for the QA integration branch worker.", {
       ...options,
-      integrationBranch: policy.integrationBranch || "",
+      integrationCommand: `npm run qa-integrate -- --project ${project.key}`,
     })];
   }
 
@@ -348,9 +370,11 @@ export function formatSupervisorReport(report) {
     lines.push(`  Task: ${action.taskUrl}`);
     if (action.prUrl) lines.push(`  PR: ${action.prUrl}`);
     if (action.branchName) lines.push(`  Branch: ${action.branchName}`);
-    if (action.integrationBranch) lines.push(`  Integration branch: ${action.integrationBranch}`);
+    if (action.integrationBranch) lines.push(`  QA branch: ${action.integrationBranch}${action.integrationBranchUrl ? ` (${action.integrationBranchUrl})` : ""}`);
+    if (action.integrationStatus) lines.push(`  QA status: ${action.integrationStatus}`);
     if (action.promptCommand) lines.push(`  Prompt: ${action.promptCommand}`);
     if (action.reviewCommand) lines.push(`  Review command: ${action.reviewCommand}`);
+    if (action.integrationCommand) lines.push(`  Integration command: ${action.integrationCommand}`);
     if (action.nextStatus) lines.push(`  Next status: ${action.nextStatus}`);
     lines.push("");
   }

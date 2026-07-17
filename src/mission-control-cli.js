@@ -19,6 +19,7 @@ import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js"
 import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
+import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
 import {
   expandHome,
   loadConfig,
@@ -128,6 +129,10 @@ async function setup() {
           workspaceRoot: "~/.mission-control/run-workspaces",
           timeoutMs: 7200000,
         },
+        qaIntegration: {
+          intervalSeconds: 300,
+          validationTimeoutMs: 600000,
+        },
         notifier: {
           intervalSeconds: 60,
           channel: "macos",
@@ -142,6 +147,8 @@ async function setup() {
           qaReviewerRole: "qa-reviewer",
           integrationBranch: "",
         },
+        trustLeadApprovals: false,
+        integrationBranch: "",
         standards: [
           "standards/engineering.md",
           "standards/design-system.md",
@@ -218,6 +225,8 @@ async function setup() {
         validationCommands: validation.trim() ? [validation.trim()] : [],
         safetyRules: config.defaults.safetyRules,
         reviewPolicy: config.defaults.reviewPolicy,
+        trustLeadApprovals: false,
+        integrationBranch: "",
       });
     }
 
@@ -282,6 +291,7 @@ Commands:
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
+  qa-integrate                  Merge lead-approved PR heads into QA integration branches
   notifier                      Send local owner/failure notifications
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
@@ -299,9 +309,10 @@ Task fields:
   --branch                      Associated feature branch
   --pr-url                      Associated pull request URL
   --standards                   Project standards, comma or newline separated
-  --trust-leads                 Route lead-approved work to QA review instead of per-task owner review
+  --trust-leads                 Route lead-approved work to QA integration and review
+  --trust-lead-approvals        Alias for --trust-leads
   --no-trust-leads              Disable Trust Leads for a project
-  --integration-branch          Non-production branch used for local QA bundles
+  --integration-branch          Non-production branch used for QA integration bundles
   --parent                      Parent epic/task ID
   --depends-on                  Dependency task IDs, comma or newline separated
 
@@ -311,6 +322,7 @@ Automation:
   mission-control dispatcher --plan
   mission-control runner --plan
   mission-control runner --provider codex-sdk
+  mission-control qa-integrate --plan
   mission-control notifier --plan
   mission-control runs --status queued
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
@@ -425,6 +437,10 @@ Automation:
   }
 
   if (command === "add-project") {
+    const trustLeadApprovals = args["no-trust-leads"]
+      ? false
+      : args["trust-lead-approvals"] || args.trustLeadApprovals || args["trust-leads"];
+    const integrationBranch = args["integration-branch"] || args.integrationBranch || "";
     const project = await addProject({
       key: args.key,
       name: args.name,
@@ -437,9 +453,11 @@ Automation:
       standards: args.standards,
       safetyRules: args.safety,
       reviewPolicy: {
-        trustLeadApprovals: Boolean(args["trust-leads"]),
-        integrationBranch: args["integration-branch"] || "",
+        trustLeadApprovals,
+        integrationBranch,
       },
+      trustLeadApprovals,
+      integrationBranch,
     });
     console.log(`Added project ${project.id}: ${project.name}`);
     return;
@@ -459,6 +477,7 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "safety")) patch.safetyRules = args.safety;
     const reviewPolicy = {};
     if (Object.prototype.hasOwnProperty.call(args, "trust-leads")) reviewPolicy.trustLeadApprovals = true;
+    if (Object.prototype.hasOwnProperty.call(args, "trust-lead-approvals")) reviewPolicy.trustLeadApprovals = args["trust-lead-approvals"];
     if (Object.prototype.hasOwnProperty.call(args, "no-trust-leads")) reviewPolicy.trustLeadApprovals = false;
     if (Object.prototype.hasOwnProperty.call(args, "qa-reviewer-role")) reviewPolicy.qaReviewerRole = args["qa-reviewer-role"];
     if (Object.prototype.hasOwnProperty.call(args, "integration-branch")) reviewPolicy.integrationBranch = args["integration-branch"];
@@ -628,6 +647,26 @@ Automation:
     });
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(formatNotificationReport(report));
+    return;
+  }
+
+  if (command === "qa-integrate" || command === "qa-integration") {
+    const options = {
+      project: args.project || args.projects,
+      task: args.task || args.tasks || args["task-id"],
+      dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
+      validationTimeoutMs: args["validation-timeout-ms"],
+    };
+    if (args.plan || args["dry-run"] || args.dryRun) {
+      const state = await readState();
+      const plan = planQaIntegrations(state, options);
+      if (args.json) console.log(JSON.stringify(plan, null, 2));
+      else console.log(formatQaIntegrationReport(plan));
+      return;
+    }
+    const report = await runQaIntegration(options);
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatQaIntegrationReport(report));
     return;
   }
 

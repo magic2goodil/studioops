@@ -84,7 +84,9 @@ The supervisor emits active actions like:
 - `start_review`: a PR is ready for a backend, frontend, or lead reviewer.
 - `continue_review`: a review lane has not recorded an outcome yet.
 - `return_to_builder`: branch/PR intake is incomplete or a reviewer requested changes.
-- `notify_qa_review`: the task is lead-approved and ready for local QA review.
+- `run_qa_integration`: a lead-approved task is in `qa_review` and waiting for the QA integration worker.
+- `qa_bundle_ready`: the integration branch was validated and is ready for local owner testing.
+- `qa_integration_blocked`: the integration worker recorded a conflict, validation failure, push failure, or local safety blocker.
 - `notify_owner`: the task is ready for final human owner review.
 
 By default, passive `waiting_on_dependency` and `blocked` tasks are summarized in the waiting count instead of printed as actions. Use `--all` when you want the full dependency backlog.
@@ -95,13 +97,15 @@ Each action includes:
 - task ID and title
 - task URL
 - branch and PR URL when present
+- QA integration branch and status when present
 - prompt command for the relevant Codex role
 - review command when the action is a review
+- integration command when the action needs the QA integration worker
 - reason for the action
 
 ## Relationship To Automation Tick
 
-`automation-tick` mutates workflow state. It assigns tasks, blocks/unblocks dependency work, routes review stages, and moves reviewed work to `user_review` or, when Trust Leads is enabled, `qa_review`.
+`automation-tick` mutates workflow state. It assigns tasks, blocks/unblocks dependency work, routes review stages, and moves reviewed work to `user_review` or, for opted-in Trust Leads projects, `qa_review`.
 
 The supervisor is the outer orchestration view. It is safe to run continuously because it only reads state and prints the next actions.
 
@@ -110,9 +114,10 @@ Recommended loop for a Codex runner:
 1. Run `npm run automation-tick -- --limit 10`.
 2. Run `npm run dispatcher`.
 3. Let `mission-control-runner` consume queued builder/reviewer dispatch runs.
-4. Let `mission-control-notifier` send local notifications for owner handoff and failed runs.
-5. For `notify_owner` or `notify_qa_review`, the human owner reviews the task URL, PR URL, and QA list.
-6. Stop at the human owner gate. Do not merge or deploy automatically.
+4. Run `npm run qa-integrate` when the supervisor reports `run_qa_integration`.
+5. Let `mission-control-notifier` send local notifications for owner handoff and failed runs.
+6. For `notify_owner` or `qa_bundle_ready`, the human owner reviews the task URL, PR URL, and QA integration branch.
+7. Stop at the human owner gate. Do not merge or deploy automatically.
 
 See [DISPATCHER.md](DISPATCHER.md), [RUNNER.md](RUNNER.md), and [NOTIFIER.md](NOTIFIER.md) for the durable automation layers.
 
@@ -144,7 +149,7 @@ The concurrency values are policy hints for the dispatcher and any Codex-native 
 
 ## Human Gate
 
-`user_review` is the default handoff point. `qa_review` is the Trust Leads handoff point for local visual QA before production approval.
+`user_review` is the final handoff point. For Trust Leads projects, `qa_review` is the local bundle-testing gate before any final merge/deploy decision.
 
 Before notifying the owner, the task should show:
 
@@ -154,6 +159,7 @@ Before notifying the owner, the task should show:
 - backend review or explicit skip
 - frontend review or explicit skip
 - lead review
+- QA integration branch link when the project uses Trust Leads mode
 - known gaps and residual risk
 
 The owner decides whether to request changes, approve, merge, or deploy.

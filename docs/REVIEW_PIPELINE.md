@@ -77,9 +77,10 @@ Each time a builder moves work into `builder_review`, Mission Control increments
    - Always required before `qa_review` or `user_review`.
 
 6. `qa_review`
-   - Optional Trust Leads stop point for lead-approved work.
-   - Work is ready to merge into a non-production integration branch or local review bundle.
-   - The human owner should visually test the full QA list locally before approving production.
+   - Optional Trust Leads gate for projects with `trustLeadApprovals: true` and a safe `integrationBranch`.
+   - The QA integration worker merges lead-approved PR heads into the configured non-production integration branch, runs validation commands, and records conflicts or validation failures back on the task.
+   - This branch must not be `main`, `master`, `production`, or the project default branch.
+   - The human owner should test the full QA bundle locally before approving production.
    - This is not production approval.
 
 7. `user_review`
