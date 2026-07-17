@@ -120,3 +120,48 @@ test("default GitHub App credentials remain an intentional fallback when no role
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("accessibility reviewer GitHub App credentials resolve as a reviewer role", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+  let auth = null;
+
+  try {
+    await writeApp(root, "accessibility-reviewer", { role: "accessibility-reviewer" });
+    globalThis.fetch = async (url, options = {}) => {
+      if (String(url).endsWith("/repos/example/repo/installation")) {
+        return {
+          ok: true,
+          text: async () => JSON.stringify({ id: 98765 }),
+        };
+      }
+      if (String(url).endsWith("/app/installations/98765/access_tokens")) {
+        const body = JSON.parse(options.body);
+        assert.equal(body.permissions.actions, "read");
+        assert.equal(body.permissions.checks, "read");
+        assert.equal(body.permissions.contents, "write");
+        assert.equal(body.permissions.pull_requests, "write");
+        return {
+          ok: true,
+          text: async () => JSON.stringify({
+            token: "ghs_test_installation_token",
+            expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          }),
+        };
+      }
+      throw new Error(`Unexpected GitHub API call: ${url}`);
+    };
+
+    auth = await prepareGitHubAppAuth(runFixture("accessibility-reviewer"), {
+      githubAppCredentialsDir: root,
+      githubAppRuntimeDir: path.join(root, "runtime"),
+    });
+
+    assert.equal(auth.app.key, "accessibility-reviewer");
+    assert.equal(auth.role, "accessibility-reviewer");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanupGitHubAppAuth(auth);
+    await rm(root, { recursive: true, force: true });
+  }
+});

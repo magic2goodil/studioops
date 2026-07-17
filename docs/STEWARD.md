@@ -5,7 +5,7 @@ The steward is the scheduled workflow-routing tick.
 It runs `automation-tick`, which advances task state when the rules are satisfied:
 
 - dependency-blocked tasks return to the queue when dependencies complete
-- `builder_review` tasks route into backend, frontend, and lead review
+- `builder_review` tasks route into backend, frontend, accessibility, and lead review
 - review changes send work back to the builder
 - fully reviewed work moves to `user_review`, or to `qa_review` when Trust Leads QA integration is enabled for the project
 

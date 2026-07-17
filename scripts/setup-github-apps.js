@@ -41,6 +41,12 @@ const ROLE_SETS = {
       description: "Reviews UI, accessibility, responsiveness, design-system reuse, and browser behavior.",
     },
     {
+      key: "accessibility-reviewer",
+      role: "accessibility-reviewer",
+      name: "MC Accessibility Reviewer",
+      description: "Reviews contrast, keyboard behavior, semantics, labels, alt text, ARIA use, and screen-reader basics.",
+    },
+    {
       key: "lead-reviewer",
       role: "lead-reviewer",
       name: "MC Lead Reviewer",

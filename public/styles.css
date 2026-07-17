@@ -365,6 +365,7 @@ h2 {
 .status.builder_review,
 .status.backend_review,
 .status.frontend_review,
+.status.accessibility_review,
 .status.lead_review,
 .status.in_progress {
   color: #120d05;

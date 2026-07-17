@@ -52,6 +52,8 @@ For UI work, reviewers should specifically ask:
 - Was desktop verified?
 - Was the direct URL/refresh path verified?
 - Was the full visible page considered, not just the smallest component?
+- Did an accessibility reviewer approve the work or explicitly skip it because there is no user-visible accessibility surface?
+- Are contrast, readable typography, visible focus, keyboard tab order, semantic headings, link/button names, alt text, title text, form labels, ARIA use, and screen-reader basics acceptable?
 
 For backend/data work, reviewers should specifically ask:
 

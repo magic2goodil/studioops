@@ -132,6 +132,7 @@ The runner maps roles to app identities using `mission-control.config.md` `githu
 - `builder`
 - `backend-reviewer`
 - `frontend-reviewer`
+- `accessibility-reviewer`
 - `lead-reviewer`
 
 For each claimed run, Mission Control mints a short-lived repository-scoped installation token, configures `GH_TOKEN`/`GITHUB_TOKEN` for GitHub CLI calls, configures `GIT_ASKPASS` for HTTPS pushes, and rewrites GitHub SSH remotes to HTTPS only inside the runner child process. Tokens are not written into git remotes or command arguments, and runner logs redact them if a child process prints one.

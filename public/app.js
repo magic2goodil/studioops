@@ -199,6 +199,7 @@ function reviewStageOptions(project) {
   const stages = project?.reviewPipeline?.length ? project.reviewPipeline : [
     { key: "backend", label: "Backend Review", role: "backend-reviewer" },
     { key: "frontend", label: "Frontend Review", role: "frontend-reviewer" },
+    { key: "accessibility", label: "Accessibility Review", role: "accessibility-reviewer" },
     { key: "lead", label: "Primary Lead Review", role: "lead-reviewer" },
   ];
   return stages.map((stage) => `<option value="${escapeHtml(stage.key || stage.role)}">${escapeHtml(stage.label || stage.key || stage.role)}</option>`).join("");
@@ -598,6 +599,7 @@ async function renderDetail() {
   const builderPrompt = await api(`/api/tasks/${task.id}/prompt?role=builder`);
   const backendReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=backend-reviewer`);
   const frontendReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=frontend-reviewer`);
+  const accessibilityReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=accessibility-reviewer`);
   const leadReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=lead-reviewer`);
   const link = taskUrl(task.id);
   const isFullPage = Boolean(state.routeTaskId);
@@ -633,6 +635,7 @@ async function renderDetail() {
       <button type="button" data-status="builder_review">Builder Review</button>
       <button type="button" data-status="backend_review">Backend Review</button>
       <button type="button" data-status="frontend_review">Frontend Review</button>
+      <button type="button" data-status="accessibility_review">Accessibility Review</button>
       <button type="button" data-status="lead_review">Lead Review</button>
       <button type="button" data-status="qa_review">QA Review</button>
       <button type="button" data-status="needs_changes">Needs Changes</button>
@@ -646,6 +649,8 @@ async function renderDetail() {
     <div class="prompt-box">${escapeHtml(backendReviewerPrompt.prompt)}</div>
     <h3>Frontend Reviewer Prompt</h3>
     <div class="prompt-box">${escapeHtml(frontendReviewerPrompt.prompt)}</div>
+    <h3>Accessibility Reviewer Prompt</h3>
+    <div class="prompt-box">${escapeHtml(accessibilityReviewerPrompt.prompt)}</div>
     <h3>Primary Lead Reviewer Prompt</h3>
     <div class="prompt-box">${escapeHtml(leadReviewerPrompt.prompt)}</div>
   `;

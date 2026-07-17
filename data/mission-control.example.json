@@ -75,6 +75,14 @@
           "description": "Review UI/UX, responsiveness, accessibility, design-system reuse, content editability, and browser health."
         },
         {
+          "key": "accessibility",
+          "label": "Accessibility Review",
+          "role": "accessibility-reviewer",
+          "status": "accessibility_review",
+          "required": true,
+          "description": "Expert review of contrast, readable typography, focus-visible states, keyboard behavior, semantics, labels, alt text, ARIA use, and screen-reader basics before lead review."
+        },
+        {
           "key": "lead",
           "label": "Primary Lead Review",
           "role": "lead-reviewer",

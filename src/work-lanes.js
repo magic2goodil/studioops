@@ -8,6 +8,8 @@ const FRONTEND_TYPES = new Set([
   "sass",
   "css",
   "page",
+  "accessibility",
+  "a11y",
 ]);
 
 const DESIGN_TYPES = new Set([
@@ -55,6 +57,7 @@ function roleLane(role) {
   if (normalized.includes("lead")) return "project-wide";
   if (normalized.includes("backend")) return "backend";
   if (normalized.includes("frontend")) return "frontend";
+  if (normalized.includes("accessibility") || normalized.includes("a11y")) return "frontend";
   if (normalized.includes("design")) return "design";
   if (normalized.includes("owner")) return "owner";
   return "";
@@ -77,7 +80,7 @@ export function inferTaskLane(task = {}, role = "") {
   const text = normalize(`${task.title || ""} ${task.description || ""} ${task.userStory || ""} ${task.expectedOutcome || ""}`);
   if (textIncludesAny(text, ["deploy", "release", "github action", "ci", "workflow", "production"])) return "devops";
   if (textIncludesAny(text, ["mockup", "design", "visual", "layout", "typography", "figma", "image"])) return "design";
-  if (textIncludesAny(text, ["css", "sass", "frontend", "component", "responsive", "browser", "page", "ui", "ux"])) return "frontend";
+  if (textIncludesAny(text, ["css", "sass", "frontend", "component", "responsive", "browser", "page", "ui", "ux", "accessibility", "a11y"])) return "frontend";
   if (textIncludesAny(text, ["api", "database", "postgres", "auth", "session", "migration", "index", "queue", "privacy", "security"])) return "backend";
 
   return "product";

@@ -81,7 +81,7 @@ The supervisor emits active actions like:
 - `start_builder`: a `ready` or `queued` task can be picked up by a builder.
 - `unblock_task`: a blocked task can return to the queue.
 - `start_builder_fix`: reviewer changes need builder work.
-- `start_review`: a PR is ready for a backend, frontend, or lead reviewer.
+- `start_review`: a PR is ready for a backend, frontend, accessibility, or lead reviewer.
 - `continue_review`: a review lane has not recorded an outcome yet.
 - `return_to_builder`: branch/PR intake is incomplete or a reviewer requested changes.
 - `run_qa_integration`: a lead-approved task is in `qa_review` and waiting for the QA integration worker.
@@ -158,6 +158,7 @@ Before notifying the owner, the task should show:
 - builder comment with changed files and validation
 - backend review or explicit skip
 - frontend review or explicit skip
+- accessibility review or explicit skip
 - lead review
 - QA integration branch link when the project uses Trust Leads mode
 - known gaps and residual risk

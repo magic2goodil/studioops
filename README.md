@@ -2,7 +2,7 @@
 
 Codex Mission Control is a local-first task board for coordinating Codex work across multiple projects.
 
-It is designed for a workflow where you say an idea once, capture it as a task, send it to a builder branch, run backend/frontend/lead reviewer passes as applicable, and only then kick it to the human owner for final review.
+It is designed for a workflow where you say an idea once, capture it as a task, send it to a builder branch, run backend/frontend/accessibility/lead reviewer passes as applicable, and only then kick it to the human owner for final review.
 
 This first version is intentionally simple:
 
@@ -11,7 +11,7 @@ This first version is intentionally simple:
 - Has a browser task board.
 - Has a CLI for adding/listing tasks.
 - Generates builder and reviewer prompts you can hand to Codex.
-- Generates backend, frontend, and primary lead reviewer prompts.
+- Generates backend, frontend, accessibility, and primary lead reviewer prompts.
 - Includes a supervisor loop for continuously reporting builder, reviewer, dependency, and owner-handoff actions across projects.
 - Includes a steward tick for continuously routing task workflow state across projects.
 - Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
@@ -181,6 +181,7 @@ Generate a reviewer prompt:
 ```bash
 node src/mission-control-cli.js prompt task_1 --role backend-reviewer
 node src/mission-control-cli.js prompt task_1 --role frontend-reviewer
+node src/mission-control-cli.js prompt task_1 --role accessibility-reviewer
 node src/mission-control-cli.js prompt task_1 --role lead-reviewer
 ```
 
@@ -288,10 +289,11 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 8. Automation tick verifies branch/PR intake and routes work through the review pipeline.
 9. Backend reviewer records `approved`, `skipped`, or `changes_requested`.
 10. Frontend reviewer records `approved`, `skipped`, or `changes_requested`.
-11. Primary lead reviewer records the final review outcome.
-12. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled for the project.
-13. The supervisor reports `notify_owner` or `notify_qa_review` for tasks that have reached the human gate.
-14. Human owner tests the QA bundle locally, approves, asks for changes, merges, or deploys through the protected release workflow.
+11. Accessibility reviewer records `approved`, `skipped`, or `changes_requested` for UI/frontend work, or explicitly skips non-UI work.
+12. Primary lead reviewer records the final review outcome.
+13. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled for the project.
+14. The supervisor reports `notify_owner` or `notify_qa_review` for tasks that have reached the human gate.
+15. Human owner tests the QA bundle locally, approves, asks for changes, merges, or deploys through the protected release workflow.
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 

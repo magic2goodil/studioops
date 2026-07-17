@@ -26,6 +26,7 @@ const VALID_STATUSES = new Set([
   "builder_review",
   "backend_review",
   "frontend_review",
+  "accessibility_review",
   "lead_review",
   "qa_review",
   "needs_changes",
@@ -81,6 +82,14 @@ const DEFAULT_REVIEW_PIPELINE = [
     status: "frontend_review",
     required: true,
     description: "Review UI/UX, responsiveness, accessibility, design-system reuse, content editability, and browser health.",
+  },
+  {
+    key: "accessibility",
+    label: "Accessibility Review",
+    role: "accessibility-reviewer",
+    status: "accessibility_review",
+    required: true,
+    description: "Expert review of contrast, readable typography, focus-visible states, keyboard behavior, semantics, labels, alt text, ARIA use, and screen-reader basics before lead review.",
   },
   {
     key: "lead",
@@ -1127,7 +1136,7 @@ export function generatePrompt(state, taskId, role = "builder") {
     ? reviewStages
         .map((stage) => `- ${stage.label || stage.key} (${stage.role})${stage.required ? "" : " optional"}: ${stage.description || stage.status || "No description recorded."}`)
         .join("\n")
-    : "- Builder review -> domain review when relevant -> lead review -> user review.";
+    : "- Builder review -> domain review when relevant -> accessibility review for UI work -> lead review -> user review.";
   const reviewPolicyText = [
     `- Maximum routine builder review cycles: ${reviewPolicy.maxBuilderReviewCycles}`,
     `- Reviewers may fix small deterministic issues directly: ${reviewPolicy.reviewerMayFixSmallIssues ? "yes" : "no"}`,
@@ -1193,6 +1202,7 @@ ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
 - Check the listed project standards and fail the task for material violations.
 - For data/backend changes, check query shape, indexes, pagination, migrations, and privacy boundaries.
 - For frontend/UI changes, check responsive behavior, accessibility, visual hierarchy, component reuse, content editability, and browser console/runtime errors.
+- For accessibility review, check color contrast, readable typography, focus-visible states, keyboard tab order, semantic headings, link and button names, alt text, title text, form labels, ARIA use, and screen-reader basics across mobile, tablet, and desktop.
 - For consent-sensitive features, check opt-in, revocation, transparency, retention, and data minimization.
 - For deployment/release workflow changes, fail unsafe patterns where PR merges or integration branch pushes deploy production by default, release/tag deploys do not verify the commit is reachable from the protected integration branch, manual dispatch can mutate production without a dry-run/preview default and explicit emergency approval path, or production sync can broadly delete runtime state.
 - Confirm whether the acceptance criteria are met.
@@ -1305,13 +1315,27 @@ function reviewerProfileForRole(role) {
       ],
     };
   }
+  if (normalized.includes("accessibility") || normalized.includes("a11y")) {
+    return {
+      label: "accessibility expert reviewer",
+      domain: "accessibility/a11y product UI",
+      stageHint: "accessibility",
+      focus: [
+        "WCAG-oriented color contrast, readable typography, non-color-only states, and zoom-safe text",
+        "visible focus states, keyboard reachability, logical tab order, skip/escape behavior, and no keyboard traps",
+        "semantic headings, landmarks, link names, button names, form labels, title text, and accessible error text",
+        "informative alt text, decorative image handling, restrained ARIA use, and screen-reader basics",
+        "mobile, tablet, and desktop accessibility coverage, including responsive navigation and dialogs",
+      ],
+    };
+  }
   return {
     label: "primary team lead reviewer",
     domain: "product/architecture/release",
     stageHint: "lead",
     focus: [
       "acceptance criteria, product intent, scope control, and user-facing risk",
-      "whether backend and frontend reviews are complete or explicitly waived",
+      "whether backend, frontend, and accessibility reviews are complete or explicitly waived",
       "cross-cutting architecture, security/privacy posture, deployment safety, and rollback path",
       "whether the PR should move to QA/user review, needs changes, or be split into smaller PRs",
     ],

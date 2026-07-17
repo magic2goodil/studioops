@@ -209,6 +209,14 @@ async function setup() {
             description: "Review UI/UX, responsiveness, accessibility, design-system reuse, content editability, and browser health.",
           },
           {
+            key: "accessibility",
+            label: "Accessibility Review",
+            role: "accessibility-reviewer",
+            status: "accessibility_review",
+            required: true,
+            description: "Expert review of contrast, readable typography, focus-visible states, keyboard behavior, semantics, labels, alt text, ARIA use, and screen-reader basics before lead review.",
+          },
+          {
             key: "lead",
             label: "Primary Lead Review",
             role: "lead-reviewer",
@@ -321,7 +329,7 @@ Commands:
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
-  prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, or lead-reviewer prompt
+  prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, accessibility-reviewer, or lead-reviewer prompt
   qa-list                       List tasks waiting for local QA review
 
 Task fields:
