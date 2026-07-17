@@ -113,4 +113,9 @@ It must not:
 
 The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
 
+The runner also acts as a stale-run failsafe. Each sweep marks orphaned or
+timed-out `running` rows as failed before it checks available capacity. That
+keeps dead child processes from blocking dispatcher/runner progress indefinitely,
+and the notifier will surface those failures locally.
+
 Mission Control treats backend and frontend work as compatible by default. Design conflicts with frontend, and devops/project-wide work conflicts with other lanes in the same project. That keeps parallel agents from editing the same UI/CSS/deployment surface while still allowing a real team-style flow.

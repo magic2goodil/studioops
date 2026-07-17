@@ -116,6 +116,27 @@ Runs have a default two-hour timeout. Override it with:
 npm run runner -- --timeout-ms 7200000
 ```
 
+## Stale Run Failsafe
+
+Every runner sweep first checks active `running` rows before claiming new work.
+If a run's recorded runner process is gone, or if the run is older than the
+configured timeout, Mission Control marks that run `failed`, records a task
+comment, emits a `run_reaped` event, and frees the lane/concurrency slot.
+
+This prevents dead Codex child processes, abandoned screenshots, closed laptops,
+or killed terminal sessions from pinning the queue overnight.
+
+The same timeout setting controls both the running child process and stale-run
+reaping:
+
+```bash
+npm run runner -- --timeout-ms 7200000
+MISSION_CONTROL_RUN_TIMEOUT_MS=7200000 npm run runner
+```
+
+Failed reaped runs go through the normal notifier path, so the owner gets told
+that automation stalled instead of discovering it by manually checking the board.
+
 ## GitHub App Bot Auth
 
 Builder and reviewer runs use GitHub App installation tokens by default for GitHub operations. The runner fails before launch when app credentials are missing, invalid, or not installed on the target repository.

@@ -99,6 +99,68 @@ function booleanOption(value, fallback = true) {
   return fallback;
 }
 
+function numberOption(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function processExists(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function runStartedAt(run) {
+  const startedAt = Date.parse(run.startedAt || run.updatedAt || run.createdAt || "");
+  return Number.isFinite(startedAt) ? startedAt : 0;
+}
+
+async function reapStaleRunningRuns(state, input, now) {
+  const timeoutMs = numberOption(
+    input.runTimeoutMs || input.timeoutMs || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS,
+    DEFAULT_RUN_TIMEOUT_MS,
+  );
+  const currentTime = Date.now();
+  const staleRuns = [];
+
+  for (const run of state.runs || []) {
+    if (!ACTIVE_STATUSES.has(run.status)) continue;
+    const startedAt = runStartedAt(run);
+    const timedOut = startedAt && currentTime - startedAt > timeoutMs;
+    const missingRunner = run.runnerPid && !processExists(run.runnerPid);
+    if (!timedOut && !missingRunner) continue;
+
+    const reason = missingRunner
+      ? `runner pid ${run.runnerPid} is no longer alive`
+      : `run exceeded ${Math.round(timeoutMs / 1000)}s timeout`;
+    run.status = "failed";
+    run.exitCode = missingRunner ? "stale_runner_pid" : "run_timeout";
+    run.completedAt = now;
+    run.updatedAt = now;
+    run.notes = [run.notes, `Mission Control reaped stale run: ${reason}.`].filter(Boolean).join("\n");
+    staleRuns.push({ run, reason });
+  }
+
+  for (const item of staleRuns) {
+    await appendTaskComment(state, item.run, `${item.run.id} was marked failed by Mission Control because ${item.reason}.`, now);
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "run_reaped",
+      projectId: item.run.projectId,
+      taskId: item.run.taskId,
+      message: `${item.run.id} marked failed: ${item.reason}`,
+      createdAt: now,
+    });
+  }
+
+  return staleRuns;
+}
+
 function slugify(value) {
   return String(value || "run")
     .toLowerCase()
@@ -375,16 +437,17 @@ async function appendTaskComment(state, run, body, now, author = "Mission Contro
   });
 }
 
-export async function claimRuns(input = {}) {
+async function claimRunsWithReport(input = {}) {
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
   return mutateState(async (state) => {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
     const now = new Date().toISOString();
+    const reaped = await reapStaleRunningRuns(state, input, now);
     const activeCount = state.runs.filter((run) => ACTIVE_STATUSES.has(run.status)).length;
     const available = Math.max(0, limit - activeCount);
-    if (available <= 0) return [];
+    if (available <= 0) return { claimed: [], reaped };
 
     const claimed = [];
     const plannedRuns = [];
@@ -439,8 +502,13 @@ export async function claimRuns(input = {}) {
       });
       plannedRuns.push(run);
     }
-    return claimed;
+    return { claimed, reaped };
   });
+}
+
+export async function claimRuns(input = {}) {
+  const report = await claimRunsWithReport(input);
+  return report.claimed;
 }
 
 export async function completeRun(runId, input = {}) {
@@ -753,11 +821,19 @@ export async function runClaimedRun(run, input = {}) {
 }
 
 export async function runQueuedRuns(input = {}) {
-  const claimed = await claimRuns(input);
-  const results = await Promise.all(claimed.map((run) => runClaimedRun(run, input)));
+  const claimReport = await claimRunsWithReport(input);
+  const results = await Promise.all(claimReport.claimed.map((run) => runClaimedRun(run, input)));
   return {
     generatedAt: new Date().toISOString(),
-    claimed: claimed.map((run) => run.id),
+    claimed: claimReport.claimed.map((run) => run.id),
+    reaped: claimReport.reaped.map((item) => ({
+      id: item.run.id,
+      taskId: item.run.taskId,
+      projectId: item.run.projectId,
+      reason: item.reason,
+      exitCode: item.run.exitCode,
+      outputPath: item.run.outputPath || "",
+    })),
     results,
   };
 }
@@ -765,10 +841,17 @@ export async function runQueuedRuns(input = {}) {
 export function formatRunnerReport(report) {
   const lines = [
     `Mission Control runner sweep (${report.generatedAt})`,
-    `Claimed: ${report.claimed.length}  Finished: ${report.results.length}`,
+    `Claimed: ${report.claimed.length}  Finished: ${report.results.length}  Reaped: ${(report.reaped || []).length}`,
     "",
   ];
-  if (!report.claimed.length) {
+  for (const run of report.reaped || []) {
+    lines.push(`[${run.id}] reaped stale run (${run.exitCode})`);
+    lines.push(`  Task: ${run.taskId}`);
+    lines.push(`  Reason: ${run.reason}`);
+    if (run.outputPath) lines.push(`  Output: ${run.outputPath}`);
+    lines.push("");
+  }
+  if (!report.claimed.length && !(report.reaped || []).length) {
     lines.push("No queued runs claimed.");
     return lines.join("\n");
   }

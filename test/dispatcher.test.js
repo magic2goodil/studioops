@@ -86,3 +86,73 @@ test("blocked QA integrations are dispatchable builder remediation runs", () => 
   assert.equal(report.selected[0].group, "builder");
   assert.equal(report.skipped.length, 0);
 });
+
+test("completed runs do not permanently suppress unresolved actions", () => {
+  const state = fixtureState();
+  state.runs.push({
+    id: "run_1",
+    taskId: "task_2",
+    projectId: "project_1",
+    dispatchKey: "task_2:0:qa_integration_blocked:builder:qa_integration_blocked",
+    actionType: "qa_integration_blocked",
+    group: "builder",
+    role: "builder",
+    status: "completed",
+  });
+
+  const report = planDispatches(state, [
+    {
+      id: "task_2:qa_integration_blocked",
+      type: "qa_integration_blocked",
+      role: "builder",
+      projectId: "project_1",
+      projectKey: "demo",
+      projectName: "Demo",
+      taskId: "task_2",
+      taskTitle: "Blocked integration task",
+      taskStatus: "qa_review",
+      priority: "high",
+      reason: "QA integration is still blocked.",
+      integrationStatus: "blocked",
+    },
+  ]);
+
+  assert.equal(report.selected.length, 1);
+  assert.equal(report.selected[0].action.type, "qa_integration_blocked");
+  assert.equal(report.skipped.length, 0);
+});
+
+test("active runs still suppress duplicate dispatches", () => {
+  const state = fixtureState();
+  state.runs.push({
+    id: "run_1",
+    taskId: "task_2",
+    projectId: "project_1",
+    dispatchKey: "task_2:0:qa_integration_blocked:builder:qa_integration_blocked",
+    actionType: "qa_integration_blocked",
+    group: "builder",
+    role: "builder",
+    status: "running",
+  });
+
+  const report = planDispatches(state, [
+    {
+      id: "task_2:qa_integration_blocked",
+      type: "qa_integration_blocked",
+      role: "builder",
+      projectId: "project_1",
+      projectKey: "demo",
+      projectName: "Demo",
+      taskId: "task_2",
+      taskTitle: "Blocked integration task",
+      taskStatus: "qa_review",
+      priority: "high",
+      reason: "QA integration is still blocked.",
+      integrationStatus: "blocked",
+    },
+  ]);
+
+  assert.equal(report.selected.length, 0);
+  assert.equal(report.skipped.length, 1);
+  assert.equal(report.skipped[0].reason, "already_dispatched");
+});
