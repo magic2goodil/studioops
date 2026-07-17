@@ -15,7 +15,7 @@ const DISPATCHABLE_ACTIONS = new Set([
 ]);
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
-const FINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const DUPLICATE_BLOCKING_RUN_STATUSES = new Set(["queued", "running", "notified"]);
 
 const DEFAULTS = {
   provider: "prompt-outbox",
@@ -88,7 +88,7 @@ function dispatchKeyFor(task, action) {
 function activeRunMatches(run, action, task) {
   if (run.taskId !== task.id) return false;
   if (["notify_owner", "notify_qa_review", "qa_bundle_ready"].includes(action.type)) {
-    return run.actionType === action.type && !FINAL_RUN_STATUSES.has(run.status);
+    return run.actionType === action.type && DUPLICATE_BLOCKING_RUN_STATUSES.has(run.status);
   }
   if (!ACTIVE_RUN_STATUSES.has(run.status)) return false;
   if (run.role !== action.role) return false;
@@ -98,7 +98,7 @@ function activeRunMatches(run, action, task) {
 function hasExistingDispatch(state, action, task) {
   const key = dispatchKeyFor(task, action);
   return (state.runs || []).some((run) => (
-    (run.dispatchKey === key && !FINAL_RUN_STATUSES.has(run.status))
+    (run.dispatchKey === key && DUPLICATE_BLOCKING_RUN_STATUSES.has(run.status))
     || activeRunMatches(run, action, task)
   ));
 }
