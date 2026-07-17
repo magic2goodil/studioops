@@ -267,7 +267,7 @@ function standardReference(item) {
 
 function normalizeReviewPipeline(value) {
   if (!Array.isArray(value)) return [];
-  return value
+  const stages = value
     .map((stage) => ({
       key: String(stage.key || "").trim(),
       label: String(stage.label || stage.key || "").trim(),
@@ -277,6 +277,7 @@ function normalizeReviewPipeline(value) {
       description: String(stage.description || "").trim(),
     }))
     .filter((stage) => stage.key && stage.role);
+  return reviewStagesWithDefaultAccessibility(stages);
 }
 
 function normalizeBoolean(value, defaultValue = false) {
@@ -726,8 +727,39 @@ function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds
   }
 }
 
-function reviewStagesForProject(project) {
-  return (project.reviewPipeline || []).length ? project.reviewPipeline : DEFAULT_REVIEW_PIPELINE;
+function stageSearchText(stage) {
+  return [
+    stage?.key,
+    stage?.status,
+    stage?.role,
+    stage?.label,
+  ].map((item) => String(item || "").toLowerCase().replaceAll("_", "-")).join(" ");
+}
+
+function isAccessibilityReviewStage(stage) {
+  const text = stageSearchText(stage);
+  return text.includes("accessibility") || text.includes("a11y");
+}
+
+function isFrontendReviewStage(stage) {
+  return stageSearchText(stage).includes("frontend");
+}
+
+function reviewStagesWithDefaultAccessibility(stages) {
+  if (!Array.isArray(stages) || !stages.length) return DEFAULT_REVIEW_PIPELINE;
+  if (stages.some(isAccessibilityReviewStage) || !stages.some(isFrontendReviewStage)) return stages;
+  const leadIndex = stages.findIndex(isLeadReviewStage);
+  if (leadIndex === -1) return stages;
+  const accessibilityStage = DEFAULT_REVIEW_PIPELINE.find((stage) => stage.key === "accessibility");
+  return [
+    ...stages.slice(0, leadIndex),
+    { ...accessibilityStage },
+    ...stages.slice(leadIndex),
+  ];
+}
+
+export function reviewStagesForProject(project) {
+  return reviewStagesWithDefaultAccessibility(project?.reviewPipeline || []);
 }
 
 export function reviewPolicyForProject(project) {
@@ -1130,7 +1162,7 @@ export function generatePrompt(state, taskId, role = "builder") {
   const safety = (project.safetyRules || []).map((item) => `- ${item}`).join("\n") || "- No project-specific safety rules recorded.";
   const context = (project.contextLinks || []).map((item) => `- ${item}`).join("\n") || "- README.md";
   const standards = (project.standards || []).map((item) => `- ${standardReference(item)}`).join("\n") || "- No project-specific standards recorded.";
-  const reviewStages = (project.reviewPipeline || []).length ? project.reviewPipeline : DEFAULT_REVIEW_PIPELINE;
+  const reviewStages = reviewStagesForProject(project);
   const reviewPolicy = reviewPolicyForProject(project);
   const reviewPipeline = reviewStages.length
     ? reviewStages

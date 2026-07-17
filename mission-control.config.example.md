@@ -56,6 +56,7 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "builder": "default",
       "backend-reviewer": "default",
       "frontend-reviewer": "default",
+      "accessibility-reviewer": "default",
       "lead-reviewer": "default"
     }
   },
@@ -129,6 +130,14 @@ The app reads the first fenced `json mission-control-config` block in this file.
         "status": "frontend_review",
         "required": true,
         "description": "Review UI/UX, responsiveness, accessibility, design-system reuse, content editability, and browser health."
+      },
+      {
+        "key": "accessibility",
+        "label": "Accessibility Review",
+        "role": "accessibility-reviewer",
+        "status": "accessibility_review",
+        "required": true,
+        "description": "Expert review of contrast, readable typography, focus-visible states, keyboard behavior, semantics, labels, alt text, ARIA use, and screen-reader basics before lead review."
       },
       {
         "key": "lead",
@@ -221,6 +230,14 @@ The app reads the first fenced `json mission-control-config` block in this file.
           "status": "frontend_review",
           "required": true,
           "description": "Required when UI, UX, frontend assets, content rendering, responsiveness, or accessibility changes."
+        },
+        {
+          "key": "accessibility",
+          "label": "Accessibility Review",
+          "role": "accessibility-reviewer",
+          "status": "accessibility_review",
+          "required": true,
+          "description": "Required before lead review when UI, UX, frontend assets, content rendering, responsiveness, or accessibility changes; otherwise skip explicitly."
         },
         {
           "key": "lead",

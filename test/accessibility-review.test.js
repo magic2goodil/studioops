@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { extractConfigJson, projectFromConfig } from "../src/config.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { DEFAULT_REVIEW_PIPELINE, generatePrompt } from "../src/store.js";
 import { laneProfile } from "../src/work-lanes.js";
 
-function fixtureState(taskPatch = {}, reviews = []) {
+function fixtureState(taskPatch = {}, reviews = [], projectPatch = {}) {
   return {
     projects: [
       {
@@ -15,6 +17,7 @@ function fixtureState(taskPatch = {}, reviews = []) {
         repoUrl: "https://github.com/example/demo",
         defaultBranch: "main",
         validationCommands: ["npm run check"],
+        ...projectPatch,
       },
     ],
     tasks: [
@@ -80,6 +83,60 @@ test("default review pipeline routes accessibility review before lead review", (
   assert.match(report.actions[0].reviewCommand, /--stage accessibility /);
 });
 
+test("legacy frontend review pipelines gain accessibility review before lead review", () => {
+  const state = fixtureState({}, [
+    {
+      id: "review_1",
+      taskId: "task_1",
+      stageKey: "backend",
+      role: "backend-reviewer",
+      cycle: 1,
+      outcome: "approved",
+      createdAt: "2026-07-17T10:00:00.000Z",
+    },
+    {
+      id: "review_2",
+      taskId: "task_1",
+      stageKey: "frontend",
+      role: "frontend-reviewer",
+      cycle: 1,
+      outcome: "approved",
+      createdAt: "2026-07-17T10:05:00.000Z",
+    },
+  ], {
+    reviewPipeline: [
+      {
+        key: "backend",
+        label: "Backend Review",
+        role: "backend-reviewer",
+        status: "backend_review",
+        required: true,
+      },
+      {
+        key: "frontend",
+        label: "Frontend Review",
+        role: "frontend-reviewer",
+        status: "frontend_review",
+        required: true,
+      },
+      {
+        key: "lead",
+        label: "Primary Lead Review",
+        role: "lead-reviewer",
+        status: "lead_review",
+        required: true,
+      },
+    ],
+  });
+
+  const report = createSupervisorReport(state);
+  const prompt = generatePrompt(state, "task_1", "lead-reviewer");
+
+  assert.equal(report.actions[0].role, "accessibility-reviewer");
+  assert.equal(report.actions[0].nextStatus, "accessibility_review");
+  assert.match(prompt, /Accessibility Review \(accessibility-reviewer\)/);
+});
+
 test("accessibility reviewer prompt includes the required checklist and breakpoints", () => {
   const prompt = generatePrompt(fixtureState(), "task_1", "accessibility-reviewer");
 
@@ -105,4 +162,23 @@ test("accessibility reviewer runs use the frontend lane profile", () => {
 
   assert.equal(profile.lane, "frontend");
   assert.equal(profile.conflictGroup, "frontend-surface");
+});
+
+test("example config imports accessibility review before lead review", async () => {
+  const markdown = await readFile("mission-control.config.example.md", "utf8");
+  const config = extractConfigJson(markdown);
+
+  assert.equal(config.githubApps.roleMap["accessibility-reviewer"], "default");
+  assert.deepEqual(
+    config.defaults.reviewPipeline.map((stage) => stage.key),
+    ["backend", "frontend", "accessibility", "lead"],
+  );
+
+  const project = projectFromConfig(config.projects[0], config.defaults);
+  assert.deepEqual(
+    project.reviewPipeline.map((stage) => stage.key),
+    ["backend", "frontend", "accessibility", "lead"],
+  );
+  assert.equal(project.reviewPipeline[2].status, "accessibility_review");
+  assert.equal(project.reviewPipeline[2].role, "accessibility-reviewer");
 });

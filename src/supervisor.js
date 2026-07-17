@@ -1,4 +1,4 @@
-import { DEFAULT_REVIEW_PIPELINE, reviewPolicyForProject } from "./store.js";
+import { reviewPolicyForProject, reviewStagesForProject } from "./store.js";
 import {
   branchWebUrl,
   integrationBranchName,
@@ -17,10 +17,6 @@ const PRIORITY_WEIGHT = {
   medium: 2,
   low: 3,
 };
-
-function stagesForProject(project) {
-  return (project?.reviewPipeline || []).length ? project.reviewPipeline : DEFAULT_REVIEW_PIPELINE;
-}
 
 function projectForTask(state, task) {
   return state.projects.find((project) => project.id === task.projectId) || null;
@@ -68,7 +64,7 @@ function isLeadReviewStage(stage) {
 }
 
 function leadReviewStageForProject(project) {
-  const stages = stagesForProject(project);
+  const stages = reviewStagesForProject(project);
   return stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
 }
 
@@ -91,7 +87,7 @@ function leadReviewCompleteForCycle(state, task, project) {
 }
 
 function stageForStatus(project, status) {
-  return stagesForProject(project).find((stage) => stage.status === status) || null;
+  return reviewStagesForProject(project).find((stage) => stage.status === status) || null;
 }
 
 function nextOpenReviewStage(state, project, task) {
@@ -102,7 +98,7 @@ function nextOpenReviewStage(state, project, task) {
     if (leadReviewCompleteForCycle(state, task, project)) return null;
     return leadReviewStageForProject(project);
   }
-  return stagesForProject(project).find((stage) => {
+  return reviewStagesForProject(project).find((stage) => {
     const latest = latestReviewForStage(state, task, stage);
     return !latest || !REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
   }) || null;
