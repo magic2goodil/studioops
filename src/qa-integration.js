@@ -69,6 +69,11 @@ function resolveWorkspaceRoot(value) {
   return path.resolve(raw);
 }
 
+function pathContains(parentPath, childPath) {
+  const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function prNumberFromUrl(value) {
   const match = String(value || "").match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/i);
   return match ? match[1] : "";
@@ -147,6 +152,15 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
       || options.workspaceRoot
       || process.env.MISSION_CONTROL_QA_WORKSPACE_ROOT,
   );
+  if (pathContains(sourceRepoPath, workspaceRoot)) {
+    throw new Error(`QA workspace root must be outside the registered project repoPath: ${workspaceRoot}`);
+  }
+
+  const originUrl = await git(sourceRepoPath, ["remote", "get-url", "origin"], { allowFailure: true });
+  if (!originUrl.ok || !originUrl.output.trim()) {
+    throw new Error("Project repoPath must have an origin remote before QA integration can fetch source branches or push integration updates.");
+  }
+
   const projectSegment = workspaceSegment(projectPlan.projectKey || projectPlan.projectId || "project");
   const branchSegment = workspaceSegment(projectPlan.integrationBranch || "qa");
   const workspaceParent = path.join(workspaceRoot, projectSegment);
@@ -155,14 +169,11 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
   const workspacePath = await mkdtemp(path.join(workspaceParent, `${branchSegment}-`));
 
   try {
-    const originUrl = await git(sourceRepoPath, ["remote", "get-url", "origin"], { allowFailure: true });
     await runCommand("git", ["clone", "--shared", "--no-tags", sourceRepoPath, workspacePath], {
       timeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
     });
     await seedLocalBranchFromSourceClone(workspacePath, projectPlan.integrationBranch);
-    if (originUrl.ok && originUrl.output.trim()) {
-      await git(workspacePath, ["remote", "set-url", "origin", originUrl.output.trim()]);
-    }
+    await git(workspacePath, ["remote", "set-url", "origin", originUrl.output.trim()]);
     await copyGitIdentity(sourceRepoPath, workspacePath);
     return {
       executionRepoPath: workspacePath,
