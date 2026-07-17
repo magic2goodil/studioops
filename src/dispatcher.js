@@ -98,7 +98,8 @@ function activeRunMatches(run, action, task) {
 function hasExistingDispatch(state, action, task) {
   const key = dispatchKeyFor(task, action);
   return (state.runs || []).some((run) => (
-    run.dispatchKey === key || activeRunMatches(run, action, task)
+    (run.dispatchKey === key && !FINAL_RUN_STATUSES.has(run.status))
+    || activeRunMatches(run, action, task)
   ));
 }
 
