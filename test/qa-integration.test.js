@@ -425,6 +425,86 @@ test("successful QA integration uses an isolated workspace without switching the
   }
 });
 
+test("QA integration can sync default branch changes into QA and refresh a local preview checkout", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-default-sync-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  const previewPath = path.join(root, "preview");
+
+  try {
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
+    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    await git(repoPath, ["push", "origin", "main"]);
+    await git(repoPath, ["push", "origin", "main:qa/integration"]);
+
+    await git(root, ["clone", remotePath, previewPath]);
+    await git(previewPath, ["checkout", "-b", "qa/integration", "origin/qa/integration"]);
+    await writeFile(path.join(previewPath, "dirty-preview-note.txt"), "keep me\n", "utf8");
+
+    await writeFile(path.join(repoPath, "app.txt"), "main update\n", "utf8");
+    await git(repoPath, ["commit", "-am", "main update"]);
+    await git(repoPath, ["push", "origin", "main"]);
+
+    await mkdir(path.join(root, "data"), { recursive: true });
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+      meta: {},
+      projects: [
+        {
+          id: "project_1",
+          key: "demo",
+          name: "Demo",
+          repoPath,
+          repoUrl: "",
+          defaultBranch: "main",
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          reviewPolicy: {
+            trustLeadApprovals: true,
+            integrationBranch: "qa/integration",
+          },
+          qaIntegration: {
+            syncDefaultBranchIntoIntegration: true,
+            localPreview: {
+              enabled: true,
+              checkoutPath: previewPath,
+              branch: "qa/integration",
+              stashDirty: true,
+            },
+          },
+        },
+      ],
+      tasks: [],
+      comments: [],
+      events: [],
+      reviews: [],
+      runs: [],
+    }, null, 2)}\n`, "utf8");
+
+    const script = `
+      import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      const report = await runQaIntegration({ workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))} });
+      console.log(JSON.stringify(report));
+    `;
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const report = JSON.parse(runResult.stdout.trim());
+
+    assert.equal(report.projects[0].status, "ready");
+    assert.equal(report.projects[0].defaultBranchSync.status, "merged");
+    assert.equal(report.projects[0].localQaPreview.stashed, true);
+    assert.match(report.projects[0].localQaPreview.status, /^(updated|current)$/);
+    assert.equal(await git(remotePath, ["show", "refs/heads/qa/integration:app.txt"]), "main update");
+    assert.equal(await readFile(path.join(previewPath, "app.txt"), "utf8"), "main update\n");
+    assert.match(await git(previewPath, ["stash", "list"]), /Mission Control local QA preview sync/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("QA integration preserves a distinct origin push URL in the isolated workspace", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
   const fetchRemotePath = path.join(root, "fetch-remote.git");
