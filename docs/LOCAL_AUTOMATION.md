@@ -11,6 +11,7 @@ The always-on stack includes:
 - `runner`: launches queued builder/reviewer runs with a Codex provider
 - `qa-integration`: merges `qa_review` PR heads into opted-in non-production integration branches after validation
 - `notifier`: sends local owner-review and failure notifications
+- `self-update`: fetches `origin/main`, fast-forwards Mission Control itself when safe, and restarts worker LaunchAgents
 
 ## Install
 
@@ -42,6 +43,7 @@ node src/mission-control-cli.js runs
 npm run runner -- --plan
 npm run dispatcher -- --plan
 npm run qa-integrate -- --plan
+npm run self-update -- --plan
 ```
 
 The runner defaults to `codex-cli`. To test SDK-backed Codex threads:
@@ -80,6 +82,33 @@ npm run qa-integrate -- --project myapp
 The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It prepares each QA bundle in an isolated workspace under `~/.mission-control/qa-workspaces/` by default, so the registered project checkout can stay on the owner's active branch with local changes. Override the workspace root with `MISSION_CONTROL_QA_WORKSPACE_ROOT` when needed, but keep it outside the registered project checkout.
 
 QA integration requires the registered project checkout to have an `origin` remote. It aborts merge conflicts, records comments on affected tasks, runs validation commands from the isolated workspace, and only then pushes the non-production integration branch to that remote. Reports and task comments include the workspace path and strategy used for the run. It does not merge PRs, deploy, force-push, or checkout the registered project repoPath.
+
+## Self Update
+
+Mission Control can update its own local checkout after a control-plane PR is merged to `origin/main`:
+
+```bash
+npm run self-update -- --plan
+npm run self-update
+```
+
+The self-updater only fast-forwards the configured branch, `main` by default. It refuses to update when:
+
+- the working tree has uncommitted or untracked files
+- local `main` cannot fast-forward to `origin/main`
+- the checkout is on another branch
+- builder or reviewer Codex runs are actively running
+
+Running builder/reviewer runs are ignored only when they are stale, such as a missing runner process when PID checks are enabled or a `startedAt` timestamp older than the configured stale-run window. After a successful update, the updater restarts these LaunchAgents:
+
+- `com.codex.mission-control.dispatcher`
+- `com.codex.mission-control.runner`
+- `com.codex.mission-control.notifier`
+- `com.codex.mission-control.qa-integration`
+
+During an applied update, Mission Control records a short-lived self-update lease in local state. The runner checks that lease before claiming queued builder/reviewer work, so queued runs wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
+
+Use `mission-control.config.md` `defaults.selfUpdate` or CLI flags such as `--branch`, `--remote`, `--stale-run-ms`, `--task`, `--notify`, and `--no-restart` to tune local behavior. `--task` records a Mission Control comment on that task; all material non-dry-run outcomes are recorded as Mission Control events.
 
 ## Uninstall
 

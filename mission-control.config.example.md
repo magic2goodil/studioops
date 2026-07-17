@@ -93,6 +93,13 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "intervalSeconds": 300,
       "validationTimeoutMs": 600000
     },
+    "selfUpdate": {
+      "intervalSeconds": 300,
+      "remote": "origin",
+      "branch": "main",
+      "staleRunMs": 7200000,
+      "notify": false
+    },
     "validationCommands": [
       "npm run check"
     ],

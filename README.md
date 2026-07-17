@@ -17,6 +17,7 @@ This first version is intentionally simple:
 - Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
 - Includes a runner loop for consuming queued builder/reviewer runs with Codex CLI or the Codex SDK.
 - Includes an opt-in Trust Leads QA integration worker that merges lead-approved PR heads into a configured non-production integration branch after validation.
+- Includes a self-update worker that fast-forwards Mission Control main from `origin/main` and restarts local worker LaunchAgents after safe merged control-plane updates.
 - Runs builders/reviewers in isolated workspaces with lane-aware scheduling so backend, frontend, design, and devops work do not blindly collide.
 - Includes a notifier loop for local owner-review and failed-run notifications.
 - Includes a GitHub App manifest setup helper for Mission Control bot identities.
@@ -243,6 +244,18 @@ Send local macOS notifications for owner/failure handoffs:
 
 ```bash
 npm run notifier
+```
+
+Preview Mission Control self-updates:
+
+```bash
+npm run self-update -- --plan
+```
+
+Run a safe self-update sweep:
+
+```bash
+npm run self-update
 ```
 
 Preview Trust Leads QA integration work:

@@ -20,6 +20,7 @@ import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from 
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
+import { formatSelfUpdateReport, runSelfUpdate } from "./self-update.js";
 import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
 import {
   expandHome,
@@ -67,6 +68,15 @@ function printTable(rows, columns) {
   for (const row of rows) {
     console.log(columns.map((column, index) => String(row[column] || "").padEnd(widths[index])).join("  "));
   }
+}
+
+function booleanOption(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 async function bestEffortCheck(command, args) {
@@ -144,6 +154,13 @@ async function setup() {
           intervalSeconds: 60,
           channel: "macos",
           limit: 10,
+        },
+        selfUpdate: {
+          intervalSeconds: 300,
+          remote: "origin",
+          branch: "main",
+          staleRunMs: 7200000,
+          notify: false,
         },
         validationCommands: [],
         reviewPolicy: {
@@ -300,6 +317,7 @@ Commands:
   runner                        Run queued builder/reviewer dispatches with Codex
   qa-integrate                  Merge lead-approved PR heads into QA integration branches
   notifier                      Send local owner/failure notifications
+  self-update                   Fast-forward Mission Control main and restart workers
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
@@ -331,6 +349,7 @@ Automation:
   mission-control runner --provider codex-sdk
   mission-control qa-integrate --plan
   mission-control notifier --plan
+  mission-control self-update --plan
   mission-control runs --status queued
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
 `);
@@ -658,6 +677,30 @@ Automation:
     });
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(formatNotificationReport(report));
+    return;
+  }
+
+  if (command === "self-update") {
+    const config = await loadConfig();
+    const defaults = {
+      ...(config?.defaults?.selfUpdate || {}),
+      ...(config?.selfUpdate || {}),
+    };
+    const report = await runSelfUpdate({
+      repoPath: args.repo || args["repo-path"] || defaults.repoPath || process.cwd(),
+      remote: args.remote || defaults.remote,
+      branch: args.branch || defaults.branch || defaults.defaultBranch,
+      staleRunMs: args["stale-run-ms"] || defaults.staleRunMs,
+      restartAgentLabels: args.agents || args["restart-agents"] || defaults.restartAgentLabels || defaults.agents,
+      restartAgents: args["no-restart"] ? false : booleanOption(args.restart || defaults.restartAgents, true),
+      commentTaskId: args.task || args["task-id"] || defaults.commentTaskId || defaults.taskId,
+      notify: args["no-notify"] ? false : booleanOption(args.notify || defaults.notify, false),
+      recordNoop: booleanOption(args["record-noop"] || defaults.recordNoop, false),
+      dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
+      checkPids: args["check-pids"] ? true : booleanOption(defaults.checkPids, false),
+    });
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatSelfUpdateReport(report));
     return;
   }
 
