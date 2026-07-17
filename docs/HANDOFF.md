@@ -297,9 +297,11 @@ Default rules:
 - Avoid broad logging of PII.
 - Do not send notifications, emails, SMS, or external messages without explicit approval.
 - Do not deploy production without explicit approval.
-- Production deploys should run through the project's GitHub Actions deployment workflow, not ad hoc local SSH.
-- Real production deploy workflows should be gated to the protected production branch and approved owner/deployer actor.
-- Deployment work must preserve production state. Do not allow broad delete flags, stale-file deletion switches, or cleanup commands that can remove env files, databases, uploads, generated media, logs, virtualenvs, backups, or production-only runtime assets.
+- PR merges and protected integration branch pushes should run validation, previews, or staging only; they must not deploy production by default.
+- Production deploys should run through an explicit release/tag workflow that verifies the target commit is reachable from the protected integration branch, not ad hoc local SSH.
+- Manual `workflow_dispatch` deploys should be dry-run or preview-only unless explicitly approved for an emergency production path.
+- Real production deploy workflows should be gated to the approved owner/deployer actor or allowed deployer list.
+- Deployment work must preserve production state. Do not allow broad delete flags, stale-file deletion switches, sync-cleanup, or cleanup commands that can remove env files, databases, uploads, generated media, logs, virtualenvs, backups, or production-only runtime assets.
 
 Consent-sensitive features include:
 
