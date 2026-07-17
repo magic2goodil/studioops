@@ -38,7 +38,13 @@ function parseArgs(argv) {
       args._.push(item);
       continue;
     }
-    const key = item.slice(2);
+    const rawKey = item.slice(2);
+    const equalsIndex = rawKey.indexOf("=");
+    if (equalsIndex !== -1) {
+      args[rawKey.slice(0, equalsIndex)] = rawKey.slice(equalsIndex + 1);
+      continue;
+    }
+    const key = rawKey;
     const next = argv[index + 1];
     if (!next || next.startsWith("--")) {
       args[key] = true;
