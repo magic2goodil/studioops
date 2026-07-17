@@ -246,6 +246,87 @@ test("successful QA integration uses an isolated workspace without switching the
   }
 });
 
+test("QA integration preserves a distinct origin push URL in the isolated workspace", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
+  const fetchRemotePath = path.join(root, "fetch-remote.git");
+  const pushRemotePath = path.join(root, "push-remote.git");
+  const repoPath = path.join(root, "repo");
+
+  try {
+    await git(root, ["init", "--bare", fetchRemotePath]);
+    await git(root, ["init", "--bare", pushRemotePath]);
+    await git(root, ["clone", fetchRemotePath, repoPath]);
+    await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
+    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    await git(repoPath, ["push", "origin", "main"]);
+    await git(repoPath, ["push", "origin", "main:qa/integration"]);
+    await git(repoPath, ["push", pushRemotePath, "main:qa/integration"]);
+
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "app.txt"), "feature\n", "utf8");
+    await git(repoPath, ["commit", "-am", "feature"]);
+    await git(repoPath, ["push", "origin", "feature/task"]);
+    await git(repoPath, ["remote", "set-url", "--push", "origin", pushRemotePath]);
+
+    await git(repoPath, ["checkout", "-b", "owner/work", "main"]);
+    const ownerStatusBefore = await git(repoPath, ["status", "--porcelain"]);
+
+    await mkdir(path.join(root, "data"), { recursive: true });
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+      meta: {},
+      projects: [
+        {
+          id: "project_1",
+          key: "demo",
+          name: "Demo",
+          repoPath,
+          repoUrl: "",
+          defaultBranch: "main",
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          reviewPolicy: {
+            trustLeadApprovals: true,
+            integrationBranch: "qa/integration",
+          },
+        },
+      ],
+      tasks: [
+        {
+          id: "task_1",
+          projectId: "project_1",
+          title: "Feature task",
+          status: "qa_review",
+          branchName: "feature/task",
+          prUrl: "",
+        },
+      ],
+      comments: [],
+      events: [],
+      reviews: [],
+      runs: [],
+    }, null, 2)}\n`, "utf8");
+
+    const script = `
+      import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      const report = await runQaIntegration({ workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))} });
+      console.log(JSON.stringify(report));
+    `;
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const report = JSON.parse(runResult.stdout.trim());
+
+    assert.equal(report.projects[0].status, "ready");
+    assert.equal(await git(pushRemotePath, ["show", "refs/heads/qa/integration:app.txt"]), "feature");
+    assert.equal(await git(fetchRemotePath, ["show", "refs/heads/qa/integration:app.txt"]), "base");
+    assert.equal(await git(repoPath, ["symbolic-ref", "--short", "HEAD"]), "owner/work");
+    assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("QA integration refuses a repo without origin instead of pushing back into the registered repo", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
   const repoPath = path.join(root, "repo");

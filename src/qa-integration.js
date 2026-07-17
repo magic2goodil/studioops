@@ -138,6 +138,22 @@ async function copyGitIdentity(sourceRepoPath, workspacePath) {
   await copyGitConfigValue(sourceRepoPath, workspacePath, "user.email");
 }
 
+async function configureWorkspaceOrigin(sourceRepoPath, workspacePath, originUrl) {
+  const fetchUrl = String(originUrl || "").trim();
+  await git(workspacePath, ["remote", "set-url", "origin", fetchUrl]);
+
+  const pushUrlResult = await git(sourceRepoPath, ["remote", "get-url", "--push", "--all", "origin"], { allowFailure: true });
+  const pushUrls = pushUrlResult.ok
+    ? pushUrlResult.output.split("\n").map((item) => item.trim()).filter(Boolean)
+    : [];
+  if (pushUrls.length === 0 || (pushUrls.length === 1 && pushUrls[0] === fetchUrl)) return;
+
+  await git(workspacePath, ["remote", "set-url", "--push", "origin", pushUrls[0]]);
+  for (const pushUrl of pushUrls.slice(1)) {
+    await git(workspacePath, ["remote", "set-url", "--add", "--push", "origin", pushUrl]);
+  }
+}
+
 async function seedLocalBranchFromSourceClone(workspacePath, branchName) {
   if (!branchName || await localBranchExists(workspacePath, branchName)) return;
   const clonedSourceRef = `refs/remotes/origin/${branchName}`;
@@ -173,7 +189,7 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
       timeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
     });
     await seedLocalBranchFromSourceClone(workspacePath, projectPlan.integrationBranch);
-    await git(workspacePath, ["remote", "set-url", "origin", originUrl.output.trim()]);
+    await configureWorkspaceOrigin(sourceRepoPath, workspacePath, originUrl.output);
     await copyGitIdentity(sourceRepoPath, workspacePath);
     return {
       executionRepoPath: workspacePath,
