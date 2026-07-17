@@ -14,6 +14,18 @@ const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 120_000;
 const VALIDATION_TIMEOUT_MS = 10 * 60_000;
 const MAX_OUTPUT_CHARS = 4_000;
+const DEFAULT_QA_INTEGRATION_PATH = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
+].join(":");
+
+function childEnv(options = {}) {
+  return {
+    ...process.env,
+    PATH: options.path || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH || DEFAULT_QA_INTEGRATION_PATH,
+  };
+}
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -64,6 +76,7 @@ async function runCommand(command, args, options = {}) {
   try {
     const result = await execFileAsync(command, args, {
       cwd: options.cwd,
+      env: childEnv(options),
       timeout: Number(options.timeoutMs || COMMAND_TIMEOUT_MS),
       maxBuffer: 10 * 1024 * 1024,
     });
