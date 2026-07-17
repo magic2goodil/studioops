@@ -2,6 +2,7 @@ import { access, readFile, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { integrationBranchName, trustLeadApprovalsEnabled } from "./integration-policy.js";
 
 export const CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "mission-control.config.example.md";
@@ -64,7 +65,34 @@ export async function writeConfig(config, rootDir = process.cwd()) {
   return configPath;
 }
 
+function hasOwnValue(item, key) {
+  return Object.prototype.hasOwnProperty.call(item || {}, key);
+}
+
+function reviewPolicyFromConfig(rawProject = {}, defaults = {}) {
+  const reviewPolicy = {
+    ...(defaults.reviewPolicy || {}),
+    ...(rawProject.reviewPolicy || {}),
+  };
+  if (
+    !hasOwnValue(rawProject.reviewPolicy, "trustLeadApprovals")
+    && !hasOwnValue(rawProject.reviewPolicy, "trustLeads")
+    && hasOwnValue(rawProject, "trustLeadApprovals")
+  ) {
+    reviewPolicy.trustLeadApprovals = rawProject.trustLeadApprovals;
+  }
+  if (
+    !hasOwnValue(rawProject.reviewPolicy, "integrationBranch")
+    && !hasOwnValue(rawProject.reviewPolicy, "reviewBranch")
+    && hasOwnValue(rawProject, "integrationBranch")
+  ) {
+    reviewPolicy.integrationBranch = rawProject.integrationBranch;
+  }
+  return reviewPolicy;
+}
+
 export function projectFromConfig(rawProject, defaults = {}) {
+  const reviewPolicy = reviewPolicyFromConfig(rawProject, defaults);
   return {
     key: rawProject.key,
     name: rawProject.name,
@@ -77,6 +105,8 @@ export function projectFromConfig(rawProject, defaults = {}) {
     standards: rawProject.standards || defaults.standards || [],
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
     reviewPipeline: rawProject.reviewPipeline || defaults.reviewPipeline || [],
-    reviewPolicy: rawProject.reviewPolicy || defaults.reviewPolicy || {},
+    reviewPolicy,
+    trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
+    integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),
   };
 }

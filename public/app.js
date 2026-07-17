@@ -51,6 +51,12 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+function truthyFlag(value) {
+  if (value === true) return true;
+  if (typeof value === "string") return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+  return false;
+}
+
 function linkifyText(value) {
   return escapeHtml(value).replace(/https?:\/\/[^\s<]+/g, (url) => `<a href="${url}" target="_blank" rel="noreferrer">${url}</a>`);
 }
@@ -106,6 +112,28 @@ function branchUrl(project, branchName) {
   return `${repoUrl}/tree/${branch.split("/").map(encodeURIComponent).join("/")}`;
 }
 
+function integrationBranch(task, project) {
+  return String(
+    task.integrationBranch
+    || project?.integrationBranch
+    || project?.reviewPolicy?.integrationBranch
+    || project?.reviewPolicy?.reviewBranch
+    || "",
+  ).trim();
+}
+
+function integrationBranchUrl(task, project) {
+  const linkedUrl = String(task.integrationBranchUrl || "").trim();
+  if (linkedUrl) return linkedUrl;
+  return branchUrl(project, integrationBranch(task, project));
+}
+
+function integrationStatusLabel(task) {
+  const status = String(task.integrationStatus || "").trim();
+  if (!status) return "pending";
+  return status.replaceAll("_", " ");
+}
+
 function taskSummaryMeta(task) {
   const project = projectFor(task);
   const owner = workflowOwner(task);
@@ -140,6 +168,7 @@ function workflowOwner(task) {
   if (task.assignedAgentRole) return task.assignedAgentRole;
   if (task.status === "qa_review") return "local QA";
   if (task.status === "user_review") return "owner";
+  if (task.status === "qa_review") return "owner";
   if (["ready", "queued", "in_progress", "needs_changes"].includes(task.status)) return "builder";
   if (task.status === "builder_review") return "automation";
   return "";
@@ -147,6 +176,11 @@ function workflowOwner(task) {
 
 function workflowGate(task) {
   const owner = workflowOwner(task);
+  if (task.status === "qa_review") {
+    if (task.integrationStatus === "ready") return "QA bundle ready";
+    if (["conflict", "validation_failed", "push_failed", "blocked"].includes(task.integrationStatus)) return "QA integration blocked";
+    return "QA integration pending";
+  }
   if (owner) return `Owner: ${owner}`;
   if (task.status === "blocked") return "Waiting on dependencies";
   if (["done", "closed", "merged", "deployed"].includes(task.status)) return "Complete";
@@ -357,18 +391,29 @@ function renderTasks() {
     const childCount = state.tasks.filter((item) => item.parentTaskId === task.id).length;
     const dependencies = (task.dependsOnTaskIds || []).map(taskById).filter(Boolean);
     const parent = task.parentTaskId ? taskById(task.parentTaskId) : null;
+    const qaBranch = integrationBranch(task, project);
+    const qaBranchHref = integrationBranchUrl(task, project);
+    const qaMeta = task.status === "qa_review" && qaBranch
+      ? `<div class="qa-card-meta">
+          <span>QA ${escapeHtml(integrationStatusLabel(task))}</span>
+          ${qaBranchHref ? `<a href="${escapeHtml(qaBranchHref)}" target="_blank" rel="noreferrer">Open ${escapeHtml(qaBranch)}</a>` : `<span>${escapeHtml(qaBranch)}</span>`}
+        </div>`
+      : "";
     return `
-      <button type="button" class="task-card ${task.id === state.selectedTaskId ? "selected" : ""}" data-task-id="${escapeHtml(task.id)}">
-        <div class="task-card-top">
-          <span class="task-id-pill">${escapeHtml(task.id)}</span>
-          <span class="priority">${escapeHtml(task.type || task.priority || "task")}</span>
-        </div>
-        <span class="status ${escapeHtml(task.status)}">${escapeHtml(task.status)}</span>
-        <h3>${escapeHtml(task.title)}</h3>
-        <p>${escapeHtml(task.description || "No description yet.")}</p>
-        <span class="workflow-owner">${escapeHtml(workflowGate(task))}${task.reviewCycle ? ` · cycle ${escapeHtml(task.reviewCycle)}` : ""}</span>
-        <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${parent ? ` · parent ${escapeHtml(parent.id)} ${escapeHtml(parent.title)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencies.length ? ` · depends on ${dependencies.map((item) => `${item.id} ${item.title}`).join(", ")}` : ""}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
-      </button>
+      <article class="task-card ${task.id === state.selectedTaskId ? "selected" : ""}">
+        <button type="button" class="task-card-main" data-task-id="${escapeHtml(task.id)}">
+          <div class="task-card-top">
+            <span class="task-id-pill">${escapeHtml(task.id)}</span>
+            <span class="priority">${escapeHtml(task.type || task.priority || "task")}</span>
+          </div>
+          <span class="status ${escapeHtml(task.status)}">${escapeHtml(task.status)}</span>
+          <h3>${escapeHtml(task.title)}</h3>
+          <p>${escapeHtml(task.description || "No description yet.")}</p>
+          <span class="workflow-owner">${escapeHtml(workflowGate(task))}${task.reviewCycle ? ` · cycle ${escapeHtml(task.reviewCycle)}` : ""}</span>
+          <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${parent ? ` · parent ${escapeHtml(parent.id)} ${escapeHtml(parent.title)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencies.length ? ` · depends on ${dependencies.map((item) => `${item.id} ${item.title}`).join(", ")}` : ""}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
+        </button>
+        ${qaMeta}
+      </article>
     `;
   }).join("") || `<p>No tasks match this view.</p>`;
 }
@@ -423,6 +468,52 @@ function renderBranchPanel(task, project) {
         <label>Pull Request URL <input name="prUrl" value="${escapeHtml(task.prUrl || "")}" placeholder="https://github.com/owner/repo/pull/123"></label>
         <button type="button" data-action="save-git-links">Save Git Links</button>
       </div>
+    </section>
+  `;
+}
+
+function renderIntegrationPanel(task, project) {
+  const enabled = truthyFlag(project?.trustLeadApprovals ?? project?.reviewPolicy?.trustLeadApprovals ?? project?.reviewPolicy?.trustLeads);
+  const qaBranch = integrationBranch(task, project);
+  if (!enabled && !qaBranch && !task.integrationStatus) return "";
+  const qaBranchHref = integrationBranchUrl(task, project);
+  const validation = task.integrationValidation?.commands || [];
+  return `
+    <section class="detail-section integration-section">
+      <div class="section-heading">
+        <h3>QA Integration</h3>
+        <span>${escapeHtml(integrationStatusLabel(task))}</span>
+      </div>
+      <div class="workflow-grid">
+        <div>
+          <strong>Trust Leads</strong>
+          <span>${enabled ? "enabled" : "disabled"}</span>
+        </div>
+        <div>
+          <strong>Integration branch</strong>
+          <span>${qaBranchHref ? `<a class="inline-link" href="${escapeHtml(qaBranchHref)}" target="_blank" rel="noreferrer">${escapeHtml(qaBranch)}</a>` : escapeHtml(qaBranch || "not configured")}</span>
+        </div>
+        <div>
+          <strong>Commit</strong>
+          <span>${escapeHtml(task.integrationCommit || "not ready")}</span>
+        </div>
+        <div>
+          <strong>Updated</strong>
+          <span>${task.integrationUpdatedAt ? escapeHtml(new Date(task.integrationUpdatedAt).toLocaleString()) : "not run"}</span>
+        </div>
+      </div>
+      ${task.integrationConflictFiles?.length ? `
+        <div class="conflict-list">
+          <strong>Conflicts</strong>
+          ${task.integrationConflictFiles.map((file) => `<code>${escapeHtml(file)}</code>`).join("")}
+        </div>
+      ` : ""}
+      ${validation.length ? `
+        <div class="validation-list">
+          <strong>Validation</strong>
+          ${validation.map((item) => `<code>${escapeHtml(item.command)}: ${item.ok ? "passed" : "failed"}</code>`).join("")}
+        </div>
+      ` : ""}
     </section>
   `;
 }
@@ -504,6 +595,7 @@ async function renderDetail() {
       </section>
       ${renderHierarchyPanel(fullTask)}
       ${renderBranchPanel(fullTask, project)}
+      ${renderIntegrationPanel(fullTask, project)}
       ${renderStandardsPanel(project)}
     </div>
     ${attachmentList(fullTask.attachments)}
@@ -566,6 +658,12 @@ async function openTaskModal(taskId) {
   const detail = await api(`/api/tasks/${encodeURIComponent(taskId)}/detail`);
   const task = detail.task;
   const project = task.project || projectFor(task);
+  const qaSummary = task.status === "qa_review" || integrationBranch(task, project) || task.integrationStatus
+    ? `<section>
+        <h3>QA Integration</h3>
+        <p>${escapeHtml(integrationStatusLabel(task))}${integrationBranch(task, project) ? ` · ${escapeHtml(integrationBranch(task, project))}` : ""}</p>
+      </section>`
+    : "";
   taskModalOpenLink.href = taskPath(task.id);
   taskModalBody.innerHTML = `
     <div class="task-modal-hero">
@@ -582,6 +680,7 @@ async function openTaskModal(taskId) {
         <h3>Current Owner</h3>
         <p>${escapeHtml(workflowGate(task))}</p>
       </section>
+      ${qaSummary}
       <section>
         <h3>Parent</h3>
         ${task.parent ? taskReferenceCard(task.parent) : `<p class="muted-note">No parent linked.</p>`}

@@ -16,10 +16,20 @@ It can:
 It does not:
 
 - merge PRs
+- update QA integration branches
 - deploy production
 - send external notifications
 - delete production files
 - silently approve work
+
+The QA integration worker is a separate local command:
+
+```bash
+npm run qa-integrate -- --plan
+npm run qa-integrate
+```
+
+The dispatcher may show `run_qa_integration` in supervisor output, but it does not dispatch that action to Codex. The integration worker performs the Git merge, validation, and non-force push for opted-in Trust Leads projects.
 
 ## Run A Plan
 

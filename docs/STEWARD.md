@@ -7,7 +7,7 @@ It runs `automation-tick`, which advances task state when the rules are satisfie
 - dependency-blocked tasks return to the queue when dependencies complete
 - `builder_review` tasks route into backend, frontend, and lead review
 - review changes send work back to the builder
-- fully reviewed work moves to `user_review`, or to `qa_review` when Trust Leads is enabled
+- fully reviewed work moves to `user_review`, or to `qa_review` when Trust Leads QA integration is enabled for the project
 
 It intentionally leaves `ready` and `queued` tasks in place. The dispatcher owns turning those tasks into durable builder runs. This prevents the steward from moving tasks to `in_progress` before a builder has actually been launched.
 
@@ -15,6 +15,7 @@ It does not:
 
 - run Codex
 - merge PRs
+- update QA integration branches
 - deploy production
 - send notifications
 - approve owner review
@@ -47,6 +48,7 @@ The rest of the automation stack is:
 2. Supervisor reports next actions.
 3. Dispatcher creates durable run records.
 4. Runner executes queued builder/reviewer runs with Codex CLI.
-5. Notifier sends local owner/failure notifications.
+5. QA integration worker updates opted-in non-production integration branches.
+6. Notifier sends local owner/failure notifications.
 
 The human owner remains the final merge/deploy authority.

@@ -1,6 +1,13 @@
 import { mkdir, readFile, writeFile, copyFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileExists } from "./config.js";
+import {
+  branchWebUrl,
+  integrationBranchName,
+  integrationBranchSafetyError,
+  projectUsesTrustLeadQa,
+  trustLeadApprovalsEnabled,
+} from "./integration-policy.js";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const DATA_FILE = path.join(DATA_DIR, "mission-control.json");
@@ -285,6 +292,25 @@ function normalizeReviewPolicy(value = {}) {
   };
 }
 
+function reviewPolicyInputForProject(input = {}) {
+  const reviewPolicy = { ...(input.reviewPolicy || {}) };
+  if (
+    !Object.prototype.hasOwnProperty.call(reviewPolicy, "trustLeadApprovals")
+    && !Object.prototype.hasOwnProperty.call(reviewPolicy, "trustLeads")
+    && Object.prototype.hasOwnProperty.call(input, "trustLeadApprovals")
+  ) {
+    reviewPolicy.trustLeadApprovals = input.trustLeadApprovals;
+  }
+  if (
+    !Object.prototype.hasOwnProperty.call(reviewPolicy, "integrationBranch")
+    && !Object.prototype.hasOwnProperty.call(reviewPolicy, "reviewBranch")
+    && Object.prototype.hasOwnProperty.call(input, "integrationBranch")
+  ) {
+    reviewPolicy.integrationBranch = input.integrationBranch;
+  }
+  return reviewPolicy;
+}
+
 export async function addProject(input) {
   return mutateState(async (state) => {
     const now = new Date().toISOString();
@@ -293,6 +319,7 @@ export async function addProject(input) {
     if (state.projects.some((project) => project.key === key)) {
       throw new Error(`Project key already exists: ${key}`);
     }
+    const reviewPolicy = normalizeReviewPolicy(reviewPolicyInputForProject(input));
     const project = {
       id: nextId(state.projects, "project"),
       key,
@@ -306,7 +333,9 @@ export async function addProject(input) {
       standards: normalizeList(input.standards),
       safetyRules: normalizeList(input.safetyRules),
       reviewPipeline: normalizeReviewPipeline(input.reviewPipeline),
-      reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
+      reviewPolicy,
+      trustLeadApprovals: reviewPolicy.trustLeadApprovals,
+      integrationBranch: reviewPolicy.integrationBranch,
       createdAt: now,
       updatedAt: now,
     };
@@ -359,6 +388,8 @@ export async function updateProject(projectId, patch = {}) {
         ...(project.reviewPolicy || {}),
         ...(patch.reviewPolicy || {}),
       });
+      project.trustLeadApprovals = project.reviewPolicy.trustLeadApprovals;
+      project.integrationBranch = project.reviewPolicy.integrationBranch;
     }
     project.updatedAt = now;
     state.events.push({
@@ -825,23 +856,31 @@ function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLa
 
 function moveTaskToQaReview(state, task, project, now, author, body, actions, actionLabel = "ready for QA review") {
   const policy = reviewPolicyForProject(project);
+  const integrationBranch = integrationBranchName(project);
+  const integrationBranchUrl = branchWebUrl(project, integrationBranch);
   if (task.status !== "qa_review" || task.assignedAgentRole !== (policy.qaReviewerRole || "qa-reviewer")) {
     setTaskWorkflowState(state, task, {
       status: "qa_review",
       assignedAgentRole: policy.qaReviewerRole || "qa-reviewer",
       reviewerThreadId: "",
+      integrationStatus: task.integrationStatus || "pending",
+      integrationBranch,
+      integrationBranchUrl,
     }, now);
   }
-  const integrationText = policy.integrationBranch
-    ? ` Lead-approved work may be integrated into \`${policy.integrationBranch}\` for local QA.`
-    : " Lead-approved work is ready for a non-production local QA branch/bundle.";
-  addAutomationComment(state, task, `${body}${integrationText}`, now, author);
+  addAutomationComment(
+    state,
+    task,
+    `${body} Lead-approved work can be merged into ${integrationBranch} for local QA.${integrationBranchUrl ? `\n\nIntegration branch: ${integrationBranchUrl}` : ""}`,
+    now,
+    author,
+  );
   state.events.push({
     id: nextId(state.events, "event"),
     type: "qa_review_requested",
     projectId: task.projectId,
     taskId: task.id,
-    message: `${task.title} is ready for local QA review.`,
+    message: `${task.title} is ready for QA integration.`,
     createdAt: now,
   });
   actions.push(`${task.id}: ${actionLabel}`);
@@ -849,10 +888,23 @@ function moveTaskToQaReview(state, task, project, now, author, body, actions, ac
 }
 
 function moveTaskAfterReviewsComplete(state, task, project, now, author, body, actions) {
-  const policy = reviewPolicyForProject(project);
-  if (policy.trustLeadApprovals) {
-    return moveTaskToQaReview(state, task, project, now, author, body, actions);
+  if (projectUsesTrustLeadQa(project)) {
+    return moveTaskToQaReview(state, task, project, now, author, body, actions, "ready for QA integration");
   }
+
+  if (trustLeadApprovalsEnabled(project)) {
+    const reason = integrationBranchSafetyError(project);
+    if (reason) {
+      addAutomationComment(
+        state,
+        task,
+        `Trust Leads QA integration is enabled, but this project is not eligible for QA branch routing: ${reason} Routing to human owner review without touching an integration branch.`,
+        now,
+        author,
+      );
+    }
+  }
+
   return moveTaskToOwnerReview(state, task, now, author, body, actions);
 }
 

@@ -16,6 +16,7 @@ This first version is intentionally simple:
 - Includes a steward tick for continuously routing task workflow state across projects.
 - Includes a dispatcher loop for creating durable builder, reviewer, and owner handoff run records from supervisor actions.
 - Includes a runner loop for consuming queued builder/reviewer runs with Codex CLI or the Codex SDK.
+- Includes an opt-in Trust Leads QA integration worker that merges lead-approved PR heads into a configured non-production integration branch after validation.
 - Runs builders/reviewers in isolated workspaces with lane-aware scheduling so backend, frontend, design, and devops work do not blindly collide.
 - Includes a notifier loop for local owner-review and failed-run notifications.
 - Includes a GitHub App manifest setup helper for Mission Control bot identities.
@@ -65,7 +66,7 @@ The runner uses these local GitHub App credentials by default for builder and re
 
 ## Always-On Local Automation
 
-On macOS, install the local web UI, steward, supervisor, dispatcher, runner, and notifier as user LaunchAgents:
+On macOS, install the local web UI, steward, supervisor, dispatcher, runner, QA integration worker, and notifier as user LaunchAgents:
 
 ```bash
 npm run install-agents
@@ -242,6 +243,18 @@ Send local macOS notifications for owner/failure handoffs:
 
 ```bash
 npm run notifier
+```
+
+Preview Trust Leads QA integration work:
+
+```bash
+npm run qa-integrate -- --plan
+```
+
+Run the QA integration worker once:
+
+```bash
+npm run qa-integrate
 ```
 
 Record a review outcome:
