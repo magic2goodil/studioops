@@ -667,6 +667,10 @@ Automation:
       task: args.task || args.tasks || args["task-id"],
       dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
       validationTimeoutMs: args["validation-timeout-ms"],
+      githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
+      githubAppCredentialsDir: args["github-apps-dir"],
+      githubAppRole: args["github-app-role"],
+      githubAppDefaultRole: args["github-app-default-role"],
     };
     if (args.plan || args["dry-run"] || args.dryRun) {
       const state = await readState();
