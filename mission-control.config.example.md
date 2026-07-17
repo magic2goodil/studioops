@@ -95,7 +95,10 @@ The app reads the first fenced `json mission-control-config` block in this file.
     "reviewPolicy": {
       "maxBuilderReviewCycles": 2,
       "reviewerMayFixSmallIssues": true,
-      "leadOwnsFinalDecisionAtLimit": true
+      "leadOwnsFinalDecisionAtLimit": true,
+      "trustLeadApprovals": false,
+      "qaReviewerRole": "qa-reviewer",
+      "integrationBranch": ""
     },
     "reviewPipeline": [
       {
@@ -182,7 +185,10 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "reviewPolicy": {
         "maxBuilderReviewCycles": 2,
         "reviewerMayFixSmallIssues": true,
-        "leadOwnsFinalDecisionAtLimit": true
+        "leadOwnsFinalDecisionAtLimit": true,
+        "trustLeadApprovals": false,
+        "qaReviewerRole": "qa-reviewer",
+        "integrationBranch": "qa/example"
       },
       "reviewPipeline": [
         {
@@ -207,7 +213,7 @@ The app reads the first fenced `json mission-control-config` block in this file.
           "role": "lead-reviewer",
           "status": "lead_review",
           "required": true,
-          "description": "Always required before a task moves to user_review."
+          "description": "Always required before a task moves to qa_review or user_review."
         }
       ],
       "safetyRules": [

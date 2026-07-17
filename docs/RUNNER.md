@@ -175,7 +175,7 @@ node src/mission-control-cli.js run-prompt run_1
 
 The runner can create branches, validate work, commit, push, and open/update PRs when the task asks for that. It must not merge or deploy.
 
-Once reviewers and lead review pass, the task moves to `user_review`. The notifier then tells the human owner. That is the merge/deploy gate.
+Once reviewers and lead review pass, the task moves to `user_review`, or to `qa_review` when Trust Leads is enabled. The notifier then tells the human owner. That is the local QA or merge/deploy gate; production still requires explicit owner approval.
 
 ## Isolated Workspaces
 

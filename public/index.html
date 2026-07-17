@@ -26,12 +26,16 @@
           <span id="projectCount">0</span>
         </div>
         <div id="projectList" class="project-list"></div>
+        <div id="projectSettings" class="project-settings"></div>
+        <div id="qaReviewPanel" class="qa-review-panel"></div>
         <form id="projectForm" class="stacked-form">
           <h3>Add Project</h3>
           <label>Key <input name="key" placeholder="myapp" required></label>
           <label>Name <input name="name" placeholder="My App" required></label>
           <label>Repo Path <input name="repoPath" placeholder="/absolute/path/to/repo"></label>
           <label>GitHub Repo URL <input name="repoUrl" placeholder="https://github.com/owner/repo"></label>
+          <label class="checkbox-row"><input name="trustLeadApprovals" type="checkbox"> Trust lead approvals</label>
+          <label>QA Integration Branch <input name="integrationBranch" placeholder="qa/myapp"></label>
           <label>Standards <textarea name="standards" rows="3" placeholder="standards/frontend.md&#10;standards/styles.md&#10;standards/performance.md"></textarea></label>
           <label>Validation <input name="validationCommands" placeholder="npm run check"></label>
           <button type="submit">Add Project</button>
@@ -55,6 +59,7 @@
             <option value="backend_review">Backend review</option>
             <option value="frontend_review">Frontend review</option>
             <option value="lead_review">Lead review</option>
+            <option value="qa_review">QA review</option>
             <option value="needs_changes">Needs changes</option>
             <option value="user_review">User review</option>
             <option value="approved">Approved</option>

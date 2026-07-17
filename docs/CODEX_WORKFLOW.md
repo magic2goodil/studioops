@@ -55,8 +55,8 @@ Default automated task flow:
 4. Backend reviewer records `approved`, `skipped`, or `changes_requested`.
 5. Frontend reviewer records `approved`, `skipped`, or `changes_requested`.
 6. Primary team lead reviewer records `approved` or `changes_requested`.
-7. Automation tick moves fully reviewed work to `user_review`.
-8. Human owner reviews only after `user_review`.
+7. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled.
+8. Human owner reviews only after `user_review` or `qa_review`.
 
 Backend and frontend review can be explicitly skipped only when that lane has no relevant surface. The skip must be recorded as a review outcome with a reason.
 
@@ -137,6 +137,6 @@ Use the generated domain reviewer prompts. The reviewer should:
 
 ## Human Owner
 
-The human owner is the final product and merge authority. Tasks should reach the human owner only after backend/frontend review has been completed or explicitly skipped and the primary team lead has marked the work `user_review`.
+The human owner is the final product and production-release authority. Tasks should reach the human owner only after backend/frontend review has been completed or explicitly skipped and the primary team lead has approved the work into `user_review` or, when Trust Leads is enabled, `qa_review`.
 
-When a task reaches `user_review`, Mission Control emits an `owner_review_requested` event and assigns the owner role. External notifications should be built from that event rather than arbitrary status polling.
+When a task reaches `user_review`, Mission Control emits an `owner_review_requested` event and assigns the owner role. When Trust Leads routes a task to `qa_review`, Mission Control emits `qa_review_requested` and the supervisor reports `notify_qa_review`. External notifications should be built from those events rather than arbitrary status polling.

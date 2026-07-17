@@ -13,6 +13,8 @@ const taskBoard = document.querySelector("#taskBoard");
 const taskDetail = document.querySelector("#taskDetail");
 const projectForm = document.querySelector("#projectForm");
 const taskForm = document.querySelector("#taskForm");
+const projectSettings = document.querySelector("#projectSettings");
+const qaReviewPanel = document.querySelector("#qaReviewPanel");
 const automationButton = document.querySelector("#automationButton");
 const refreshButton = document.querySelector("#refreshButton");
 const statusFilter = document.querySelector("#statusFilter");
@@ -136,6 +138,7 @@ function taskRelationshipList(tasks, emptyText) {
 
 function workflowOwner(task) {
   if (task.assignedAgentRole) return task.assignedAgentRole;
+  if (task.status === "qa_review") return "local QA";
   if (task.status === "user_review") return "owner";
   if (["ready", "queued", "in_progress", "needs_changes"].includes(task.status)) return "builder";
   if (task.status === "builder_review") return "automation";
@@ -284,6 +287,67 @@ function renderProjects() {
 
   const select = taskForm.elements.project;
   select.innerHTML = state.projects.map((project) => `<option value="${escapeHtml(project.key)}">${escapeHtml(project.name)}</option>`).join("");
+  renderProjectSettings();
+  renderQaReviewPanel();
+}
+
+function selectedProject() {
+  return state.projects.find((project) => project.id === state.selectedProjectId) || null;
+}
+
+function renderProjectSettings() {
+  const project = selectedProject();
+  if (!project) {
+    projectSettings.innerHTML = "";
+    return;
+  }
+  const policy = project.reviewPolicy || {};
+  projectSettings.innerHTML = `
+    <form class="project-settings-form" data-project-settings>
+      <h3>Review Policy</h3>
+      <label class="checkbox-row">
+        <input name="trustLeadApprovals" type="checkbox" ${policy.trustLeadApprovals ? "checked" : ""}>
+        Trust Leads
+      </label>
+      <p class="muted-note">Lead-approved work goes to QA Review instead of asking you to review every task one by one.</p>
+      <label>QA Integration Branch
+        <input name="integrationBranch" value="${escapeHtml(policy.integrationBranch || "")}" placeholder="qa/${escapeHtml(project.key)}">
+      </label>
+      <button type="submit">Save Policy</button>
+    </form>
+  `;
+}
+
+function renderQaReviewPanel() {
+  const project = selectedProject();
+  if (!project) {
+    qaReviewPanel.innerHTML = "";
+    return;
+  }
+  const items = state.tasks
+    .filter((task) => task.projectId === project.id)
+    .filter((task) => task.status === "qa_review");
+  qaReviewPanel.innerHTML = `
+    <section class="qa-review-list">
+      <div class="section-heading">
+        <h3>QA Review</h3>
+        <span>${items.length} ready</span>
+      </div>
+      ${items.length ? `
+        <div class="qa-review-items">
+          ${items.map((task) => `
+            <article class="qa-review-item">
+              <button type="button" data-task-id="${escapeHtml(task.id)}">
+                <span class="task-id-pill">${escapeHtml(task.id)}</span>
+                <strong>${escapeHtml(task.title)}</strong>
+                <small>${escapeHtml(task.branchName || "No branch")} ${task.prUrl ? "· PR linked" : "· No PR"}</small>
+              </button>
+            </article>
+          `).join("")}
+        </div>
+      ` : `<p class="muted-note">Nothing is waiting for local QA yet.</p>`}
+    </section>
+  `;
 }
 
 function renderTasks() {
@@ -452,6 +516,7 @@ async function renderDetail() {
       <button type="button" data-status="backend_review">Backend Review</button>
       <button type="button" data-status="frontend_review">Frontend Review</button>
       <button type="button" data-status="lead_review">Lead Review</button>
+      <button type="button" data-status="qa_review">QA Review</button>
       <button type="button" data-status="needs_changes">Needs Changes</button>
       <button type="button" data-status="user_review">User Review</button>
       <button type="button" data-status="done">Done</button>
@@ -548,6 +613,33 @@ projectList.addEventListener("click", (event) => {
   render();
 });
 
+projectSettings.addEventListener("submit", async (event) => {
+  const form = event.target.closest("[data-project-settings]");
+  if (!form) return;
+  event.preventDefault();
+  const project = selectedProject();
+  if (!project) return;
+  const formData = new FormData(form);
+  await api(`/api/projects/${encodeURIComponent(project.id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      reviewPolicy: {
+        trustLeadApprovals: formData.get("trustLeadApprovals") === "on",
+        integrationBranch: formData.get("integrationBranch") || "",
+      },
+    }),
+  });
+  await loadState();
+});
+
+qaReviewPanel.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-task-id]");
+  if (!button) return;
+  state.selectedTaskId = button.dataset.taskId;
+  window.history.pushState(null, "", taskPath(state.selectedTaskId));
+  loadState().catch((error) => alert(error.message));
+});
+
 taskBoard.addEventListener("click", (event) => {
   const button = event.target.closest("[data-task-id]");
   if (!button) return;
@@ -642,6 +734,12 @@ projectForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(projectForm);
   const body = Object.fromEntries(form.entries());
+  body.reviewPolicy = {
+    trustLeadApprovals: form.get("trustLeadApprovals") === "on",
+    integrationBranch: form.get("integrationBranch") || "",
+  };
+  delete body.trustLeadApprovals;
+  delete body.integrationBranch;
   await api("/api/projects", {
     method: "POST",
     body: JSON.stringify(body),

@@ -5,6 +5,7 @@ The notifier is the local handoff layer.
 It sends macOS notifications when:
 
 - a task reaches owner review through a `notify_owner` run
+- a task reaches Trust Leads local QA through a `notify_qa_review` run
 - an automated runner run fails
 
 It does not:
@@ -53,6 +54,8 @@ Failed runner notifications are marked with:
 - `notificationChannel`
 
 That prevents repeat notifications every sweep.
+
+`notify_qa_review` uses the same notification marker fields. It means "review the local QA bundle before production," not "deploy this."
 
 ## Safety
 

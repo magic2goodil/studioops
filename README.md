@@ -23,7 +23,8 @@ This first version is intentionally simple:
 - Opens tasks at shareable URLs like `/tasks/task_1`.
 - Supports local image previews, feature branch links, PR links, and task comments.
 - Supports epic/task hierarchy and dependency links so broad work can be planned before builders start.
-- Includes default project standards for engineering, frontend, Sass/CSS, assets, content/IA, data/backend, mockup intake, SEO, performance, accessibility, security/privacy, testing, release/deployment, and review.
+- Supports optional Trust Leads mode, where lead-approved work goes to a consolidated `qa_review` queue instead of requiring owner review on every individual task.
+- Includes default project standards for engineering, frontend, Sass/CSS, assets, content/IA, data/backend, mockup intake, SEO, performance, accessibility, security/privacy, testing, and review.
 - Includes design-system standards for reusable components, Storybook/component catalogs, Twig or equivalent templates, and Sass mixins/tokens.
 
 ## Quick Start
@@ -262,13 +263,15 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 9. Backend reviewer records `approved`, `skipped`, or `changes_requested`.
 10. Frontend reviewer records `approved`, `skipped`, or `changes_requested`.
 11. Primary lead reviewer records the final review outcome.
-12. Automation tick moves fully reviewed work to `user_review`.
-13. The supervisor reports `notify_owner` for tasks that have reached the human gate.
-14. Human owner approves, asks for changes, merges, or deploys.
+12. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled for the project.
+13. The supervisor reports `notify_owner` or `notify_qa_review` for tasks that have reached the human gate.
+14. Human owner tests the QA bundle locally, approves, asks for changes, merges, or deploys through the protected release workflow.
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 
 Default review-loop rule: reviewers may fix small deterministic issues directly and document the fix. Material issues get `changes_requested`, but routine builder-review ping-pong is capped at two cycles; after that, non-lead change requests route to the primary lead for the final automation decision.
+
+Trust Leads mode is project-level. When `reviewPolicy.trustLeadApprovals` is true, lead-approved work moves to `qa_review` with an optional non-production `integrationBranch`. This reduces per-PR owner review fatigue, but it does not authorize production deploys or bypass the final owner release decision.
 
 For continuous coordination, see [docs/STEWARD.md](docs/STEWARD.md), [docs/SUPERVISOR.md](docs/SUPERVISOR.md), [docs/DISPATCHER.md](docs/DISPATCHER.md), [docs/RUNNER.md](docs/RUNNER.md), and [docs/NOTIFIER.md](docs/NOTIFIER.md).
 

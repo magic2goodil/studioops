@@ -7,7 +7,7 @@ It runs `automation-tick`, which advances task state when the rules are satisfie
 - dependency-blocked tasks return to the queue when dependencies complete
 - `builder_review` tasks route into backend, frontend, and lead review
 - review changes send work back to the builder
-- fully reviewed work moves to `user_review`
+- fully reviewed work moves to `user_review`, or to `qa_review` when Trust Leads is enabled
 
 It intentionally leaves `ready` and `queued` tasks in place. The dispatcher owns turning those tasks into durable builder runs. This prevents the steward from moving tasks to `in_progress` before a builder has actually been launched.
 

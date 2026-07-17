@@ -240,16 +240,17 @@ codex/<project-key>-<task-id>-<short-title>
 18. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
 19. Reviewers record outcomes with `mission-control review <task-id> --stage backend|frontend|lead --outcome approved|skipped|changes_requested --body "..."`.
 20. A first routine `changes_requested` outcome returns the task to `needs_changes` and assigns the builder. At the configured review-cycle limit, non-lead `changes_requested` routes to lead review instead of another builder loop.
-21. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review` and emits `owner_review_requested`.
-22. The supervisor reports `notify_owner` for final human review.
-23. The notifier sends a local owner-review notification.
-24. The human owner makes the final merge/deploy decision.
+21. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review`, or to `qa_review` when Trust Leads is enabled.
+22. The supervisor reports `notify_owner` for final human review or `notify_qa_review` for local QA bundle review.
+23. The notifier sends a local owner/QA-review notification.
+24. The human owner makes the final production release decision.
 
 Default PR rule:
 
 - One PR should have one primary Mission Control task.
 - Related tasks can be referenced in the PR body or task comments.
 - Do not mark several independent tasks `user_review` from one PR unless the PR satisfies each task's acceptance criteria.
+- In Trust Leads mode, do not treat `qa_review` as production approval; it is a local QA bundle gate.
 - If one foundation PR intentionally covers several related tasks, add comments to each linked task saying whether the PR completes it or only partially advances it.
 
 ## Mockup Breakdown Flow

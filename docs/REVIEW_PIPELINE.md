@@ -38,6 +38,7 @@ The automation tick:
 - requires branch and PR links before reviewer routing
 - routes each `builder_review` task through backend, frontend, and lead review stages
 - records owner handoff by moving fully reviewed tasks to `user_review`
+- when Trust Leads is enabled, records QA handoff by moving lead-approved tasks to `qa_review` instead of per-task `user_review`
 
 The supervisor reports the next action across projects. It is read-oriented and safe to keep running because it does not merge, deploy, or send external notifications.
 
@@ -73,18 +74,24 @@ Each time a builder moves work into `builder_review`, Mission Control increments
 
 5. `lead_review`
    - Primary team lead checks product fit, acceptance criteria, architecture, cross-cutting risk, prior reviewer findings, task/PR scope, deployment safety, and readiness for the human owner.
-   - Always required before `user_review`.
+   - Always required before `qa_review` or `user_review`.
 
-6. `user_review`
+6. `qa_review`
+   - Optional Trust Leads stop point for lead-approved work.
+   - Work is ready to merge into a non-production integration branch or local review bundle.
+   - The human owner should visually test the full QA list locally before approving production.
+   - This is not production approval.
+
+7. `user_review`
    - Work is ready for the human owner to inspect, test, request changes, approve, merge, or deploy.
 
-7. `needs_changes`
+8. `needs_changes`
    - Any reviewer or the human owner can send the work back.
    - The task should include a comment with concrete requested changes.
    - Builder fixes the same branch/PR unless the reviewer asks for a split PR.
    - At the configured review-cycle limit, unresolved non-lead findings route to lead review instead of another routine builder pass.
 
-8. `done`
+9. `done`
    - Work is merged/deployed or intentionally closed.
 
 ## Reviewer Outcome Rules
@@ -140,9 +147,22 @@ Projects can override the default with:
 "reviewPolicy": {
   "maxBuilderReviewCycles": 2,
   "reviewerMayFixSmallIssues": true,
-  "leadOwnsFinalDecisionAtLimit": true
+  "leadOwnsFinalDecisionAtLimit": true,
+  "trustLeadApprovals": false,
+  "qaReviewerRole": "qa-reviewer",
+  "integrationBranch": ""
 }
 ```
+
+## Trust Leads And QA Review
+
+Trust Leads is a project-level option for reducing owner review fatigue.
+
+When `reviewPolicy.trustLeadApprovals` is `true`, Mission Control trusts the primary lead's `approved` or `skipped` outcome after backend/frontend review is complete. The task moves to `qa_review` instead of `user_review`, and the supervisor reports `notify_qa_review`.
+
+Use `reviewPolicy.integrationBranch` to name the non-production branch or bundle target that should collect lead-approved work for local testing, for example `qa/event-horizons-web`.
+
+Trust Leads does not allow production deploys. It only changes the handoff from "review every PR" to "review the QA bundle." Production release still requires explicit owner approval and the project's protected deployment workflow.
 
 ## One PR Versus Multiple Tasks
 
@@ -166,9 +186,9 @@ When one PR intentionally covers multiple tasks:
 
 ## Human Owner Gate
 
-The human owner should receive only tasks in `user_review`.
+The human owner should receive only tasks in `user_review` or `qa_review`.
 
-`user_review` is the stop point. Automation should not merge to `main`, deploy production, or mark final completion. The human owner approves, requests changes, or merges.
+`user_review` and `qa_review` are stop points. Automation should not merge to `main`, deploy production, or mark final completion. The human owner approves, requests changes, or merges.
 
 Before a task reaches `user_review`, Mission Control should show:
 

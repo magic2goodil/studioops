@@ -84,8 +84,9 @@ Usage:
   mission-control-notifier --watch --interval 60
   mission-control notifier --project event-horizons-web
 
-The notifier sends local macOS notifications when a task reaches owner review or
-when an automated run fails. It does not approve, merge, deploy, or contact users.
+The notifier sends local macOS notifications when a task reaches owner review,
+Trust Leads QA review, or when an automated run fails. It does not approve,
+merge, deploy, or contact users.
 `);
     return;
   }

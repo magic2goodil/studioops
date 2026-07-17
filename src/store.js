@@ -20,6 +20,7 @@ const VALID_STATUSES = new Set([
   "backend_review",
   "frontend_review",
   "lead_review",
+  "qa_review",
   "needs_changes",
   "user_review",
   "approved",
@@ -88,6 +89,9 @@ const DEFAULT_REVIEW_POLICY = {
   maxBuilderReviewCycles: 2,
   reviewerMayFixSmallIssues: true,
   leadOwnsFinalDecisionAtLimit: true,
+  trustLeadApprovals: false,
+  qaReviewerRole: "qa-reviewer",
+  integrationBranch: "",
 };
 
 export {
@@ -259,12 +263,25 @@ function normalizeReviewPipeline(value) {
     .filter((stage) => stage.key && stage.role);
 }
 
+function normalizeBoolean(value, defaultValue = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  }
+  return defaultValue;
+}
+
 function normalizeReviewPolicy(value = {}) {
   const maxCycles = Number(value.maxBuilderReviewCycles ?? value.maxReviewCycles ?? DEFAULT_REVIEW_POLICY.maxBuilderReviewCycles);
   return {
     maxBuilderReviewCycles: Number.isFinite(maxCycles) ? Math.max(1, Math.floor(maxCycles)) : DEFAULT_REVIEW_POLICY.maxBuilderReviewCycles,
-    reviewerMayFixSmallIssues: value.reviewerMayFixSmallIssues !== false,
-    leadOwnsFinalDecisionAtLimit: value.leadOwnsFinalDecisionAtLimit !== false,
+    reviewerMayFixSmallIssues: normalizeBoolean(value.reviewerMayFixSmallIssues, DEFAULT_REVIEW_POLICY.reviewerMayFixSmallIssues),
+    leadOwnsFinalDecisionAtLimit: normalizeBoolean(value.leadOwnsFinalDecisionAtLimit, DEFAULT_REVIEW_POLICY.leadOwnsFinalDecisionAtLimit),
+    trustLeadApprovals: normalizeBoolean(value.trustLeadApprovals ?? value.trustLeads, DEFAULT_REVIEW_POLICY.trustLeadApprovals),
+    qaReviewerRole: String(value.qaReviewerRole || DEFAULT_REVIEW_POLICY.qaReviewerRole).trim(),
+    integrationBranch: String(value.integrationBranch || value.reviewBranch || "").trim(),
   };
 }
 
@@ -299,6 +316,56 @@ export async function addProject(input) {
       type: "project_created",
       projectId: project.id,
       message: `Project created: ${project.name}`,
+      createdAt: now,
+    });
+    return project;
+  });
+}
+
+export async function updateProject(projectId, patch = {}) {
+  return mutateState(async (state) => {
+    const project = findProject(state, projectId);
+    if (!project) throw new Error(`Unknown project: ${projectId}`);
+    const now = new Date().toISOString();
+    const allowed = [
+      "name",
+      "description",
+      "repoPath",
+      "repoUrl",
+      "defaultBranch",
+    ];
+    for (const key of allowed) {
+      if (Object.prototype.hasOwnProperty.call(patch, key)) {
+        project[key] = String(patch[key] || "").trim();
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "validationCommands")) {
+      project.validationCommands = normalizeList(patch.validationCommands);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "contextLinks")) {
+      project.contextLinks = normalizeList(patch.contextLinks);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "standards")) {
+      project.standards = normalizeList(patch.standards);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "safetyRules")) {
+      project.safetyRules = normalizeList(patch.safetyRules);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "reviewPipeline")) {
+      project.reviewPipeline = normalizeReviewPipeline(patch.reviewPipeline);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "reviewPolicy")) {
+      project.reviewPolicy = normalizeReviewPolicy({
+        ...(project.reviewPolicy || {}),
+        ...(patch.reviewPolicy || {}),
+      });
+    }
+    project.updatedAt = now;
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "project_updated",
+      projectId: project.id,
+      message: `Project updated: ${project.name}`,
       createdAt: now,
     });
     return project;
@@ -519,7 +586,7 @@ export async function automationTick(input = {}) {
     const actions = [];
     const candidates = state.tasks
       .filter((task) => !project || task.projectId === project.id)
-      .filter((task) => !["done", "closed", "deployed", "merged", "user_review", "approved"].includes(task.status))
+      .filter((task) => !["done", "closed", "deployed", "merged", "qa_review", "user_review", "approved"].includes(task.status))
       .sort((a, b) => String(a.updatedAt || a.createdAt || "").localeCompare(String(b.updatedAt || b.createdAt || "")));
 
     for (const task of candidates) {
@@ -756,6 +823,39 @@ function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLa
   return actions;
 }
 
+function moveTaskToQaReview(state, task, project, now, author, body, actions, actionLabel = "ready for QA review") {
+  const policy = reviewPolicyForProject(project);
+  if (task.status !== "qa_review" || task.assignedAgentRole !== (policy.qaReviewerRole || "qa-reviewer")) {
+    setTaskWorkflowState(state, task, {
+      status: "qa_review",
+      assignedAgentRole: policy.qaReviewerRole || "qa-reviewer",
+      reviewerThreadId: "",
+    }, now);
+  }
+  const integrationText = policy.integrationBranch
+    ? ` Lead-approved work may be integrated into \`${policy.integrationBranch}\` for local QA.`
+    : " Lead-approved work is ready for a non-production local QA branch/bundle.";
+  addAutomationComment(state, task, `${body}${integrationText}`, now, author);
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "qa_review_requested",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title} is ready for local QA review.`,
+    createdAt: now,
+  });
+  actions.push(`${task.id}: ${actionLabel}`);
+  return actions;
+}
+
+function moveTaskAfterReviewsComplete(state, task, project, now, author, body, actions) {
+  const policy = reviewPolicyForProject(project);
+  if (policy.trustLeadApprovals) {
+    return moveTaskToQaReview(state, task, project, now, author, body, actions);
+  }
+  return moveTaskToOwnerReview(state, task, now, author, body, actions);
+}
+
 function routeChangesRequestedInState(state, task, project, stage, now, author, actions) {
   const policy = reviewPolicyForProject(project);
   const stageLabel = stage.label || stage.key;
@@ -895,12 +995,13 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
     && changeRequestedReviewsForCycle(state, task).length
     && leadReviewCompleteForCycle(state, task, project)
   ) {
-    return moveTaskToOwnerReview(
+    return moveTaskAfterReviewsComplete(
       state,
       task,
+      project,
       now,
       author,
-      "Lead review finalized this task after the configured review-cycle limit. Human owner review is requested with any residual risk captured in review comments.",
+      "Lead review finalized this task after the configured review-cycle limit. Residual risk should be captured in review comments.",
       actions,
     );
   }
@@ -925,12 +1026,13 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
   }
 
   if (task.status !== "user_review") {
-    moveTaskToOwnerReview(
+    moveTaskAfterReviewsComplete(
       state,
       task,
+      project,
       now,
       author,
-      "All required review stages for this cycle are complete. Human owner review is requested.",
+      "All required review stages for this cycle are complete.",
       actions,
     );
   }
@@ -978,6 +1080,8 @@ export function generatePrompt(state, taskId, role = "builder") {
     `- Maximum routine builder review cycles: ${reviewPolicy.maxBuilderReviewCycles}`,
     `- Reviewers may fix small deterministic issues directly: ${reviewPolicy.reviewerMayFixSmallIssues ? "yes" : "no"}`,
     `- Lead owns final decision at the cycle limit: ${reviewPolicy.leadOwnsFinalDecisionAtLimit ? "yes" : "no"}`,
+    `- Trust lead approvals after review completion: ${reviewPolicy.trustLeadApprovals ? "yes, route to QA review instead of per-task owner review" : "no, route to owner review"}`,
+    `- Lead-approved integration branch: ${reviewPolicy.integrationBranch || "(not configured)"}`,
   ].join("\n");
 
   if (role !== "builder") {
@@ -1157,7 +1261,7 @@ function reviewerProfileForRole(role) {
       "acceptance criteria, product intent, scope control, and user-facing risk",
       "whether backend and frontend reviews are complete or explicitly waived",
       "cross-cutting architecture, security/privacy posture, deployment safety, and rollback path",
-      "whether the PR should move to user review, needs changes, or be split into smaller PRs",
+      "whether the PR should move to QA/user review, needs changes, or be split into smaller PRs",
     ],
   };
 }

@@ -19,7 +19,10 @@
       "reviewPolicy": {
         "maxBuilderReviewCycles": 2,
         "reviewerMayFixSmallIssues": true,
-        "leadOwnsFinalDecisionAtLimit": true
+        "leadOwnsFinalDecisionAtLimit": true,
+        "trustLeadApprovals": false,
+        "qaReviewerRole": "qa-reviewer",
+        "integrationBranch": ""
       },
       "contextLinks": [
         "README.md",

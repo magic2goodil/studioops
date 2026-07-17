@@ -8,7 +8,7 @@ It can:
 
 - create builder runs for `start_builder`, `start_builder_fix`, and `return_to_builder`
 - create reviewer runs for `start_review` and `continue_review`
-- create owner handoff notifications for `notify_owner`
+- create owner handoff notifications for `notify_owner` and Trust Leads QA notifications for `notify_qa_review`
 - update task status and assignment so work is not dispatched repeatedly
 - store a prompt snapshot on each run
 - enforce builder, reviewer, and owner handoff concurrency
@@ -141,4 +141,4 @@ node src/mission-control-cli.js update-task task_1 --lane backend --work-area "s
 
 The dispatcher stops at the human owner gate.
 
-It may create an owner handoff run, but it must not merge, deploy, or mark final approval. Production deployment still belongs to the human owner and the project-specific protected GitHub Actions workflow.
+It may create an owner or QA handoff run, but it must not merge, deploy, or mark final approval. Production deployment still belongs to the human owner and the project-specific protected GitHub Actions workflow.

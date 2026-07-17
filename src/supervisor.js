@@ -139,6 +139,7 @@ function actionBase(state, task, type, role, reason, options = {}) {
     promptCommand: role && role !== "owner" ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     nextStatus: options.nextStatus || "",
+    integrationBranch: options.integrationBranch || "",
     dependencies: dependenciesForTask(state, task).map((dependency) => ({
       id: dependency.id,
       status: dependency.status,
@@ -205,6 +206,14 @@ function taskActions(state, task, options = {}) {
     }
     const nextStage = nextOpenReviewStage(state, project, task);
     if (!nextStage) {
+      const policy = reviewPolicyForProject(project);
+      if (policy.trustLeadApprovals) {
+        return [actionBase(state, task, "notify_qa_review", "owner", "All review stages are complete and Trust Leads is enabled; local QA review should be requested.", {
+          ...options,
+          nextStatus: "qa_review",
+          integrationBranch: policy.integrationBranch || "",
+        })];
+      }
       return [actionBase(state, task, "notify_owner", "owner", "All review stages are complete; owner review should be requested.", {
         ...options,
         nextStatus: "user_review",
@@ -257,9 +266,25 @@ function taskActions(state, task, options = {}) {
         nextStatus: nextStage.status,
       })];
     }
+    const policy = reviewPolicyForProject(project);
+    if (policy.trustLeadApprovals) {
+      return [actionBase(state, task, "notify_qa_review", "owner", "All review stages are complete and Trust Leads is enabled; local QA review should be requested.", {
+        ...options,
+        nextStatus: "qa_review",
+        integrationBranch: policy.integrationBranch || "",
+      })];
+    }
     return [actionBase(state, task, "notify_owner", "owner", "All review stages are complete; owner review should be requested.", {
       ...options,
       nextStatus: "user_review",
+    })];
+  }
+
+  if (task.status === "qa_review") {
+    const policy = reviewPolicyForProject(project);
+    return [actionBase(state, task, "notify_qa_review", "owner", "Lead-approved task is ready for local QA review before production approval.", {
+      ...options,
+      integrationBranch: policy.integrationBranch || "",
     })];
   }
 
@@ -323,6 +348,7 @@ export function formatSupervisorReport(report) {
     lines.push(`  Task: ${action.taskUrl}`);
     if (action.prUrl) lines.push(`  PR: ${action.prUrl}`);
     if (action.branchName) lines.push(`  Branch: ${action.branchName}`);
+    if (action.integrationBranch) lines.push(`  Integration branch: ${action.integrationBranch}`);
     if (action.promptCommand) lines.push(`  Prompt: ${action.promptCommand}`);
     if (action.reviewCommand) lines.push(`  Review command: ${action.reviewCommand}`);
     if (action.nextStatus) lines.push(`  Next status: ${action.nextStatus}`);

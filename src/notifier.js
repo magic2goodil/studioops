@@ -32,7 +32,11 @@ function projectAllowed(run, project, options) {
 
 function needsNotification(run) {
   if (!NOTIFIABLE_STATUSES.has(run.status)) return false;
-  if (run.status === "notified" && run.group === "owner" && run.actionType === "notify_owner") {
+  if (
+    run.status === "notified"
+    && run.group === "owner"
+    && ["notify_owner", "notify_qa_review"].includes(run.actionType)
+  ) {
     return !run.externalNotifiedAt && run.notificationStatus !== "failed";
   }
   if (run.status === "failed") {
@@ -49,6 +53,13 @@ function notificationFor(state, run) {
       title: "Mission Control run failed",
       subtitle: `${project?.key || run.projectId} · ${run.id}`,
       body: `${task?.title || run.taskId}. Check ${run.outputPath || "the run log"}.`,
+    };
+  }
+  if (run.actionType === "notify_qa_review") {
+    return {
+      title: "Mission Control QA review ready",
+      subtitle: `${project?.key || run.projectId} · ${run.taskId}`,
+      body: `${task?.title || "Task ready for local QA"}${run.prUrl ? ` · ${run.prUrl}` : ""}`,
     };
   }
   return {

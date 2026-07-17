@@ -86,7 +86,7 @@ It must not:
 - deploy production
 - send customer-facing messages
 - commit secrets or private data
-- bypass the human owner review gate
+- bypass the human owner review or Trust Leads QA gate
 
 The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
 
