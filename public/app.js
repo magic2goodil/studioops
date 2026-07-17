@@ -115,9 +115,9 @@ function branchUrl(project, branchName) {
 function integrationBranch(task, project) {
   return String(
     task.integrationBranch
-    || project?.integrationBranch
     || project?.reviewPolicy?.integrationBranch
     || project?.reviewPolicy?.reviewBranch
+    || project?.integrationBranch
     || "",
   ).trim();
 }
@@ -132,6 +132,13 @@ function integrationStatusLabel(task) {
   const status = String(task.integrationStatus || "").trim();
   if (!status) return "pending";
   return status.replaceAll("_", " ");
+}
+
+function trustLeadApprovalsEnabled(project) {
+  const policy = project?.reviewPolicy || {};
+  if (Object.prototype.hasOwnProperty.call(policy, "trustLeadApprovals")) return truthyFlag(policy.trustLeadApprovals);
+  if (Object.prototype.hasOwnProperty.call(policy, "trustLeads")) return truthyFlag(policy.trustLeads);
+  return truthyFlag(project?.trustLeadApprovals);
 }
 
 function taskSummaryMeta(task) {
@@ -484,7 +491,7 @@ function renderBranchPanel(task, project) {
 }
 
 function renderIntegrationPanel(task, project) {
-  const enabled = truthyFlag(project?.trustLeadApprovals ?? project?.reviewPolicy?.trustLeadApprovals ?? project?.reviewPolicy?.trustLeads);
+  const enabled = trustLeadApprovalsEnabled(project);
   const qaBranch = integrationBranch(task, project);
   if (!enabled && !qaBranch && !task.integrationStatus) return "";
   const qaBranchHref = integrationBranchUrl(task, project);
