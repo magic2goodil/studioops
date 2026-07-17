@@ -25,6 +25,7 @@ const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
 const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
+const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "blocked"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
@@ -88,6 +89,46 @@ function findRunnableLaneConflict(state, run, extraRuns = []) {
   const current = runLaneContext(state, run);
   if (!current) return null;
   return activeLaneContexts(state, extraRuns).find((item) => laneProfilesConflict(current, item)) || null;
+}
+
+function staleRunReason(state, run) {
+  const task = findTask(state, run.taskId);
+  if (!task) return "task_missing";
+
+  if (run.actionType === "qa_integration_blocked") {
+    if (task.status !== "qa_review") return `task_status_changed:${task.status || "unknown"}`;
+    if (!BLOCKED_QA_INTEGRATION_STATUSES.has(task.integrationStatus)) {
+      return `qa_integration_status_changed:${task.integrationStatus || "unknown"}`;
+    }
+    if (run.integrationStatus && run.integrationStatus !== task.integrationStatus) {
+      return `qa_integration_status_changed:${run.integrationStatus}->${task.integrationStatus}`;
+    }
+    return "";
+  }
+
+  if (["start_builder", "start_builder_fix", "return_to_builder"].includes(run.actionType)) {
+    if (task.status !== "in_progress") return `task_status_changed:${task.status || "unknown"}`;
+    if (task.assignedAgentRole && task.assignedAgentRole !== run.role) {
+      return `assignee_changed:${task.assignedAgentRole}`;
+    }
+    return "";
+  }
+
+  if (run.actionType === "unblock_task") {
+    if (!["queued", "in_progress"].includes(task.status)) return `task_status_changed:${task.status || "unknown"}`;
+    return "";
+  }
+
+  if (["start_review", "continue_review"].includes(run.actionType)) {
+    if (!String(task.status || "").includes("review")) return `task_status_changed:${task.status || "unknown"}`;
+    if (task.status === "qa_review" || task.status === "user_review") return `task_status_changed:${task.status}`;
+    if (task.assignedAgentRole && task.assignedAgentRole !== run.role) {
+      return `assignee_changed:${task.assignedAgentRole}`;
+    }
+    return "";
+  }
+
+  return "";
 }
 
 function booleanOption(value, fallback = true) {
@@ -286,6 +327,11 @@ export function planRunnableRuns(state, input = {}) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "project_filter" });
       continue;
     }
+    const staleReason = staleRunReason(state, run);
+    if (staleReason) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: `stale_run:${staleReason}` });
+      continue;
+    }
     if (!project?.repoPath) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "missing_repo_path" });
       continue;
@@ -394,6 +440,24 @@ export async function claimRuns(input = {}) {
       if (!RUNNABLE_STATUSES.has(run.status)) continue;
       if (!RUNNABLE_GROUPS.has(run.group)) continue;
       if (!projectAllowed(run, project, input)) continue;
+      const staleReason = staleRunReason(state, run);
+      if (staleReason) {
+        run.status = "cancelled";
+        run.exitCode = staleReason;
+        run.completedAt = now;
+        run.updatedAt = now;
+        const message = `${run.id} cancelled before launch because its queued action is stale: ${staleReason}.`;
+        await appendTaskComment(state, run, message, now);
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: "run_cancelled",
+          projectId: run.projectId,
+          taskId: run.taskId,
+          message,
+          createdAt: now,
+        });
+        continue;
+      }
       const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
       if (laneConflict) continue;
       if (!project?.repoPath) {
