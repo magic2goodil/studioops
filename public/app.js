@@ -175,8 +175,9 @@ function taskRelationshipList(tasks, emptyText) {
 function workflowOwner(task) {
   if (task.assignedAgentRole) return task.assignedAgentRole;
   if (task.status === "qa_review") return "local QA";
+  if (task.status === "approved_for_main") return "promotion-worker";
+  if (task.status === "promotion_blocked") return "builder";
   if (task.status === "user_review") return "owner";
-  if (task.status === "qa_review") return "owner";
   if (["ready", "queued", "in_progress", "needs_changes"].includes(task.status)) return "builder";
   if (task.status === "builder_review") return "automation";
   return "";
@@ -189,6 +190,8 @@ function workflowGate(task) {
     if (["conflict", "validation_failed", "push_failed", "blocked"].includes(task.integrationStatus)) return "QA integration blocked";
     return "QA integration pending";
   }
+  if (task.status === "approved_for_main") return "Approved for main promotion";
+  if (task.status === "promotion_blocked") return "Promotion blocked";
   if (owner) return `Owner: ${owner}`;
   if (task.status === "blocked") return "Waiting on dependencies";
   if (["done", "closed", "merged", "deployed"].includes(task.status)) return "Complete";
@@ -376,12 +379,12 @@ function renderQaReviewPanel() {
   }
   const items = state.tasks
     .filter((task) => task.projectId === project.id)
-    .filter((task) => task.status === "qa_review");
+    .filter((task) => ["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status));
   qaReviewPanel.innerHTML = `
     <section class="qa-review-list">
       <div class="section-heading">
         <h3>QA Review</h3>
-        <span>${items.length} ready</span>
+        <span>${items.length} active</span>
       </div>
       ${items.length ? `
         <div class="qa-review-items">
@@ -390,7 +393,7 @@ function renderQaReviewPanel() {
             const qaBranchHref = integrationBranchUrl(task, project);
             const qaBranchMeta = qaBranch
               ? `<div class="qa-card-meta">
-                  <span>QA ${escapeHtml(integrationStatusLabel(task))}</span>
+                  <span>${escapeHtml(task.status === "approved_for_main" ? "promotion queued" : task.status === "promotion_blocked" ? "promotion blocked" : `QA ${integrationStatusLabel(task)}`)}</span>
                   ${qaBranchHref ? `<a href="${escapeHtml(qaBranchHref)}" target="_blank" rel="noreferrer">Open ${escapeHtml(qaBranch)}</a>` : `<span>${escapeHtml(qaBranch)}</span>`}
                 </div>`
               : "";
@@ -420,9 +423,9 @@ function renderTasks() {
     const parent = task.parentTaskId ? taskById(task.parentTaskId) : null;
     const qaBranch = integrationBranch(task, project);
     const qaBranchHref = integrationBranchUrl(task, project);
-    const qaMeta = task.status === "qa_review" && qaBranch
+    const qaMeta = ["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status) && (qaBranch || task.promotionStatus)
       ? `<div class="qa-card-meta">
-          <span>QA ${escapeHtml(integrationStatusLabel(task))}</span>
+          <span>${escapeHtml(task.promotionStatus ? `Promotion ${promotionStatusLabel(task)}` : `QA ${integrationStatusLabel(task)}`)}</span>
           ${qaBranchHref ? `<a href="${escapeHtml(qaBranchHref)}" target="_blank" rel="noreferrer">Open ${escapeHtml(qaBranch)}</a>` : `<span>${escapeHtml(qaBranch)}</span>`}
         </div>`
       : "";
@@ -545,6 +548,100 @@ function renderIntegrationPanel(task, project) {
   `;
 }
 
+function promotionStatusLabel(task) {
+  const status = String(task.promotionStatus || "").trim();
+  if (!status) return task.status === "approved_for_main" ? "queued" : "not queued";
+  return status.replaceAll("_", " ");
+}
+
+function renderPromotionPanel(task, project) {
+  if (!["approved_for_main", "promotion_blocked", "merged"].includes(task.status) && !task.promotionStatus) return "";
+  const targetBranch = task.promotionTargetBranch || project?.promotion?.targetBranch || project?.defaultBranch || "main";
+  const targetHref = branchUrl(project, targetBranch);
+  const validation = task.promotionValidation?.commands || [];
+  return `
+    <section class="detail-section promotion-section">
+      <div class="section-heading">
+        <h3>Main Promotion</h3>
+        <span>${escapeHtml(promotionStatusLabel(task))}</span>
+      </div>
+      <div class="workflow-grid">
+        <div>
+          <strong>Target branch</strong>
+          <span>${targetHref ? `<a class="inline-link" href="${escapeHtml(targetHref)}" target="_blank" rel="noreferrer">${escapeHtml(targetBranch)}</a>` : escapeHtml(targetBranch || "not configured")}</span>
+        </div>
+        <div>
+          <strong>Commit</strong>
+          <span>${escapeHtml(task.promotionCommit || "not promoted")}</span>
+        </div>
+        <div>
+          <strong>Updated</strong>
+          <span>${task.promotionUpdatedAt ? escapeHtml(new Date(task.promotionUpdatedAt).toLocaleString()) : "not run"}</span>
+        </div>
+        <div>
+          <strong>Worker</strong>
+          <span>${escapeHtml(task.assignedAgentRole || "promotion-worker")}</span>
+        </div>
+      </div>
+      ${task.promotionConflictFiles?.length ? `
+        <div class="conflict-list">
+          <strong>Conflicts</strong>
+          ${task.promotionConflictFiles.map((file) => `<code>${escapeHtml(file)}</code>`).join("")}
+        </div>
+      ` : ""}
+      ${validation.length ? `
+        <div class="validation-list">
+          <strong>Validation</strong>
+          ${validation.map((item) => `<code>${escapeHtml(item.command)}: ${item.ok ? "passed" : "failed"}</code>`).join("")}
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderQaDecisionPanel(task) {
+  if (!["qa_review", "approved_for_main"].includes(task.status)) return "";
+  const ready = task.status === "approved_for_main" || !task.integrationStatus || task.integrationStatus === "ready";
+  const disabledAttr = ready ? "" : "disabled";
+  const statusCopy = task.status === "approved_for_main"
+    ? "This task passed local QA and is queued for promotion."
+    : ready
+      ? "Review the local QA preview, then pass or fail this task."
+      : `QA cannot pass until integration is ready. Current state: ${integrationStatusLabel(task)}.`;
+  return `
+    <section class="detail-section qa-decision-section">
+      <div class="section-heading">
+        <h3>Owner QA Decision</h3>
+        <span>${escapeHtml(task.status === "approved_for_main" ? "passed" : integrationStatusLabel(task))}</span>
+      </div>
+      <p class="muted-note">${escapeHtml(statusCopy)}</p>
+      ${task.qaDecision ? `
+        <div class="workflow-grid">
+          <div>
+            <strong>Last decision</strong>
+            <span>${escapeHtml(task.qaDecision.outcome || "")}</span>
+          </div>
+          <div>
+            <strong>By</strong>
+            <span>${escapeHtml(task.qaDecision.author || "")}</span>
+          </div>
+          <div>
+            <strong>At</strong>
+            <span>${task.qaDecision.decidedAt ? escapeHtml(new Date(task.qaDecision.decidedAt).toLocaleString()) : ""}</span>
+          </div>
+        </div>
+      ` : ""}
+      <label>QA Notes
+        <textarea name="qaDecisionNotes" rows="3" placeholder="What you checked locally, what failed, or anything the builder should know.">${escapeHtml(task.qaDecision?.notes || "")}</textarea>
+      </label>
+      <div class="qa-decision-actions">
+        <button type="button" data-qa-decision="passed" ${disabledAttr}>QA Passed</button>
+        <button type="button" data-qa-decision="failed">QA Failed</button>
+      </div>
+    </section>
+  `;
+}
+
 function renderStandardsPanel(project) {
   const standards = project?.standards || [];
   return `
@@ -624,6 +721,8 @@ async function renderDetail() {
       ${renderHierarchyPanel(fullTask)}
       ${renderBranchPanel(fullTask, project)}
       ${renderIntegrationPanel(fullTask, project)}
+      ${renderQaDecisionPanel(fullTask)}
+      ${renderPromotionPanel(fullTask, project)}
       ${renderStandardsPanel(project)}
     </div>
     ${attachmentList(fullTask.attachments)}
@@ -638,6 +737,8 @@ async function renderDetail() {
       <button type="button" data-status="accessibility_review">Accessibility Review</button>
       <button type="button" data-status="lead_review">Lead Review</button>
       <button type="button" data-status="qa_review">QA Review</button>
+      <button type="button" data-status="approved_for_main">Approved For Main</button>
+      <button type="button" data-status="promotion_blocked">Promotion Blocked</button>
       <button type="button" data-status="needs_changes">Needs Changes</button>
       <button type="button" data-status="user_review">User Review</button>
       <button type="button" data-status="done">Done</button>
@@ -689,10 +790,10 @@ async function openTaskModal(taskId) {
   const detail = await api(`/api/tasks/${encodeURIComponent(taskId)}/detail`);
   const task = detail.task;
   const project = task.project || projectFor(task);
-  const qaSummary = task.status === "qa_review" || integrationBranch(task, project) || task.integrationStatus
+  const qaSummary = ["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status) || integrationBranch(task, project) || task.integrationStatus
     ? `<section>
-        <h3>QA Integration</h3>
-        <p>${escapeHtml(integrationStatusLabel(task))}${integrationBranch(task, project) ? ` · ${escapeHtml(integrationBranch(task, project))}` : ""}</p>
+        <h3>QA & Promotion</h3>
+        <p>${escapeHtml(integrationStatusLabel(task))}${task.promotionStatus ? ` · promotion ${escapeHtml(promotionStatusLabel(task))}` : ""}${integrationBranch(task, project) ? ` · ${escapeHtml(integrationBranch(task, project))}` : ""}</p>
       </section>`
     : "";
   taskModalOpenLink.href = taskPath(task.id);
@@ -819,6 +920,20 @@ taskDetail.addEventListener("click", async (event) => {
       body: JSON.stringify({
         parentTaskId: taskDetail.querySelector("[name='detailParentTaskId']")?.value || "",
         dependsOnTaskIds: taskDetail.querySelector("[name='detailDependsOnTaskIds']")?.value || "",
+      }),
+    });
+    await loadState();
+    return;
+  }
+
+  const qaDecisionButton = event.target.closest("[data-qa-decision]");
+  if (qaDecisionButton && state.selectedTaskId) {
+    await api(`/api/tasks/${state.selectedTaskId}/qa-decision`, {
+      method: "POST",
+      body: JSON.stringify({
+        outcome: qaDecisionButton.dataset.qaDecision,
+        notes: taskDetail.querySelector("[name='qaDecisionNotes']")?.value || "",
+        author: "Owner QA",
       }),
     });
     await loadState();

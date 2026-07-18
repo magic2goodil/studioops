@@ -110,6 +110,10 @@ export function projectFromConfig(rawProject, defaults = {}) {
       ...(defaults.qaIntegration || {}),
       ...(rawProject.qaIntegration || {}),
     },
+    promotion: {
+      ...(defaults.promotion || {}),
+      ...(rawProject.promotion || {}),
+    },
     localQaPreview: rawProject.localQaPreview || rawProject.qaIntegration?.localPreview || null,
     trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
     integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),

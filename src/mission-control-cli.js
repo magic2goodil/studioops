@@ -9,6 +9,7 @@ import {
   addTask,
   automationTick,
   generatePrompt,
+  recordQaDecision,
   recordReview,
   readState,
   updateProject,
@@ -20,6 +21,7 @@ import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from 
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
+import { formatPromotionReport, planPromotions, runPromotion } from "./promotion.js";
 import { formatSelfUpdateReport, runSelfUpdate } from "./self-update.js";
 import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
 import {
@@ -114,6 +116,18 @@ async function setup() {
       workspace: {
         root: workspaceRoot.trim() || "~/Development",
       },
+      githubApps: {
+        credentialsDir: ".mission-control/github-apps",
+        defaultRole: "default",
+        roleMap: {
+          builder: "default",
+          "backend-reviewer": "default",
+          "frontend-reviewer": "default",
+          "accessibility-reviewer": "default",
+          "lead-reviewer": "default",
+          "promotion-worker": "default",
+        },
+      },
       defaults: {
         supervisor: {
           intervalSeconds: 300,
@@ -149,6 +163,13 @@ async function setup() {
         qaIntegration: {
           intervalSeconds: 300,
           validationTimeoutMs: 600000,
+        },
+        promotion: {
+          intervalSeconds: 300,
+          validationTimeoutMs: 600000,
+          workspaceRoot: "~/.mission-control/promotion-workspaces",
+          githubAppAuth: true,
+          githubAppRole: "promotion-worker",
         },
         notifier: {
           intervalSeconds: 60,
@@ -324,6 +345,9 @@ Commands:
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
   qa-integrate                  Merge lead-approved PR heads into QA integration branches
+  qa-pass TASK_ID --body        Mark local QA passed and queue promotion to main
+  qa-fail TASK_ID --body        Mark local QA failed and return the task for changes
+  promote                       Merge owner-QA-passed PR heads into target branches
   notifier                      Send local owner/failure notifications
   self-update                   Fast-forward Mission Control main and restart workers
   runs                          List dispatch runs
@@ -356,10 +380,12 @@ Automation:
   mission-control runner --plan
   mission-control runner --provider codex-sdk
   mission-control qa-integrate --plan
+  mission-control promote --plan
   mission-control notifier --plan
   mission-control self-update --plan
   mission-control runs --status queued
   mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
+  mission-control qa-pass task_1 --body "Looks good locally."
 `);
     return;
   }
@@ -410,6 +436,17 @@ Automation:
         title: task.title,
       };
     }), ["id", "project", "integrationBranch", "integrationLink", "branch", "pr", "title"]);
+    return;
+  }
+
+  if (command === "qa-pass" || command === "qa-fail") {
+    const taskId = args._[1] || args.task || args["task-id"];
+    const result = await recordQaDecision(taskId, {
+      outcome: command === "qa-pass" ? "passed" : "failed",
+      body: args.body || args.notes || "",
+      author: args.author || "Owner QA",
+    });
+    console.log(`${result.task.id}: QA ${result.outcome}. Status now ${result.task.status}.`);
     return;
   }
 
@@ -733,6 +770,36 @@ Automation:
     const report = await runQaIntegration(options);
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(formatQaIntegrationReport(report));
+    return;
+  }
+
+  if (command === "promote" || command === "promotion") {
+    const config = await loadConfig();
+    const defaults = {
+      ...(config?.defaults?.promotion || {}),
+      ...(config?.promotion || {}),
+    };
+    const options = {
+      project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
+      task: args.task || args.tasks || args["task-id"],
+      dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
+      validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
+      promotionWorkspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
+      githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || defaults.githubAppAuth),
+      githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir,
+      githubAppRole: args["github-app-role"] || defaults.githubAppRole || "promotion-worker",
+      githubAppDefaultRole: args["github-app-default-role"] || defaults.githubAppDefaultRole,
+    };
+    if (args.plan || args["dry-run"] || args.dryRun) {
+      const state = await readState();
+      const plan = planPromotions(state, options);
+      if (args.json) console.log(JSON.stringify(plan, null, 2));
+      else console.log(formatPromotionReport(plan));
+      return;
+    }
+    const report = await runPromotion(options);
+    if (args.json) console.log(JSON.stringify(report, null, 2));
+    else console.log(formatPromotionReport(report));
     return;
   }
 

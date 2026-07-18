@@ -52,6 +52,12 @@ const ROLE_SETS = {
       name: "MC Lead Reviewer",
       description: "Reviews product fit, architecture, task scope, and owner-readiness.",
     },
+    {
+      key: "promotion-worker",
+      role: "promotion-worker",
+      name: "MC Promotion Worker",
+      description: "Promotes owner-QA-passed work into protected target branches after validation.",
+    },
   ],
 };
 

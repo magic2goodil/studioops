@@ -57,7 +57,8 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "backend-reviewer": "default",
       "frontend-reviewer": "default",
       "accessibility-reviewer": "default",
-      "lead-reviewer": "default"
+      "lead-reviewer": "default",
+      "promotion-worker": "default"
     }
   },
   "defaults": {
@@ -103,6 +104,13 @@ The app reads the first fenced `json mission-control-config` block in this file.
         "postUpdateCommands": [],
         "restartLaunchAgents": []
       }
+    },
+    "promotion": {
+      "intervalSeconds": 300,
+      "validationTimeoutMs": 600000,
+      "workspaceRoot": "~/.mission-control/promotion-workspaces",
+      "githubAppAuth": true,
+      "githubAppRole": "promotion-worker"
     },
     "selfUpdate": {
       "intervalSeconds": 300,
@@ -209,6 +217,13 @@ The app reads the first fenced `json mission-control-config` block in this file.
             "com.example.local-preview"
           ]
         }
+      },
+      "promotion": {
+        "enabled": true,
+        "targetBranch": "main",
+        "validationCommands": [
+          "npm run check"
+        ]
       },
       "contextLinks": [
         "README.md",

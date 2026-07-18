@@ -29,6 +29,8 @@ const VALID_STATUSES = new Set([
   "accessibility_review",
   "lead_review",
   "qa_review",
+  "approved_for_main",
+  "promotion_blocked",
   "needs_changes",
   "user_review",
   "approved",
@@ -343,6 +345,9 @@ export async function addProject(input) {
       standards: normalizeList(input.standards),
       safetyRules: normalizeList(input.safetyRules),
       reviewPipeline: normalizeReviewPipeline(input.reviewPipeline),
+      qaIntegration: input.qaIntegration || {},
+      localQaPreview: input.localQaPreview || input.qaIntegration?.localPreview || null,
+      promotion: input.promotion || {},
       reviewPolicy,
       trustLeadApprovals: reviewPolicy.trustLeadApprovals,
       integrationBranch: reviewPolicy.integrationBranch,
@@ -392,6 +397,19 @@ export async function updateProject(projectId, patch = {}) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, "reviewPipeline")) {
       project.reviewPipeline = normalizeReviewPipeline(patch.reviewPipeline);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "qaIntegration")) {
+      project.qaIntegration = {
+        ...(project.qaIntegration || {}),
+        ...(patch.qaIntegration || {}),
+      };
+      project.localQaPreview = project.qaIntegration.localPreview || project.localQaPreview || null;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "promotion")) {
+      project.promotion = {
+        ...(project.promotion || {}),
+        ...(patch.promotion || {}),
+      };
     }
     if (Object.prototype.hasOwnProperty.call(patch, "reviewPolicy")) {
       project.reviewPolicy = normalizeReviewPolicy({
@@ -527,6 +545,86 @@ export async function updateTask(taskId, patch) {
   });
 }
 
+export async function recordQaDecision(taskId, input = {}) {
+  return mutateState(async (state) => {
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (!task) throw new Error(`Unknown task: ${taskId}`);
+    const project = findProject(state, task.projectId);
+    if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
+    const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
+    if (!["passed", "failed"].includes(outcome)) {
+      throw new Error("QA decision outcome must be passed or failed.");
+    }
+    if (!["qa_review", "approved_for_main"].includes(task.status)) {
+      throw new Error(`Task must be in qa_review before QA can be marked passed or failed. Current status: ${task.status}`);
+    }
+    if (outcome === "passed" && task.integrationStatus && task.integrationStatus !== "ready") {
+      throw new Error(`Task QA integration is not ready yet: ${task.integrationStatus}`);
+    }
+
+    const now = new Date().toISOString();
+    const author = String(input.author || "Owner QA").trim();
+    const notes = String(input.notes || input.body || "").trim();
+    task.qaDecision = {
+      outcome,
+      author,
+      notes,
+      decidedAt: now,
+    };
+
+    if (outcome === "passed") {
+      setTaskWorkflowState(state, task, {
+        status: "approved_for_main",
+        assignedAgentRole: "promotion-worker",
+        reviewerThreadId: "",
+        promotionStatus: "queued",
+        promotionTargetBranch: project.defaultBranch || "main",
+        promotionUpdatedAt: now,
+      }, now);
+      addAutomationComment(
+        state,
+        task,
+        `Local QA passed. This task is approved for promotion to ${project.defaultBranch || "main"}.${notes ? `\n\n${notes}` : ""}`,
+        now,
+        author,
+      );
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "qa_passed",
+        projectId: task.projectId,
+        taskId: task.id,
+        message: `${task.title} passed local QA and is approved for main promotion.`,
+        createdAt: now,
+      });
+      return { task, outcome };
+    }
+
+    setTaskWorkflowState(state, task, {
+      status: "needs_changes",
+      assignedAgentRole: "builder",
+      reviewerThreadId: "",
+      promotionStatus: "",
+      promotionUpdatedAt: now,
+    }, now);
+    addAutomationComment(
+      state,
+      task,
+      `Local QA failed. Returning this task to the builder.${notes ? `\n\n${notes}` : ""}`,
+      now,
+      author,
+    );
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "qa_failed",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title} failed local QA and was returned for changes.`,
+      createdAt: now,
+    });
+    return { task, outcome };
+  });
+}
+
 export async function addComment(taskId, body, author = "user") {
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
@@ -627,7 +725,7 @@ export async function automationTick(input = {}) {
     const actions = [];
     const candidates = state.tasks
       .filter((task) => !project || task.projectId === project.id)
-      .filter((task) => !["done", "closed", "deployed", "merged", "qa_review", "user_review", "approved"].includes(task.status))
+      .filter((task) => !["done", "closed", "deployed", "merged", "qa_review", "approved_for_main", "promotion_blocked", "user_review", "approved"].includes(task.status))
       .sort((a, b) => String(a.updatedAt || a.createdAt || "").localeCompare(String(b.updatedAt || b.createdAt || "")));
 
     for (const task of candidates) {

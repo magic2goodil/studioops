@@ -45,6 +45,7 @@ This creates manifests for:
 - `MC Frontend Reviewer`
 - `MC Accessibility Reviewer`
 - `MC Lead Reviewer`
+- `MC Promotion Worker`
 
 Separate role apps create clearer GitHub audit trails, but they also mean more app registrations, installations, private keys, and installation tokens to rotate and monitor.
 
@@ -99,6 +100,7 @@ With `npm run setup-github-role-apps`, Mission Control looks for these directori
 - `frontend-reviewer`
 - `accessibility-reviewer`
 - `lead-reviewer`
+- `promotion-worker`
 
 You can override the mapping in `mission-control.config.md`:
 
@@ -111,7 +113,8 @@ You can override the mapping in `mission-control.config.md`:
     "backend-reviewer": "backend-reviewer",
     "frontend-reviewer": "frontend-reviewer",
     "accessibility-reviewer": "accessibility-reviewer",
-    "lead-reviewer": "lead-reviewer"
+    "lead-reviewer": "lead-reviewer",
+    "promotion-worker": "promotion-worker"
   }
 }
 ```

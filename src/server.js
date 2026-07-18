@@ -1,7 +1,7 @@
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
+import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordQaDecision, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
 import { loadConfig } from "./config.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
@@ -172,6 +172,12 @@ async function handleApi(req, res, url) {
   const reviewMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/reviews$/);
   if (reviewMatch && req.method === "POST") {
     sendJson(res, 201, await recordReview(reviewMatch[1], await readJsonBody(req)));
+    return;
+  }
+
+  const qaDecisionMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/qa-decision$/);
+  if (qaDecisionMatch && req.method === "POST") {
+    sendJson(res, 201, await recordQaDecision(qaDecisionMatch[1], await readJsonBody(req)));
     return;
   }
 

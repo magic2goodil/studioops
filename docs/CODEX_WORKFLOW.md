@@ -57,7 +57,11 @@ Default automated task flow:
 6. Accessibility reviewer records `approved`, `skipped`, or `changes_requested` before lead review for UI/frontend work.
 7. Primary team lead reviewer records `approved` or `changes_requested`.
 8. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled.
-9. Human owner reviews only after `user_review` or `qa_review`.
+9. QA integration merges `qa_review` PR heads into a non-production QA branch and refreshes the local preview when configured.
+10. Human owner reviews only after `user_review` or after the local QA preview is ready.
+11. Owner QA pass moves the task to `approved_for_main`; owner QA fail moves it back to `needs_changes`.
+12. The promotion worker merges `approved_for_main` task heads into the configured target branch after validation, using a non-force push.
+13. Production deployment remains release/tag gated and separate from PR, QA-branch, or target-branch promotion.
 
 Backend, frontend, and accessibility review can be explicitly skipped only when that lane has no relevant surface. The skip must be recorded as a review outcome with a reason.
 
@@ -103,6 +107,15 @@ npm run runner -- --plan
 npm run runner
 ```
 
+Preview and execute QA integration plus main promotion with:
+
+```bash
+npm run qa-integrate -- --plan
+npm run qa-integrate
+npm run promotion -- --plan
+npm run promotion
+```
+
 Preview and send local owner/failure notifications with:
 
 ```bash
@@ -114,6 +127,13 @@ Record review outcomes with:
 
 ```bash
 node src/mission-control-cli.js review task_123 --stage backend --outcome approved --body "Reviewed API and persistence."
+```
+
+Record owner QA outcomes with:
+
+```bash
+node src/mission-control-cli.js qa-pass task_123 --body "Checked the local QA preview."
+node src/mission-control-cli.js qa-fail task_123 --body "Mobile nav still overlaps."
 ```
 
 A scheduled automation stack can call the tick command every few minutes, then let the dispatcher create durable builder, reviewer, and owner handoff runs, the runner execute queued Codex builder/reviewer work, and the notifier alert the human owner when review or failures need attention. The stack should not deploy production or merge PRs.
@@ -141,3 +161,5 @@ Use the generated domain reviewer prompts. The reviewer should:
 The human owner is the final product and production-release authority. Tasks should reach the human owner only after backend/frontend/accessibility review has been completed or explicitly skipped and the primary team lead has approved the work into `user_review` or, when Trust Leads is enabled, `qa_review`.
 
 When a task reaches `user_review`, Mission Control emits an `owner_review_requested` event and assigns the owner role. When Trust Leads routes a task to `qa_review`, Mission Control emits `qa_review_requested` and the supervisor reports `notify_qa_review`. External notifications should be built from those events rather than arbitrary status polling.
+
+When local QA passes, Mission Control emits `qa_passed`, assigns the promotion worker, and queues target-branch promotion. When promotion succeeds, it emits `release_candidate_ready` for the project. That event means the target branch is ready for owner release-candidate review; it does not mean production has deployed.
