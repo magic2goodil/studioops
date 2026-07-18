@@ -10,6 +10,7 @@ The always-on stack includes:
 - `dispatcher`: creates durable builder, reviewer, and owner-handoff runs
 - `runner`: launches queued builder/reviewer runs with a Codex provider
 - `qa-integration`: merges `qa_review` PR heads into opted-in non-production integration branches after validation
+- `promotion`: merges owner-QA-passed work into the project target branch after validation
 - `notifier`: sends local owner-review and failure notifications
 - `self-update`: fetches `origin/main`, fast-forwards Mission Control itself when safe, and restarts worker LaunchAgents
 
@@ -43,6 +44,7 @@ node src/mission-control-cli.js runs
 npm run runner -- --plan
 npm run dispatcher -- --plan
 npm run qa-integrate -- --plan
+npm run promotion -- --plan
 npm run self-update -- --plan
 ```
 
@@ -105,6 +107,40 @@ Projects can also opt into keeping their QA branch and local preview checkout cu
 
 `localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, Mission Control preserves them in a Git stash before fast-forwarding. `restartLaunchAgents` is intended for local preview servers only.
 
+## Main Promotion
+
+After the owner reviews the local QA preview, mark the task from the UI or CLI:
+
+```bash
+mission-control qa-pass task_123 --body "Checked locally."
+mission-control qa-fail task_123 --body "Hero image still covers the full page."
+```
+
+`qa-pass` moves the task to `approved_for_main` and queues it for the promotion worker. `qa-fail` moves it back to `needs_changes` with the owner notes preserved as a task comment.
+
+Promotion is configured per project and defaults to the project's `defaultBranch`:
+
+```json
+{
+  "promotion": {
+    "enabled": true,
+    "targetBranch": "main",
+    "validationCommands": ["npm run check"]
+  }
+}
+```
+
+Run or preview promotion manually:
+
+```bash
+npm run promotion -- --plan
+npm run promotion -- --project myapp
+```
+
+The promotion worker uses an isolated clone under `~/.mission-control/promotion-workspaces/`, fetches the task branch or PR head, merges it into the target branch, runs validation, and performs a non-force push only after validation passes. It records conflicts, validation failures, push failures, and successful target-branch commits back on the task.
+
+Promotion does not deploy production. It prepares the target branch for owner release-candidate review. Production deploys should remain behind explicit release or tag workflows.
+
 ## Self Update
 
 Mission Control can update its own local checkout after a control-plane PR is merged to `origin/main`:
@@ -127,6 +163,7 @@ Running builder/reviewer runs are ignored only when they are stale, such as a mi
 - `com.codex.mission-control.runner`
 - `com.codex.mission-control.notifier`
 - `com.codex.mission-control.qa-integration`
+- `com.codex.mission-control.promotion`
 
 During an applied update, Mission Control records a short-lived self-update lease in local state. The runner checks that lease before claiming queued builder/reviewer work, so queued runs wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
 
@@ -154,11 +191,11 @@ data/run-outputs/
 
 ## Safety
 
-The always-on stack may create branches, run validation, commit, push, and open or update pull requests when a task asks for that behavior.
+The always-on stack may create branches, run validation, commit, push, open or update pull requests, and merge owner-QA-passed task heads into a configured target branch when a project allows that behavior.
 
 It must not:
 
-- merge pull requests
+- press GitHub's pull-request merge button or bypass the configured owner-QA gate
 - deploy production
 - send customer-facing messages
 - commit secrets or private data

@@ -377,6 +377,42 @@ h2 {
   background: #7fb4ff;
 }
 
+.status.approved_for_main {
+  color: #08110b;
+  background: linear-gradient(135deg, var(--green), #9ef7c4);
+}
+
+.status.promotion_blocked {
+  color: #18070b;
+  background: linear-gradient(135deg, var(--coral), #ffd0d8);
+}
+
+.qa-decision-section textarea {
+  width: 100%;
+}
+
+.qa-decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.qa-decision-actions button:first-child {
+  background: linear-gradient(135deg, var(--green), #72f0ae);
+  color: #06120c;
+}
+
+.qa-decision-actions button:last-child {
+  background: linear-gradient(135deg, var(--coral), #ff9faf);
+  color: #18070b;
+}
+
+.qa-decision-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .qa-card-meta {
   display: flex;
   align-items: center;

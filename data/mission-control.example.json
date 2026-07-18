@@ -30,6 +30,14 @@
           "restartLaunchAgents": []
         }
       },
+      "promotion": {
+        "enabled": true,
+        "targetBranch": "main",
+        "workspaceRoot": "~/.mission-control/promotion-workspaces",
+        "validationCommands": [
+          "npm run check"
+        ]
+      },
       "reviewPolicy": {
         "maxBuilderReviewCycles": 2,
         "reviewerMayFixSmallIssues": true,

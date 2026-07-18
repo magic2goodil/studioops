@@ -46,6 +46,11 @@ const ROLE_PERMISSIONS = {
     issues: "write",
     pull_requests: "write",
   },
+  "promotion-worker": {
+    contents: "write",
+    issues: "write",
+    pull_requests: "write",
+  },
   default: {
     contents: "write",
     issues: "write",
@@ -79,6 +84,7 @@ function normalizeRole(value) {
   if (normalized.includes("backend")) return "backend-reviewer";
   if (normalized.includes("frontend")) return "frontend-reviewer";
   if (normalized.includes("accessibility") || normalized.includes("a11y")) return "accessibility-reviewer";
+  if (normalized.includes("promotion") || normalized.includes("promoter")) return "promotion-worker";
   if (normalized.includes("lead")) return "lead-reviewer";
   if (normalized.includes("builder")) return "builder";
   return normalized || "builder";
