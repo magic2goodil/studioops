@@ -5,6 +5,7 @@ mission-control.config.md
 .mission-control/
 data/workspaces/
 data/mission-control.json
+data/.mission-control.lock/
 data/local-attachments/
 data/run-outputs/
 data/*.local.json
