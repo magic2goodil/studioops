@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { branchReuseSafetyReason, claimRuns, planRunnableRuns } from "../src/runner.js";
+import { branchReuseSafetyReason, claimRuns, cloneFallbackSource, planRunnableRuns } from "../src/runner.js";
 
 function fixtureState(taskPatch = {}, runPatch = {}) {
   return {
@@ -167,4 +167,12 @@ test("reviewer runs are not blocked by closed PR branch reuse checks", () => {
     headRefName: "codex/demo-task",
     url: "https://github.com/example/repo/pull/12",
   }), "");
+});
+
+test("clone fallback prefers the repository origin over a local worktree source", () => {
+  assert.equal(
+    cloneFallbackSource("/tmp/local-worktree", "git@github.com:example/repo.git"),
+    "git@github.com:example/repo.git",
+  );
+  assert.equal(cloneFallbackSource("/tmp/local-worktree", ""), "/tmp/local-worktree");
 });
