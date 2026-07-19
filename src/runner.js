@@ -284,11 +284,16 @@ async function createWorktreeWorkspace(run, workspacePath, branch, startRef, log
 async function createCloneWorkspace(run, workspacePath, branch, startRef, log, gitEnv) {
   const repoPath = run.project.repoPath;
   const originUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
-  await git(["clone", "--shared", "--no-tags", repoPath, workspacePath], { cwd: process.cwd(), timeout: 300_000, env: gitEnv });
-  if (originUrl) await git(["remote", "set-url", "origin", originUrl], { cwd: workspacePath, env: gitEnv });
+  const cloneSource = cloneFallbackSource(repoPath, originUrl);
+  await git(["clone", "--no-tags", cloneSource, workspacePath], { cwd: process.cwd(), timeout: 300_000, env: gitEnv });
   await git(["fetch", "origin", "--prune"], { cwd: workspacePath, timeout: 300_000, env: gitEnv });
   await git(["checkout", "-B", branch, startRef], { cwd: workspacePath, env: gitEnv });
   log.write(`Workspace strategy: isolated clone fallback\n`);
+  log.write(`Clone source: ${originUrl ? "origin remote" : "local repository"}\n`);
+}
+
+export function cloneFallbackSource(repoPath, originUrl) {
+  return String(originUrl || "").trim() || repoPath;
 }
 
 async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
