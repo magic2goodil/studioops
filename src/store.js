@@ -1,6 +1,4 @@
-import { mkdir, readFile, writeFile, copyFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { fileExists } from "./config.js";
 import {
   branchWebUrl,
   integrationBranchName,
@@ -8,14 +6,18 @@ import {
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
+import { missionControlDataDir } from "./runtime-paths.js";
+import {
+  DATABASE_FILE,
+  LEGACY_DATA_FILE,
+  ensureStateDatabase,
+  mutateDatabaseState,
+  readDatabaseState,
+  writeDatabaseState,
+} from "./state-database.js";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const DATA_FILE = path.join(DATA_DIR, "mission-control.json");
-const EXAMPLE_FILE = path.join(DATA_DIR, "mission-control.example.json");
-const LOCK_DIR = path.join(DATA_DIR, ".mission-control.lock");
-const LOCK_RETRY_MS = 25;
-const LOCK_TIMEOUT_MS = 10_000;
-const STALE_LOCK_MS = 60_000;
+const DATA_DIR = missionControlDataDir();
+const DATA_FILE = LEGACY_DATA_FILE;
 
 const VALID_STATUSES = new Set([
   "idea",
@@ -113,7 +115,9 @@ const DEFAULT_REVIEW_POLICY = {
 };
 
 export {
+  DATA_DIR,
   DATA_FILE,
+  DATABASE_FILE,
   VALID_STATUSES,
   VALID_REVIEW_OUTCOMES,
   VALID_RUN_STATUSES,
@@ -122,73 +126,23 @@ export {
 };
 
 export async function ensureDataFile() {
-  await mkdir(DATA_DIR, { recursive: true });
-  if (!(await fileExists(DATA_FILE))) {
-    await copyFile(EXAMPLE_FILE, DATA_FILE);
-  }
+  await ensureStateDatabase();
 }
 
 export async function readState() {
-  await ensureDataFile();
-  return JSON.parse(await readFile(DATA_FILE, "utf8"));
+  return readDatabaseState();
 }
 
 export async function writeState(state) {
   const now = new Date().toISOString();
   state.meta = state.meta || {};
   state.meta.updatedAt = now;
-  const tmpFile = `${DATA_FILE}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  await rename(tmpFile, DATA_FILE);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-async function acquireStateLock() {
-  await mkdir(DATA_DIR, { recursive: true });
-  const startedAt = Date.now();
-  while (true) {
-    try {
-      await mkdir(LOCK_DIR);
-      await writeFile(path.join(LOCK_DIR, "owner"), `${process.pid}\n${new Date().toISOString()}\n`, "utf8");
-      return;
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      try {
-        const lockStat = await stat(LOCK_DIR);
-        if (Date.now() - lockStat.mtimeMs > STALE_LOCK_MS) {
-          await rm(LOCK_DIR, { recursive: true, force: true });
-          continue;
-        }
-      } catch (statError) {
-        if (statError?.code !== "ENOENT") throw statError;
-      }
-      if (Date.now() - startedAt > LOCK_TIMEOUT_MS) {
-        throw new Error("Timed out waiting for Mission Control data lock.");
-      }
-      await sleep(LOCK_RETRY_MS);
-    }
-  }
-}
-
-async function releaseStateLock() {
-  await rm(LOCK_DIR, { recursive: true, force: true });
+  state.meta.storageBackend = "sqlite";
+  await writeDatabaseState(state);
 }
 
 export async function mutateState(mutator) {
-  await acquireStateLock();
-  try {
-    const state = await readState();
-    const result = await mutator(state);
-    await writeState(state);
-    return result;
-  } finally {
-    await releaseStateLock();
-  }
+  return mutateDatabaseState(mutator);
 }
 
 function nextId(items, prefix) {
@@ -542,7 +496,7 @@ export async function updateTask(taskId, patch) {
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
       && patch.status !== "blocked"
-      && task.automationBlocker?.type === "configuration"
+      && task.automationBlocker
     ) {
       delete task.automationBlocker;
     }
@@ -559,83 +513,125 @@ export async function updateTask(taskId, patch) {
   });
 }
 
-export async function recordQaDecision(taskId, input = {}) {
-  return mutateState(async (state) => {
-    const task = state.tasks.find((item) => item.id === taskId);
-    if (!task) throw new Error(`Unknown task: ${taskId}`);
-    const project = findProject(state, task.projectId);
-    if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
-    const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
-    if (!["passed", "failed"].includes(outcome)) {
-      throw new Error("QA decision outcome must be passed or failed.");
-    }
-    if (!["qa_review", "approved_for_main"].includes(task.status)) {
-      throw new Error(`Task must be in qa_review before QA can be marked passed or failed. Current status: ${task.status}`);
-    }
-    if (outcome === "passed" && task.integrationStatus && task.integrationStatus !== "ready") {
-      throw new Error(`Task QA integration is not ready yet: ${task.integrationStatus}`);
-    }
+function recordQaDecisionInState(state, task, input = {}) {
+  if (!task) throw new Error("Unknown task for QA decision.");
+  const project = findProject(state, task.projectId);
+  if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
+  const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
+  if (!["passed", "failed"].includes(outcome)) {
+    throw new Error("QA decision outcome must be passed or failed.");
+  }
+  if (!["qa_review", "approved_for_main"].includes(task.status)) {
+    throw new Error(`Task must be in qa_review before QA can be marked passed or failed. Current status: ${task.status}`);
+  }
+  if (outcome === "passed" && task.integrationStatus && task.integrationStatus !== "ready") {
+    throw new Error(`Task QA integration is not ready yet: ${task.integrationStatus}`);
+  }
 
-    const now = new Date().toISOString();
-    const author = String(input.author || "Owner QA").trim();
-    const notes = String(input.notes || input.body || "").trim();
-    task.qaDecision = {
-      outcome,
-      author,
-      notes,
-      decidedAt: now,
-    };
+  const now = new Date().toISOString();
+  const author = String(input.author || "Owner QA").trim();
+  const notes = String(input.notes || input.body || "").trim();
+  task.qaDecision = {
+    outcome,
+    author,
+    notes,
+    decidedAt: now,
+  };
 
-    if (outcome === "passed") {
-      setTaskWorkflowState(state, task, {
-        status: "approved_for_main",
-        assignedAgentRole: "promotion-worker",
-        reviewerThreadId: "",
-        promotionStatus: "queued",
-        promotionTargetBranch: project.defaultBranch || "main",
-        promotionUpdatedAt: now,
-      }, now);
-      addAutomationComment(
-        state,
-        task,
-        `Local QA passed. This task is approved for promotion to ${project.defaultBranch || "main"}.${notes ? `\n\n${notes}` : ""}`,
-        now,
-        author,
-      );
-      state.events.push({
-        id: nextId(state.events, "event"),
-        type: "qa_passed",
-        projectId: task.projectId,
-        taskId: task.id,
-        message: `${task.title} passed local QA and is approved for main promotion.`,
-        createdAt: now,
-      });
-      return { task, outcome };
-    }
-
+  if (outcome === "passed") {
     setTaskWorkflowState(state, task, {
-      status: "needs_changes",
-      assignedAgentRole: "builder",
+      status: "approved_for_main",
+      assignedAgentRole: "promotion-worker",
       reviewerThreadId: "",
-      promotionStatus: "",
+      promotionStatus: "queued",
+      promotionTargetBranch: project.defaultBranch || "main",
       promotionUpdatedAt: now,
     }, now);
     addAutomationComment(
       state,
       task,
-      `Local QA failed. Returning this task to the builder.${notes ? `\n\n${notes}` : ""}`,
+      `Local QA passed. This task is approved for promotion to ${project.defaultBranch || "main"}.${notes ? `\n\n${notes}` : ""}`,
       now,
       author,
     );
     state.events.push({
       id: nextId(state.events, "event"),
-      type: "qa_failed",
+      type: "qa_passed",
       projectId: task.projectId,
       taskId: task.id,
-      message: `${task.title} failed local QA and was returned for changes.`,
+      message: `${task.title} passed local QA and is approved for main promotion.`,
       createdAt: now,
     });
     return { task, outcome };
+  }
+
+  setTaskWorkflowState(state, task, {
+    status: "needs_changes",
+    assignedAgentRole: "builder",
+    reviewerThreadId: "",
+    promotionStatus: "",
+    promotionUpdatedAt: now,
+  }, now);
+  addAutomationComment(
+    state,
+    task,
+    `Local QA failed. Returning this task to the builder.${notes ? `\n\n${notes}` : ""}`,
+    now,
+    author,
+  );
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "qa_failed",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title} failed local QA and was returned for changes.`,
+    createdAt: now,
+  });
+  return { task, outcome };
+}
+
+export async function recordQaDecision(taskId, input = {}) {
+  return mutateState(async (state) => {
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (!task) throw new Error(`Unknown task: ${taskId}`);
+    return recordQaDecisionInState(state, task, input);
+  });
+}
+
+export async function recordQaBundleDecision(bundleId, input = {}) {
+  return mutateState(async (state) => {
+    const bundle = (state.qaBundles || []).find((item) => item.id === bundleId);
+    if (!bundle) throw new Error(`Unknown QA bundle: ${bundleId}`);
+    const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
+    if (!["passed", "failed"].includes(outcome)) throw new Error("QA bundle outcome must be passed or failed.");
+    const taskIds = normalizeList(input.taskIds || input.tasks);
+    const selectedIds = taskIds.length ? new Set(taskIds) : new Set((bundle.tasks || []).map((task) => task.id));
+    const decisions = [];
+    for (const taskId of selectedIds) {
+      const task = state.tasks.find((item) => item.id === taskId && item.qaBundleId === bundle.id);
+      if (!task) throw new Error(`Task ${taskId} is not part of QA bundle ${bundle.id}.`);
+      decisions.push(recordQaDecisionInState(state, task, input));
+    }
+    const now = new Date().toISOString();
+    const bundleTaskIds = new Set((bundle.tasks || []).map((task) => task.id));
+    const remaining = state.tasks.filter((task) => bundleTaskIds.has(task.id) && task.status === "qa_review");
+    bundle.status = remaining.length ? "partially_reviewed" : outcome;
+    bundle.updatedAt = now;
+    bundle.qaDecision = {
+      outcome,
+      taskIds: [...selectedIds],
+      author: String(input.author || "Owner QA").trim(),
+      notes: String(input.notes || input.body || "").trim(),
+      decidedAt: now,
+    };
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: `qa_bundle_${bundle.status}`,
+      projectId: bundle.projectId,
+      message: `${bundle.id}: ${decisions.length} task(s) marked ${outcome}.`,
+      createdAt: now,
+    });
+    return { bundle, decisions };
   });
 }
 
@@ -1132,7 +1128,7 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   }
 
   if (task.status === "blocked") {
-    if (task.automationBlocker?.type === "configuration") {
+    if (task.automationBlocker) {
       return actions;
     }
     const body = "Dependencies are now complete. Automation returned this task to the builder queue.";

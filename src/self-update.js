@@ -7,6 +7,7 @@ import {
   DEFAULT_SELF_UPDATE_LEASE_MS,
 } from "./self-update-lease.js";
 import { mutateState, readState } from "./store.js";
+import { deployRuntime } from "./runtime-install.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,6 +17,9 @@ const DEFAULT_STALE_RUN_MS = 2 * 60 * 60 * 1000;
 const ACTIVE_RUN_STATUSES = new Set(["running"]);
 const BLOCKING_RUN_GROUPS = new Set(["builder", "reviewer"]);
 const DEFAULT_RESTART_AGENT_LABELS = [
+  "com.codex.mission-control.web",
+  "com.codex.mission-control.steward",
+  "com.codex.mission-control.supervisor",
   "com.codex.mission-control.dispatcher",
   "com.codex.mission-control.runner",
   "com.codex.mission-control.notifier",
@@ -578,6 +582,22 @@ export async function runSelfUpdate(input = {}) {
       reason: `Fast-forwarded ${finalPlan.branch} to ${shortCommit(currentCommit)}.`,
     };
 
+    if (input.deployRuntime !== false) {
+      try {
+        updatedReport.runtimeDeployment = await deployRuntime({
+          sourceRoot: finalPlan.repoPath,
+          runtimeRoot: input.runtimeRoot || process.env.MISSION_CONTROL_RUNTIME_ROOT,
+        });
+      } catch (error) {
+        updatedReport.status = "runtime_deploy_failed";
+        updatedReport.updated = false;
+        updatedReport.reason = `Source updated, but the stable runtime could not be published: ${error.message}`;
+        updatedReport.notification = await sendSelfUpdateNotification(updatedReport, input);
+        updatedReport.record = await recordSelfUpdateResult(updatedReport, input);
+        return updatedReport;
+      }
+    }
+
     updatedReport.restartResults = await restartLaunchAgents(finalPlan.restartAgentLabels, input);
     updatedReport.notification = await sendSelfUpdateNotification(updatedReport, input);
     updatedReport.record = await recordSelfUpdateResult(updatedReport, input);
@@ -605,6 +625,7 @@ export function formatSelfUpdateReport(report) {
   if (report.previousCommit || report.currentCommit) {
     lines.push(`Updated: ${shortCommit(report.previousCommit)} -> ${shortCommit(report.currentCommit)}`);
   }
+  if (report.runtimeDeployment?.releasePath) lines.push(`Runtime: ${report.runtimeDeployment.releasePath}`);
   if (report.reason) lines.push(`Reason: ${report.reason}`);
 
   if (report.dirtyFiles?.length) {

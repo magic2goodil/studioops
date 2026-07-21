@@ -30,6 +30,7 @@ import {
   projectFromConfig,
   writeConfig,
 } from "./config.js";
+import { backupStateDatabase } from "./state-database.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -138,6 +139,15 @@ async function setup() {
         },
       },
       defaults: {
+        executionPolicy: {
+          model: "gpt-5.6-sol",
+          reasoningEffort: "high",
+          leadReasoningEffort: "xhigh",
+          complexReasoningEffort: "xhigh",
+          maxAttempts: 2,
+          retryBackoffMs: 300000,
+          staleRunMs: 7200000,
+        },
         supervisor: {
           intervalSeconds: 300,
           baseUrl: "http://127.0.0.1:4317",
@@ -165,6 +175,8 @@ async function setup() {
           intervalSeconds: 300,
           limit: 3,
           provider: "codex-cli",
+          model: "gpt-5.6-sol",
+          modelReasoningEffort: "high",
           useWorkspaces: true,
           workspaceRoot: "~/.mission-control/run-workspaces",
           timeoutMs: 7200000,
@@ -359,6 +371,7 @@ Commands:
   promote                       Merge owner-QA-passed PR heads into target branches
   notifier                      Send local owner/failure notifications
   self-update                   Fast-forward Mission Control main and restart workers
+  backup [--output PATH]        Create a transactionally consistent SQLite backup
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
@@ -406,6 +419,12 @@ Automation:
 
   if (command === "import-config") {
     await importConfig();
+    return;
+  }
+
+  if (command === "backup") {
+    const outputPath = await backupStateDatabase(args.output || args.path || "");
+    console.log(`Mission Control backup created: ${outputPath}`);
     return;
   }
 
@@ -504,10 +523,13 @@ Automation:
         status: run.status,
         role: run.role,
         action: run.actionType,
+        model: run.model || "",
+        effort: run.modelReasoningEffort || "",
+        attempt: run.attempt ? `${run.attempt}/${run.maxAttempts || "?"}` : "",
         thread: run.threadId || "",
         title: task?.title || "",
       };
-    }), ["id", "project", "task", "status", "role", "action", "thread", "title"]);
+    }), ["id", "project", "task", "status", "role", "action", "model", "effort", "attempt", "thread", "title"]);
     return;
   }
 
@@ -686,6 +708,7 @@ Automation:
 
   if (command === "dispatcher" || command === "dispatch") {
     const state = await readState();
+    const config = await loadConfig();
     const supervisor = createSupervisorReport(state, {
       baseUrl: args["base-url"] || "http://127.0.0.1:4317",
       intervalSeconds: args.interval || args["interval-seconds"] || 300,
@@ -698,6 +721,10 @@ Automation:
       builderConcurrency: args["builder-concurrency"],
       reviewerConcurrency: args["reviewer-concurrency"],
       ownerConcurrency: args["owner-concurrency"],
+      executionPolicy: {
+        ...(config?.defaults?.executionPolicy || {}),
+        ...(config?.executionPolicy || {}),
+      },
     };
     if (args.plan) {
       const plan = planDispatches(state, supervisor.actions, options);
@@ -719,11 +746,22 @@ Automation:
   }
 
   if (command === "runner" || command === "run") {
+    const config = await loadConfig();
+    const runnerDefaults = {
+      ...(config?.defaults?.runner || {}),
+      ...(config?.runner || {}),
+    };
     const options = {
       project: args.project || args.projects,
       limit: args.limit || args["max-runs"],
-      provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER,
+      provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER || runnerDefaults.provider,
       codexBin: args["codex-bin"],
+      model: args.model || process.env.MISSION_CONTROL_RUNNER_MODEL || runnerDefaults.model || "gpt-5.6-sol",
+      modelReasoningEffort: args["model-reasoning-effort"] || args.reasoning || process.env.MISSION_CONTROL_RUNNER_REASONING_EFFORT || runnerDefaults.modelReasoningEffort || "high",
+      executionPolicy: {
+        ...(config?.defaults?.executionPolicy || {}),
+        ...(config?.executionPolicy || {}),
+      },
       useWorkspaces: args["no-workspace"] ? false : args.workspaces,
       workspaceRoot: args["workspace-root"],
       timeoutMs: args["timeout-ms"],

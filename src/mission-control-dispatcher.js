@@ -59,6 +59,10 @@ function optionsFrom(args, config) {
     ownerConcurrency: numberFrom(args["owner-concurrency"] || defaults.ownerConcurrency, 10),
     maxDispatchesPerSweep: numberFrom(args.limit || args["max-dispatches"] || defaults.maxDispatchesPerSweep, 6),
     provider: args.provider || defaults.provider || "prompt-outbox",
+    executionPolicy: {
+      ...(config?.defaults?.executionPolicy || {}),
+      ...(config?.executionPolicy || {}),
+    },
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     dryRun: Boolean(args["dry-run"] || args.dryRun),
     intervalSeconds,

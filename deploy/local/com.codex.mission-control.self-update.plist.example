@@ -9,7 +9,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>__NODE_PATH__</string>
-    <string>__MISSION_CONTROL_REPO__/src/mission-control-self-update.js</string>
+    <string>__MISSION_CONTROL_RUNTIME__/src/mission-control-self-update.js</string>
+    <string>--repo-path</string>
+    <string>__MISSION_CONTROL_SOURCE_REPO__</string>
+    <string>--branch</string>
+    <string>main</string>
   </array>
 
   <key>WorkingDirectory</key>

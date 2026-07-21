@@ -1,12 +1,13 @@
 import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordQaDecision, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
+import { fileURLToPath } from "node:url";
+import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordQaBundleDecision, recordQaDecision, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
 import { loadConfig } from "./config.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4317);
-const PUBLIC_DIR = path.join(process.cwd(), "public");
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -127,10 +128,25 @@ async function serveLocalImage(res, url) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/health") {
+    const state = await readState();
+    sendJson(res, 200, {
+      status: "ok",
+      storage: state.meta?.storageBackend || "unknown",
+      updatedAt: state.meta?.updatedAt || "",
+    });
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/state") {
     const state = await readState();
     const config = await loadConfig();
-    sendJson(res, 200, { ...state, configLoaded: !!config });
+    sendJson(res, 200, {
+      meta: state.meta || {},
+      projects: state.projects || [],
+      tasks: state.tasks || [],
+      qaBundles: state.qaBundles || [],
+      configLoaded: !!config,
+    });
     return;
   }
 
@@ -181,6 +197,12 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  const qaBundleDecisionMatch = url.pathname.match(/^\/api\/qa\/bundles\/([^/]+)\/decision$/);
+  if (qaBundleDecisionMatch && req.method === "POST") {
+    sendJson(res, 201, await recordQaBundleDecision(qaBundleDecisionMatch[1], await readJsonBody(req)));
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/automation/tick") {
     sendJson(res, 200, await automationTick(await readJsonBody(req)));
     return;
@@ -220,7 +242,11 @@ async function handleApi(req, res, url) {
       sendJson(res, 404, { error: "Task not found." });
       return;
     }
-    sendJson(res, 200, { task: taskWithProject(state, task) });
+    const roles = ["builder", "backend-reviewer", "frontend-reviewer", "accessibility-reviewer", "lead-reviewer"];
+    sendJson(res, 200, {
+      task: taskWithProject(state, task),
+      prompts: Object.fromEntries(roles.map((role) => [role, generatePrompt(state, task.id, role)])),
+    });
     return;
   }
 

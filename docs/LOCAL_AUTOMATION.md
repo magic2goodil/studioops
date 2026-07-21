@@ -10,7 +10,7 @@ The always-on stack includes:
 - `dispatcher`: creates durable builder, reviewer, and owner-handoff runs
 - `runner`: launches queued builder/reviewer runs with a Codex provider
 - `qa-integration`: merges `qa_review` PR heads into opted-in non-production integration branches after validation
-- `promotion`: merges owner-QA-passed work into the project target branch after validation
+- `promotion`: assembles owner-QA-passed work into a validated release-candidate PR
 - `notifier`: sends local owner-review and failure notifications
 - `self-update`: fetches `origin/main`, fast-forwards Mission Control itself when safe, and restarts worker LaunchAgents
 
@@ -21,6 +21,8 @@ npm install
 npm run setup
 npm run install-agents
 ```
+
+The installer publishes a stable runtime under `~/.mission-control/runtime`, creates a clean `main` checkout under `~/.mission-control/source` for self-updates, and points LaunchAgents at the immutable runtime. Local config and SQLite state remain in the working root. This prevents workers from executing half-synced files or depending on the branch currently open in a developer checkout. Re-running the installer atomically updates the runtime and restarts all workers.
 
 By default, the web UI is only available on the local machine:
 
@@ -108,7 +110,12 @@ Projects can also opt into keeping their QA branch and local preview checkout cu
       "branch": "qa/integration",
       "stashDirty": true,
       "postUpdateCommands": ["npm run check"],
-      "restartLaunchAgents": ["com.example.myapp.local"]
+      "restartLaunchAgents": ["com.example.myapp.local"],
+      "launchAgentPlists": {
+        "com.example.myapp.local": "~/Library/LaunchAgents/com.example.myapp.local.plist"
+      },
+      "previewUrl": "http://127.0.0.1:4174/",
+      "healthCheckUrl": "http://127.0.0.1:4174/health"
     }
   }
 }
@@ -127,7 +134,7 @@ mission-control update-project myapp \
 
 `syncDefaultBranchIntoIntegration` merges the latest configured default branch into the non-production QA branch before task PR heads are integrated. This is useful after the owner merges a PR to `main`: the QA branch catches up on the next sweep instead of leaving the local preview stale.
 
-`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, Mission Control preserves them in a Git stash before fast-forwarding. `restartLaunchAgents` is intended for local preview servers only.
+`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, Mission Control preserves them in a Git stash before fast-forwarding. Missing preview LaunchAgents are bootstrapped from the configured plist (or the standard `~/Library/LaunchAgents/<label>.plist` path), restarted, and health-checked before the bundle is marked ready.
 
 ## Main Promotion
 
@@ -159,7 +166,7 @@ npm run promotion -- --plan
 npm run promotion -- --project myapp
 ```
 
-The promotion worker uses an isolated clone under `~/.mission-control/promotion-workspaces/`, fetches the task branch or PR head, merges it into the target branch, runs validation, and performs a non-force push only after validation passes. It records conflicts, validation failures, push failures, and successful target-branch commits back on the task.
+The promotion worker uses an isolated clone under `~/.mission-control/promotion-workspaces/`, fetches the task branch or PR head, merges it locally on top of the target branch, runs validation, pushes a uniquely named release-candidate branch, and opens a ready PR against the target. It never pushes directly to the protected target branch. It records conflicts, validation failures, push failures, and the release-candidate PR back on the task and QA bundle.
 
 Promotion does not deploy production. It prepares the target branch for owner release-candidate review. Production deploys should remain behind explicit release or tag workflows.
 
@@ -181,6 +188,9 @@ The self-updater only fast-forwards the configured branch, `main` by default. It
 
 Running builder/reviewer runs are ignored only when they are stale, such as a missing runner process when PID checks are enabled or a `startedAt` timestamp older than the configured stale-run window. After a successful update, the updater restarts these LaunchAgents:
 
+- `com.codex.mission-control.web`
+- `com.codex.mission-control.steward`
+- `com.codex.mission-control.supervisor`
 - `com.codex.mission-control.dispatcher`
 - `com.codex.mission-control.runner`
 - `com.codex.mission-control.notifier`
@@ -213,7 +223,7 @@ data/run-outputs/
 
 ## Safety
 
-The always-on stack may create branches, run validation, commit, push, open or update pull requests, and merge owner-QA-passed task heads into a configured target branch when a project allows that behavior.
+The always-on stack may create branches, run validation, commit, push, and open or update pull requests. It may assemble owner-QA-passed task heads on a release-candidate branch, but it does not merge that branch into the protected target.
 
 It must not:
 

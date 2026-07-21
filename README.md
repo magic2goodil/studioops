@@ -4,10 +4,10 @@ Codex Mission Control is a local-first task board for coordinating Codex work ac
 
 It is designed for a workflow where you say an idea once, capture it as a task, send it to a builder branch, run backend/frontend/accessibility/lead reviewer passes as applicable, and only then kick it to the human owner for final review.
 
-This first version is intentionally simple:
+The local control plane is intentionally self-contained:
 
 - Runs locally with Node.js.
-- Stores data in a JSON file.
+- Stores authoritative state in a transactional SQLite database with WAL mode.
 - Has a browser task board.
 - Has a CLI for adding/listing tasks.
 - Generates builder and reviewer prompts you can hand to Codex.
@@ -20,6 +20,9 @@ This first version is intentionally simple:
 - Includes a self-update worker that fast-forwards Mission Control main from `origin/main` and restarts local worker LaunchAgents after safe merged control-plane updates.
 - Runs builders/reviewers in isolated workspaces with lane-aware scheduling so backend, frontend, design, and devops work do not blindly collide.
 - Includes a notifier loop for local owner-review and failed-run notifications.
+- Pins every Codex run to an auditable model/reasoning policy (`gpt-5.6-sol`, high by default; xhigh for lead and high-risk work).
+- Recovers orphaned runs, bounds retries, and pauses repeatedly failing work with a visible blocker instead of looping forever.
+- Publishes workers into a stable runtime outside cloud-synced source folders before starting LaunchAgents.
 - Includes a GitHub App manifest setup helper for Mission Control bot identities.
 - Keeps project safety rules and validation commands beside the task.
 - Opens tasks at shareable URLs like `/tasks/task_1`.
@@ -45,7 +48,13 @@ Open:
 http://127.0.0.1:4317
 ```
 
-No external database is required. The app writes to `data/mission-control.json`.
+No external database server is required. Mission Control writes to `data/mission-control.sqlite3`. Existing `data/mission-control.json` state is imported once on first launch; SQLite is authoritative afterward. The data directory is mode `0700`, and database, WAL, shared-memory, and legacy state files are restricted to the current user.
+
+Create a transactionally consistent backup while workers are running:
+
+```bash
+npm run backup
+```
 
 The setup wizard writes `mission-control.config.md`, which is ignored by Git. It asks about your GitHub owner, local workspace, AI tools, and first project. It checks GitHub CLI and SSH readiness, but it does not ask for or store private SSH keys.
 
@@ -97,7 +106,7 @@ Remove the LaunchAgents:
 npm run uninstall-agents
 ```
 
-The installer writes user LaunchAgents under `~/Library/LaunchAgents` and logs under `data/launch-agents/`. It does not install system services, ask for sudo, merge PRs, deploy production, or store private keys.
+The installer writes user LaunchAgents under `~/Library/LaunchAgents`, publishes an atomic runtime under `~/.mission-control/runtime`, and writes logs under `data/launch-agents/`. It does not install system services, ask for sudo, merge PRs, deploy production, or store private keys.
 
 ## CLI
 
@@ -291,9 +300,10 @@ node src/mission-control-cli.js review task_1 --stage backend --outcome approved
 10. Frontend reviewer records `approved`, `skipped`, or `changes_requested`.
 11. Accessibility reviewer records `approved`, `skipped`, or `changes_requested` for UI/frontend work, or explicitly skips non-UI work.
 12. Primary lead reviewer records the final review outcome.
-13. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled for the project.
-14. The supervisor reports `notify_owner` or `notify_qa_review` for tasks that have reached the human gate.
-15. Human owner tests the QA bundle locally, approves, asks for changes, merges, or deploys through the protected release workflow.
+13. Automation moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled for the project.
+14. QA integration validates a coherent bundle, fast-forwards the configured local preview, restarts it, verifies health, and sends one owner notification with the preview and task checklist.
+15. Human owner passes or returns the bundle. Passed work is assembled into a validated release-candidate PR; it is never pushed directly to `main`.
+16. The owner merges the release-candidate PR and later creates an explicit release/tag to authorize production deployment.
 
 Default PR rule: one PR should have one primary Mission Control task. Related tasks may be referenced, but they should not all move to `user_review` unless the PR satisfies each task's acceptance criteria. See [docs/REVIEW_PIPELINE.md](docs/REVIEW_PIPELINE.md).
 

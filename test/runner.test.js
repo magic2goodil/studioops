@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { branchReuseSafetyReason, claimRuns, cloneFallbackSource, planRunnableRuns } from "../src/runner.js";
+import { activeRunStaleReason, branchReuseSafetyReason, claimRuns, cloneFallbackSource, planRunnableRuns } from "../src/runner.js";
 
 function fixtureState(taskPatch = {}, runPatch = {}) {
   return {
@@ -175,4 +175,42 @@ test("clone fallback prefers the repository origin over a local worktree source"
     "git@github.com:example/repo.git",
   );
   assert.equal(cloneFallbackSource("/tmp/local-worktree", ""), "/tmp/local-worktree");
+});
+
+test("dead or overlong running jobs are identified for automatic recovery", () => {
+  const nowMs = Date.parse("2026-07-20T12:00:00.000Z");
+  assert.match(activeRunStaleReason({
+    status: "running",
+    startedAt: "2026-07-20T11:00:00.000Z",
+    runnerPid: 999_999_999,
+  }, { nowMs, pidGraceMs: 1_000 }), /runner_pid_not_alive/);
+
+  assert.match(activeRunStaleReason({
+    status: "running",
+    startedAt: "2026-07-20T08:00:00.000Z",
+    staleRunMs: 60 * 60 * 1000,
+  }, { nowMs }), /run_exceeded/);
+});
+
+test("legacy queued security work is upgraded to the current xhigh execution policy when claimed", async () => {
+  const state = fixtureState(
+    {
+      title: "Harden OAuth PII storage",
+      status: "in_progress",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+    },
+    {
+      actionType: "start_builder",
+      integrationStatus: "",
+      model: "",
+      modelReasoningEffort: "",
+    },
+  );
+
+  const [run] = await claimRuns({ state, limit: 1, modelReasoningEffort: "high" });
+
+  assert.equal(run.model, "gpt-5.6-sol");
+  assert.equal(run.modelReasoningEffort, "xhigh");
+  assert.equal(run.modelSelectionReason, "complex_task");
 });

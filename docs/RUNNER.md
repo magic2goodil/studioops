@@ -12,6 +12,9 @@ It can:
 - store Codex thread IDs on runs and tasks when the SDK provider returns them
 - pass the task ID and run ID into the worker environment
 - run continuously through a local LaunchAgent
+- pin and record the selected model, reasoning effort, attempt number, and selection reason
+- recover stale running records whose process died or exceeded its allowed runtime
+- verify that builders linked a branch/PR and reviewers recorded an outcome before accepting a successful process exit
 
 It does not:
 
@@ -40,6 +43,12 @@ npm run runner
 ```
 
 The default limit is one active Codex run. This keeps parallel builders from independently inventing duplicate architecture, Sass mixins, or project conventions.
+
+## Model And Retry Policy
+
+Every dispatched run is explicitly pinned to `gpt-5.6-sol`. Ordinary work uses `high` reasoning; lead reviews and architecture, auth, privacy, data, security, migration, and deployment work use `xhigh`. Configure role overrides under `defaults.executionPolicy.roles`.
+
+Each workflow action gets two attempts by default with a five-minute backoff. After the limit, Mission Control blocks the task with the run ID and failure reason for visible owner repair. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
 
 ## Run Continuously
 
@@ -207,6 +216,11 @@ The runner passes these environment variables to Codex:
 - `MISSION_CONTROL_WORKSPACE_PATH`
 - `MISSION_CONTROL_SOURCE_REPO_PATH`
 - `MISSION_CONTROL_WORK_LANE`
+- `MISSION_CONTROL_ROOT`
+- `MISSION_CONTROL_CONFIG_ROOT`
+- `MISSION_CONTROL_DATA_DIR`
+
+The explicit state paths are important: a worker can execute inside any project workspace while still updating the one authoritative Mission Control database.
 
 ## Work Lanes
 
