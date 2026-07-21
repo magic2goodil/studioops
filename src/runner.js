@@ -521,8 +521,16 @@ async function pauseTaskForAutomationConfig(run, reason, notes) {
     state.events = state.events || [];
     const task = findTask(state, run.taskId);
     if (task) {
+      const resumeStatus = task.status;
       task.status = "blocked";
       task.assignedAgentRole = "owner";
+      task.automationBlocker = {
+        type: "configuration",
+        reason,
+        runId: run.id,
+        resumeStatus,
+        blockedAt: now,
+      };
       task.updatedAt = now;
     }
     await appendTaskComment(

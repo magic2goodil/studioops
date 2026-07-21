@@ -539,6 +539,13 @@ export async function updateTask(taskId, patch) {
     if (patch.status === "builder_review" && previousStatus !== "builder_review") {
       task.reviewCycle = Number(task.reviewCycle || 0) + 1;
     }
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "status")
+      && patch.status !== "blocked"
+      && task.automationBlocker?.type === "configuration"
+    ) {
+      delete task.automationBlocker;
+    }
     task.updatedAt = new Date().toISOString();
     state.events.push({
       id: nextId(state.events, "event"),
@@ -723,7 +730,10 @@ export async function recordReview(taskId, input = {}) {
 }
 
 export async function automationTick(input = {}) {
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => {
     const now = new Date().toISOString();
     const project = input.project || input.projectId ? findProject(state, input.project || input.projectId) : null;
     if ((input.project || input.projectId) && !project) throw new Error(`Unknown project: ${input.project || input.projectId}`);
@@ -1122,6 +1132,9 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   }
 
   if (task.status === "blocked") {
+    if (task.automationBlocker?.type === "configuration") {
+      return actions;
+    }
     const body = "Dependencies are now complete. Automation returned this task to the builder queue.";
     addAutomationComment(state, task, body, now, author);
     setTaskWorkflowState(state, task, {

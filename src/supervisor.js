@@ -206,6 +206,20 @@ function taskActions(state, task, options = {}) {
   }
 
   if (task.status === "blocked") {
+    if (task.automationBlocker?.type === "configuration") {
+      const blocker = task.automationBlocker;
+      return [actionBase(
+        state,
+        task,
+        "repair_automation_config",
+        "owner",
+        `Automation is paused after ${blocker.runId || "a runner failure"}: ${blocker.reason || "configuration error"}. Repair the runner configuration, then restore the task to ${blocker.resumeStatus || "its prior workflow state"}.`,
+        {
+          ...options,
+          nextStatus: blocker.resumeStatus || "queued",
+        },
+      )];
+    }
     if (missingDependencies.length) {
       return [actionBase(
         state,
