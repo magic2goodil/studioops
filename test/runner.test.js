@@ -6,9 +6,15 @@ import {
   cloneFallbackSource,
   planRunnableRuns,
   resolveCodexBin,
+  loadCodexSdk,
   sdkClientOptions,
   sdkThreadOptions,
 } from "../src/runner.js";
+
+test("Codex SDK resolves through its exported ESM entrypoint", async () => {
+  const sdk = await loadCodexSdk();
+  assert.equal(typeof sdk.Codex, "function");
+});
 
 function fixtureState(taskPatch = {}, runPatch = {}) {
   return {

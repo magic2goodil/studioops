@@ -759,6 +759,11 @@ export function sdkClientOptions(input = {}, authContext = null) {
   };
 }
 
+export async function loadCodexSdk() {
+  const sdkUrl = import.meta.resolve("@openai/codex-sdk");
+  return import(sdkUrl);
+}
+
 async function runClaimedRunWithSdk(run, input = {}) {
   await mkdir(RUN_OUTPUT_DIR, { recursive: true });
   const timeoutMs = Math.max(60_000, Number(input.timeoutMs || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS || DEFAULT_RUN_TIMEOUT_MS));
@@ -795,7 +800,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Existing thread: ${run.threadId || "(new thread)"}\n`);
     log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
 
-    const { Codex } = await import("@openai/codex-sdk");
+    const { Codex } = await loadCodexSdk();
     const codex = new Codex(sdkClientOptions(input, authContext));
     const options = sdkThreadOptions(executionRun, input);
     const thread = run.threadId

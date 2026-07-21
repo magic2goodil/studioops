@@ -13,8 +13,6 @@
     <string>--watch</string>
     <string>--interval</string>
     <string>300</string>
-    <string>--limit</string>
-    <string>3</string>
   </array>
 
   <key>WorkingDirectory</key>
