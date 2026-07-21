@@ -571,13 +571,17 @@ function applyFailedRunToTask(task, run, reason, now) {
     task.status = "blocked";
     task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
+    const recoveryCount = Math.max(0, Number(task.lastAutomationRecoveryCount || 0));
+    const recoveryDelayMs = Math.min(2 * 60 * 60 * 1000, 15 * 60 * 1000 * (2 ** recoveryCount));
     task.automationBlocker = {
-      type: "execution",
+      type: "transient",
       reason,
       runId: run.id,
       attempts: attempt,
       resumeStatus,
       blockedAt: now,
+      retryAt: new Date(Date.parse(now) + recoveryDelayMs).toISOString(),
+      recoveryCount,
     };
     return { blocked: true, retryAt: "" };
   }
@@ -590,7 +594,7 @@ function applyFailedRunToTask(task, run, reason, now) {
 
 function runFailureComment(run, reason, disposition) {
   if (disposition.blocked) {
-    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Automatic retries are now bounded and paused for owner attention.`;
+    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Rapid retries are paused; Mission Control will automatically probe this transient failure again after its recovery delay.`;
   }
   return `${run.id} failed: ${reason}. Mission Control will retry no earlier than ${disposition.retryAt}.`;
 }

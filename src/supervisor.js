@@ -219,6 +219,19 @@ function taskActions(state, task, options = {}) {
   if (task.status === "blocked") {
     if (task.automationBlocker) {
       const blocker = task.automationBlocker;
+      if (["execution", "transient"].includes(blocker.type)) {
+        return [actionBase(
+          state,
+          task,
+          "waiting_for_transient_recovery",
+          "",
+          `Mission Control will automatically retry this transient failure${blocker.retryAt ? ` after ${blocker.retryAt}` : " after its recovery delay"}: ${blocker.reason || "worker error"}.`,
+          {
+            ...options,
+            nextStatus: blocker.resumeStatus || "queued",
+          },
+        )];
+      }
       return [actionBase(
         state,
         task,

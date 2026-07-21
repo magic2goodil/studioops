@@ -70,6 +70,11 @@ const DEPENDENCY_COMPLETE_STATUSES = new Set([
   "closed",
 ]);
 
+const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
+const DEFAULT_ORPHANED_TASK_GRACE_MS = 15 * 60 * 1000;
+const DEFAULT_TRANSIENT_RECOVERY_MS = 15 * 60 * 1000;
+const MAX_TRANSIENT_RECOVERY_MS = 2 * 60 * 60 * 1000;
+
 const DEFAULT_REVIEW_PIPELINE = [
   {
     key: "backend",
@@ -730,12 +735,18 @@ export async function automationTick(input = {}) {
     ? async (mutator) => mutator(input.state)
     : mutateState;
   return mutate(async (state) => {
-    const now = new Date().toISOString();
+    const nowMs = Number(input.nowMs || Date.now());
+    const now = new Date(nowMs).toISOString();
     const project = input.project || input.projectId ? findProject(state, input.project || input.projectId) : null;
     if ((input.project || input.projectId) && !project) throw new Error(`Unknown project: ${input.project || input.projectId}`);
     const parsedLimit = Number(input.limit || 10);
     const limit = Number.isFinite(parsedLimit) ? Math.max(1, parsedLimit) : 10;
-    const actions = [];
+    const actions = reconcileAutomationStateInState(state, {
+      ...input,
+      now,
+      nowMs,
+      project,
+    });
     const candidates = state.tasks
       .filter((task) => !project || task.projectId === project.id)
       .filter((task) => !["done", "closed", "deployed", "merged", "qa_review", "approved_for_main", "promotion_blocked", "user_review", "approved"].includes(task.status))
@@ -764,6 +775,93 @@ export async function automationTick(input = {}) {
     });
     return { actions };
   });
+}
+
+function taskHasActiveRun(state, taskId) {
+  return (state.runs || []).some((run) => run.taskId === taskId && ACTIVE_RUN_STATUSES.has(run.status));
+}
+
+function transientRecoveryAt(blocker, input = {}) {
+  const explicit = Date.parse(blocker.retryAt || "");
+  if (Number.isFinite(explicit)) return explicit;
+  const blockedAt = Date.parse(blocker.blockedAt || "");
+  if (!Number.isFinite(blockedAt)) return 0;
+  const baseMs = Math.max(60_000, Number(input.transientRecoveryMs || DEFAULT_TRANSIENT_RECOVERY_MS));
+  const cycle = Math.max(0, Number(blocker.recoveryCount || 0));
+  return blockedAt + Math.min(MAX_TRANSIENT_RECOVERY_MS, baseMs * (2 ** cycle));
+}
+
+function recordRecovery(state, task, body, eventType, now) {
+  state.comments = state.comments || [];
+  state.events = state.events || [];
+  addAutomationComment(state, task, body, now, "Mission Control Resilience");
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: eventType,
+    projectId: task.projectId,
+    taskId: task.id,
+    message: body,
+    createdAt: now,
+  });
+}
+
+export function reconcileAutomationStateInState(state, input = {}) {
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const orphanGraceMs = Math.max(60_000, Number(input.orphanGraceMs || DEFAULT_ORPHANED_TASK_GRACE_MS));
+  const actions = [];
+
+  for (const task of state.tasks || []) {
+    if (input.project && task.projectId !== input.project.id) continue;
+
+    const blocker = task.automationBlocker;
+    if (
+      task.status === "blocked"
+      && blocker
+      && ["execution", "transient"].includes(blocker.type)
+      && transientRecoveryAt(blocker, input) <= nowMs
+    ) {
+      const resumeStatus = VALID_STATUSES.has(blocker.resumeStatus) ? blocker.resumeStatus : "queued";
+      const recoveryCount = Math.max(0, Number(blocker.recoveryCount || 0)) + 1;
+      task.status = resumeStatus;
+      task.assignedAgentRole = "";
+      task.assignedThreadId = "";
+      task.reviewerThreadId = "";
+      task.retryNotBefore = "";
+      task.lastAutomationRecoveryCount = recoveryCount;
+      task.updatedAt = now;
+      delete task.automationBlocker;
+      recordRecovery(
+        state,
+        task,
+        `Recovered transient automation failure and returned the task to ${resumeStatus}. Recovery cycle ${recoveryCount}.`,
+        "transient_failure_recovered",
+        now,
+      );
+      actions.push(`${task.id}: recovered transient automation failure`);
+    }
+
+    if (task.status !== "in_progress" || task.type === "epic" || taskHasActiveRun(state, task.id)) continue;
+    const updatedAt = Date.parse(task.updatedAt || task.createdAt || "");
+    if (Number.isFinite(updatedAt) && nowMs - updatedAt < orphanGraceMs) continue;
+
+    task.status = "queued";
+    task.assignedAgentRole = "";
+    task.assignedThreadId = "";
+    task.reviewerThreadId = "";
+    task.retryNotBefore = "";
+    task.updatedAt = now;
+    recordRecovery(
+      state,
+      task,
+      "Recovered an orphaned in-progress task because no queued or running durable run exists.",
+      "orphaned_task_recovered",
+      now,
+    );
+    actions.push(`${task.id}: recovered orphaned in-progress task`);
+  }
+
+  return actions;
 }
 
 export async function updateRun(runId, patch = {}) {

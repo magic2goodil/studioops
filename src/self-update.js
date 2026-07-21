@@ -25,6 +25,7 @@ const DEFAULT_RESTART_AGENT_LABELS = [
   "com.codex.mission-control.notifier",
   "com.codex.mission-control.qa-integration",
   "com.codex.mission-control.promotion",
+  "com.codex.mission-control.watchdog",
 ];
 
 export { DEFAULT_RESTART_AGENT_LABELS, DEFAULT_STALE_RUN_MS, DEFAULT_SELF_UPDATE_LEASE_MS };

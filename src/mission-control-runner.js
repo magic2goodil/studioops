@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { readState } from "./store.js";
 import {
@@ -8,6 +7,7 @@ import {
   planRunnableRuns,
   runQueuedRuns,
 } from "./runner.js";
+import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
 const DEFAULT_INTERVAL_SECONDS = 300;
 const DEFAULT_LIMIT = 1;
@@ -104,11 +104,14 @@ async function runOnce(args) {
 
 async function runWatch(args) {
   const options = await optionsFrom(args);
-  while (true) {
-    await runOnce(args);
-    await sleep(options.intervalSeconds * 1000);
-    console.log("");
-  }
+  await runResilientWorkerLoop({
+    worker: "runner",
+    intervalSeconds: options.intervalSeconds,
+    runOnce: async () => {
+      await runOnce(args);
+      console.log("");
+    },
+  });
 }
 
 async function main() {
