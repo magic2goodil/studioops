@@ -123,3 +123,37 @@ test("SQLite import removes orphaned and cross-project QA bundle references", as
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("SQLite migration reconstructs bundles for previously integrated QA tasks", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-bundle-backfill-"));
+  try {
+    const state = baseState();
+    state.projects[0].repoUrl = "git@github.com:example/demo.git";
+    state.projects[0].localQaPreview = {
+      checkoutPath: "/tmp/demo-qa",
+      previewUrl: "http://127.0.0.1:4174/",
+    };
+    Object.assign(state.tasks[0], {
+      status: "qa_review",
+      qaBundleId: "qa_bundle_99",
+      localQaPreview: {
+        status: "current",
+        branch: "qa/demo",
+        after: "abc123",
+        checkoutPath: "/tmp/demo-qa",
+      },
+    });
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.qaBundles.length, 1);
+    assert.equal(persisted.qaBundles[0].projectId, "project_1");
+    assert.equal(persisted.qaBundles[0].previewUrl, "http://127.0.0.1:4174/");
+    assert.equal(persisted.qaBundles[0].integrationBranchUrl, "https://github.com/example/demo/tree/qa/demo");
+    assert.equal(persisted.tasks[0].qaBundleId, persisted.qaBundles[0].id);
+    assert.deepEqual(persisted.qaBundles[0].tasks.map((task) => task.id), ["task_1"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

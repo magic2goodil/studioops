@@ -7,7 +7,7 @@ import { missionControlDataDir, missionControlRoot } from "./runtime-paths.js";
 const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles"]);
-const STATE_INTEGRITY_VERSION = 1;
+const STATE_INTEGRITY_VERSION = 2;
 const DATA_DIR = missionControlDataDir();
 export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
@@ -160,6 +160,68 @@ export function reconcileStateIntegrity(state) {
     }
   }
   return state;
+}
+
+function nextQaBundleId(bundles) {
+  const highest = bundles
+    .map((bundle) => Number(String(bundle.id || "").match(/^qa_bundle_(\d+)$/)?.[1] || 0))
+    .reduce((max, value) => Math.max(max, value), 0);
+  return `qa_bundle_${highest + 1}`;
+}
+
+function branchUrl(repoUrl, branch) {
+  const httpsUrl = String(repoUrl || "")
+    .replace(/^git@github\.com:/, "https://github.com/")
+    .replace(/\.git$/, "");
+  const branchPath = String(branch || "").split("/").map(encodeURIComponent).join("/");
+  return httpsUrl && branchPath ? `${httpsUrl}/tree/${branchPath}` : "";
+}
+
+function backfillIntegratedQaBundles(state, now) {
+  const projectsById = new Map(state.projects.map((project) => [project.id, project]));
+  const groups = new Map();
+  for (const task of state.tasks) {
+    const preview = task.localQaPreview || {};
+    if (
+      task.qaBundleId
+      || task.status !== "qa_review"
+      || !["current", "ready", "updated"].includes(preview.status)
+      || !preview.after
+    ) continue;
+    const key = `${task.projectId}:${preview.branch || ""}:${preview.after}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(task);
+  }
+
+  for (const tasks of groups.values()) {
+    const project = projectsById.get(tasks[0].projectId);
+    if (!project) continue;
+    const taskPreview = tasks[0].localQaPreview || {};
+    const projectPreview = project.localQaPreview || project.qaIntegration?.localPreview || {};
+    const integrationBranch = taskPreview.branch || project.reviewPolicy?.integrationBranch || "";
+    const bundle = {
+      id: nextQaBundleId(state.qaBundles),
+      projectId: project.id,
+      projectKey: project.key || "",
+      projectName: project.name || project.key || "Project",
+      status: "ready",
+      integrationBranch,
+      integrationBranchUrl: branchUrl(project.repoUrl, integrationBranch),
+      integrationCommit: taskPreview.after,
+      previewUrl: projectPreview.previewUrl || taskPreview.previewUrl || "",
+      previewCheckoutPath: projectPreview.checkoutPath || taskPreview.checkoutPath || "",
+      validation: [],
+      tasks: [],
+      createdAt: now,
+      readyAt: now,
+      updatedAt: now,
+      notifiedAt: "",
+      notificationAttempts: 0,
+      notificationRetryNotBefore: "",
+    };
+    state.qaBundles.push(bundle);
+    for (const task of tasks) task.qaBundleId = bundle.id;
+  }
 }
 
 function readStateFromOpenDatabase(db) {
@@ -319,6 +381,8 @@ function migrateStateIntegrity(db) {
       return;
     }
     const snapshot = mutationSnapshot(state);
+    reconcileStateIntegrity(state);
+    backfillIntegratedQaBundles(state, new Date().toISOString());
     reconcileStateIntegrity(state);
     state.meta = state.meta || {};
     state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
