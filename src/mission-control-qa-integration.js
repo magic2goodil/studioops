@@ -45,6 +45,7 @@ async function optionsFrom(args) {
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     task: args.task || args.tasks || args["task-id"],
     dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
+    force: Boolean(args.force || args.reintegrate),
     validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
     githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || defaults.githubAppAuth),
     githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir,
@@ -89,13 +90,15 @@ async function main() {
 Usage:
   mission-control-qa-integration --plan
   mission-control-qa-integration --project myapp
+  mission-control-qa-integration --project myapp --force
   mission-control-qa-integration --watch --interval 300
   mission-control qa-integrate --plan
   mission-control qa-integrate --github-apps-dir .mission-control/github-apps
 
 The worker merges qa_review task PR heads into a project's configured
 non-production integrationBranch only when trustLeadApprovals is enabled. It
-does not merge PRs to production, deploy, or force-push.
+skips tasks whose current integration result is already ready unless --force
+is supplied. It does not merge PRs to production, deploy, or force-push.
 
 For GitHub repositories, the worker uses short-lived GitHub App installation
 tokens by default. If no dedicated qa-integration-worker app exists, it falls
