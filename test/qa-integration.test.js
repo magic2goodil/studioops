@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -431,8 +432,14 @@ test("QA integration can sync default branch changes into QA and refresh a local
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const previewPath = path.join(root, "preview");
+  const healthServer = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"ok":true}');
+  });
 
   try {
+    await new Promise((resolve) => healthServer.listen(0, "127.0.0.1", resolve));
+    const healthPort = healthServer.address().port;
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
@@ -475,6 +482,8 @@ test("QA integration can sync default branch changes into QA and refresh a local
               checkoutPath: previewPath,
               branch: "qa/integration",
               stashDirty: true,
+              previewUrl: `http://127.0.0.1:${healthPort}/`,
+              healthCheckUrl: `http://127.0.0.1:${healthPort}/health`,
             },
           },
         },
@@ -498,10 +507,12 @@ test("QA integration can sync default branch changes into QA and refresh a local
     assert.equal(report.projects[0].defaultBranchSync.status, "merged");
     assert.equal(report.projects[0].localQaPreview.stashed, true);
     assert.match(report.projects[0].localQaPreview.status, /^(updated|current)$/);
+    assert.equal(report.projects[0].localQaPreview.healthCheckUrl, `http://127.0.0.1:${healthPort}/health`);
     assert.equal(await git(remotePath, ["show", "refs/heads/qa/integration:app.txt"]), "main update");
     assert.equal(await readFile(path.join(previewPath, "app.txt"), "utf8"), "main update\n");
     assert.match(await git(previewPath, ["stash", "list"]), /Mission Control local QA preview sync/);
   } finally {
+    await new Promise((resolve) => healthServer.close(resolve));
     await rm(root, { recursive: true, force: true });
   }
 });

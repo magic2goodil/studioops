@@ -576,10 +576,10 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     result.stashed = true;
   }
 
-  const fetch = await git(preview.checkoutPath, ["fetch", "origin", `refs/heads/${preview.branch}:refs/remotes/origin/${preview.branch}`], { ...gitOptions, allowFailure: true });
-  if (!fetch.ok) {
+  const fetchResult = await git(preview.checkoutPath, ["fetch", "origin", `refs/heads/${preview.branch}:refs/remotes/origin/${preview.branch}`], { ...gitOptions, allowFailure: true });
+  if (!fetchResult.ok) {
     result.status = "blocked";
-    result.output = `Could not fetch local QA preview branch origin/${preview.branch}: ${truncateOutput(fetch.output)}`;
+    result.output = `Could not fetch local QA preview branch origin/${preview.branch}: ${truncateOutput(fetchResult.output)}`;
     return result;
   }
 
