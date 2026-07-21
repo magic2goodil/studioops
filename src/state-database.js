@@ -7,11 +7,13 @@ import { missionControlDataDir, missionControlRoot } from "./runtime-paths.js";
 const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles"]);
+const STATE_INTEGRITY_VERSION = 1;
 const DATA_DIR = missionControlDataDir();
 export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
 
 let database = null;
+let integrityMigrated = false;
 
 async function secureStoragePaths() {
   await chmod(DATA_DIR, 0o700).catch(() => {});
@@ -23,10 +25,10 @@ async function secureStoragePaths() {
 function openDatabase() {
   if (database) return database;
   database = new DatabaseSync(DATABASE_FILE);
+  database.exec("PRAGMA busy_timeout = 10000");
   database.exec("PRAGMA journal_mode = WAL");
   database.exec("PRAGMA synchronous = FULL");
   database.exec("PRAGMA foreign_keys = ON");
-  database.exec("PRAGMA busy_timeout = 10000");
   database.exec(`
     CREATE TABLE IF NOT EXISTS state_meta (
       singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
@@ -110,6 +112,54 @@ function parsePayload(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function qaBundleTaskSummary(task) {
+  return {
+    id: task.id,
+    title: task.title || "Untitled task",
+    prUrl: task.prUrl || "",
+    branchName: task.branchName || "",
+    acceptanceCriteria: task.acceptanceCriteria || [],
+  };
+}
+
+export function reconcileStateIntegrity(state) {
+  state.projects = Array.isArray(state.projects) ? state.projects : [];
+  state.tasks = Array.isArray(state.tasks) ? state.tasks : [];
+  state.qaBundles = Array.isArray(state.qaBundles) ? state.qaBundles : [];
+
+  const projectIds = new Set(state.projects.map((project) => project.id));
+  const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
+  const bundlesById = new Map(state.qaBundles.map((bundle) => [bundle.id, bundle]));
+
+  for (const task of state.tasks) {
+    if (!task.qaBundleId) continue;
+    const bundle = bundlesById.get(task.qaBundleId);
+    if (!bundle || bundle.projectId !== task.projectId) delete task.qaBundleId;
+  }
+
+  for (const bundle of state.qaBundles) {
+    if (!projectIds.has(bundle.projectId)) bundle.status = "blocked";
+    const seenTaskIds = new Set();
+    bundle.tasks = (Array.isArray(bundle.tasks) ? bundle.tasks : [])
+      .map((entry) => tasksById.get(entry?.id))
+      .filter((task) => {
+        if (!task || task.projectId !== bundle.projectId || seenTaskIds.has(task.id)) return false;
+        if (task.qaBundleId && task.qaBundleId !== bundle.id) return false;
+        task.qaBundleId = bundle.id;
+        seenTaskIds.add(task.id);
+        return true;
+      })
+      .map(qaBundleTaskSummary);
+
+    for (const task of state.tasks) {
+      if (task.projectId !== bundle.projectId || task.qaBundleId !== bundle.id || seenTaskIds.has(task.id)) continue;
+      bundle.tasks.push(qaBundleTaskSummary(task));
+      seenTaskIds.add(task.id);
+    }
+  }
+  return state;
 }
 
 function readStateFromOpenDatabase(db) {
@@ -253,6 +303,35 @@ function writeMutationToOpenDatabase(db, state, snapshot) {
   }
 }
 
+function migrateStateIntegrity(db) {
+  if (integrityMigrated) return;
+  const currentMeta = db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
+  if (Number(parsePayload(currentMeta?.payload, {}).stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION) {
+    integrityMigrated = true;
+    return;
+  }
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const state = readStateFromOpenDatabase(db);
+    if (Number(state?.meta?.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION) {
+      db.exec("COMMIT");
+      integrityMigrated = true;
+      return;
+    }
+    const snapshot = mutationSnapshot(state);
+    reconcileStateIntegrity(state);
+    state.meta = state.meta || {};
+    state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
+    state.meta.updatedAt = new Date().toISOString();
+    writeMutationToOpenDatabase(db, state, snapshot);
+    db.exec("COMMIT");
+    integrityMigrated = true;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 async function initialState() {
   const candidates = [
     LEGACY_DATA_FILE,
@@ -260,7 +339,7 @@ async function initialState() {
   ];
   for (const candidate of candidates) {
     if (!(await fileExists(candidate))) continue;
-    return JSON.parse(await readFile(candidate, "utf8"));
+    return reconcileStateIntegrity(JSON.parse(await readFile(candidate, "utf8")));
   }
   return { meta: {}, projects: [], tasks: [], comments: [], reviews: [], events: [], runs: [], qaBundles: [] };
 }
@@ -286,6 +365,7 @@ export async function ensureStateDatabase() {
       throw error;
     }
   }
+  migrateStateIntegrity(db);
   await secureStoragePaths();
   return db;
 }
@@ -299,6 +379,7 @@ export async function writeDatabaseState(state) {
   const db = await ensureStateDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
+    reconcileStateIntegrity(state);
     writeStateToOpenDatabase(db, state);
     db.exec("COMMIT");
     await secureStoragePaths();
@@ -314,7 +395,9 @@ export async function mutateDatabaseState(mutator) {
   try {
     const state = readStateFromOpenDatabase(db);
     const snapshot = mutationSnapshot(state);
+    reconcileStateIntegrity(state);
     const result = await mutator(state);
+    reconcileStateIntegrity(state);
     state.meta = state.meta || {};
     state.meta.updatedAt = new Date().toISOString();
     state.meta.storageBackend = "sqlite";

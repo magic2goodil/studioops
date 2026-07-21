@@ -24,10 +24,10 @@ function baseState() {
   };
 }
 
-async function writeLegacyState(root) {
+async function writeLegacyState(root, state = baseState()) {
   const dataDir = path.join(root, "data");
   await mkdir(dataDir, { recursive: true });
-  await writeFile(path.join(dataDir, "mission-control.json"), `${JSON.stringify(baseState(), null, 2)}\n`, "utf8");
+  await writeFile(path.join(dataDir, "mission-control.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 async function runStoreScript(root, source) {
@@ -85,6 +85,40 @@ test("concurrent worker processes serialize updates without dropping comments", 
     const state = readPersistedState(root);
     const bodies = state.comments.map((comment) => comment.body).sort();
     assert.deepEqual(bodies, ["worker-0", "worker-1", "worker-2", "worker-3", "worker-4", "worker-5"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite import removes orphaned and cross-project QA bundle references", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-bundle-integrity-"));
+  try {
+    const state = baseState();
+    state.projects.push({ id: "project_2", key: "other", name: "Other" });
+    state.tasks[0].qaBundleId = "qa_bundle_1";
+    state.tasks.push({
+      id: "task_2",
+      projectId: "project_2",
+      title: "Valid QA task",
+      status: "qa_review",
+      qaBundleId: "qa_bundle_1",
+    });
+    state.qaBundles.push({
+      id: "qa_bundle_1",
+      projectId: "project_2",
+      status: "ready",
+      tasks: [
+        { id: "task_1", title: "Wrong project" },
+        { id: "task_2", title: "Valid QA task" },
+      ],
+    });
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.tasks.find((task) => task.id === "task_1").qaBundleId, undefined);
+    assert.equal(persisted.tasks.find((task) => task.id === "task_2").qaBundleId, "qa_bundle_1");
+    assert.deepEqual(persisted.qaBundles[0].tasks.map((task) => task.id), ["task_2"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
