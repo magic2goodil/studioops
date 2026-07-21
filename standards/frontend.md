@@ -53,9 +53,15 @@ Every generated or CMS-managed link must resolve to a real route, a real element
 
 Fragment links should be verified after rendering. Do not ship dropdowns or generated nav with broken `#section` targets.
 
+- Dense desktop navigation must use a deliberate compact mobile pattern, such as a disclosure menu or drawer. Do not simply wrap every desktop link and authentication action into a tall mobile header unless that composition is explicitly designed and approved.
+- Mobile navigation must define and verify both closed and open states, usable touch targets, keyboard behavior, focus restoration, and Escape dismissal.
+- Avoid oversized rounded pills for multiline eyebrow or supporting copy. Mobile variants should fit their content and preserve a clear visual hierarchy without dominating the first viewport.
+
 ## Visual Verification
 
 UI tasks must include visual verification notes for mobile, tablet, and desktop. Screenshots are preferred when practical.
+
+Passing overflow checks is necessary but not sufficient. Reviewers must also judge hierarchy, spacing, proportions, first-viewport consumption, and whether the interface looks intentionally designed at each breakpoint.
 
 ## Component Reuse
 
