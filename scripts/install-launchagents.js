@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -13,6 +13,7 @@ const logDir = path.join(repoRoot, "data", "launch-agents");
 const uid = String(process.getuid?.() || "");
 const defaultHost = process.env.MISSION_CONTROL_HOST || "127.0.0.1";
 const defaultPort = process.env.MISSION_CONTROL_PORT || "4317";
+const nodePath = process.env.MISSION_CONTROL_NODE_PATH || process.execPath;
 
 function usage() {
   console.log(`Mission Control LaunchAgent installer
@@ -25,6 +26,7 @@ Usage:
 Optional environment:
   MISSION_CONTROL_HOST=0.0.0.0   Bind web UI to the local network
   MISSION_CONTROL_PORT=4317      Web UI port
+  MISSION_CONTROL_NODE_PATH=...  Stable Node.js binary for every LaunchAgent
 `);
 }
 
@@ -66,7 +68,7 @@ async function templates() {
 
 function renderTemplate(raw) {
   return raw
-    .replaceAll("__NODE_PATH__", process.execPath)
+    .replaceAll("__NODE_PATH__", nodePath)
     .replaceAll("__MISSION_CONTROL_REPO__", repoRoot)
     .replaceAll("__LOG_DIR__", logDir)
     .replaceAll("__HOST__", defaultHost)
@@ -75,6 +77,7 @@ function renderTemplate(raw) {
 
 async function install() {
   ensureMac();
+  await access(nodePath);
   await mkdir(launchAgentDir, { recursive: true });
   await mkdir(logDir, { recursive: true });
 

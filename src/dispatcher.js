@@ -18,7 +18,7 @@ const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
 const FINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 const DEFAULTS = {
-  provider: "prompt-outbox",
+  provider: "codex-sdk",
   maxDispatchesPerSweep: 6,
   builderConcurrency: 3,
   reviewerConcurrency: 3,

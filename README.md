@@ -373,8 +373,8 @@ This repository now has a bounded workflow automation steward for assignment, de
 
 It also has a read-oriented supervisor command that can run every few minutes to report what builders, reviewers, or the human owner should do next across all projects.
 
-The dispatcher consumes supervisor actions and creates durable run records with prompt snapshots. The default provider is `prompt-outbox`, which is intentionally vendor-neutral and ready for a Codex/native-thread runner to pick up.
+The dispatcher consumes supervisor actions and creates durable run records with prompt snapshots. It records `codex-sdk` by default so the local runner creates and resumes persistent Codex threads.
 
-The included runner consumes queued builder/reviewer runs and launches Codex against the target project repository. The default `codex-cli` provider shells out to the local Codex CLI. The optional `codex-sdk` provider uses `@openai/codex-sdk`, streams structured events, stores returned Codex thread IDs, and resumes those threads on later task runs. Builder and reviewer prompts allow branch creation, validation, commits, pushes, and PR creation when the task requires it, while still forbidding production deploys, merges, secrets, external messages, and bypassing the human owner gate.
+The included runner consumes queued builder/reviewer runs and launches Codex against the target project repository. The default `codex-sdk` provider uses `@openai/codex-sdk`, streams structured events, stores returned Codex thread IDs, and resumes those threads on later task runs. The `codex-cli` provider remains available for compatibility. Builder and reviewer prompts allow branch creation, validation, commits, pushes, and PR creation when the task requires it, while still forbidding production deploys, merges, secrets, external messages, and bypassing the human owner gate.
 
 The next logical layer is richer GitHub integration and deeper native Codex task/action integration, but the local runner is already enough to execute queued work on a developer machine.

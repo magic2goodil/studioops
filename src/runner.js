@@ -1,4 +1,4 @@
-import { createWriteStream } from "node:fs";
+import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -20,7 +20,10 @@ import { findProject, findTask, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_CODEX_BIN = "/Applications/Codex.app/Contents/Resources/codex";
+const DEFAULT_CODEX_BINS = [
+  "/Applications/ChatGPT.app/Contents/Resources/codex",
+  "/Applications/Codex.app/Contents/Resources/codex",
+];
 const RUN_OUTPUT_DIR = path.join(process.cwd(), "data", "run-outputs");
 const DEFAULT_WORKSPACE_ROOT = path.join(os.homedir(), ".mission-control", "run-workspaces");
 const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
@@ -56,9 +59,15 @@ function normalizeList(value) {
 }
 
 function normalizeProvider(value) {
-  const provider = String(value || "codex-cli").trim();
-  if (!provider || provider === "prompt-outbox") return "codex-cli";
-  return SUPPORTED_PROVIDERS.has(provider) ? provider : "codex-cli";
+  const provider = String(value || "codex-sdk").trim();
+  if (!provider || provider === "prompt-outbox") return "codex-sdk";
+  return SUPPORTED_PROVIDERS.has(provider) ? provider : "codex-sdk";
+}
+
+export function resolveCodexBin(input = {}) {
+  const explicit = String(input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || "").trim();
+  if (explicit) return explicit;
+  return DEFAULT_CODEX_BINS.find((candidate) => existsSync(candidate)) || "codex";
 }
 
 function projectAllowed(run, project, options) {
@@ -81,17 +90,27 @@ function runLaneContext(state, run) {
   };
 }
 
-function activeLaneContexts(state, extraRuns = []) {
+function activeRunIsFresh(run, input = {}) {
+  if (!ACTIVE_STATUSES.has(run.status)) return false;
+  const startedAt = Date.parse(run.startedAt || run.updatedAt || run.createdAt || "");
+  if (!Number.isFinite(startedAt)) return true;
+  const configuredStaleMs = Number(input.staleRunAfterMs || 0);
+  const timeoutMs = Math.max(60_000, Number(input.timeoutMs || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS || DEFAULT_RUN_TIMEOUT_MS));
+  const staleAfterMs = configuredStaleMs > 0 ? configuredStaleMs : timeoutMs + (5 * 60 * 1000);
+  return Number(input.nowMs || Date.now()) - startedAt <= staleAfterMs;
+}
+
+function activeLaneContexts(state, extraRuns = [], input = {}) {
   return [
-    ...(state.runs || []).filter((run) => ACTIVE_STATUSES.has(run.status)),
+    ...(state.runs || []).filter((run) => activeRunIsFresh(run, input)),
     ...extraRuns,
   ].map((run) => runLaneContext(state, run)).filter(Boolean);
 }
 
-function findRunnableLaneConflict(state, run, extraRuns = []) {
+function findRunnableLaneConflict(state, run, extraRuns = [], input = {}) {
   const current = runLaneContext(state, run);
   if (!current) return null;
-  return activeLaneContexts(state, extraRuns).find((item) => laneProfilesConflict(current, item)) || null;
+  return activeLaneContexts(state, extraRuns, input).find((item) => laneProfilesConflict(current, item)) || null;
 }
 
 function staleRunReason(state, run) {
@@ -363,7 +382,9 @@ function withExecutionWorkspace(run, workspace) {
 
 export function planRunnableRuns(state, input = {}) {
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
-  const activeCount = (state.runs || []).filter((run) => ACTIVE_STATUSES.has(run.status)).length;
+  const activeRuns = (state.runs || []).filter((run) => activeRunIsFresh(run, input));
+  const staleActiveCount = (state.runs || []).filter((run) => ACTIVE_STATUSES.has(run.status)).length - activeRuns.length;
+  const activeCount = activeRuns.length;
   const available = Math.max(0, limit - activeCount);
   const selfUpdateLease = activeSelfUpdateLease(state, input);
   const runnable = [];
@@ -394,7 +415,7 @@ export function planRunnableRuns(state, input = {}) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "missing_repo_path" });
       continue;
     }
-    const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
+    const laneConflict = findRunnableLaneConflict(state, run, plannedRuns, input);
     if (laneConflict) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `lane_conflict:${laneConflict.taskId || laneConflict.id}` });
       continue;
@@ -413,7 +434,11 @@ export function planRunnableRuns(state, input = {}) {
   return {
     generatedAt: new Date().toISOString(),
     limit,
+    provider: normalizeProvider(input.provider),
+    model: input.model || "",
+    modelReasoningEffort: input.modelReasoningEffort || "",
     activeCount,
+    staleActiveCount,
     available,
     runnable,
     skipped,
@@ -561,7 +586,7 @@ export async function claimRuns(input = {}) {
     state.events = state.events || [];
     state.comments = state.comments || [];
     const now = new Date().toISOString();
-    const activeCount = state.runs.filter((run) => ACTIVE_STATUSES.has(run.status)).length;
+    const activeCount = state.runs.filter((run) => activeRunIsFresh(run, input)).length;
     const available = Math.max(0, limit - activeCount);
     if (available <= 0) return [];
     if (activeSelfUpdateLease(state, input)) return [];
@@ -592,7 +617,7 @@ export async function claimRuns(input = {}) {
         });
         continue;
       }
-      const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
+      const laneConflict = findRunnableLaneConflict(state, run, plannedRuns, input);
       if (laneConflict) continue;
       if (!project?.repoPath) {
         run.status = "failed";
@@ -705,7 +730,7 @@ async function persistRunThread(run, threadId) {
   });
 }
 
-function sdkThreadOptions(run, input = {}) {
+export function sdkThreadOptions(run, input = {}) {
   return {
     workingDirectory: run.project.repoPath,
     sandboxMode: input.sandboxMode || "danger-full-access",
@@ -717,13 +742,17 @@ function sdkThreadOptions(run, input = {}) {
   };
 }
 
-function sdkClientOptions(input = {}, authContext = null) {
-  const codexPathOverride = input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || DEFAULT_CODEX_BIN;
+export function sdkClientOptions(input = {}, authContext = null) {
+  const codexPathOverride = resolveCodexBin(input);
   const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
   const env = githubAppAuthEnv(authContext, {
     ...process.env,
     PATH: childPath,
   });
+  if (!booleanOption(input.allowApiKeyAuth, false)) {
+    delete env.OPENAI_API_KEY;
+    delete env.CODEX_API_KEY;
+  }
   return {
     codexPathOverride,
     env,
@@ -754,6 +783,9 @@ async function runClaimedRunWithSdk(run, input = {}) {
   try {
     log.write(`Mission Control SDK Runner started ${run.id} at ${new Date().toISOString()}\n`);
     log.write(`Provider: codex-sdk\n`);
+    log.write(`Model: ${input.model || "Codex default"}\n`);
+    log.write(`Reasoning: ${input.modelReasoningEffort || "Codex default"}\n`);
+    log.write(`Authentication: ${booleanOption(input.allowApiKeyAuth, false) ? "environment allowed" : "ChatGPT sign-in only"}\n`);
     authContext = await prepareGitHubAppAuth(run, input);
     log.write(formatGitHubAppAuthForLog(authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
@@ -818,7 +850,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
 
 async function runClaimedRunWithCli(run, input = {}) {
   await mkdir(RUN_OUTPUT_DIR, { recursive: true });
-  const codexBin = input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || DEFAULT_CODEX_BIN;
+  const codexBin = resolveCodexBin(input);
   const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
   const timeoutMs = Math.max(60_000, Number(input.timeoutMs || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS || DEFAULT_RUN_TIMEOUT_MS));
   const outputPath = run.outputPath || path.join(RUN_OUTPUT_DIR, `${run.id}.log`);
@@ -990,7 +1022,8 @@ export function formatRunnerReport(report) {
 export function formatRunnerPlan(plan) {
   const lines = [
     `Mission Control runner plan (${plan.generatedAt})`,
-    `Limit: ${plan.limit}  Active: ${plan.activeCount}  Available: ${plan.available}  Runnable: ${plan.runnable.length}`,
+    `Limit: ${plan.limit}  Active: ${plan.activeCount}  Stale active: ${plan.staleActiveCount || 0}  Available: ${plan.available}  Runnable: ${plan.runnable.length}`,
+    `Provider: ${plan.provider || "codex-sdk"}  Model: ${plan.model || "Codex default"}  Reasoning: ${plan.modelReasoningEffort || "Codex default"}`,
     "",
   ];
   if (!plan.runnable.length) {

@@ -73,7 +73,7 @@ The app reads the first fenced `json mission-control-config` block in this file.
     },
     "dispatcher": {
       "intervalSeconds": 300,
-      "provider": "prompt-outbox",
+      "provider": "codex-sdk",
       "maxDispatchesPerSweep": 6,
       "builderConcurrency": 3,
       "reviewerConcurrency": 3,
@@ -83,8 +83,11 @@ The app reads the first fenced `json mission-control-config` block in this file.
     },
     "runner": {
       "intervalSeconds": 300,
-      "limit": 3,
-      "provider": "codex-cli",
+      "limit": 1,
+      "provider": "codex-sdk",
+      "model": "gpt-5.6",
+      "modelReasoningEffort": "xhigh",
+      "allowApiKeyAuth": false,
       "useWorkspaces": true,
       "workspaceRoot": "~/.mission-control/run-workspaces",
       "timeoutMs": 7200000,

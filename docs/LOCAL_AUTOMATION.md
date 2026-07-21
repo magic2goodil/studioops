@@ -48,19 +48,29 @@ npm run promotion -- --plan
 npm run self-update -- --plan
 ```
 
-The runner defaults to `codex-cli`. To test SDK-backed Codex threads:
+The runner defaults to persistent `codex-sdk` threads. To run one explicitly:
 
 ```bash
 npm run runner -- --provider codex-sdk --limit 1
 ```
 
-To make LaunchAgent runs use the SDK provider, set `defaults.runner.provider` to `codex-sdk` in `mission-control.config.md`, then restart the local agents.
+To make LaunchAgent runs use persistent Codex threads, set `defaults.runner.provider` to `codex-sdk`, `defaults.runner.model` to `gpt-5.6`, and `defaults.runner.modelReasoningEffort` to `xhigh` in `mission-control.config.md`, then restart the local agents. Keep `allowApiKeyAuth` false unless API billing is explicitly authorized.
 
 For an ad hoc shell or service override, set:
 
 ```bash
 MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk
+MISSION_CONTROL_RUNNER_MODEL=gpt-5.6
+MISSION_CONTROL_RUNNER_REASONING_EFFORT=xhigh
 ```
+
+When installing on macOS, pin the worker services to a stable Node.js binary instead of whatever Node happens to invoke npm:
+
+```bash
+MISSION_CONTROL_NODE_PATH=/path/to/node npm run install-agents
+```
+
+Continuous LaunchAgents include a 60-second restart throttle so a startup failure cannot create a resource-exhausting crash loop.
 
 Runner workspace preparation is serialized per source repository with a local
 Git lock under `~/.mission-control/locks/git` by default. This prevents
@@ -223,6 +233,6 @@ It must not:
 - commit secrets or private data
 - bypass the human owner review or Trust Leads QA gate
 
-The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
+The runner defaults to isolated workspaces and one active Codex run. Increase the limit only after validating that the host and repository lanes can safely support more concurrency.
 
 Mission Control treats backend and frontend work as compatible by default. Design conflicts with frontend, and devops/project-wide work conflicts with other lanes in the same project. That keeps parallel agents from editing the same UI/CSS/deployment surface while still allowing a real team-style flow.

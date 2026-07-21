@@ -58,7 +58,7 @@ function optionsFrom(args, config) {
     reviewerConcurrency: numberFrom(args["reviewer-concurrency"] || defaults.reviewerConcurrency, 3),
     ownerConcurrency: numberFrom(args["owner-concurrency"] || defaults.ownerConcurrency, 10),
     maxDispatchesPerSweep: numberFrom(args.limit || args["max-dispatches"] || defaults.maxDispatchesPerSweep, 6),
-    provider: args.provider || defaults.provider || "prompt-outbox",
+    provider: args.provider || defaults.provider || "codex-sdk",
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     dryRun: Boolean(args["dry-run"] || args.dryRun),
     intervalSeconds,
@@ -126,8 +126,8 @@ Usage:
 The dispatcher consumes supervisor actions and creates durable run records. It
 does not merge PRs, deploy production, or send external notifications.
 
-Default provider is prompt-outbox: the generated Codex prompt is stored on the
-run record so a Codex-capable runner can pick it up.
+Default provider is codex-sdk: the generated Codex prompt is stored on the run
+record and a persistent Codex task is created or resumed by the runner.
 `);
     return;
   }

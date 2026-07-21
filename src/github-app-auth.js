@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { setTimeout as sleep } from "node:timers/promises";
 import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expandHome, loadConfig } from "./config.js";
@@ -135,6 +136,15 @@ function isMissingPathError(error) {
   return error?.code === "ENOENT" || error?.code === "ENOTDIR";
 }
 
+function isTransientReadError(error) {
+  return error?.code === "EAGAIN"
+    || error?.code === "EBUSY"
+    || error?.code === "EMFILE"
+    || error?.code === "ENFILE"
+    || error?.errno === -11
+    || /Unknown system error -11/i.test(String(error?.message || ""));
+}
+
 async function appDirectoryExists(appDir, key) {
   try {
     const appDirStat = await stat(appDir);
@@ -149,14 +159,22 @@ async function appDirectoryExists(appDir, key) {
 }
 
 async function readCredentialFile(filePath, label) {
-  try {
-    return await readFile(filePath, "utf8");
-  } catch (error) {
-    if (isMissingPathError(error)) {
-      throw new Error(`missing ${label}`);
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await readFile(filePath, "utf8");
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        throw new Error(`missing ${label}`);
+      }
+      if (isTransientReadError(error) && attempt < maxAttempts) {
+        await sleep(75 * (2 ** (attempt - 1)));
+        continue;
+      }
+      throw new Error(`could not read ${label}: ${error.message}`);
     }
-    throw new Error(`could not read ${label}: ${error.message}`);
   }
+  throw new Error(`could not read ${label}`);
 }
 
 async function githubJson(pathname, { method = "GET", token, body } = {}) {

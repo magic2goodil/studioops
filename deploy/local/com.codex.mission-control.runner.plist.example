@@ -26,6 +26,9 @@
   <key>KeepAlive</key>
   <true/>
 
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
   <key>StandardOutPath</key>
   <string>__LOG_DIR__/runner.log</string>
 
