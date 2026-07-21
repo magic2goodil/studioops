@@ -165,7 +165,7 @@ async function setup() {
           intervalSeconds: 300,
           limit: 1,
           provider: "codex-sdk",
-          model: "gpt-5.6",
+          model: "gpt-5.6-sol",
           modelReasoningEffort: "xhigh",
           allowApiKeyAuth: false,
           useWorkspaces: true,

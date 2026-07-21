@@ -85,7 +85,7 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "intervalSeconds": 300,
       "limit": 1,
       "provider": "codex-sdk",
-      "model": "gpt-5.6",
+      "model": "gpt-5.6-sol",
       "modelReasoningEffort": "xhigh",
       "allowApiKeyAuth": false,
       "useWorkspaces": true,

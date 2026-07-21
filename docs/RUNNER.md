@@ -79,7 +79,7 @@ Or make it the default in `mission-control.config.md`:
   "defaults": {
     "runner": {
       "provider": "codex-sdk",
-      "model": "gpt-5.6",
+      "model": "gpt-5.6-sol",
       "modelReasoningEffort": "xhigh",
       "allowApiKeyAuth": false
     }
@@ -94,7 +94,7 @@ By default the SDK runner removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the 
 The equivalent one-shot flags are:
 
 ```bash
-npm run runner -- --provider codex-sdk --model gpt-5.6 --model-reasoning-effort xhigh --limit 1
+npm run runner -- --provider codex-sdk --model gpt-5.6-sol --model-reasoning-effort xhigh --limit 1
 ```
 
 ## Codex CLI

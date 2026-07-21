@@ -116,13 +116,13 @@ Usage:
   mission-control-runner --watch --interval 300 --limit 1
   mission-control-runner --watch --timeout-ms 7200000
   mission-control-runner --provider codex-sdk
-  mission-control-runner --model gpt-5.6 --model-reasoning-effort xhigh
+  mission-control-runner --model gpt-5.6-sol --model-reasoning-effort xhigh
   mission-control-runner --workspace-root .mission-control/run-workspaces
   mission-control-runner --no-workspace
   mission-control-runner --github-apps-dir .mission-control/github-apps
   mission-control-runner --no-github-app-auth
   MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk mission-control-runner
-  MISSION_CONTROL_RUNNER_MODEL=gpt-5.6 MISSION_CONTROL_RUNNER_REASONING_EFFORT=xhigh mission-control-runner
+  MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=xhigh mission-control-runner
   mission-control runner --project event-horizons-web --limit 1
 
 The runner claims queued builder/reviewer dispatch runs and launches a Codex

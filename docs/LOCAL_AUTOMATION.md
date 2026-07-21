@@ -54,13 +54,13 @@ The runner defaults to persistent `codex-sdk` threads. To run one explicitly:
 npm run runner -- --provider codex-sdk --limit 1
 ```
 
-To make LaunchAgent runs use persistent Codex threads, set `defaults.runner.provider` to `codex-sdk`, `defaults.runner.model` to `gpt-5.6`, and `defaults.runner.modelReasoningEffort` to `xhigh` in `mission-control.config.md`, then restart the local agents. Keep `allowApiKeyAuth` false unless API billing is explicitly authorized.
+To make LaunchAgent runs use persistent Codex threads, set `defaults.runner.provider` to `codex-sdk`, `defaults.runner.model` to `gpt-5.6-sol`, and `defaults.runner.modelReasoningEffort` to `xhigh` in `mission-control.config.md`, then restart the local agents. Keep `allowApiKeyAuth` false unless API billing is explicitly authorized.
 
 For an ad hoc shell or service override, set:
 
 ```bash
 MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk
-MISSION_CONTROL_RUNNER_MODEL=gpt-5.6
+MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol
 MISSION_CONTROL_RUNNER_REASONING_EFFORT=xhigh
 ```
 

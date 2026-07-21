@@ -240,14 +240,14 @@ test("clone fallback prefers the repository origin over a local worktree source"
 
 test("SDK threads receive the configured model and reasoning effort", () => {
   assert.deepEqual(sdkThreadOptions({ project: { repoPath: "/tmp/demo" } }, {
-    model: "gpt-5.6",
+    model: "gpt-5.6-sol",
     modelReasoningEffort: "xhigh",
   }), {
     workingDirectory: "/tmp/demo",
     sandboxMode: "danger-full-access",
     approvalPolicy: "never",
     networkAccessEnabled: true,
-    model: "gpt-5.6",
+    model: "gpt-5.6-sol",
     modelReasoningEffort: "xhigh",
   });
 });
