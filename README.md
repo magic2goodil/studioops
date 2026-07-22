@@ -12,6 +12,10 @@ It is for developers who want an AI coding workflow to behave more like an accou
 
 ![StudioOps routes structured work through builders, specialist review, QA, and a human release gate](plugins/studioops/assets/screenshot-flow-overview.png)
 
+The local board uses the same five-stage model, so builders, rejected reviews, QA handoffs, and release decisions are visible without translating a flat task list.
+
+![The StudioOps task board groups live work into intake, build, specialist review, QA, and human release lanes](plugins/studioops/assets/screenshot-pipeline-board.png)
+
 ## What It Does
 
 - Captures ideas as epics and buildable tasks with user stories, acceptance criteria, dependencies, attachments, safety rules, and project standards.
@@ -45,7 +49,7 @@ Every builder and reviewer receives the same project standards. A passing backen
 
 ![StudioOps project standards and specialist review gates](plugins/studioops/assets/screenshot-standards-contract.png)
 
-This is a real StudioOps task: backend review approved PR #41, then frontend review requested changes because responsive captures, keyboard and accessibility checks, browser-console evidence, and Core Web Vitals were still missing.
+This is a real StudioOps-style review state: backend review approved the change, then frontend review requested changes because responsive captures, keyboard and accessibility checks, browser-console evidence, and Core Web Vitals were still missing. The task workspace keeps the decision readable while the full evidence stays one click away.
 
 ![A real StudioOps task with backend approval followed by frontend changes requested](plugins/studioops/assets/screenshot-review-gate.png)
 

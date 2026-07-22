@@ -11,6 +11,7 @@ const state = {
 const appLayout = document.querySelector("#appLayout");
 const projectList = document.querySelector("#projectList");
 const taskBoard = document.querySelector("#taskBoard");
+const boardSummary = document.querySelector("#boardSummary");
 const taskDetail = document.querySelector("#taskDetail");
 const projectForm = document.querySelector("#projectForm");
 const taskForm = document.querySelector("#taskForm");
@@ -31,6 +32,53 @@ const imageModalCaption = document.querySelector("#imageModalCaption");
 const taskModal = document.querySelector("#taskModal");
 const taskModalBody = document.querySelector("#taskModalBody");
 const taskModalOpenLink = document.querySelector("#taskModalOpenLink");
+const taskCreateDialog = document.querySelector("#taskCreateDialog");
+const qaDisclosure = document.querySelector(".qa-disclosure");
+
+if (window.matchMedia("(max-width: 760px)").matches) qaDisclosure?.removeAttribute("open");
+
+const WORKFLOW_STAGES = [
+  {
+    key: "intake",
+    number: "01",
+    eyebrow: "Structured intake",
+    title: "Make it real",
+    description: "Story, scope, and acceptance criteria",
+    statuses: ["idea", "ready", "queued"],
+  },
+  {
+    key: "build",
+    number: "02",
+    eyebrow: "AI builders",
+    title: "Build + validate",
+    description: "Standards, checks, and linked PRs",
+    statuses: ["in_progress", "builder_review", "blocked"],
+  },
+  {
+    key: "review",
+    number: "03",
+    eyebrow: "Specialist review",
+    title: "Challenge the PR",
+    description: "Backend, frontend, a11y, and lead gates",
+    statuses: ["backend_review", "frontend_review", "accessibility_review", "lead_review", "needs_changes"],
+  },
+  {
+    key: "qa",
+    number: "04",
+    eyebrow: "QA integration",
+    title: "Prove it works",
+    description: "Integrated preview, tests, and evidence",
+    statuses: ["qa_review"],
+  },
+  {
+    key: "release",
+    number: "05",
+    eyebrow: "Human release gate",
+    title: "You ship it",
+    description: "Owner approval, merge, and deployment",
+    statuses: ["approved_for_main", "promotion_blocked", "user_review", "approved", "merged", "deployed", "done", "closed"],
+  },
+];
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -58,6 +106,41 @@ function truthyFlag(value) {
   if (value === true) return true;
   if (typeof value === "string") return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
   return false;
+}
+
+function humanize(value) {
+  return String(value || "")
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .replace(/\bQa\b/g, "QA")
+    .replace(/\bPr\b/g, "PR")
+    .replace(/\bApi\b/g, "API");
+}
+
+function truncate(value, length = 160) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= length) return normalized;
+  return `${normalized.slice(0, Math.max(0, length - 1)).trimEnd()}…`;
+}
+
+function workflowStage(task) {
+  return WORKFLOW_STAGES.find((stage) => stage.statuses.includes(task?.status)) || WORKFLOW_STAGES[0];
+}
+
+function workflowStageIndex(task) {
+  return WORKFLOW_STAGES.findIndex((stage) => stage.key === workflowStage(task).key);
+}
+
+function reviewTone(outcome) {
+  if (outcome === "approved") return "approved";
+  if (outcome === "changes_requested") return "changes-requested";
+  return "recorded";
+}
+
+function reviewOutcomeLabel(outcome) {
+  if (outcome === "changes_requested") return "Changes requested";
+  return humanize(outcome || "recorded");
 }
 
 function linkifyText(value) {
@@ -200,6 +283,27 @@ function workflowGate(task) {
   return "Unassigned";
 }
 
+function renderWorkflowRail(task) {
+  const currentIndex = workflowStageIndex(task);
+  const isBlocked = ["blocked", "needs_changes", "promotion_blocked"].includes(task.status);
+  return `
+    <nav class="workflow-rail" aria-label="Task delivery stages">
+      ${WORKFLOW_STAGES.map((stage, index) => {
+    const stateClass = index < currentIndex ? "complete" : index === currentIndex ? (isBlocked ? "current blocked" : "current") : "pending";
+    return `
+        <div class="workflow-step ${stateClass}">
+          <span class="workflow-step-number">${stage.number}</span>
+          <span>
+            <small>${escapeHtml(stage.eyebrow)}</small>
+            <strong>${escapeHtml(stage.title)}</strong>
+          </span>
+        </div>
+      `;
+  }).join("")}
+    </nav>
+  `;
+}
+
 function reviewStageOptions(project) {
   const stages = project?.reviewPipeline?.length ? project.reviewPipeline : [
     { key: "backend", label: "Backend Review", role: "backend-reviewer" },
@@ -212,56 +316,65 @@ function reviewStageOptions(project) {
 
 function renderReviewPanel(task, project) {
   const reviews = task.reviews || [];
+  const approvedCount = reviews.filter((review) => review.outcome === "approved").length;
+  const changesCount = reviews.filter((review) => review.outcome === "changes_requested").length;
   return `
     <section class="detail-section workflow-section">
       <div class="section-heading">
-        <h3>Review Workflow</h3>
+        <div>
+          <p class="section-kicker">Specialist evidence</p>
+          <h3>Review gates</h3>
+        </div>
         <span>Cycle ${escapeHtml(task.reviewCycle || 0)}</span>
       </div>
-      <div class="workflow-grid">
-        <div>
-          <strong>Current owner</strong>
-          <span>${escapeHtml(workflowGate(task))}</span>
-        </div>
-        <div>
-          <strong>Status</strong>
-          <span>${escapeHtml(task.status || "unknown")}</span>
-        </div>
-        <div>
-          <strong>Branch</strong>
-          <span>${escapeHtml(task.branchName || "not linked")}</span>
-        </div>
-        <div>
-          <strong>Pull request</strong>
-          <span>${task.prUrl ? `<a href="${escapeHtml(task.prUrl)}" target="_blank" rel="noreferrer">Open PR</a>` : "not linked"}</span>
-        </div>
+      <div class="review-summary">
+        <span class="review-summary-chip approved"><strong>${approvedCount}</strong> approved</span>
+        <span class="review-summary-chip changes-requested"><strong>${changesCount}</strong> changes requested</span>
+        <span class="review-summary-chip"><strong>${reviews.length}</strong> recorded</span>
       </div>
       <div class="review-list">
-        ${reviews.map((review) => `
-          <article class="review-card">
-            <div>
-              <strong>${escapeHtml(review.stageKey || review.role || "review")}: ${escapeHtml(review.outcome || "recorded")}</strong>
+        ${[...reviews].reverse().map((review) => {
+    const body = String(review.body || "").trim();
+    const tone = reviewTone(review.outcome);
+    return `
+          <article class="review-card ${tone}">
+            <div class="review-card-heading">
+              <div>
+                <span class="review-outcome ${tone}">${escapeHtml(reviewOutcomeLabel(review.outcome))}</span>
+                <strong>${escapeHtml(humanize(review.stageKey || review.role || "review"))}</strong>
+              </div>
               <time>${escapeHtml(new Date(review.createdAt).toLocaleString())}</time>
             </div>
-            ${review.body ? `<p>${linkifyText(review.body)}</p>` : ""}
+            ${body ? `
+              <details class="review-evidence">
+                <summary>${escapeHtml(truncate(body, 190))}</summary>
+                <div>${linkifyText(body)}</div>
+              </details>
+            ` : `<p class="muted-note">Outcome recorded without supporting notes.</p>`}
           </article>
-        `).join("") || `<p class="muted-note">No review outcomes recorded for this task yet.</p>`}
+        `;
+  }).join("") || `<div class="empty-state"><strong>No review outcomes yet</strong><span>Evidence will appear here as specialist gates complete.</span></div>`}
       </div>
-      <form class="review-form" data-review-form>
-        <label>Review Stage
-          <select name="stage">${reviewStageOptions(project)}</select>
-        </label>
-        <label>Outcome
-          <select name="outcome">
-            <option value="approved">Approved</option>
-            <option value="skipped">Skipped</option>
-            <option value="changes_requested">Changes requested</option>
-          </select>
-        </label>
-        <label>Reviewer <input name="author" value="${escapeHtml(workflowOwner(task) || "reviewer")}"></label>
-        <label>Review Notes <textarea name="body" rows="4" placeholder="Scope reviewed, findings, validation checked, residual risk..."></textarea></label>
-        <button type="submit">Record Review Outcome</button>
-      </form>
+      <details class="editor-disclosure">
+        <summary>Record a review outcome</summary>
+        <form class="review-form" data-review-form>
+          <div class="form-grid">
+            <label>Review Stage
+              <select name="stage">${reviewStageOptions(project)}</select>
+            </label>
+            <label>Outcome
+              <select name="outcome">
+                <option value="approved">Approved</option>
+                <option value="skipped">Skipped</option>
+                <option value="changes_requested">Changes requested</option>
+              </select>
+            </label>
+          </div>
+          <label>Reviewer <input name="author" value="${escapeHtml(workflowOwner(task) || "reviewer")}"></label>
+          <label>Review Notes <textarea name="body" rows="4" placeholder="Scope reviewed, findings, validation checked, residual risk..."></textarea></label>
+          <button class="button button-primary" type="submit">Record outcome</button>
+        </form>
+      </details>
     </section>
   `;
 }
@@ -461,67 +574,103 @@ function renderQaReviewPanel() {
 
 function renderTasks() {
   const tasks = visibleTasks();
-  taskBoard.innerHTML = tasks.map((task) => {
+  const activeCount = tasks.filter((task) => !["done", "closed", "merged", "deployed"].includes(task.status)).length;
+  const buildCount = tasks.filter((task) => workflowStage(task).key === "build").length;
+  const reviewCount = tasks.filter((task) => workflowStage(task).key === "review").length;
+  const ownerCount = tasks.filter((task) => ["qa", "release"].includes(workflowStage(task).key)).length;
+  boardSummary.innerHTML = `
+    <div><strong>${activeCount}</strong><span>Active work</span></div>
+    <div><strong>${buildCount}</strong><span>With builders</span></div>
+    <div><strong>${reviewCount}</strong><span>At review gates</span></div>
+    <div><strong>${ownerCount}</strong><span>QA or release</span></div>
+  `;
+
+  const taskCard = (task) => {
     const project = projectFor(task);
     const childCount = state.tasks.filter((item) => item.parentTaskId === task.id).length;
     const dependencies = (task.dependsOnTaskIds || []).map(taskById).filter(Boolean);
-    const parent = task.parentTaskId ? taskById(task.parentTaskId) : null;
     const qaBranch = integrationBranch(task, project);
     const qaBranchHref = integrationBranchUrl(task, project);
-    const qaMeta = ["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status) && (qaBranch || task.promotionStatus)
-      ? `<div class="qa-card-meta">
-          <span>${escapeHtml(task.promotionStatus ? `Promotion ${promotionStatusLabel(task)}` : `QA ${integrationStatusLabel(task)}`)}</span>
-          ${qaBranchHref ? `<a href="${escapeHtml(qaBranchHref)}" target="_blank" rel="noreferrer">Open ${escapeHtml(qaBranch)}</a>` : `<span>${escapeHtml(qaBranch)}</span>`}
-        </div>`
-      : "";
+    const reviews = task.reviews || [];
+    const latestReview = reviews.at(-1);
     return `
-      <article class="task-card ${task.id === state.selectedTaskId ? "selected" : ""}">
+      <article class="task-card ${task.id === state.selectedTaskId ? "selected" : ""} ${["blocked", "needs_changes", "promotion_blocked"].includes(task.status) ? "attention" : ""}">
         <button type="button" class="task-card-main" data-task-id="${escapeHtml(task.id)}">
           <div class="task-card-top">
             <span class="task-id-pill">${escapeHtml(task.id)}</span>
-            <span class="priority">${escapeHtml(task.type || task.priority || "task")}</span>
+            <span class="priority">${escapeHtml(task.priority || "medium")}</span>
           </div>
-          <span class="status ${escapeHtml(task.status)}">${escapeHtml(task.status)}</span>
+          <span class="status ${escapeHtml(task.status)}">${escapeHtml(humanize(task.status))}</span>
           <h3>${escapeHtml(task.title)}</h3>
-          <p>${escapeHtml(task.description || "No description yet.")}</p>
-          <span class="workflow-owner">${escapeHtml(workflowGate(task))}${task.reviewCycle ? ` · cycle ${escapeHtml(task.reviewCycle)}` : ""}</span>
-          <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${parent ? ` · parent ${escapeHtml(parent.id)} ${escapeHtml(parent.title)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencies.length ? ` · depends on ${dependencies.map((item) => `${item.id} ${item.title}`).join(", ")}` : ""}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
+          <p>${escapeHtml(truncate(task.description || task.expectedOutcome || "No delivery summary yet.", 130))}</p>
+          ${latestReview ? `<span class="card-review ${reviewTone(latestReview.outcome)}">${escapeHtml(humanize(latestReview.stageKey || latestReview.role || "review"))}: ${escapeHtml(reviewOutcomeLabel(latestReview.outcome))}</span>` : ""}
+          <div class="task-card-footer">
+            <span><i aria-hidden="true"></i>${escapeHtml(workflowGate(task))}${task.reviewCycle ? ` · cycle ${escapeHtml(task.reviewCycle)}` : ""}</span>
+            <small>${escapeHtml(project?.key || "unknown")}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencies.length ? ` · ${dependencies.length} blocked by` : ""}</small>
+          </div>
         </button>
-        ${qaMeta}
+        ${["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status) && (qaBranch || task.promotionStatus) ? `
+          <div class="qa-card-meta">
+            <span>${escapeHtml(task.promotionStatus ? `Promotion ${promotionStatusLabel(task)}` : `QA ${integrationStatusLabel(task)}`)}</span>
+            ${qaBranchHref ? `<a href="${escapeHtml(qaBranchHref)}" target="_blank" rel="noreferrer">Open QA branch</a>` : `<span>${escapeHtml(qaBranch)}</span>`}
+          </div>
+        ` : ""}
       </article>
     `;
-  }).join("") || `<p>No tasks match this view.</p>`;
+  };
+
+  taskBoard.innerHTML = WORKFLOW_STAGES.map((stage) => {
+    const stageTasks = tasks.filter((task) => workflowStage(task).key === stage.key);
+    return `
+      <section class="workflow-lane" data-stage="${stage.key}">
+        <header class="lane-header">
+          <div class="lane-number">${stage.number}</div>
+          <div>
+            <p>${escapeHtml(stage.eyebrow)}</p>
+            <h2>${escapeHtml(stage.title)}</h2>
+          </div>
+          <span class="lane-count">${stageTasks.length}</span>
+        </header>
+        <p class="lane-description">${escapeHtml(stage.description)}</p>
+        <div class="lane-cards">
+          ${stageTasks.map(taskCard).join("") || `<div class="lane-empty"><span>Clear</span><small>No work at this stage</small></div>`}
+        </div>
+      </section>
+    `;
+  }).join("");
 }
 
 function renderHierarchyPanel(task) {
   const dependsOnValue = (task.dependsOnTaskIds || []).join(", ");
   return `
-    <section class="detail-section hierarchy-section">
-      <div class="section-heading">
-        <h3>Epic & Dependencies</h3>
-        <span>${escapeHtml(task.type || "task")}</span>
-      </div>
-      <div class="relationship-grid">
-        <div>
-          <h4>Parent</h4>
-          ${task.parent ? taskReferenceCard(task.parent) : `<p class="muted-note">No parent epic/task linked.</p>`}
+    <details class="detail-section sidebar-details hierarchy-section">
+      <summary>
+        <span><small>Planning</small><strong>Epic & dependencies</strong></span>
+        <span>${escapeHtml(humanize(task.type || "task"))}</span>
+      </summary>
+      <div class="sidebar-details-body">
+        <div class="relationship-grid">
+          <div>
+            <h4>Parent</h4>
+            ${task.parent ? taskReferenceCard(task.parent) : `<p class="muted-note">No parent epic/task linked.</p>`}
+          </div>
+          <div>
+            <h4>Children</h4>
+            ${taskRelationshipList(task.children || [], "No child tasks yet.")}
+          </div>
+          <div>
+            <h4>Depends On</h4>
+            ${taskRelationshipList(task.dependencies || [], "No dependencies recorded.")}
+          </div>
         </div>
-        <div>
-          <h4>Children</h4>
-          ${taskRelationshipList(task.children || [], "No child tasks yet.")}
-        </div>
-        <div>
-          <h4>Depends On</h4>
-          ${taskRelationshipList(task.dependencies || [], "No dependencies recorded.")}
+        <div class="relationship-edit-grid">
+          <h4>Edit relationship IDs</h4>
+          <label>Parent Epic/Task ID <input name="detailParentTaskId" value="${escapeHtml(task.parentTaskId || "")}" placeholder="task_12"></label>
+          <label>Depends On Task IDs <textarea name="detailDependsOnTaskIds" rows="2" placeholder="task_1, task_2">${escapeHtml(dependsOnValue)}</textarea></label>
+          <button class="button button-primary" type="button" data-action="save-relationships">Save relationships</button>
         </div>
       </div>
-      <div class="relationship-edit-grid">
-        <h4>Edit Relationship IDs</h4>
-        <label>Parent Epic/Task ID <input name="detailParentTaskId" value="${escapeHtml(task.parentTaskId || "")}" placeholder="task_12"></label>
-        <label>Depends On Task IDs <textarea name="detailDependsOnTaskIds" rows="2" placeholder="task_1, task_2">${escapeHtml(dependsOnValue)}</textarea></label>
-        <button type="button" data-action="save-relationships">Save Relationships</button>
-      </div>
-    </section>
+    </details>
   `;
 }
 
@@ -529,21 +678,23 @@ function renderBranchPanel(task, project) {
   const branchHref = branchUrl(project, task.branchName);
   const prUrl = String(task.prUrl || "").trim();
   return `
-    <section class="detail-section branch-section">
-      <div class="section-heading">
-        <h3>Git Association</h3>
-        <span>${escapeHtml(task.branchName || "No branch linked yet")}</span>
+    <details class="detail-section sidebar-details branch-section">
+      <summary>
+        <span><small>Delivery</small><strong>Git association</strong></span>
+        <span>${task.prUrl ? "PR linked" : "Not linked"}</span>
+      </summary>
+      <div class="sidebar-details-body">
+        <div class="branch-links">
+          ${branchHref ? `<a class="button button-quiet" href="${escapeHtml(branchHref)}" target="_blank" rel="noreferrer">Open feature branch</a>` : `<span class="empty-pill">Add a repo URL and branch name to open the branch.</span>`}
+          ${prUrl ? `<a class="button button-primary" href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open pull request</a>` : `<span class="empty-pill">No PR linked yet</span>`}
+        </div>
+        <div class="branch-edit-grid">
+          <label>Feature Branch <input name="branchName" value="${escapeHtml(task.branchName || "")}" placeholder="codex/project-task-short-title"></label>
+          <label>Pull Request URL <input name="prUrl" value="${escapeHtml(task.prUrl || "")}" placeholder="https://github.com/owner/repo/pull/123"></label>
+          <button class="button button-primary" type="button" data-action="save-git-links">Save git links</button>
+        </div>
       </div>
-      <div class="branch-links">
-        ${branchHref ? `<a href="${escapeHtml(branchHref)}" target="_blank" rel="noreferrer">Open Feature Branch</a>` : `<span class="empty-pill">Add a GitHub repo URL and branch name to open the branch.</span>`}
-        ${prUrl ? `<a href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open Pull Request</a>` : `<span class="empty-pill">No PR linked yet</span>`}
-      </div>
-      <div class="branch-edit-grid">
-        <label>Feature Branch <input name="branchName" value="${escapeHtml(task.branchName || "")}" placeholder="codex/project-task-short-title"></label>
-        <label>Pull Request URL <input name="prUrl" value="${escapeHtml(task.prUrl || "")}" placeholder="https://github.com/owner/repo/pull/123"></label>
-        <button type="button" data-action="save-git-links">Save Git Links</button>
-      </div>
-    </section>
+    </details>
   `;
 }
 
@@ -706,7 +857,10 @@ function renderComments(comments) {
   return `
     <section class="detail-section comments-section">
       <div class="section-heading">
-        <h3>Builder Notes & PR Updates</h3>
+        <div>
+          <p class="section-kicker">Delivery log</p>
+          <h3>Builder notes & PR updates</h3>
+        </div>
         <span>${comments.length} comment${comments.length === 1 ? "" : "s"}</span>
       </div>
       <div class="comment-list">
@@ -720,11 +874,116 @@ function renderComments(comments) {
           </article>
         `).join("") || `<p class="muted-note">No builder notes yet.</p>`}
       </div>
-      <form class="comment-form" data-comment-form>
-        <label>Author <input name="author" value="Codex Builder"></label>
-        <label>Comment <textarea name="body" rows="4" placeholder="What changed, validation results, PR link, known gaps..."></textarea></label>
-        <button type="submit">Add Comment</button>
-      </form>
+      <details class="editor-disclosure">
+        <summary>Add delivery note</summary>
+        <form class="comment-form" data-comment-form>
+          <label>Author <input name="author" value="Codex Builder"></label>
+          <label>Comment <textarea name="body" rows="4" placeholder="What changed, validation results, PR link, known gaps..."></textarea></label>
+          <button class="button button-primary" type="submit">Add note</button>
+        </form>
+      </details>
+    </section>
+  `;
+}
+
+function renderRequirementsPanel(task) {
+  const criteria = Array.isArray(task.acceptanceCriteria)
+    ? task.acceptanceCriteria
+    : String(task.acceptanceCriteria || "").split("\n").map((item) => item.trim()).filter(Boolean);
+  return `
+    <section class="detail-section contract-section">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Engineering contract</p>
+          <h3>Definition of done</h3>
+        </div>
+        <span>${criteria.length} acceptance checks</span>
+      </div>
+      <div class="contract-grid">
+        <article>
+          <span>User story</span>
+          <p>${escapeHtml(task.userStory || "No user story recorded yet.")}</p>
+        </article>
+        <article>
+          <span>Expected outcome</span>
+          <p>${escapeHtml(task.expectedOutcome || task.description || "No expected outcome recorded yet.")}</p>
+        </article>
+      </div>
+      <div class="criteria-list">
+        ${criteria.map((criterion) => `<div><span aria-hidden="true">✓</span><p>${escapeHtml(criterion)}</p></div>`).join("") || `<div class="empty-state"><strong>No acceptance criteria</strong><span>Add measurable checks before the task enters build.</span></div>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderTaskSnapshot(task, project) {
+  const branchHref = branchUrl(project, task.branchName);
+  return `
+    <section class="detail-section snapshot-section">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Current handoff</p>
+          <h3>${escapeHtml(workflowGate(task))}</h3>
+        </div>
+        <span class="status ${escapeHtml(task.status)}">${escapeHtml(humanize(task.status))}</span>
+      </div>
+      <dl class="snapshot-list">
+        <div><dt>Owner</dt><dd>${escapeHtml(workflowOwner(task) || "Unassigned")}</dd></div>
+        <div><dt>Review cycle</dt><dd>${escapeHtml(task.reviewCycle || 0)}</dd></div>
+        <div><dt>Branch</dt><dd>${branchHref ? `<a class="inline-link" href="${escapeHtml(branchHref)}" target="_blank" rel="noreferrer">${escapeHtml(task.branchName)}</a>` : escapeHtml(task.branchName || "Not linked")}</dd></div>
+        <div><dt>Pull request</dt><dd>${task.prUrl ? `<a class="inline-link" href="${escapeHtml(task.prUrl)}" target="_blank" rel="noreferrer">Open PR</a>` : "Not linked"}</dd></div>
+      </dl>
+    </section>
+  `;
+}
+
+function renderStatusActions(task) {
+  const statuses = [
+    "ready", "in_progress", "builder_review", "backend_review", "frontend_review",
+    "accessibility_review", "lead_review", "qa_review", "approved_for_main",
+    "promotion_blocked", "needs_changes", "user_review", "done",
+  ];
+  return `
+    <section class="detail-section action-section">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Owner control</p>
+          <h3>Move task</h3>
+        </div>
+      </div>
+      <label>Next status
+        <select name="taskStatusUpdate">
+          ${statuses.map((status) => `<option value="${status}" ${task.status === status ? "selected" : ""}>${escapeHtml(humanize(status))}</option>`).join("")}
+        </select>
+      </label>
+      <button class="button button-primary" type="button" data-action="update-status">Update workflow</button>
+    </section>
+  `;
+}
+
+function renderPromptLibrary(prompts) {
+  const roles = [
+    ["builder", "Builder"],
+    ["backend-reviewer", "Backend reviewer"],
+    ["frontend-reviewer", "Frontend reviewer"],
+    ["accessibility-reviewer", "Accessibility reviewer"],
+    ["lead-reviewer", "Primary lead reviewer"],
+  ];
+  return `
+    <section class="detail-section prompt-library">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Agent context</p>
+          <h3>Generated prompts</h3>
+        </div>
+        <span>${roles.length} roles</span>
+      </div>
+      ${roles.map(([key, label]) => `
+        <details class="prompt-disclosure">
+          <summary>${escapeHtml(label)}</summary>
+          <div class="prompt-box">${escapeHtml(prompts[key] || "Prompt unavailable.")}</div>
+        </details>
+      `).join("")}
     </section>
   `;
 }
@@ -742,59 +1001,44 @@ async function renderDetail() {
   const link = taskUrl(task.id);
   const isFullPage = Boolean(state.routeTaskId);
   taskDetail.innerHTML = `
-    ${isFullPage ? `<button class="back-link" type="button" data-action="back-to-board">Back to board</button>` : ""}
+    ${isFullPage ? `<button class="back-link button button-quiet" type="button" data-action="back-to-board">← Back to pipeline</button>` : ""}
     <div class="detail-hero">
       <div>
-        <span class="task-id-pill hero-task-id">${escapeHtml(fullTask.id)}</span>
-        <div class="detail-title">${escapeHtml(fullTask.title)}</div>
-        <p>${escapeHtml(project?.name || "Unknown project")} · ${escapeHtml(fullTask.status)} · ${escapeHtml(fullTask.priority)}</p>
+        <div class="hero-meta">
+          <span class="task-id-pill hero-task-id">${escapeHtml(fullTask.id)}</span>
+          <span>${escapeHtml(project?.name || "Unknown project")}</span>
+          <span>${escapeHtml(humanize(fullTask.type || "task"))}</span>
+          <span>${escapeHtml(humanize(fullTask.priority || "medium"))} priority</span>
+        </div>
+        <h1 class="detail-title">${escapeHtml(fullTask.title)}</h1>
+        <p>${escapeHtml(fullTask.description || "No delivery summary recorded yet.")}</p>
       </div>
-      ${!isFullPage ? `<a href="${escapeHtml(link)}">Open Full Page</a>` : ""}
+      ${!isFullPage ? `<a class="button button-primary" href="${escapeHtml(link)}">Open workspace</a>` : ""}
     </div>
-    ${renderReviewPanel(fullTask, project)}
-    <div class="detail-grid ${isFullPage ? "detail-grid-full" : ""}">
-      <section class="detail-section">
-        <h3>Description</h3>
-        <p>${escapeHtml(fullTask.description || "No description yet.")}</p>
-        ${fullTask.userStory ? `<h3>User Story</h3><p>${escapeHtml(fullTask.userStory)}</p>` : ""}
-        ${fullTask.expectedOutcome ? `<h3>Expected Outcome</h3><p>${escapeHtml(fullTask.expectedOutcome)}</p>` : ""}
-      </section>
-      ${renderHierarchyPanel(fullTask)}
-      ${renderBranchPanel(fullTask, project)}
-      ${renderIntegrationPanel(fullTask, project)}
-      ${renderQaDecisionPanel(fullTask)}
-      ${renderPromotionPanel(fullTask, project)}
-      ${renderStandardsPanel(project)}
+    ${renderWorkflowRail(fullTask)}
+    <div class="task-workspace-grid">
+      <div class="workspace-main">
+        ${renderRequirementsPanel(fullTask)}
+        ${renderReviewPanel(fullTask, project)}
+        ${fullTask.attachments?.length ? `<section class="detail-section attachment-section">${attachmentList(fullTask.attachments)}</section>` : ""}
+        ${renderComments(fullTask.comments || [])}
+        ${renderPromptLibrary(prompts)}
+      </div>
+      <aside class="workspace-sidebar">
+        ${renderTaskSnapshot(fullTask, project)}
+        ${renderStatusActions(fullTask)}
+        ${renderQaDecisionPanel(fullTask)}
+        ${renderIntegrationPanel(fullTask, project)}
+        ${renderPromotionPanel(fullTask, project)}
+        ${renderStandardsPanel(project)}
+        ${renderHierarchyPanel(fullTask)}
+        ${renderBranchPanel(fullTask, project)}
+        <section class="detail-section task-link-section">
+          <p class="section-kicker">Shareable local link</p>
+          <a class="plain-link" href="${escapeHtml(taskPath(task.id))}">${escapeHtml(link)}</a>
+        </section>
+      </aside>
     </div>
-    ${attachmentList(fullTask.attachments)}
-    <h3>Task Link</h3>
-    <p><a class="plain-link" href="${escapeHtml(taskPath(task.id))}">${escapeHtml(link)}</a></p>
-    <div class="detail-actions">
-      <button type="button" data-status="ready">Ready</button>
-      <button type="button" data-status="in_progress">In Progress</button>
-      <button type="button" data-status="builder_review">Builder Review</button>
-      <button type="button" data-status="backend_review">Backend Review</button>
-      <button type="button" data-status="frontend_review">Frontend Review</button>
-      <button type="button" data-status="accessibility_review">Accessibility Review</button>
-      <button type="button" data-status="lead_review">Lead Review</button>
-      <button type="button" data-status="qa_review">QA Review</button>
-      <button type="button" data-status="approved_for_main">Approved For Main</button>
-      <button type="button" data-status="promotion_blocked">Promotion Blocked</button>
-      <button type="button" data-status="needs_changes">Needs Changes</button>
-      <button type="button" data-status="user_review">User Review</button>
-      <button type="button" data-status="done">Done</button>
-    </div>
-    ${renderComments(fullTask.comments || [])}
-    <h3>Builder Prompt</h3>
-    <div class="prompt-box">${escapeHtml(prompts.builder || "Prompt unavailable.")}</div>
-    <h3>Backend Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(prompts["backend-reviewer"] || "Prompt unavailable.")}</div>
-    <h3>Frontend Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(prompts["frontend-reviewer"] || "Prompt unavailable.")}</div>
-    <h3>Accessibility Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(prompts["accessibility-reviewer"] || "Prompt unavailable.")}</div>
-    <h3>Primary Lead Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(prompts["lead-reviewer"] || "Prompt unavailable.")}</div>
   `;
 }
 
@@ -996,6 +1240,18 @@ taskDetail.addEventListener("click", async (event) => {
     return;
   }
 
+  const updateStatusButton = event.target.closest("[data-action='update-status']");
+  if (updateStatusButton && state.selectedTaskId) {
+    const nextStatus = taskDetail.querySelector("[name='taskStatusUpdate']")?.value;
+    if (!nextStatus) return;
+    await api(`/api/tasks/${state.selectedTaskId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: nextStatus }),
+    });
+    await loadState();
+    return;
+  }
+
   const statusButton = event.target.closest("[data-status]");
   if (!statusButton || !state.selectedTaskId) return;
   await api(`/api/tasks/${state.selectedTaskId}`, {
@@ -1058,6 +1314,7 @@ taskForm.addEventListener("submit", async (event) => {
     body: JSON.stringify(body),
   });
   taskForm.reset();
+  taskCreateDialog.close();
   if (result.task?.id) window.history.pushState(null, "", taskPath(result.task.id));
   await loadState();
 });
@@ -1065,10 +1322,12 @@ taskForm.addEventListener("submit", async (event) => {
 newTaskButton.addEventListener("click", () => {
   const activeProject = activeProjectForNewTask();
   if (activeProject) taskForm.elements.project.value = activeProject.key;
-  taskForm.scrollIntoView({ behavior: "smooth", block: "start" });
-  taskForm.classList.add("form-highlight");
-  window.setTimeout(() => taskForm.classList.remove("form-highlight"), 1400);
-  taskForm.elements.title.focus({ preventScroll: true });
+  taskCreateDialog.showModal();
+  window.setTimeout(() => taskForm.elements.title.focus(), 0);
+});
+
+taskCreateDialog.addEventListener("click", (event) => {
+  if (event.target.closest("[data-close-task-create]")) taskCreateDialog.close();
 });
 
 refreshButton.addEventListener("click", () => {

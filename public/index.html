@@ -8,72 +8,94 @@
   </head>
   <body>
     <header class="topbar">
-      <div>
-        <p class="eyebrow">Local-first AI work orchestration</p>
-        <h1>StudioOps</h1>
-      </div>
+      <a class="brand-lockup" href="/" aria-label="StudioOps home">
+        <span class="brand-mark" aria-hidden="true"><span></span></span>
+        <span>
+          <strong>StudioOps</strong>
+          <small>Senior AI engineering workflow</small>
+        </span>
+      </a>
       <div class="topbar-actions">
         <span id="productPlan" class="plan-badge">Community · local</span>
-        <button id="newTaskButton" type="button">New Task</button>
-        <button id="automationButton" type="button">Run Automation Tick</button>
-        <button id="refreshButton" type="button">Refresh</button>
-        <a href="https://github.com/magic2goodil/studioops" target="_blank" rel="noreferrer">GitHub</a>
+        <button id="refreshButton" class="button button-quiet" type="button">Refresh</button>
+        <button id="automationButton" class="button button-quiet" type="button">Run agents</button>
+        <button id="newTaskButton" class="button button-primary" type="button">+ New task</button>
+        <a class="button button-quiet" href="https://github.com/magic2goodil/studioops" target="_blank" rel="noreferrer">GitHub</a>
       </div>
     </header>
 
     <main id="appLayout" class="layout">
-      <section class="panel project-panel">
-        <div class="panel-header">
-          <h2>Projects</h2>
-          <span id="projectCount">0</span>
+      <aside class="panel project-panel">
+        <div class="workspace-heading">
+          <div>
+            <p class="eyebrow">Workspace</p>
+            <h2>Projects</h2>
+          </div>
+          <span id="projectCount" class="count-badge">0</span>
         </div>
         <div id="projectList" class="project-list"></div>
-        <div id="projectSettings" class="project-settings"></div>
-        <div id="qaReviewPanel" class="qa-review-panel"></div>
-        <form id="projectForm" class="stacked-form">
-          <h3>Add Project</h3>
-          <label>Key <input name="key" placeholder="myapp" required></label>
-          <label>Name <input name="name" placeholder="My App" required></label>
-          <label>Repo Path <input name="repoPath" placeholder="/absolute/path/to/repo"></label>
-          <label>GitHub Repo URL <input name="repoUrl" placeholder="https://github.com/owner/repo"></label>
-          <label class="checkbox-row"><input name="trustLeadApprovals" type="checkbox"> Trust lead approvals</label>
-          <label>QA Integration Branch <input name="integrationBranch" placeholder="qa/myapp"></label>
-          <label>Standards <textarea name="standards" rows="3" placeholder="standards/frontend.md&#10;standards/styles.md&#10;standards/performance.md"></textarea></label>
-          <label>Validation <input name="validationCommands" placeholder="npm run check"></label>
-          <button type="submit">Add Project</button>
-        </form>
-      </section>
+
+        <details class="sidebar-disclosure qa-disclosure" open>
+          <summary>Owner QA</summary>
+          <div id="qaReviewPanel" class="qa-review-panel"></div>
+        </details>
+
+        <details class="sidebar-disclosure">
+          <summary>Project settings</summary>
+          <div id="projectSettings" class="project-settings"></div>
+        </details>
+
+        <details class="sidebar-disclosure">
+          <summary>Add project</summary>
+          <form id="projectForm" class="stacked-form">
+            <label>Key <input name="key" placeholder="myapp" required></label>
+            <label>Name <input name="name" placeholder="My App" required></label>
+            <label>Repo Path <input name="repoPath" placeholder="/absolute/path/to/repo"></label>
+            <label>GitHub Repo URL <input name="repoUrl" placeholder="https://github.com/owner/repo"></label>
+            <label class="checkbox-row"><input name="trustLeadApprovals" type="checkbox"> Trust lead approvals</label>
+            <label>QA Integration Branch <input name="integrationBranch" placeholder="qa/myapp"></label>
+            <label>Standards <textarea name="standards" rows="3" placeholder="standards/frontend.md&#10;standards/styles.md&#10;standards/performance.md"></textarea></label>
+            <label>Validation <input name="validationCommands" placeholder="npm run check"></label>
+            <button class="button button-primary" type="submit">Add project</button>
+          </form>
+        </details>
+      </aside>
 
       <section class="panel board-panel">
-        <div class="panel-header">
+        <div class="board-header">
           <div>
-            <h2>Tasks</h2>
+            <p class="eyebrow">Delivery pipeline</p>
+            <h1>From request to release</h1>
             <p id="configStatus">Checking config...</p>
           </div>
-          <select id="statusFilter" aria-label="Status filter">
-            <option value="">All statuses</option>
-            <option value="idea">Idea</option>
-            <option value="ready">Ready</option>
-            <option value="queued">Queued</option>
-            <option value="in_progress">In progress</option>
-            <option value="blocked">Blocked</option>
-            <option value="builder_review">Builder review</option>
-            <option value="backend_review">Backend review</option>
-            <option value="frontend_review">Frontend review</option>
-            <option value="accessibility_review">Accessibility review</option>
-            <option value="lead_review">Lead review</option>
-            <option value="qa_review">QA review</option>
-            <option value="approved_for_main">Approved for main</option>
-            <option value="promotion_blocked">Promotion blocked</option>
-            <option value="needs_changes">Needs changes</option>
-            <option value="user_review">User review</option>
-            <option value="approved">Approved</option>
-            <option value="merged">Merged</option>
-            <option value="deployed">Deployed</option>
-            <option value="done">Done</option>
-            <option value="closed">Closed</option>
-          </select>
+          <label class="filter-control">
+            <span>Filter</span>
+            <select id="statusFilter" aria-label="Status filter">
+              <option value="">All statuses</option>
+              <option value="idea">Idea</option>
+              <option value="ready">Ready</option>
+              <option value="queued">Queued</option>
+              <option value="in_progress">In progress</option>
+              <option value="blocked">Blocked</option>
+              <option value="builder_review">Builder review</option>
+              <option value="backend_review">Backend review</option>
+              <option value="frontend_review">Frontend review</option>
+              <option value="accessibility_review">Accessibility review</option>
+              <option value="lead_review">Lead review</option>
+              <option value="qa_review">QA review</option>
+              <option value="approved_for_main">Approved for main</option>
+              <option value="promotion_blocked">Promotion blocked</option>
+              <option value="needs_changes">Needs changes</option>
+              <option value="user_review">User review</option>
+              <option value="approved">Approved</option>
+              <option value="merged">Merged</option>
+              <option value="deployed">Deployed</option>
+              <option value="done">Done</option>
+              <option value="closed">Closed</option>
+            </select>
+          </label>
         </div>
+        <div id="boardSummary" class="board-summary" aria-live="polite"></div>
         <div id="taskBoard" class="task-board"></div>
       </section>
 
@@ -84,11 +106,22 @@
         <div id="taskDetail" class="task-detail">
           <p>Select a task to view prompts and review metadata.</p>
         </div>
-        <form id="taskForm" class="stacked-form" aria-label="Add StudioOps task">
-          <h3>Add Task</h3>
+      </aside>
+    </main>
+
+    <dialog id="taskCreateDialog" class="task-create-dialog">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">Structured intake</p>
+          <h2>Create a task</h2>
+          <p>Give the engineering team a clear contract before builders start.</p>
+        </div>
+        <button class="button button-quiet" type="button" data-close-task-create aria-label="Close task form">Close</button>
+      </div>
+      <form id="taskForm" class="stacked-form task-create-form" aria-label="Add StudioOps task">
+        <div class="form-grid">
           <label>Project <select name="project" required></select></label>
           <label>Title <input name="title" placeholder="Build the thing" required></label>
-          <label>Description <textarea name="description" rows="4" placeholder="What should happen?"></textarea></label>
           <label>Type
             <select name="type">
               <option value="feature">Feature</option>
@@ -103,11 +136,6 @@
               <option value="review">Review</option>
             </select>
           </label>
-          <label>Parent Epic/Task <input name="parentTaskId" placeholder="task_12"></label>
-          <label>Depends On <textarea name="dependsOnTaskIds" rows="2" placeholder="task_1, task_2"></textarea></label>
-          <label>User Story <textarea name="userStory" rows="2" placeholder="As a customer, I want..."></textarea></label>
-          <label>Expected Outcome <textarea name="expectedOutcome" rows="3" placeholder="What should be true when this is complete?"></textarea></label>
-          <label>Visual Attachments <textarea name="attachments" rows="3" placeholder="One image path, screenshot, mockup URL, or reference per line"></textarea></label>
           <label>Status
             <select name="status">
               <option value="idea">Idea</option>
@@ -115,11 +143,22 @@
               <option value="queued">Queued</option>
             </select>
           </label>
+        </div>
+        <label>Description <textarea name="description" rows="4" placeholder="What should happen?"></textarea></label>
+        <div class="form-grid">
+          <label>Parent Epic/Task <input name="parentTaskId" placeholder="task_12"></label>
+          <label>Depends On <textarea name="dependsOnTaskIds" rows="2" placeholder="task_1, task_2"></textarea></label>
+        </div>
+          <label>User Story <textarea name="userStory" rows="2" placeholder="As a customer, I want..."></textarea></label>
+          <label>Expected Outcome <textarea name="expectedOutcome" rows="3" placeholder="What should be true when this is complete?"></textarea></label>
+          <label>Visual Attachments <textarea name="attachments" rows="3" placeholder="One image path, screenshot, mockup URL, or reference per line"></textarea></label>
           <label>Acceptance Criteria <textarea name="acceptanceCriteria" rows="3" placeholder="One per line"></textarea></label>
-          <button type="submit">Add Task</button>
-        </form>
-      </aside>
-    </main>
+          <div class="dialog-actions">
+            <button class="button button-quiet" type="button" data-close-task-create>Cancel</button>
+            <button class="button button-primary" type="submit">Create task</button>
+          </div>
+      </form>
+    </dialog>
 
     <template id="taskTemplate">
       <article class="task-card">
