@@ -1,9 +1,9 @@
 {
   "name": "studioops",
-  "version": "0.1.0+codex.20260722185504",
+  "version": "0.1.0+codex.20260722185818",
   "description": "Run software work through a senior AI engineering team and a structured delivery board.",
   "author": {
-    "name": "Jason Robison",
+    "name": "Team Robison",
     "url": "https://github.com/magic2goodil"
   },
   "homepage": "https://github.com/magic2goodil/studioops",
@@ -20,7 +20,7 @@
     "displayName": "StudioOps",
     "shortDescription": "A senior AI engineering team with a real workflow.",
     "longDescription": "Turn software ideas into structured projects and tasks, then move them through builders, domain review, lead review, QA, and a human release gate.",
-    "developerName": "Jason Robison",
+    "developerName": "Team Robison",
     "category": "Developer Tools",
     "capabilities": [
       "Structured intake",
