@@ -186,6 +186,9 @@ function taskActions(state, task, options = {}) {
     return [actionBase(state, task, "repair_task_project", "owner", "Task is attached to a missing project.", options)];
   }
 
+  const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
+  if (task.type === "epic" || hasChildren) return [];
+
   const missingDependencies = incompleteDependencies(state, task);
   const retryNotBefore = Date.parse(task.retryNotBefore || "");
   if (Number.isFinite(retryNotBefore) && retryNotBefore > Date.now()) {

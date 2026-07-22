@@ -1,5 +1,5 @@
 import { createWriteStream, existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -12,16 +12,18 @@ import {
   formatGitHubAppAuthForPrompt,
   githubAppAuthEnv,
   githubAppAuthSecrets,
+  parseGitHubRepoUrl,
   prepareGitHubAppAuth,
   redactSecrets,
 } from "./github-app-auth.js";
 import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
-import { DATA_DIR, findProject, findTask, mutateState } from "./store.js";
+import { DATA_DIR, findProject, findTask, mutateState, readState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
 import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
+import { normalizeProjectWorkflowMode } from "./config.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -136,6 +138,9 @@ function findRunnableLaneConflict(state, run, extraRuns = []) {
 function staleRunReason(state, run) {
   const task = findTask(state, run.taskId);
   if (!task) return "task_missing";
+  if (task.type === "epic" || (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id)) {
+    return "tracking_container";
+  }
 
   if (run.actionType === "qa_integration_blocked") {
     if (task.status !== "qa_review") return `task_status_changed:${task.status || "unknown"}`;
@@ -192,6 +197,35 @@ function slugify(value) {
 
 function branchNameForRun(run) {
   return String(run.branchName || `codex/${run.project?.key || run.projectId}-${run.taskId || run.id}`).trim();
+}
+
+export function resolveProjectWorkflowMode(project = {}, originUrl = "") {
+  const configured = normalizeProjectWorkflowMode(project.workflowMode || "auto");
+  if (configured !== "auto") return configured;
+  return parseGitHubRepoUrl(project.repoUrl) || parseGitHubRepoUrl(originUrl) ? "github" : "local";
+}
+
+function preflightFailure(code, message, remediation) {
+  return { ok: false, code, message, remediation };
+}
+
+function workflowAuthEnv(workflowMode, authContext, baseEnv = process.env) {
+  const env = githubAppAuthEnv(authContext, baseEnv);
+  if (workflowMode !== "local") return env;
+  for (const key of [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "MISSION_CONTROL_GITHUB_TOKEN",
+    "MISSION_CONTROL_GITHUB_APP_AUTH",
+    "MISSION_CONTROL_GITHUB_APP_ROLE",
+    "MISSION_CONTROL_GITHUB_APP_SLUG",
+    "MISSION_CONTROL_GITHUB_REPOSITORY",
+    "MISSION_CONTROL_GIT_USERNAME",
+    "GIT_ASKPASS",
+    "GIT_CONFIG_PARAMETERS",
+  ]) delete env[key];
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
 }
 
 function isBranchWriterRun(run) {
@@ -273,6 +307,139 @@ async function remoteBranchExists(repoPath, branch) {
   return gitOk(["rev-parse", "--verify", `refs/remotes/origin/${branch}`], { cwd: repoPath });
 }
 
+async function resolveLocalBaseRef(repoPath, branch, defaultBranch) {
+  const refs = [
+    branch ? `refs/heads/${branch}` : "",
+    defaultBranch ? `refs/heads/${defaultBranch}` : "",
+    "HEAD",
+  ].filter((value, index, items) => value && items.indexOf(value) === index);
+  for (const ref of refs) {
+    if (await gitOk(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { cwd: repoPath })) {
+      return {
+        ref,
+        commit: await git(["rev-parse", "--verify", `${ref}^{commit}`], { cwd: repoPath }),
+      };
+    }
+  }
+  return null;
+}
+
+async function defaultGitHubRemoteCheck(run, authContext) {
+  await git(["ls-remote", "origin"], {
+    cwd: run.project.repoPath,
+    env: githubAppAuthEnv(authContext, process.env),
+    timeout: 60_000,
+  });
+}
+
+function githubCredentialFailure(error) {
+  const notes = error?.message || String(error);
+  return nonRetryableWorkspaceFailureReason(notes) || "github_credential_failure";
+}
+
+export async function preflightRun(run, input = {}) {
+  const project = run.project || {};
+  const repoPath = String(project.repoPath || "").trim();
+  if (!repoPath) {
+    return preflightFailure(
+      "missing_repo_path",
+      "The project does not have a local repository path.",
+      "Set the project repoPath to the absolute path of an existing local Git repository.",
+    );
+  }
+
+  let repositoryStat;
+  try {
+    repositoryStat = await stat(repoPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return preflightFailure(
+        "repo_path_not_found",
+        `The configured repository path does not exist: ${repoPath}`,
+        "Update repoPath to an existing local checkout, then restore the task to its prior queue state.",
+      );
+    }
+    return preflightFailure(
+      "repo_path_inaccessible",
+      `The configured repository path cannot be read: ${repoPath}`,
+      "Fix the path permissions or update repoPath to a readable local checkout.",
+    );
+  }
+  if (!repositoryStat.isDirectory()) {
+    return preflightFailure(
+      "repo_path_not_directory",
+      `The configured repository path is not a directory: ${repoPath}`,
+      "Set repoPath to the root directory of a local Git repository.",
+    );
+  }
+  if (!await gitOk(["rev-parse", "--git-dir"], { cwd: repoPath })) {
+    return preflightFailure(
+      "not_git_repository",
+      `The configured repository path is not a Git repository: ${repoPath}`,
+      "Initialize Git in this directory or update repoPath to an existing Git checkout.",
+    );
+  }
+
+  const originUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
+  const workflowMode = resolveProjectWorkflowMode(project, originUrl);
+  if (workflowMode === "local") {
+    const base = await resolveLocalBaseRef(
+      repoPath,
+      branchNameForRun(run),
+      String(project.defaultBranch || "main").trim(),
+    );
+    if (!base) {
+      return preflightFailure(
+        "missing_local_base_ref",
+        "The local repository has no feature branch, configured default branch, or valid HEAD commit to build from.",
+        "Create an initial commit, create the configured default branch, or point the task at an existing local feature branch.",
+      );
+    }
+    return {
+      ok: true,
+      workflowMode,
+      originUrl,
+      baseRef: base.ref,
+      baseCommit: base.commit,
+    };
+  }
+
+  if (!parseGitHubRepoUrl(originUrl)) {
+    return preflightFailure(
+      "missing_github_origin",
+      "GitHub workflow mode requires an origin remote hosted on github.com.",
+      "Add the GitHub repository as the origin remote, or change the project workflowMode to local.",
+    );
+  }
+
+  const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
+  const cleanupAuth = input.cleanupGitHubAppAuth || cleanupGitHubAppAuth;
+  const checkRemote = input.checkGitHubRemote || defaultGitHubRemoteCheck;
+  let authContext = null;
+  try {
+    authContext = await prepareAuth({ ...run, workflowMode, project: { ...project, workflowMode } }, input);
+  } catch (error) {
+    const code = githubCredentialFailure(error);
+    return preflightFailure(
+      code,
+      `GitHub credentials could not be prepared: ${error?.message || String(error)}`,
+      "Repair the configured GitHub App credentials and installation for this repository, then restore the task to its prior queue state.",
+    );
+  }
+  try {
+    await checkRemote({ ...run, workflowMode, project: { ...project, workflowMode } }, authContext, input);
+  } catch (error) {
+    return preflightFailure(
+      "inaccessible_github_remote",
+      `The GitHub origin is not accessible: ${error?.message || String(error)}`,
+      "Verify the origin URL, repository access, network connection, and GitHub App installation permissions.",
+    );
+  } finally {
+    await cleanupAuth(authContext);
+  }
+  return { ok: true, workflowMode, originUrl };
+}
+
 async function localBranchExists(repoPath, branch) {
   return gitOk(["rev-parse", "--verify", `refs/heads/${branch}`], { cwd: repoPath });
 }
@@ -331,12 +498,25 @@ async function createCloneWorkspace(run, workspacePath, branch, startRef, log, g
   log.write(`Clone source: ${originUrl ? "origin remote" : "local repository"}\n`);
 }
 
+async function createLocalCloneWorkspace(run, workspacePath, branch, startCommit, log, gitEnv) {
+  await git(["clone", "--no-tags", "--no-hardlinks", run.project.repoPath, workspacePath], {
+    cwd: process.cwd(),
+    timeout: 300_000,
+    env: gitEnv,
+  });
+  await git(["checkout", "-B", branch, startCommit], { cwd: workspacePath, env: gitEnv });
+  await git(["remote", "remove", "origin"], { cwd: workspacePath, env: gitEnv });
+  log.write("Workspace strategy: isolated local clone fallback\n");
+  log.write("Clone source: local repository\n");
+}
+
 export function cloneFallbackSource(repoPath, originUrl) {
   return String(originUrl || "").trim() || repoPath;
 }
 
-async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
-  const gitEnv = githubAppAuthEnv(authContext, process.env);
+export async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
+  const workflowMode = run.workflowMode || resolveProjectWorkflowMode(run.project, run.preflightOriginUrl);
+  const gitEnv = workflowAuthEnv(workflowMode, authContext, process.env);
   const enabled = booleanOption(
     input.useWorkspaces
       ?? input.workspaces
@@ -344,7 +524,7 @@ async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
       ?? process.env.MISSION_CONTROL_USE_WORKSPACES,
     true,
   );
-  if (!enabled) {
+  if (!enabled && workflowMode !== "local") {
     return {
       executionRepoPath: run.project.repoPath,
       workspacePath: "",
@@ -367,12 +547,22 @@ async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
   await safeRemoveWorkspace(workspacePath, workspaceRoot);
   return withGitRepositoryLock(run.project.repoPath, async () => {
     log.write(`Acquired source repository Git lock: ${run.project.repoPath}\n`);
-    await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000, env: gitEnv });
-    await assertBranchReuseIsSafe(run, gitEnv, log);
-
-    const startRef = await remoteBranchExists(run.project.repoPath, branch)
-      ? `origin/${branch}`
-      : `origin/${defaultBranch}`;
+    let startRef;
+    let startCommit = "";
+    if (workflowMode === "github") {
+      await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000, env: gitEnv });
+      await assertBranchReuseIsSafe(run, gitEnv, log);
+      startRef = await remoteBranchExists(run.project.repoPath, branch)
+        ? `origin/${branch}`
+        : `origin/${defaultBranch}`;
+    } else {
+      const base = run.preflightBaseRef && run.preflightBaseCommit
+        ? { ref: run.preflightBaseRef, commit: run.preflightBaseCommit }
+        : await resolveLocalBaseRef(run.project.repoPath, branch, defaultBranch);
+      if (!base) throw new Error("Local workspace preparation could not resolve a valid local base ref.");
+      startRef = base.ref;
+      startCommit = base.commit;
+    }
 
     log.write(`Preparing isolated workspace for ${run.id}\n`);
     log.write(`Source repo: ${run.project.repoPath}\n`);
@@ -380,10 +570,17 @@ async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
     log.write(`Branch: ${branch}\n`);
     log.write(`Start ref: ${startRef}\n`);
 
+    if (workflowMode === "local") {
+      await createLocalCloneWorkspace(run, workspacePath, branch, startCommit, log, gitEnv);
+      const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "local-clone" };
+      await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
+      return workspace;
+    }
+
     try {
       await createWorktreeWorkspace(run, workspacePath, branch, startRef, log, gitEnv);
       const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "worktree" };
-      await persistRunWorkspace(run, workspace);
+      await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
       return workspace;
     } catch (error) {
       log.write(`Worktree preparation fell back to clone: ${error.message}\n`);
@@ -391,7 +588,7 @@ async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
       await mkdir(path.dirname(workspacePath), { recursive: true });
       await createCloneWorkspace(run, workspacePath, branch, startRef, log, gitEnv);
       const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "clone" };
-      await persistRunWorkspace(run, workspace);
+      await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
       return workspace;
     }
   }, input.gitLock || {});
@@ -409,6 +606,12 @@ function withExecutionWorkspace(run, workspace) {
       repoPath: workspace.executionRepoPath || run.project.repoPath,
     },
   };
+}
+
+async function prepareRunAuth(run, input = {}) {
+  if (run.workflowMode === "local") return null;
+  const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
+  return prepareAuth(run, input);
 }
 
 export function planRunnableRuns(state, input = {}) {
@@ -440,10 +643,6 @@ export function planRunnableRuns(state, input = {}) {
     const staleReason = staleRunReason(state, run);
     if (staleReason) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `stale_run:${staleReason}` });
-      continue;
-    }
-    if (!project?.repoPath) {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "missing_repo_path" });
       continue;
     }
     const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
@@ -489,6 +688,7 @@ Run details:
 - Repository path: ${executionRepoPath}
 - Source repository path: ${sourceRepoPath}
 - Workspace strategy: ${run.workspaceStrategy || "source-checkout"}
+- Workflow mode: ${run.workflowMode || project?.workflowMode || "auto"}
 - Work lane: ${run.lane || "(not recorded)"}
 - File scope: ${(run.fileScope || []).join(", ") || "(not recorded)"}
 - Task: ${run.taskId}
@@ -499,7 +699,9 @@ Run details:
 - Reasoning effort: ${run.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort}
 - Attempt: ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts}
 
-${formatGitHubAppAuthForPrompt(authContext)}
+${run.workflowMode === "local"
+    ? "Local project workflow:\n- GitHub App authentication is disabled for this run.\n- Do not fetch an external remote, push commits, or open/update a pull request.\n- Work only in the isolated local workspace and preserve the resulting local branch and commits."
+    : formatGitHubAppAuthForPrompt(authContext)}
 
 StudioOps CLI:
 \`node ${missionControlCli}\`
@@ -516,7 +718,9 @@ Automation rules:
 - When implementation/review work is ready, update the task and leave a clear StudioOps comment with changed files, validation, known gaps, branch/PR, and next review step.
 - If blocked, add a StudioOps comment explaining the blocker and set the task to an appropriate blocked/needs_changes state.
 - The runner will mark this run completed or failed based on your process exit code.
-- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. StudioOps verifies this handoff after the process exits.
+${run.workflowMode === "local"
+    ? "- Local mode forbids pushes and pull requests; leave the local branch and validation evidence recorded on the task."
+    : "- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. StudioOps verifies this handoff after the process exits."}
 
 Original prompt:
 
@@ -694,8 +898,63 @@ async function pauseTaskForAutomationConfig(run, reason, notes) {
   });
 }
 
+async function blockQueuedRunForPreflight(state, run, failure, now) {
+  const task = findTask(state, run.taskId);
+  run.status = "cancelled";
+  run.exitCode = failure.code;
+  // Configuration preflight is outside the worker retry budget. Clearing the
+  // attempt key keeps a repaired task's first actual worker launch at attempt 1.
+  run.attemptKey = "";
+  run.notes = `${failure.message}\n\nRemediation: ${failure.remediation}`;
+  run.completedAt = now;
+  run.updatedAt = now;
+  if (task) {
+    const resumeStatus = restoreTaskStatusForRun(run, task);
+    task.status = "blocked";
+    task.assignedAgentRole = "owner";
+    task.retryNotBefore = "";
+    task.lastAutomationFailure = failure.code;
+    task.lastAutomationFailureRunId = run.id;
+    task.automationBlocker = {
+      type: "configuration",
+      reason: failure.code,
+      message: failure.message,
+      remediation: failure.remediation,
+      runId: run.id,
+      resumeStatus,
+      blockedAt: now,
+    };
+    task.updatedAt = now;
+  }
+  const body = `${run.id} was blocked by runner preflight before a worker was claimed: ${failure.code}.\n\n${failure.message}\n\nRemediation: ${failure.remediation}`;
+  await appendTaskComment(state, run, body, now);
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "runner_preflight_blocked",
+    projectId: run.projectId,
+    taskId: run.taskId,
+    message: `${run.id} blocked before claim: ${failure.code}`,
+    createdAt: now,
+  });
+}
+
 export async function claimRuns(input = {}) {
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
+  const preflightState = input.state || await readState();
+  const candidates = planRunnableRuns(preflightState, { ...input, limit }).runnable;
+  const preflightResults = new Map();
+  for (const candidate of candidates) {
+    try {
+      const check = input.preflightRun || preflightRun;
+      preflightResults.set(candidate.id, await check(candidate, input));
+    } catch (error) {
+      preflightResults.set(candidate.id, preflightFailure(
+        "runner_preflight_failed",
+        `Runner preflight could not complete: ${error?.message || String(error)}`,
+        "Review the runner logs and project configuration, then restore the task to its prior queue state.",
+      ));
+    }
+  }
   const mutate = input.state
     ? async (mutator) => mutator(input.state)
     : mutateState;
@@ -740,16 +999,22 @@ export async function claimRuns(input = {}) {
       }
       const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
       if (laneConflict) continue;
-      if (!project?.repoPath) {
-        run.status = "failed";
-        run.exitCode = "missing_repo_path";
-        run.completedAt = now;
-        run.updatedAt = now;
-        await appendTaskComment(state, run, `${run.id} failed before launch: project repository path is not recorded.`, now);
+      const preflight = preflightResults.get(run.id);
+      if (!preflight) continue;
+      if (!preflight?.ok) {
+        await blockQueuedRunForPreflight(state, run, preflight || preflightFailure(
+          "runner_preflight_failed",
+          "Runner preflight returned no result.",
+          "Review the runner configuration and retry after correcting it.",
+        ), now);
         continue;
       }
 
       run.status = "running";
+      run.workflowMode = preflight.workflowMode;
+      run.preflightOriginUrl = preflight.originUrl || "";
+      run.preflightBaseRef = preflight.baseRef || "";
+      run.preflightBaseCommit = preflight.baseCommit || "";
       const profile = laneProfile(findTask(state, run.taskId) || {}, run);
       run.lane = run.lane || profile.lane;
       run.conflictGroup = run.conflictGroup || profile.conflictGroup;
@@ -784,7 +1049,7 @@ export async function claimRuns(input = {}) {
         message: `${run.id} claimed by StudioOps runner`,
         createdAt: now,
       });
-      await appendTaskComment(state, run, `${run.id} started by StudioOps Runner using ${run.provider}, ${run.model}, ${run.modelReasoningEffort} reasoning (attempt ${run.attempt}/${run.maxAttempts}).`, now);
+      await appendTaskComment(state, run, `${run.id} started by StudioOps Runner in ${run.workflowMode} workflow mode using ${run.provider}, ${run.model}, ${run.modelReasoningEffort} reasoning (attempt ${run.attempt}/${run.maxAttempts}).`, now);
       claimed.push({
         ...run,
         project,
@@ -934,7 +1199,7 @@ export function sdkThreadOptions(run, input = {}) {
 export function sdkClientOptions(input = {}, authContext = null) {
   const codexPathOverride = resolveCodexBin(input);
   const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
-  const env = githubAppAuthEnv(authContext, {
+  const env = workflowAuthEnv(input.workflowMode, authContext, {
     ...process.env,
     PATH: childPath,
     STUDIOOPS_ROOT: process.env.STUDIOOPS_ROOT || missionControlRoot(),
@@ -979,7 +1244,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Provider: codex-sdk\n`);
     log.write(`Model: ${run.model || input.model || DEFAULT_EXECUTION_POLICY.model}\n`);
     log.write(`Reasoning: ${run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort}\n`);
-    authContext = await prepareGitHubAppAuth(run, input);
+    authContext = await prepareRunAuth(run, input);
     log.write(formatGitHubAppAuthForLog(authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);
@@ -989,7 +1254,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
 
     const { Codex } = await import("@openai/codex-sdk");
-    const codex = new Codex(sdkClientOptions(input, authContext));
+    const codex = new Codex(sdkClientOptions({ ...input, workflowMode: run.workflowMode }, authContext));
     const options = sdkThreadOptions(executionRun, input);
     const thread = run.threadId
       ? codex.resumeThread(run.threadId, options)
@@ -1053,7 +1318,7 @@ async function runClaimedRunWithCli(run, input = {}) {
   let prompt = "";
   let authContext = null;
   try {
-    authContext = await prepareGitHubAppAuth(run, input);
+    authContext = await prepareRunAuth(run, input);
     log.write(formatGitHubAppAuthForLog(authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);
@@ -1108,7 +1373,7 @@ async function runClaimedRunWithCli(run, input = {}) {
     const child = spawn(codexBin, args, {
       cwd: executionRun.project.repoPath,
       stdio: ["pipe", "pipe", "pipe"],
-      env: githubAppAuthEnv(authContext, {
+      env: workflowAuthEnv(run.workflowMode, authContext, {
         ...process.env,
         PATH: childPath,
         MISSION_CONTROL_RUN_ID: run.id,
