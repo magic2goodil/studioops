@@ -50,7 +50,7 @@ The app reads the first fenced `json studioops-config` block in this file.
   },
   "githubApps": {
     "mode": "single",
-    "credentialsDir": ".mission-control/github-apps",
+    "credentialsDir": "~/.codex/studioops/credentials/github-apps",
     "defaultRole": "default",
     "roleMap": {
       "builder": "default",
@@ -104,12 +104,12 @@ The app reads the first fenced `json studioops-config` block in this file.
       "model": "gpt-5.6-sol",
       "modelReasoningEffort": "high",
       "useWorkspaces": true,
-      "workspaceRoot": "~/.mission-control/run-workspaces",
+      "workspaceRoot": "~/.codex/studioops/run-workspaces",
       "timeoutMs": 7200000,
       "githubAppAuth": true,
-      "githubAppCredentialsDir": ".mission-control/github-apps",
+      "githubAppCredentialsDir": "~/.codex/studioops/credentials/github-apps",
       "gitLock": {
-        "lockRoot": "~/.mission-control/locks/git",
+        "lockRoot": "~/.codex/studioops/locks/git",
         "timeoutMs": 180000,
         "staleMs": 900000,
         "pollMs": 750
@@ -135,7 +135,7 @@ The app reads the first fenced `json studioops-config` block in this file.
     "promotion": {
       "intervalSeconds": 300,
       "validationTimeoutMs": 600000,
-      "workspaceRoot": "~/.mission-control/promotion-workspaces",
+      "workspaceRoot": "~/.codex/studioops/promotion-workspaces",
       "githubAppAuth": true,
       "githubAppRole": "promotion-worker"
     },
@@ -233,7 +233,7 @@ The app reads the first fenced `json studioops-config` block in this file.
         "syncDefaultBranchIntoIntegration": true,
         "localPreview": {
           "enabled": true,
-          "checkoutPath": "~/.mission-control/qa-workspaces/example/example-clean",
+          "checkoutPath": "~/.codex/studioops/qa-workspaces/example/example-clean",
           "branch": "qa/integration",
           "stashDirty": true,
           "createIfMissing": true,

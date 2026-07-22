@@ -97,7 +97,7 @@ Usage:
   studioops-promotion --project myapp
   studioops-promotion --watch --interval 300
   studioops promote --plan
-  studioops promote --github-apps-dir .mission-control/github-apps
+  studioops promote --github-apps-dir ~/.codex/studioops/credentials/github-apps
 
 The worker merges owner-QA-passed task branches or PR heads into the project's
 configured target branch, defaulting to the project default branch. It uses an

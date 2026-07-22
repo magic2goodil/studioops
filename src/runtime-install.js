@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { cp, lstat, mkdir, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { defaultStudioOpsRuntimeRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const RUNTIME_ITEMS = ["src", "public", "scripts", "deploy", "package.json", "package-lock.json"];
@@ -108,12 +108,17 @@ async function pruneOldReleases(runtimeRoot, currentRelease, keep = 3) {
 }
 
 export function defaultRuntimeRoot() {
-  return path.join(os.homedir(), ".mission-control", "runtime");
+  return defaultStudioOpsRuntimeRoot();
 }
 
 export async function deployRuntime(input = {}) {
   const sourceRoot = path.resolve(input.sourceRoot || process.cwd());
-  const runtimeRoot = path.resolve(input.runtimeRoot || process.env.MISSION_CONTROL_RUNTIME_ROOT || defaultRuntimeRoot());
+  const runtimeRoot = path.resolve(
+    input.runtimeRoot
+      || process.env.STUDIOOPS_RUNTIME_ROOT
+      || process.env.MISSION_CONTROL_RUNTIME_ROOT
+      || defaultRuntimeRoot(),
+  );
   const version = await sourceVersion(sourceRoot);
   const releasesRoot = path.join(runtimeRoot, "releases");
   const releasePath = path.join(releasesRoot, version);

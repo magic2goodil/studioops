@@ -5,10 +5,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expandHome, loadConfig } from "./config.js";
+import { defaultStudioOpsCredentialsRoot, missionControlDataDir } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_CREDENTIALS_DIR = path.join(process.cwd(), ".mission-control", "github-apps");
-const DEFAULT_RUNTIME_DIR = path.join(process.cwd(), "data", "run-outputs", "github-app-auth");
+const DEFAULT_CREDENTIALS_DIR = defaultStudioOpsCredentialsRoot();
+const DEFAULT_RUNTIME_DIR = path.join(missionControlDataDir(), "run-outputs", "github-app-auth");
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
 const TOKEN_REDACTION = "[REDACTED_GITHUB_APP_TOKEN]";
@@ -470,6 +471,7 @@ export async function prepareGitHubAppAuth(run, input = {}) {
   const role = normalizeRole(run.role);
   const credentialsDir = resolvePath(
     input.githubAppCredentialsDir
+      || process.env.STUDIOOPS_GITHUB_APPS_DIR
       || process.env.MISSION_CONTROL_GITHUB_APPS_DIR
       || githubApps.credentialsDir,
     DEFAULT_CREDENTIALS_DIR,

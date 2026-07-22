@@ -19,6 +19,7 @@ import {
   redactSecrets,
 } from "./github-app-auth.js";
 import { mutateState, readState } from "./store.js";
+import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 120_000;
@@ -26,7 +27,7 @@ const VALIDATION_TIMEOUT_MS = 10 * 60_000;
 const MAX_OUTPUT_CHARS = 4_000;
 const WORKSPACE_COMMAND_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_QA_RETRY_DELAY_MS = 15 * 60_000;
-const DEFAULT_QA_WORKSPACE_ROOT = path.join(os.homedir(), ".mission-control", "qa-workspaces");
+const DEFAULT_QA_WORKSPACE_ROOT = defaultStudioOpsWorkspaceRoot("qa");
 const DEFAULT_QA_INTEGRATION_PATH = [
   "/opt/homebrew/bin",
   "/usr/local/bin",
@@ -289,6 +290,7 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(
     options.qaWorkspaceRoot
       || options.workspaceRoot
+      || process.env.STUDIOOPS_QA_WORKSPACE_ROOT
       || process.env.MISSION_CONTROL_QA_WORKSPACE_ROOT,
   );
   if (pathContains(sourceRepoPath, workspaceRoot)) {

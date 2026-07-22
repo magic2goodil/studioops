@@ -3,8 +3,9 @@ import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
+import { defaultStudioOpsGitLockRoot } from "./runtime-paths.js";
 
-const DEFAULT_LOCK_ROOT = path.join(os.homedir(), ".mission-control", "locks", "git");
+const DEFAULT_LOCK_ROOT = defaultStudioOpsGitLockRoot();
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_STALE_MS = 15 * 60_000;
 const DEFAULT_POLL_MS = 750;
@@ -17,7 +18,12 @@ function expandHome(value) {
 }
 
 function lockPathFor(repoPath, options = {}) {
-  const root = expandHome(options.lockRoot || process.env.MISSION_CONTROL_GIT_LOCK_ROOT || DEFAULT_LOCK_ROOT);
+  const root = expandHome(
+    options.lockRoot
+      || process.env.STUDIOOPS_GIT_LOCK_ROOT
+      || process.env.MISSION_CONTROL_GIT_LOCK_ROOT
+      || DEFAULT_LOCK_ROOT,
+  );
   const digest = createHash("sha256").update(path.resolve(repoPath)).digest("hex").slice(0, 20);
   return path.join(root, `${digest}.lock`);
 }

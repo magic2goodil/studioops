@@ -137,7 +137,7 @@ Builder and reviewer runs use GitHub App installation tokens by default for GitH
 Credentials live outside git under:
 
 ```text
-.mission-control/github-apps/
+~/.codex/studioops/credentials/github-apps/
 ```
 
 The runner maps roles to app identities using `studioops.config.md` `githubApps.roleMap`, or these default directories:
@@ -197,7 +197,7 @@ Once reviewers and lead review pass, the task moves to `user_review`, or to `qa_
 By default, runner jobs execute in isolated per-run workspaces under:
 
 ```text
-~/.mission-control/run-workspaces/
+~/.codex/studioops/run-workspaces/
 ```
 
 The runner prefers `git worktree` for a project branch. If the target branch is already checked out somewhere else, it falls back to an isolated local clone and points that clone's `origin` remote back to the real GitHub remote.

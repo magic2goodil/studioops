@@ -126,9 +126,9 @@ Usage:
   studioops-runner --watch --timeout-ms 7200000
   studioops-runner --provider codex-sdk
   studioops-runner --model gpt-5.6-sol --model-reasoning-effort high
-  studioops-runner --workspace-root .mission-control/run-workspaces
+  studioops-runner --workspace-root ~/.codex/studioops/run-workspaces
   studioops-runner --no-workspace
-  studioops-runner --github-apps-dir .mission-control/github-apps
+  studioops-runner --github-apps-dir ~/.codex/studioops/credentials/github-apps
   studioops-runner --no-github-app-auth
   MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk studioops-runner
   MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=high studioops-runner

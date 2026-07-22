@@ -46,7 +46,7 @@ Postgres is a future backend option when StudioOps needs multiple machines or re
 
 ## Runtime
 
-LaunchAgents execute an immutable release under `~/.mission-control/runtime/releases/`, with `current` swapped atomically. Their working directory still points at the configured working root so the local config and database remain stable. A separate clean `~/.mission-control/source` checkout stays on `main` for self-updates, independent of any developer feature branch. This avoids partial reads from cloud-synced development folders and ensures a restart actually runs the newly installed worker version.
+LaunchAgents execute an immutable release under `~/.codex/studioops/runtime/releases/`, with `current` swapped atomically. Their working directory defaults to `~/.codex/studioops/control-plane` so the local config, database, and logs remain outside cloud-synchronized development folders. A separate clean `~/.codex/studioops/source` checkout stays on `main` for self-updates, independent of any developer feature branch. This avoids partial reads from synchronized folders and ensures a restart actually runs the newly installed worker version.
 
 The UI and CLI can run anywhere Node.js is supported. The included always-on service installer, local notification channel, heartbeat scheduling, and worker restart implementation currently target macOS LaunchAgents.
 

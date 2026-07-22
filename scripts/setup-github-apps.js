@@ -5,10 +5,15 @@ import { chmod, mkdir, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { URL } from "node:url";
+import { defaultStudioOpsCredentialsRoot, expandLocalPath } from "../src/runtime-paths.js";
 
 const DEFAULT_PORT = 4328;
 const DEFAULT_OWNER = "magic2goodil";
-const CONFIG_DIR = path.join(process.cwd(), ".mission-control", "github-apps");
+const CONFIG_DIR = path.resolve(expandLocalPath(
+  process.env.STUDIOOPS_GITHUB_APPS_DIR
+    || process.env.MISSION_CONTROL_GITHUB_APPS_DIR
+    || defaultStudioOpsCredentialsRoot(),
+));
 const REPO_URL = "https://github.com/magic2goodil/studioops";
 const GITHUB_API_VERSION = "2026-03-10";
 
@@ -96,7 +101,7 @@ Options:
   --port PORT          Local callback server port. Default: ${DEFAULT_PORT}.
   --open               Open the local setup page in the default browser.
 
-Credentials are written under .mission-control/github-apps/ and ignored by git.
+Credentials are written under ~/.codex/studioops/credentials/github-apps/ by default.
 `);
 }
 
@@ -236,7 +241,7 @@ function page({ apps, states, endpoint, baseUrl, owner, org }) {
   <main>
     <h1>StudioOps GitHub App Setup</h1>
     <p>Owner target: <code>${htmlEscape(org ? `organization/${owner}` : `user/${owner}`)}</code></p>
-    <p>Click each app you want GitHub to create. GitHub will redirect back here, StudioOps will exchange the one-time code, and private credentials will be stored locally under <code>.mission-control/github-apps/</code>.</p>
+    <p>Click each app you want GitHub to create. GitHub will redirect back here, StudioOps will exchange the one-time code, and private credentials will be stored locally under <code>~/.codex/studioops/credentials/github-apps/</code>.</p>
     <div class="grid">${forms}</div>
   </main>
 </body>

@@ -93,7 +93,7 @@ Usage:
   studioops-qa-integration --project myapp --force
   studioops-qa-integration --watch --interval 300
   studioops qa-integrate --plan
-  studioops qa-integrate --github-apps-dir .mission-control/github-apps
+  studioops qa-integrate --github-apps-dir ~/.codex/studioops/credentials/github-apps
 
 The worker merges qa_review task PR heads into a project's configured
 non-production integrationBranch only when trustLeadApprovals is enabled. It

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
-import { access, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,11 +10,20 @@ import {
   planSourceRemoteMigration,
   sourceCheckoutSafetyError,
 } from "../src/runtime-install.js";
+import {
+  defaultStudioOpsSourceRoot,
+  defaultStudioOpsWorkingRoot,
+  expandLocalPath,
+} from "../src/runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(process.cwd());
 const workingRoot = path.resolve(
-  process.env.STUDIOOPS_WORKING_ROOT || process.env.MISSION_CONTROL_WORKING_ROOT || repoRoot,
+  expandLocalPath(
+    process.env.STUDIOOPS_WORKING_ROOT
+      || process.env.MISSION_CONTROL_WORKING_ROOT
+      || defaultStudioOpsWorkingRoot(),
+  ),
 );
 const templateDir = path.join(repoRoot, "deploy", "local");
 const launchAgentDir = path.join(os.homedir(), "Library", "LaunchAgents");
@@ -24,9 +33,11 @@ const defaultHost = process.env.STUDIOOPS_HOST || process.env.MISSION_CONTROL_HO
 const defaultPort = process.env.STUDIOOPS_PORT || process.env.MISSION_CONTROL_PORT || "4317";
 const runtimeRoot = process.env.STUDIOOPS_RUNTIME_ROOT || process.env.MISSION_CONTROL_RUNTIME_ROOT || defaultRuntimeRoot();
 const sourceRoot = path.resolve(
-  process.env.STUDIOOPS_SOURCE_ROOT
-    || process.env.MISSION_CONTROL_SOURCE_ROOT
-    || path.join(os.homedir(), ".mission-control", "source"),
+  expandLocalPath(
+    process.env.STUDIOOPS_SOURCE_ROOT
+      || process.env.MISSION_CONTROL_SOURCE_ROOT
+      || defaultStudioOpsSourceRoot(),
+  ),
 );
 const sourceBranch = process.env.STUDIOOPS_SOURCE_BRANCH || process.env.MISSION_CONTROL_SOURCE_BRANCH || "main";
 
@@ -39,6 +50,7 @@ Usage:
   npm run status-agents
 
 Optional environment:
+  STUDIOOPS_HOME=~/.codex/studioops  Local-only root for all StudioOps operational state
   STUDIOOPS_HOST=0.0.0.0        Bind web UI to the local network
   STUDIOOPS_PORT=4317           Web UI port
   STUDIOOPS_WORKING_ROOT=...    Persistent config and SQLite state root
@@ -47,10 +59,42 @@ Optional environment:
   MISSION_CONTROL_HOST=0.0.0.0   Bind web UI to the local network
   MISSION_CONTROL_PORT=4317      Web UI port
   MISSION_CONTROL_NODE_PATH=...  Stable Node.js binary for every LaunchAgent
-  MISSION_CONTROL_RUNTIME_ROOT=~/.mission-control/runtime
+  MISSION_CONTROL_RUNTIME_ROOT=...  Legacy alias for STUDIOOPS_RUNTIME_ROOT
   MISSION_CONTROL_WORKING_ROOT=... Use a separate source/config/data checkout
-  MISSION_CONTROL_SOURCE_ROOT=~/.mission-control/source Clean main checkout used by self-update
+  MISSION_CONTROL_SOURCE_ROOT=... Legacy alias for STUDIOOPS_SOURCE_ROOT
 `);
+}
+
+async function pathExists(filePath) {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureWorkingRoot() {
+  await mkdir(workingRoot, { recursive: true, mode: 0o700 });
+  await chmod(workingRoot, 0o700).catch(() => {});
+  if (workingRoot === repoRoot) return;
+
+  const configNames = ["studioops.config.md", "mission-control.config.md"];
+  for (const name of configNames) {
+    if (await pathExists(path.join(workingRoot, name))) return;
+  }
+  for (const name of configNames) {
+    const source = path.join(repoRoot, name);
+    if (!(await pathExists(source))) continue;
+    const destination = path.join(workingRoot, name);
+    await copyFile(source, destination);
+    await chmod(destination, 0o600).catch(() => {});
+    console.log(`Copied local StudioOps configuration to ${destination}.`);
+    return;
+  }
+  throw new Error(
+    `No StudioOps configuration found. Run \`studioops setup\` in ${repoRoot} before installing agents, or place studioops.config.md in ${workingRoot}.`,
+  );
 }
 
 function ensureMac() {
@@ -240,6 +284,7 @@ async function install() {
   const nodePath = await resolveNodePath();
   await access(nodePath);
   await mkdir(launchAgentDir, { recursive: true });
+  await ensureWorkingRoot();
   await mkdir(logDir, { recursive: true });
   const canonicalSourceRoot = await ensureSourceCheckout();
   const runtime = await deployRuntime({ sourceRoot: repoRoot, runtimeRoot });

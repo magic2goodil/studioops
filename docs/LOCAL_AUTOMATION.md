@@ -23,7 +23,7 @@ npm run setup
 npm run install-agents
 ```
 
-The installer publishes a stable runtime under `~/.mission-control/runtime`, creates a clean `main` checkout under `~/.mission-control/source` for self-updates, and points LaunchAgents at the immutable runtime. Local config and SQLite state remain in the working root. This prevents workers from executing half-synced files or depending on the branch currently open in a developer checkout. Re-running the installer atomically updates the runtime and restarts all workers. The installer prefers an available supported even-numbered Node.js LTS runtime; `MISSION_CONTROL_NODE_PATH` remains the explicit override.
+The installer publishes a stable runtime under `~/.codex/studioops/runtime`, creates a clean `main` checkout under `~/.codex/studioops/source` for self-updates, and stores persistent config, SQLite state, and logs under `~/.codex/studioops/control-plane`. Run, QA, and promotion workspaces also live under `~/.codex/studioops`. This keeps operational writes out of `Documents`, Desktop, iCloud Drive, and other synchronized folders. Re-running the installer atomically updates the runtime and restarts all workers. The installer prefers an available supported even-numbered Node.js LTS runtime; `STUDIOOPS_NODE_PATH` and the legacy `MISSION_CONTROL_NODE_PATH` remain explicit overrides.
 
 Existing installations from the project rename are migrated from the retired `codex-mission-control` source remote to `studioops` only when the checkout is clean, on `main`, and fast-forwardable. The installer refuses dirty, divergent, detached, or unrelated source checkouts instead of rewriting them.
 
@@ -60,6 +60,10 @@ Only use `0.0.0.0` on a trusted local network.
 
 Run maintenance commands from the same working root used during `npm run install-agents`. A watchdog started from another checkout will report the root mismatch and leave the installed workers untouched. `STUDIOOPS_WORKING_ROOT`, `STUDIOOPS_DATA_DIR`, and the legacy `MISSION_CONTROL_*` aliases can select the intended persistent instance explicitly.
 
+### Migrating a legacy or cloud-synchronized installation
+
+Do not relocate an active database by copying its live SQLite files. First let active builder and reviewer runs finish, prevent new claims, and run `npm run backup` from the existing working root. Verify the backup exists and is owner-readable only. Then copy the configuration, credentials, attachments, and the SQLite backup into `~/.codex/studioops/control-plane`, install agents with `STUDIOOPS_WORKING_ROOT=~/.codex/studioops/control-plane`, and verify `npm run status-agents`, `/api/health`, task counts, and queued-run recovery before retiring the old root. Keep the old root unchanged until those checks pass.
+
 ## Status
 
 ```bash
@@ -87,7 +91,7 @@ MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk
 ```
 
 Runner workspace preparation is serialized per source repository with a local
-Git lock under `~/.mission-control/locks/git` by default. This prevents
+Git lock under `~/.codex/studioops/locks/git` by default. This prevents
 parallel runner processes from fetching, pruning, or creating worktrees against
 the same checkout at the same time, which can otherwise surface as Git
 pack/object errors such as `Resource deadlock avoided`. Tune the lock with:
@@ -118,7 +122,7 @@ npm run qa-integrate -- --project myapp
 
 Tasks already marked with `integrationStatus: ready` are skipped on later sweeps. Use `--force` only when a branch has changed and deliberate revalidation is required.
 
-The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It prepares each QA bundle in an isolated workspace under `~/.mission-control/qa-workspaces/` by default, so the registered project checkout can stay on the owner's active branch with local changes. Override the workspace root with `MISSION_CONTROL_QA_WORKSPACE_ROOT` when needed, but keep it outside the registered project checkout.
+The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It prepares each QA bundle in an isolated workspace under `~/.codex/studioops/qa-workspaces/` by default, so the registered project checkout can stay on the owner's active branch with local changes. Override the workspace root with `STUDIOOPS_QA_WORKSPACE_ROOT` or its legacy `MISSION_CONTROL_QA_WORKSPACE_ROOT` alias when needed, but keep it outside the registered project checkout.
 
 QA integration requires the registered project checkout to have an `origin` remote. It aborts merge conflicts, records comments on affected tasks, runs validation commands from the isolated workspace, and only then pushes the non-production integration branch to that remote. Reports and task comments include the workspace path and strategy used for the run. It does not merge PRs, deploy, force-push, or checkout the registered project repoPath.
 
@@ -130,7 +134,7 @@ Projects can also opt into keeping their QA branch and local preview checkout cu
     "syncDefaultBranchIntoIntegration": true,
     "localPreview": {
       "enabled": true,
-      "checkoutPath": "~/.mission-control/qa-workspaces/myapp/myapp-clean",
+      "checkoutPath": "~/.codex/studioops/qa-workspaces/myapp/myapp-clean",
       "branch": "qa/integration",
       "stashDirty": true,
       "postUpdateCommands": ["npm run check"],
@@ -150,7 +154,7 @@ The same local preview can be configured without hand-editing the data file:
 ```bash
 studioops update-project myapp \
   --local-qa-preview \
-  --local-qa-preview-checkout ~/.mission-control/qa-workspaces/myapp/myapp-clean \
+  --local-qa-preview-checkout ~/.codex/studioops/qa-workspaces/myapp/myapp-clean \
   --local-qa-preview-branch qa/integration \
   --local-qa-preview-create \
   --local-qa-preview-stash-dirty
@@ -190,7 +194,7 @@ npm run promotion -- --plan
 npm run promotion -- --project myapp
 ```
 
-The promotion worker uses an isolated clone under `~/.mission-control/promotion-workspaces/`, fetches the task branch or PR head, merges it locally on top of the target branch, runs validation, pushes a uniquely named release-candidate branch, and opens a ready PR against the target. It never pushes directly to the protected target branch. It records conflicts, validation failures, push failures, and the release-candidate PR back on the task and QA bundle.
+The promotion worker uses an isolated clone under `~/.codex/studioops/promotion-workspaces/`, fetches the task branch or PR head, merges it locally on top of the target branch, runs validation, pushes a uniquely named release-candidate branch, and opens a ready PR against the target. It never pushes directly to the protected target branch. It records conflicts, validation failures, push failures, and the release-candidate PR back on the task and QA bundle.
 
 Promotion does not deploy production. It prepares the target branch for owner release-candidate review. Production deploys should remain behind explicit release or tag workflows.
 
