@@ -113,12 +113,27 @@ export function defaultRuntimeRoot() {
 
 export async function activateRuntime(runtime, input = {}) {
   await swapCurrentLink(runtime.runtimeRoot, runtime.releasePath);
-  await pruneOldReleases(runtime.runtimeRoot, runtime.releasePath, Number(input.keepReleases || 3));
+  if (input.prune !== false) {
+    await pruneOldReleases(runtime.runtimeRoot, runtime.releasePath, Number(input.keepReleases || 3));
+  }
   return {
     ...runtime,
     currentPath: path.join(runtime.runtimeRoot, "current"),
     currentTarget: await readlink(path.join(runtime.runtimeRoot, "current")),
   };
+}
+
+export async function restoreRuntimeCurrent(runtime) {
+  const currentPath = path.join(runtime.runtimeRoot, "current");
+  if (runtime.previousCurrentTarget) {
+    await swapCurrentLink(runtime.runtimeRoot, runtime.previousCurrentTarget);
+  } else {
+    await rm(currentPath, { force: true });
+  }
+}
+
+export async function pruneRuntimeReleases(runtime, input = {}) {
+  await pruneOldReleases(runtime.runtimeRoot, runtime.releasePath, Number(input.keepReleases || 3));
 }
 
 export async function deployRuntime(input = {}) {
@@ -164,12 +179,19 @@ export async function deployRuntime(input = {}) {
   }
 
   const currentPath = path.join(runtimeRoot, "current");
+  let previousCurrentTarget = "";
+  try {
+    previousCurrentTarget = await readlink(currentPath);
+  } catch {
+    previousCurrentTarget = "";
+  }
   const runtime = {
     sourceRoot,
     runtimeRoot,
     releasePath,
     currentPath,
     currentTarget: "",
+    previousCurrentTarget,
     version,
   };
   if (input.activate === false) return runtime;

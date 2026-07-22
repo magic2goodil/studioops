@@ -9,6 +9,8 @@ import {
   defaultRuntimeRoot,
   deployRuntime,
   planSourceRemoteMigration,
+  pruneRuntimeReleases,
+  restoreRuntimeCurrent,
   sourceCheckoutSafetyError,
 } from "../src/runtime-install.js";
 import {
@@ -377,7 +379,7 @@ function renderTemplate(raw, runtime, canonicalSourceRoot, nodePath) {
   return raw
     .replaceAll("__NODE_PATH__", nodePath)
     .replaceAll("__MISSION_CONTROL_REPO__", workingRoot)
-    .replaceAll("__MISSION_CONTROL_RUNTIME__", runtime.releasePath)
+    .replaceAll("__MISSION_CONTROL_RUNTIME__", runtime.currentPath)
     .replaceAll("__MISSION_CONTROL_SOURCE_REPO__", canonicalSourceRoot)
     .replaceAll("__LOG_DIR__", logDir)
     .replaceAll("__HOST__", defaultHost)
@@ -403,6 +405,10 @@ async function install() {
   let agentsStopped = false;
   let maintenanceReleased = false;
   let migrationResult = null;
+  let migrationAttempted = false;
+  let migrationTargetExisted = false;
+  let stagedRuntime = null;
+  let runtimeActivated = false;
 
   const releaseMaintenance = async () => {
     if (maintenanceReleased) return;
@@ -417,7 +423,7 @@ async function install() {
       await acquireStudioOpsMaintenanceLease(root, { id: maintenanceId });
     }
     const canonicalSourceRoot = await ensureSourceCheckout();
-    const runtime = await deployRuntime({ sourceRoot: repoRoot, runtimeRoot, activate: false });
+    stagedRuntime = await deployRuntime({ sourceRoot: repoRoot, runtimeRoot, activate: false });
     previousPlists = await snapshotLaunchAgentFiles(templateList);
     agentsStopped = true;
     for (const template of templateList) {
@@ -436,6 +442,8 @@ async function install() {
       console.log(`Migrated legacy StudioOps workspace directories: ${homeMigration.copied.join(", ")}.`);
     }
     if (migrationRoot && path.resolve(migrationRoot) !== workingRoot) {
+      migrationAttempted = true;
+      migrationTargetExisted = await pathExists(workingRoot);
       migrationResult = await migrateLocalStudioOpsState({
         sourceRoot: migrationRoot,
         targetRoot: workingRoot,
@@ -451,10 +459,12 @@ async function install() {
     await chmod(logDir, 0o700).catch(() => {});
     for (const template of templateList) {
       const target = targetPathForLabel(template.label);
-      const rendered = renderTemplate(await readFile(template.source, "utf8"), runtime, canonicalSourceRoot, nodePath);
+      const rendered = renderTemplate(await readFile(template.source, "utf8"), stagedRuntime, canonicalSourceRoot, nodePath);
       await writeFile(target, rendered, "utf8");
       await setPlistEnvironment(target);
     }
+    await activateRuntime(stagedRuntime, { prune: false });
+    runtimeActivated = true;
     for (const template of templateList) {
       const target = targetPathForLabel(template.label);
       await launchctl(["bootstrap", `gui/${uid}`, target]);
@@ -462,8 +472,10 @@ async function install() {
       installed.push(template.label);
     }
     await assertLabelsLoaded(templateList.map((template) => template.label));
-    await activateRuntime(runtime);
     await releaseMaintenance();
+    await pruneRuntimeReleases(stagedRuntime).catch((pruneError) => {
+      console.error(`StudioOps runtime cleanup deferred: ${pruneError.message}`);
+    });
   } catch (error) {
     let rollbackError = null;
     try {
@@ -472,6 +484,10 @@ async function install() {
           await launchctl(["bootout", `gui/${uid}`, targetPathForLabel(template.label)], { ignoreErrors: true });
         }
         await assertLabelsUnloaded(templateList.map((template) => template.label));
+        if (runtimeActivated && stagedRuntime) {
+          await restoreRuntimeCurrent(stagedRuntime);
+          runtimeActivated = false;
+        }
         await restoreLaunchAgentFiles(previousPlists);
         const previousLabels = templateList
           .filter((template) => previousPlists.get(targetPathForLabel(template.label)) !== null)
@@ -484,7 +500,10 @@ async function install() {
         await assertLabelsLoaded(previousLabels);
       }
       await releaseMaintenance();
-      if (migrationResult?.status === "migrated" && await pathExists(workingRoot)) {
+      if (
+        (migrationResult?.status === "migrated" || (migrationAttempted && !migrationTargetExisted))
+        && await pathExists(workingRoot)
+      ) {
         const quarantinePath = `${workingRoot}.failed-${new Date().toISOString().replace(/[:.]/g, "-")}`;
         await rename(workingRoot, quarantinePath);
         console.error(`Quarantined failed StudioOps migration at ${quarantinePath}.`);
