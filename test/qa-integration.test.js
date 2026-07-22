@@ -163,6 +163,48 @@ test("QA result fingerprints ignore isolated workspace names but detect material
   assert.notEqual(first, changed);
 });
 
+test("ready QA fingerprints ignore transient push and preview transitions", () => {
+  const task = { status: "ready", source: "codex/demo" };
+  const first = qaResultFingerprint({
+    status: "ready",
+    integrationBranch: "qa/demo",
+    commit: "abc123",
+    workspacePath: "/tmp/qa-one",
+    output: "To github.com:example/demo.git\n   old..abc  HEAD -> qa/demo",
+    localQaPreview: {
+      status: "updated",
+      before: "old",
+      after: "abc123",
+      output: "Local QA preview updated to abc123.",
+    },
+    validation: [{ command: "npm test", ok: true, output: "Duration 1.23s" }],
+  }, task);
+  const repeated = qaResultFingerprint({
+    status: "ready",
+    integrationBranch: "qa/demo",
+    commit: "abc123",
+    workspacePath: "/tmp/qa-two",
+    output: "Everything up-to-date",
+    localQaPreview: {
+      status: "current",
+      before: "abc123",
+      after: "abc123",
+      output: "Local QA preview already current.",
+    },
+    validation: [{ command: "npm test", ok: true, output: "Duration 9.87s" }],
+  }, task);
+  const changedCommit = qaResultFingerprint({
+    status: "ready",
+    integrationBranch: "qa/demo",
+    commit: "def456",
+    localQaPreview: { status: "updated", before: "abc123", after: "def456" },
+    validation: [{ command: "npm test", ok: true, output: "Duration 1.23s" }],
+  }, task);
+
+  assert.equal(first, repeated);
+  assert.notEqual(first, changedCommit);
+});
+
 test("validation commands use the QA integration PATH override", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-path-"));
   const remotePath = path.join(root, "remote.git");

@@ -1131,27 +1131,28 @@ function stableQaOutput(value, workspacePath) {
     .replace(/\u001b\[[0-9;]*m/g, "")
     .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, "<timestamp>")
     .replace(/\bduration_ms\s*[:=]?\s*\d+(?:\.\d+)?\b/gi, "duration_ms <duration>")
-    .replace(/\b(elapsed|duration|time)\s*[:=]\s*\d+(?:\.\d+)?\s*(?:ms|milliseconds?|s|seconds?)\b/gi, "$1=<duration>")
+    .replace(/\b(elapsed|duration|time)\s*(?::|=)?\s*\d+(?:\.\d+)?\s*(?:ms|milliseconds?|s|seconds?)\b/gi, "$1=<duration>")
     .replace(/\b(ran\s+\d+\s+tests?\s+in)\s+\d+(?:\.\d+)?s\b/gi, "$1 <duration>")
     .replace(/\bpid\s*[:=]?\s*\d+\b/gi, "pid <pid>");
 }
 
 export function qaResultFingerprint(projectResult, taskResult) {
   const workspacePath = projectResult.workspacePath || "";
+  const ready = taskResult.status === "ready";
   const payload = {
     taskStatus: taskResult.status || "",
     source: taskResult.source || "",
-    taskOutput: stableQaOutput(taskResult.output, workspacePath),
+    taskOutput: ready ? "" : stableQaOutput(taskResult.output, workspacePath),
     conflicts: [...(taskResult.conflicts || [])].sort(),
     projectStatus: projectResult.status || "",
     integrationBranch: projectResult.integrationBranch || "",
     commit: projectResult.commit || "",
-    projectOutput: stableQaOutput(projectResult.output, workspacePath),
+    projectOutput: ready ? "" : stableQaOutput(projectResult.output, workspacePath),
     localPreview: projectResult.localQaPreview ? {
-      status: projectResult.localQaPreview.status || "",
-      before: projectResult.localQaPreview.before || "",
+      status: ready ? "ready" : projectResult.localQaPreview.status || "",
+      before: ready ? "" : projectResult.localQaPreview.before || "",
       after: projectResult.localQaPreview.after || "",
-      output: stableQaOutput(projectResult.localQaPreview.output, workspacePath),
+      output: ready ? "" : stableQaOutput(projectResult.localQaPreview.output, workspacePath),
     } : null,
     validation: (projectResult.validation || []).map((item) => ({
       command: item.command || "",
