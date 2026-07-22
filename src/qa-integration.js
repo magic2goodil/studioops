@@ -796,12 +796,12 @@ export function planQaIntegrations(state, input = {}) {
       const integrationBranch = integrationBranchName(project);
       const safetyError = integrationBranchSafetyError(project);
       const trustEnabled = trustLeadApprovalsEnabled(project);
-      const tasks = (state.tasks || [])
+      const pendingTasks = (state.tasks || [])
         .filter((task) => task.projectId === project.id)
         .filter((task) => task.status === "qa_review")
         .filter((task) => input.force || task.integrationStatus !== "ready")
-        .filter((task) => input.force || retryWindowElapsed(task, nowMs))
         .filter((task) => taskMatches(task, input));
+      const tasks = pendingTasks.filter((task) => input.force || retryWindowElapsed(task, nowMs));
       return {
         projectId: project.id,
         projectKey: project.key,
@@ -818,6 +818,7 @@ export function planQaIntegrations(state, input = {}) {
         integrationBranch,
         integrationBranchUrl: branchWebUrl(project, integrationBranch),
         validationCommands: normalizeList(project.validationCommands),
+        deferredTaskCount: pendingTasks.length - tasks.length,
         tasks: tasks.map((task) => ({
           id: task.id,
           title: task.title,
@@ -836,6 +837,15 @@ export function planQaIntegrations(state, input = {}) {
     projects: projectPlans,
     taskCount: projectPlans.reduce((count, project) => count + project.tasks.length, 0),
   };
+}
+
+export function projectPlanHasWork(projectPlan) {
+  if (projectPlan.tasks.length) return true;
+  if (projectPlan.deferredTaskCount > 0) return false;
+  return Boolean(
+    projectPlan.syncDefaultBranchIntoIntegration
+    || localQaPreviewConfig(projectPlan).enabled
+  );
 }
 
 function allTaskResults(tasks, status, output) {
@@ -1115,8 +1125,15 @@ function commentForTask(projectResult, taskResult) {
 }
 
 function stableQaOutput(value, workspacePath) {
-  const output = String(value || "");
-  return workspacePath ? output.split(workspacePath).join("<qa-workspace>") : output;
+  let output = String(value || "");
+  if (workspacePath) output = output.split(workspacePath).join("<qa-workspace>");
+  return output
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, "<timestamp>")
+    .replace(/\bduration_ms\s*[:=]?\s*\d+(?:\.\d+)?\b/gi, "duration_ms <duration>")
+    .replace(/\b(elapsed|duration|time)\s*[:=]\s*\d+(?:\.\d+)?\s*(?:ms|milliseconds?|s|seconds?)\b/gi, "$1=<duration>")
+    .replace(/\b(ran\s+\d+\s+tests?\s+in)\s+\d+(?:\.\d+)?s\b/gi, "$1 <duration>")
+    .replace(/\bpid\s*[:=]?\s*\d+\b/gi, "pid <pid>");
 }
 
 export function qaResultFingerprint(projectResult, taskResult) {
@@ -1190,6 +1207,8 @@ async function recordProjectResult(projectResult) {
           id: nextId(state.comments, "comment"),
           taskId: task.id,
           author: "StudioOps QA Integration",
+          systemGenerated: true,
+          kind: "qa_integration",
           body: commentForTask(projectResult, taskResult),
           createdAt: now,
         });
@@ -1210,6 +1229,7 @@ async function recordProjectResult(projectResult) {
         item.projectId === projectResult.projectId
         && item.integrationCommit === projectResult.commit
       ));
+      let bundleChanged = false;
       if (!bundle) {
         bundle = {
           id: nextId(state.qaBundles, "qa_bundle"),
@@ -1232,6 +1252,7 @@ async function recordProjectResult(projectResult) {
           notificationRetryNotBefore: "",
         };
         state.qaBundles.push(bundle);
+        bundleChanged = true;
       }
       const existingTaskIds = new Set(bundle.tasks.map((item) => item.id));
       for (const taskResult of readyTasks) {
@@ -1247,16 +1268,20 @@ async function recordProjectResult(projectResult) {
             branchName: task.branchName || "",
             acceptanceCriteria: task.acceptanceCriteria || [],
           });
+          existingTaskIds.add(task.id);
+          bundleChanged = true;
         }
       }
-      bundle.updatedAt = now;
-      state.events.push({
-        id: nextId(state.events, "event"),
-        type: "qa_bundle_ready",
-        projectId: projectResult.projectId,
-        message: `${bundle.id} is ready with ${bundle.tasks.length} task(s) at ${projectResult.commit}.`,
-        createdAt: now,
-      });
+      if (bundleChanged) {
+        bundle.updatedAt = now;
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: "qa_bundle_ready",
+          projectId: projectResult.projectId,
+          message: `${bundle.id} is ready with ${bundle.tasks.length} task(s) at ${projectResult.commit}.`,
+          createdAt: now,
+        });
+      }
     }
   });
 }
@@ -1290,10 +1315,7 @@ export async function runQaIntegration(input = {}) {
 
   const results = [];
   for (const projectPlan of plan.projects) {
-    const hasProjectWork = projectPlan.tasks.length
-      || projectPlan.syncDefaultBranchIntoIntegration
-      || localQaPreviewConfig(projectPlan).enabled;
-    if (!hasProjectWork) continue;
+    if (!projectPlanHasWork(projectPlan)) continue;
     if (!projectPlan.eligible) {
       await recordIneligibleProject(projectPlan);
       results.push({

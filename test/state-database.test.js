@@ -163,18 +163,19 @@ test("SQLite archives excess machine QA history without compacting human comment
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-history-compaction-"));
   try {
     const state = baseState();
-    state.comments = Array.from({ length: 30 }, (_, index) => ({
+    const machineComments = Array.from({ length: 30 }, (_, index) => ({
       id: `comment_${index + 1}`,
       taskId: "task_1",
       author: "Mission Control QA Integration",
-      body: `Automated QA report ${index + 1}`,
+      body: `QA integration blocked report ${index + 1}`,
       createdAt: new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
     }));
+    state.comments = [...machineComments];
     state.comments.splice(5, 0, {
       id: "comment_human",
       taskId: "task_1",
-      author: "Owner",
-      body: "Keep this human decision.",
+      author: "Mission Control QA Integration",
+      body: "QA integration is a name I used for this human decision.",
       createdAt: "2026-07-01T00:05:30.000Z",
     });
     state.events = Array.from({ length: 50 }, (_, index) => ({
@@ -183,14 +184,56 @@ test("SQLite archives excess machine QA history without compacting human comment
       projectId: "project_1",
       taskId: "task_1",
       message: `Blocked ${index + 1}`,
-      createdAt: new Date(Date.UTC(2026, 6, 1, 1, index)).toISOString(),
+      createdAt: index < machineComments.length
+        ? machineComments[index].createdAt
+        : new Date(Date.UTC(2026, 6, 1, 1, index)).toISOString(),
     }));
     await writeLegacyState(root, state);
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
 
-    const persisted = readPersistedState(root);
-    assert.equal(persisted.comments.filter((item) => item.author === "Mission Control QA Integration").length, 20);
-    assert.equal(persisted.comments.filter((item) => item.author === "Owner").length, 1);
+    let persisted = readPersistedState(root);
+    assert.equal(persisted.comments.filter((item) => item.id !== "comment_human").length, 20);
+    assert.equal(persisted.comments.filter((item) => item.id === "comment_human").length, 1);
+    assert.equal(persisted.events.filter((item) => item.type === "qa_integration_blocked").length, 40);
+
+    const backupPath = persisted.meta.operationalArchive.backupPath;
+    assert.equal((await stat(backupPath)).mode & 0o777, 0o600);
+    const backupDb = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      assert.equal(backupDb.prepare("SELECT count(*) count FROM comments").get().count, 31);
+      assert.equal(backupDb.prepare("SELECT count(*) count FROM events").get().count, 50);
+    } finally {
+      backupDb.close();
+    }
+
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        for (let index = 1; index <= 5; index += 1) {
+          const createdAt = new Date(Date.UTC(2026, 6, 2, 0, index)).toISOString();
+          state.comments.push({
+            id: \`comment_new_\${index}\`,
+            taskId: "task_1",
+            author: "StudioOps QA Integration",
+            systemGenerated: true,
+            kind: "qa_integration",
+            body: \`QA integration blocked new report \${index}\`,
+            createdAt,
+          });
+          state.events.push({
+            id: \`event_new_\${index}\`,
+            type: "qa_integration_blocked",
+            projectId: "project_1",
+            taskId: "task_1",
+            message: \`New blocked report \${index}\`,
+            createdAt,
+          });
+        }
+      });
+    `);
+    persisted = readPersistedState(root);
+    assert.equal(persisted.comments.filter((item) => item.id !== "comment_human").length, 20);
+    assert.equal(persisted.comments.filter((item) => item.id === "comment_human").length, 1);
     assert.equal(persisted.events.filter((item) => item.type === "qa_integration_blocked").length, 40);
 
     const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
@@ -199,8 +242,8 @@ test("SQLite archives excess machine QA history without compacting human comment
         .all()
         .map((row) => ({ ...row }));
       assert.deepEqual(archived, [
-        { entity_type: "comments", count: 10 },
-        { entity_type: "events", count: 10 },
+        { entity_type: "comments", count: 15 },
+        { entity_type: "events", count: 15 },
       ]);
     } finally {
       db.close();

@@ -13,7 +13,11 @@ import {
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
-import { planQaIntegrations, qaResultFingerprint } from "../src/qa-integration.js";
+import {
+  planQaIntegrations,
+  projectPlanHasWork,
+  qaResultFingerprint,
+} from "../src/qa-integration.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -83,6 +87,8 @@ test("QA integration skips already-ready tasks unless forced", () => {
       name: "Demo",
       repoPath: "/tmp/demo",
       defaultBranch: "main",
+      qaIntegration: { syncDefaultBranchIntoIntegration: true },
+      localQaPreview: { enabled: true, checkoutPath: "/tmp/demo-preview", branch: "qa/demo" },
       reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/demo" },
     }],
     tasks: [{
@@ -121,7 +127,10 @@ test("QA integration honors retry windows for unchanged blocked work", () => {
     }],
   };
 
-  assert.equal(planQaIntegrations(state, { project: "demo", nowMs }).taskCount, 0);
+  const deferredPlan = planQaIntegrations(state, { project: "demo", nowMs });
+  assert.equal(deferredPlan.taskCount, 0);
+  assert.equal(deferredPlan.projects[0].deferredTaskCount, 1);
+  assert.equal(projectPlanHasWork(deferredPlan.projects[0]), false);
   assert.equal(planQaIntegrations(state, { project: "demo", nowMs: nowMs + 16 * 60_000 }).taskCount, 1);
   assert.equal(planQaIntegrations(state, { project: "demo", nowMs, force: true }).taskCount, 1);
 });
@@ -133,14 +142,14 @@ test("QA result fingerprints ignore isolated workspace names but detect material
     integrationBranch: "qa/demo",
     workspacePath: "/tmp/qa-one",
     output: "Failure in /tmp/qa-one",
-    validation: [{ command: "npm test", ok: false, output: "at /tmp/qa-one/test.js" }],
+    validation: [{ command: "npm test", ok: false, output: "at /tmp/qa-one/test.js\nduration_ms 123.45\nRan 10 tests in 2.2s" }],
   }, task);
   const repeated = qaResultFingerprint({
     status: "validation_failed",
     integrationBranch: "qa/demo",
     workspacePath: "/tmp/qa-two",
     output: "Failure in /tmp/qa-two",
-    validation: [{ command: "npm test", ok: false, output: "at /tmp/qa-two/test.js" }],
+    validation: [{ command: "npm test", ok: false, output: "at /tmp/qa-two/test.js\nduration_ms 987.65\nRan 10 tests in 8.8s" }],
   }, task);
   const changed = qaResultFingerprint({
     status: "validation_failed",

@@ -1,4 +1,5 @@
 import { backup, DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileExists } from "./config.js";
@@ -17,6 +18,7 @@ export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
 
 let database = null;
 let integrityMigrated = false;
+let integrityMigrationPromise = null;
 
 async function secureStoragePaths() {
   await chmod(DATA_DIR, 0o700).catch(() => {});
@@ -144,9 +146,19 @@ function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
 export function compactOperationalHistory(state, input = {}) {
   const commentLimit = Math.max(1, Number(input.commentLimit || ACTIVE_QA_COMMENTS_PER_TASK));
   const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
+  const qaEventEvidence = new Set((Array.isArray(state.events) ? state.events : [])
+    .filter((event) => /^qa_integration_/.test(event.type || ""))
+    .map((event) => `${event.taskId || ""}|${event.createdAt || ""}`));
   const comments = archiveOldestBeyondLimit(
     Array.isArray(state.comments) ? state.comments : [],
-    (comment) => QA_COMMENT_AUTHORS.has(comment.author),
+    (comment) => (
+      (comment.systemGenerated === true && comment.kind === "qa_integration")
+      || (
+        QA_COMMENT_AUTHORS.has(comment.author)
+        && /^QA integration\b/.test(comment.body || "")
+        && qaEventEvidence.has(`${comment.taskId || ""}|${comment.createdAt || ""}`)
+      )
+    ),
     (comment) => comment.taskId || "unassigned",
     commentLimit,
   );
@@ -180,6 +192,23 @@ function archiveOperationalHistory(db, archived, now) {
       );
     }
   }
+}
+
+function archivedItemCount(archived) {
+  return Object.values(archived).reduce((count, items) => count + items.length, 0);
+}
+
+function recordOperationalArchiveMetadata(state, archived, now, backupPath = "") {
+  const previous = state.meta?.operationalArchive || {};
+  state.meta.operationalArchive = {
+    migratedAt: previous.migratedAt || now,
+    updatedAt: now,
+    backupPath: backupPath || previous.backupPath || "",
+    comments: Number(previous.comments || 0) + archived.comments.length,
+    events: Number(previous.events || 0) + archived.events.length,
+    activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
+    activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
+  };
 }
 
 function parsePayload(value, fallback) {
@@ -441,13 +470,30 @@ function writeMutationToOpenDatabase(db, state, snapshot) {
   }
 }
 
-function migrateStateIntegrity(db) {
+async function preMigrationBackup(db) {
+  const backupDir = path.join(DATA_DIR, "backups");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const outputPath = path.join(
+    backupDir,
+    `pre-integrity-v${STATE_INTEGRITY_VERSION}-${timestamp}-${process.pid}-${randomUUID()}.sqlite3`,
+  );
+  await mkdir(backupDir, { recursive: true, mode: 0o700 });
+  await backup(db, outputPath);
+  await chmod(outputPath, 0o600);
+  return outputPath;
+}
+
+async function runStateIntegrityMigration(db) {
   if (integrityMigrated) return;
   const currentMeta = db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
   if (Number(parsePayload(currentMeta?.payload, {}).stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION) {
     integrityMigrated = true;
     return;
   }
+  // Node's SQLite backup API cannot run on a connection with an active write
+  // transaction. Serialize migration attempts in-process, take the recovery
+  // snapshot first, then acquire the database write lock before any mutation.
+  const backupPath = await preMigrationBackup(db);
   db.exec("BEGIN IMMEDIATE");
   try {
     const state = readStateFromOpenDatabase(db);
@@ -465,13 +511,7 @@ function migrateStateIntegrity(db) {
     archiveOperationalHistory(db, archived, now);
     state.meta = state.meta || {};
     state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
-    state.meta.operationalArchive = {
-      migratedAt: now,
-      comments: archived.comments.length,
-      events: archived.events.length,
-      activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
-      activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
-    };
+    recordOperationalArchiveMetadata(state, archived, now, backupPath);
     state.meta.updatedAt = now;
     writeMutationToOpenDatabase(db, state, snapshot);
     db.exec("COMMIT");
@@ -480,6 +520,16 @@ function migrateStateIntegrity(db) {
     db.exec("ROLLBACK");
     throw error;
   }
+}
+
+async function migrateStateIntegrity(db) {
+  if (integrityMigrated) return;
+  if (!integrityMigrationPromise) {
+    integrityMigrationPromise = runStateIntegrityMigration(db).finally(() => {
+      integrityMigrationPromise = null;
+    });
+  }
+  return integrityMigrationPromise;
 }
 
 async function initialState() {
@@ -515,7 +565,7 @@ export async function ensureStateDatabase() {
       throw error;
     }
   }
-  migrateStateIntegrity(db);
+  await migrateStateIntegrity(db);
   await secureStoragePaths();
   return db;
 }
@@ -530,6 +580,13 @@ export async function writeDatabaseState(state) {
   db.exec("BEGIN IMMEDIATE");
   try {
     reconcileStateIntegrity(state);
+    const archived = compactOperationalHistory(state);
+    if (archivedItemCount(archived)) {
+      const now = new Date().toISOString();
+      archiveOperationalHistory(db, archived, now);
+      state.meta = state.meta || {};
+      recordOperationalArchiveMetadata(state, archived, now);
+    }
     writeStateToOpenDatabase(db, state);
     db.exec("COMMIT");
     await secureStoragePaths();
@@ -549,6 +606,12 @@ export async function mutateDatabaseState(mutator) {
     const result = await mutator(state);
     reconcileStateIntegrity(state);
     state.meta = state.meta || {};
+    const archived = compactOperationalHistory(state);
+    if (archivedItemCount(archived)) {
+      const now = new Date().toISOString();
+      archiveOperationalHistory(db, archived, now);
+      recordOperationalArchiveMetadata(state, archived, now);
+    }
     state.meta.updatedAt = new Date().toISOString();
     state.meta.storageBackend = "sqlite";
     writeMutationToOpenDatabase(db, state, snapshot);
