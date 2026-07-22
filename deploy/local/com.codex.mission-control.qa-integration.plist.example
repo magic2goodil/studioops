@@ -9,7 +9,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>__NODE_PATH__</string>
-    <string>__MISSION_CONTROL_REPO__/src/mission-control-qa-integration.js</string>
+    <string>__MISSION_CONTROL_RUNTIME__/src/mission-control-qa-integration.js</string>
   </array>
 
   <key>WorkingDirectory</key>

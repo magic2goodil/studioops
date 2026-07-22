@@ -12,6 +12,9 @@ It can:
 - store Codex thread IDs on runs and tasks when the SDK provider returns them
 - pass the task ID and run ID into the worker environment
 - run continuously through a local LaunchAgent
+- pin and record the selected model, reasoning effort, attempt number, and selection reason
+- recover stale running records whose process died or exceeded its allowed runtime
+- verify that builders linked a branch/PR and reviewers recorded an outcome before accepting a successful process exit
 
 It does not:
 
@@ -41,6 +44,12 @@ npm run runner
 
 The default limit is one active Codex run. This keeps parallel builders from independently inventing duplicate architecture, Sass mixins, or project conventions.
 
+## Model And Retry Policy
+
+Every dispatched run is explicitly pinned to `gpt-5.6-sol`. Ordinary work uses `high` reasoning; lead reviews and architecture, auth, privacy, data, security, migration, and deployment work use `xhigh`. Configure role overrides under `defaults.executionPolicy.roles`.
+
+Each workflow action gets two attempts by default with a five-minute backoff. After the limit, Mission Control blocks the task with the run ID and failure reason for visible owner repair. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
+
 ## Run Continuously
 
 ```bash
@@ -57,8 +66,8 @@ deploy/local/com.codex.mission-control.runner.plist.example
 
 The runner supports two execution providers:
 
-- `codex-sdk`: recommended default; uses `@openai/codex-sdk`, streams structured events, stores the Codex thread ID, and resumes the same task thread on later runs
-- `codex-cli`: compatibility provider that shells out to the local Codex CLI with `codex exec`
+- `codex-cli`: default, shells out to the local Codex CLI with `codex exec`
+- `codex-sdk`: uses `@openai/codex-sdk`, streams structured events, stores the Codex thread ID, and resumes the same task thread on later runs
 
 Use the SDK provider for one sweep:
 
@@ -78,10 +87,7 @@ Or make it the default in `mission-control.config.md`:
 {
   "defaults": {
     "runner": {
-      "provider": "codex-sdk",
-      "model": "gpt-5.6-sol",
-      "modelReasoningEffort": "xhigh",
-      "allowApiKeyAuth": false
+      "provider": "codex-sdk"
     }
   }
 }
@@ -89,20 +95,12 @@ Or make it the default in `mission-control.config.md`:
 
 The SDK currently wraps the Codex CLI's structured JSON mode and persists threads in `~/.codex/sessions`. Mission Control records the returned thread ID on the run and on the task so later dispatches can resume it. If Codex Desktop surfaces those SDK-created sessions in the sidebar, they should appear as visible tasks; if not, the thread IDs still remain resumable through Mission Control.
 
-By default the SDK runner removes `OPENAI_API_KEY` and `CODEX_API_KEY` from the child environment and relies on the local Codex ChatGPT sign-in. Set `allowApiKeyAuth` only when API-key billing is explicitly intended. Mission Control resolves the current ChatGPT app Codex binary before the legacy standalone Codex app path.
-
-The equivalent one-shot flags are:
-
-```bash
-npm run runner -- --provider codex-sdk --model gpt-5.6-sol --model-reasoning-effort xhigh --limit 1
-```
-
 ## Codex CLI
 
 The CLI and SDK providers both default to:
 
 ```text
-/Applications/ChatGPT.app/Contents/Resources/codex
+/Applications/Codex.app/Contents/Resources/codex
 ```
 
 Override it when needed:
@@ -218,6 +216,11 @@ The runner passes these environment variables to Codex:
 - `MISSION_CONTROL_WORKSPACE_PATH`
 - `MISSION_CONTROL_SOURCE_REPO_PATH`
 - `MISSION_CONTROL_WORK_LANE`
+- `MISSION_CONTROL_ROOT`
+- `MISSION_CONTROL_CONFIG_ROOT`
+- `MISSION_CONTROL_DATA_DIR`
+
+The explicit state paths are important: a worker can execute inside any project workspace while still updating the one authoritative Mission Control database.
 
 ## Work Lanes
 

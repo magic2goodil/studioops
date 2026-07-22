@@ -1,6 +1,7 @@
 const state = {
   projects: [],
   tasks: [],
+  qaBundles: [],
   selectedProjectId: "",
   selectedTaskId: "",
   routeTaskId: "",
@@ -293,6 +294,7 @@ async function loadState() {
   const data = await api("/api/state");
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
+  state.qaBundles = data.qaBundles || [];
   state.routeTaskId = routeTaskId();
   const linkedTask = state.routeTaskId ? state.tasks.find((task) => task.id === state.routeTaskId) : null;
   if (linkedTask) {
@@ -380,10 +382,48 @@ function renderQaReviewPanel() {
   const items = state.tasks
     .filter((task) => task.projectId === project.id)
     .filter((task) => ["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status));
+  const bundles = state.qaBundles
+    .filter((bundle) => bundle.projectId === project.id)
+    .filter((bundle) => ["ready", "partially_reviewed", "release_candidate_ready"].includes(bundle.status));
   qaReviewPanel.innerHTML = `
     <section class="qa-review-list">
       <div class="section-heading">
-        <h3>QA Review</h3>
+        <h3>QA Bundles</h3>
+        <span>${bundles.length} active</span>
+      </div>
+      ${bundles.map((bundle) => `
+        <article class="qa-bundle-card">
+          <div class="qa-bundle-heading">
+            <span class="task-id-pill">${escapeHtml(bundle.id)}</span>
+            <strong>${escapeHtml(bundle.tasks?.length || 0)} changes ${bundle.status === "release_candidate_ready" ? "ready to merge" : "ready to test"}</strong>
+          </div>
+          <p>${escapeHtml(bundle.integrationBranch || "QA branch")} · ${escapeHtml((bundle.integrationCommit || "").slice(0, 10))}</p>
+          ${bundle.status === "release_candidate_ready"
+    ? `<a href="${escapeHtml(bundle.promotionPrUrl || "#")}" target="_blank" rel="noreferrer">Open release-candidate PR</a>`
+    : bundle.previewUrl ? `<a href="${escapeHtml(bundle.previewUrl)}">Open local QA preview</a>` : `<code>${escapeHtml(bundle.previewCheckoutPath || "Preview URL not configured")}</code>`}
+          <div class="qa-bundle-tasks">
+            ${(bundle.tasks || []).map((task) => `
+              <button type="button" data-task-id="${escapeHtml(task.id)}">
+                <span>${escapeHtml(task.id)}</span>
+                <strong>${escapeHtml(task.title)}</strong>
+              </button>
+            `).join("")}
+          </div>
+          ${bundle.status === "release_candidate_ready" ? `
+            <p class="muted-note">Lead review and local QA passed. Merging the PR updates main; production still requires an explicit release.</p>
+          ` : `
+            <label>QA notes
+              <textarea rows="2" data-qa-bundle-notes="${escapeHtml(bundle.id)}" placeholder="What you tested, or what needs to change"></textarea>
+            </label>
+            <div class="qa-bundle-actions">
+              <button type="button" data-qa-bundle-decision="passed" data-qa-bundle-id="${escapeHtml(bundle.id)}">Pass bundle</button>
+              <button type="button" class="secondary" data-qa-bundle-decision="failed" data-qa-bundle-id="${escapeHtml(bundle.id)}">Return bundle</button>
+            </div>
+          `}
+        </article>
+      `).join("") || `<p class="muted-note">No validated QA bundle is ready yet.</p>`}
+      <div class="section-heading qa-task-heading">
+        <h3>Tasks in QA</h3>
         <span>${items.length} active</span>
       </div>
       ${items.length ? `
@@ -693,11 +733,7 @@ async function renderDetail() {
   const detail = await api(`/api/tasks/${task.id}/detail`);
   const fullTask = detail.task;
   const project = fullTask.project || projectFor(task);
-  const builderPrompt = await api(`/api/tasks/${task.id}/prompt?role=builder`);
-  const backendReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=backend-reviewer`);
-  const frontendReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=frontend-reviewer`);
-  const accessibilityReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=accessibility-reviewer`);
-  const leadReviewerPrompt = await api(`/api/tasks/${task.id}/prompt?role=lead-reviewer`);
+  const prompts = detail.prompts || {};
   const link = taskUrl(task.id);
   const isFullPage = Boolean(state.routeTaskId);
   taskDetail.innerHTML = `
@@ -745,15 +781,15 @@ async function renderDetail() {
     </div>
     ${renderComments(fullTask.comments || [])}
     <h3>Builder Prompt</h3>
-    <div class="prompt-box">${escapeHtml(builderPrompt.prompt)}</div>
+    <div class="prompt-box">${escapeHtml(prompts.builder || "Prompt unavailable.")}</div>
     <h3>Backend Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(backendReviewerPrompt.prompt)}</div>
+    <div class="prompt-box">${escapeHtml(prompts["backend-reviewer"] || "Prompt unavailable.")}</div>
     <h3>Frontend Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(frontendReviewerPrompt.prompt)}</div>
+    <div class="prompt-box">${escapeHtml(prompts["frontend-reviewer"] || "Prompt unavailable.")}</div>
     <h3>Accessibility Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(accessibilityReviewerPrompt.prompt)}</div>
+    <div class="prompt-box">${escapeHtml(prompts["accessibility-reviewer"] || "Prompt unavailable.")}</div>
     <h3>Primary Lead Reviewer Prompt</h3>
-    <div class="prompt-box">${escapeHtml(leadReviewerPrompt.prompt)}</div>
+    <div class="prompt-box">${escapeHtml(prompts["lead-reviewer"] || "Prompt unavailable.")}</div>
   `;
 }
 
@@ -863,7 +899,22 @@ projectSettings.addEventListener("submit", async (event) => {
   await loadState();
 });
 
-qaReviewPanel.addEventListener("click", (event) => {
+qaReviewPanel.addEventListener("click", async (event) => {
+  const decisionButton = event.target.closest("[data-qa-bundle-decision]");
+  if (decisionButton) {
+    const bundleId = decisionButton.dataset.qaBundleId;
+    const notes = qaReviewPanel.querySelector(`[data-qa-bundle-notes="${CSS.escape(bundleId)}"]`)?.value || "";
+    await api(`/api/qa/bundles/${encodeURIComponent(bundleId)}/decision`, {
+      method: "POST",
+      body: JSON.stringify({
+        outcome: decisionButton.dataset.qaBundleDecision,
+        notes,
+        author: "Owner QA",
+      }),
+    });
+    await loadState();
+    return;
+  }
   const button = event.target.closest("[data-task-id]");
   if (!button) return;
   state.selectedTaskId = button.dataset.taskId;

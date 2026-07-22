@@ -1,0 +1,59 @@
+name: Bug report
+description: Report reproducible Mission Control behavior that is not working as expected.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove secrets, private repository details, customer data, and PII before submitting. Report security vulnerabilities through SECURITY.md instead of this form.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what impact did it have?
+      placeholder: Describe the observed behavior and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reliable sequence that reproduces the problem.
+      placeholder: |
+        1. Start Mission Control with ...
+        2. Create or update ...
+        3. Run ...
+        4. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Node.js version, commit or release, provider, and relevant worker mode.
+      placeholder: macOS 15.x, Node 22.x, commit abc123, codex-sdk, LaunchAgents
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Add sanitized logs, screenshots, or task/run IDs. Never include credentials or private data.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed secrets, private keys, tokens, customer data, and unnecessary PII.
+          required: true
+        - label: This is not a security vulnerability that should be reported privately.
+          required: true

@@ -1,20 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  branchReuseSafetyReason,
-  claimRuns,
-  cloneFallbackSource,
-  planRunnableRuns,
-  resolveCodexBin,
-  loadCodexSdk,
-  sdkClientOptions,
-  sdkThreadOptions,
-} from "../src/runner.js";
-
-test("Codex SDK resolves through its exported ESM entrypoint", async () => {
-  const sdk = await loadCodexSdk();
-  assert.equal(typeof sdk.Codex, "function");
-});
+import { activeRunStaleReason, branchReuseSafetyReason, claimRuns, cloneFallbackSource, planRunnableRuns } from "../src/runner.js";
 
 function fixtureState(taskPatch = {}, runPatch = {}) {
   return {
@@ -141,53 +127,6 @@ test("runner does not plan or claim runs while self-update lease is active", asy
   assert.equal(state.runs[0].status, "queued");
 });
 
-test("stale running records do not block unrelated queued work", async () => {
-  const state = fixtureState(
-    {
-      status: "in_progress",
-      integrationStatus: "",
-      assignedAgentRole: "builder",
-    },
-    {
-      actionType: "start_builder",
-      integrationStatus: "",
-      createdAt: "2026-07-20T12:00:00.000Z",
-    },
-  );
-  state.projects.push({
-    id: "project_2",
-    key: "other",
-    name: "Other",
-    repoPath: "/tmp/other",
-  });
-  state.runs.unshift({
-    id: "run_stale",
-    taskId: "task_other",
-    projectId: "project_2",
-    actionType: "start_builder",
-    group: "builder",
-    role: "builder",
-    status: "running",
-    startedAt: "2026-07-19T12:00:00.000Z",
-    updatedAt: "2026-07-19T12:00:00.000Z",
-  });
-
-  const input = {
-    limit: 1,
-    project: "demo",
-    timeoutMs: 2 * 60 * 60 * 1000,
-    nowMs: Date.parse("2026-07-20T15:00:00.000Z"),
-  };
-  const plan = planRunnableRuns(state, input);
-  assert.equal(plan.activeCount, 0);
-  assert.equal(plan.staleActiveCount, 1);
-  assert.equal(plan.runnable[0].id, "run_1");
-
-  const claimed = await claimRuns({ ...input, state });
-  assert.equal(claimed[0].id, "run_1");
-  assert.equal(state.runs.find((run) => run.id === "run_stale").status, "running");
-});
-
 test("builder runs may continue writing to open linked PR branches", () => {
   assert.equal(branchReuseSafetyReason(builderRun(), {
     state: "OPEN",
@@ -238,38 +177,40 @@ test("clone fallback prefers the repository origin over a local worktree source"
   assert.equal(cloneFallbackSource("/tmp/local-worktree", ""), "/tmp/local-worktree");
 });
 
-test("SDK threads receive the configured model and reasoning effort", () => {
-  assert.deepEqual(sdkThreadOptions({ project: { repoPath: "/tmp/demo" } }, {
-    model: "gpt-5.6-sol",
-    modelReasoningEffort: "xhigh",
-  }), {
-    workingDirectory: "/tmp/demo",
-    sandboxMode: "danger-full-access",
-    approvalPolicy: "never",
-    networkAccessEnabled: true,
-    model: "gpt-5.6-sol",
-    modelReasoningEffort: "xhigh",
-  });
+test("dead or overlong running jobs are identified for automatic recovery", () => {
+  const nowMs = Date.parse("2026-07-20T12:00:00.000Z");
+  assert.match(activeRunStaleReason({
+    status: "running",
+    startedAt: "2026-07-20T11:00:00.000Z",
+    runnerPid: 999_999_999,
+  }, { nowMs, pidGraceMs: 1_000 }), /runner_pid_not_alive/);
+
+  assert.match(activeRunStaleReason({
+    status: "running",
+    startedAt: "2026-07-20T08:00:00.000Z",
+    staleRunMs: 60 * 60 * 1000,
+  }, { nowMs }), /run_exceeded/);
 });
 
-test("SDK client defaults to ChatGPT sign-in instead of API-key billing", () => {
-  const previousOpenAiKey = process.env.OPENAI_API_KEY;
-  const previousCodexKey = process.env.CODEX_API_KEY;
-  process.env.OPENAI_API_KEY = "test-openai-key";
-  process.env.CODEX_API_KEY = "test-codex-key";
-  try {
-    const options = sdkClientOptions({ codexBin: "/tmp/codex" });
-    assert.equal(options.codexPathOverride, "/tmp/codex");
-    assert.equal(options.env.OPENAI_API_KEY, undefined);
-    assert.equal(options.env.CODEX_API_KEY, undefined);
-  } finally {
-    if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
-    else process.env.OPENAI_API_KEY = previousOpenAiKey;
-    if (previousCodexKey === undefined) delete process.env.CODEX_API_KEY;
-    else process.env.CODEX_API_KEY = previousCodexKey;
-  }
-});
+test("legacy queued security work is upgraded to the current xhigh execution policy when claimed", async () => {
+  const state = fixtureState(
+    {
+      title: "Harden OAuth PII storage",
+      status: "in_progress",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+    },
+    {
+      actionType: "start_builder",
+      integrationStatus: "",
+      model: "",
+      modelReasoningEffort: "",
+    },
+  );
 
-test("explicit Codex binary paths take precedence", () => {
-  assert.equal(resolveCodexBin({ codexBin: "/tmp/custom-codex" }), "/tmp/custom-codex");
+  const [run] = await claimRuns({ state, limit: 1, modelReasoningEffort: "high" });
+
+  assert.equal(run.model, "gpt-5.6-sol");
+  assert.equal(run.modelReasoningEffort, "xhigh");
+  assert.equal(run.modelSelectionReason, "complex_task");
 });

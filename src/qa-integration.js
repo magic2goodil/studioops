@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -43,7 +43,7 @@ function nextId(items, prefix) {
   const max = (items || [])
     .map((item) => String(item.id || ""))
     .filter((id) => id.startsWith(`${prefix}_`))
-    .map((id) => Number(id.split("_")[1]))
+    .map((id) => Number(id.slice(`${prefix}_`.length)))
     .filter(Number.isFinite)
     .reduce((highest, value) => Math.max(highest, value), 0);
   return `${prefix}_${max + 1}`;
@@ -144,7 +144,14 @@ function localQaPreviewConfig(projectPlan) {
     stashDirty: booleanOption(config.stashDirty, false),
     postUpdateCommands: normalizeList(config.postUpdateCommands || config.commands),
     restartLaunchAgents: normalizeList(config.restartLaunchAgents || config.agents),
+    launchAgentPlists: config.launchAgentPlists || {},
+    previewUrl: String(config.previewUrl || config.url || "").trim(),
+    healthCheckUrl: String(config.healthCheckUrl || config.healthUrl || config.previewUrl || config.url || "").trim(),
   };
+}
+
+function localPreviewFailed(preview) {
+  return ["blocked", "post_update_failed", "restart_failed", "health_check_failed"].includes(preview?.status);
 }
 
 function syncDefaultBranchEnabled(projectPlan) {
@@ -529,6 +536,8 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     output: "",
     commands: [],
     restartResults: [],
+    previewUrl: preview.previewUrl || "",
+    healthCheckUrl: preview.healthCheckUrl || "",
   };
   if (!preview.enabled) return result;
   if (!preview.branch) {
@@ -567,10 +576,10 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     result.stashed = true;
   }
 
-  const fetch = await git(preview.checkoutPath, ["fetch", "origin", `refs/heads/${preview.branch}:refs/remotes/origin/${preview.branch}`], { ...gitOptions, allowFailure: true });
-  if (!fetch.ok) {
+  const fetchResult = await git(preview.checkoutPath, ["fetch", "origin", `refs/heads/${preview.branch}:refs/remotes/origin/${preview.branch}`], { ...gitOptions, allowFailure: true });
+  if (!fetchResult.ok) {
     result.status = "blocked";
-    result.output = `Could not fetch local QA preview branch origin/${preview.branch}: ${truncateOutput(fetch.output)}`;
+    result.output = `Could not fetch local QA preview branch origin/${preview.branch}: ${truncateOutput(fetchResult.output)}`;
     return result;
   }
 
@@ -620,6 +629,43 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
 
   const uid = String(os.userInfo().uid);
   for (const label of preview.restartLaunchAgents) {
+    let loaded = await runCommand("launchctl", ["print", `gui/${uid}/${label}`], {
+      allowFailure: true,
+      timeoutMs: 15_000,
+      ...gitOptions,
+    });
+    if (!loaded.ok) {
+      const configuredPlist = preview.launchAgentPlists?.[label];
+      const plistPath = resolveWorkspaceRoot(configuredPlist || path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`));
+      const plistExists = await access(plistPath).then(() => true).catch(() => false);
+      if (plistExists) {
+        const bootstrap = await runCommand("launchctl", ["bootstrap", `gui/${uid}`, plistPath], {
+          allowFailure: true,
+          timeoutMs: 15_000,
+          ...gitOptions,
+        });
+        loaded = await runCommand("launchctl", ["print", `gui/${uid}/${label}`], {
+          allowFailure: true,
+          timeoutMs: 15_000,
+          ...gitOptions,
+        });
+        if (!bootstrap.ok && !loaded.ok) {
+          result.restartResults.push({
+            label,
+            status: "bootstrap_failed",
+            output: truncateOutput(bootstrap.output || loaded.output),
+          });
+          continue;
+        }
+      } else {
+        result.restartResults.push({
+          label,
+          status: "not_loaded",
+          output: `LaunchAgent is not loaded and no plist exists at ${plistPath}.`,
+        });
+        continue;
+      }
+    }
     const restart = await runCommand("launchctl", ["kickstart", "-k", `gui/${uid}/${label}`], {
       allowFailure: true,
       timeoutMs: 15_000,
@@ -630,6 +676,35 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
       status: restart.ok ? "restarted" : "failed",
       output: truncateOutput(restart.output),
     });
+  }
+
+  if (result.restartResults.some((item) => item.status !== "restarted")) {
+    result.status = "restart_failed";
+    result.output = "Local QA preview could not restart every configured LaunchAgent.";
+    return result;
+  }
+
+  if (preview.healthCheckUrl) {
+    let healthError = "";
+    let healthy = false;
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
+      try {
+        const response = await fetch(preview.healthCheckUrl, { signal: AbortSignal.timeout(5_000) });
+        if (response.ok) {
+          healthy = true;
+          break;
+        }
+        healthError = `HTTP ${response.status}`;
+      } catch (error) {
+        healthError = error.message;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+    if (!healthy) {
+      result.status = "health_check_failed";
+      result.output = `Local QA preview health check failed at ${preview.healthCheckUrl}: ${healthError}`;
+      return result;
+    }
   }
 
   result.status = result.before && result.after && result.before !== result.after ? "updated" : "current";
@@ -818,7 +893,7 @@ async function integrateProject(projectPlan, options = {}) {
 
   if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && shouldSyncLocalPreview) {
     result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
-    result.status = result.localQaPreview.status === "blocked" || result.localQaPreview.status === "post_update_failed"
+    result.status = localPreviewFailed(result.localQaPreview)
       ? "preview_blocked"
       : "preview_ready";
     result.output = result.localQaPreview.output;
@@ -877,7 +952,7 @@ async function integrateProject(projectPlan, options = {}) {
         if (shouldSyncLocalPreview) {
           result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
           result.output = appendOutput(result.output, result.localQaPreview.output);
-          if (result.localQaPreview.status === "blocked" || result.localQaPreview.status === "post_update_failed") {
+          if (localPreviewFailed(result.localQaPreview)) {
             result.status = "preview_blocked";
           }
         }
@@ -920,8 +995,9 @@ async function integrateProject(projectPlan, options = {}) {
     if (shouldSyncLocalPreview) {
       result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
       result.output = appendOutput(result.output, result.localQaPreview.output);
-      if (result.localQaPreview.status === "blocked" || result.localQaPreview.status === "post_update_failed") {
+      if (localPreviewFailed(result.localQaPreview)) {
         result.status = "preview_blocked";
+        for (const task of mergedTasks) task.status = "preview_blocked";
       }
     }
     return result;
@@ -1054,6 +1130,7 @@ async function recordProjectResult(projectResult) {
     const now = new Date().toISOString();
     state.comments = state.comments || [];
     state.events = state.events || [];
+    state.qaBundles = state.qaBundles || [];
 
     for (const taskResult of projectResult.tasks || []) {
       const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
@@ -1073,6 +1150,61 @@ async function recordProjectResult(projectResult) {
         projectId: task.projectId,
         taskId: task.id,
         message: `${task.title}: QA integration ${taskResult.status}`,
+        createdAt: now,
+      });
+    }
+
+    const readyTasks = (projectResult.tasks || []).filter((task) => task.status === "ready");
+    if (projectResult.status === "ready" && readyTasks.length) {
+      let bundle = state.qaBundles.find((item) => (
+        item.projectId === projectResult.projectId
+        && item.integrationCommit === projectResult.commit
+      ));
+      if (!bundle) {
+        bundle = {
+          id: nextId(state.qaBundles, "qa_bundle"),
+          projectId: projectResult.projectId,
+          projectKey: projectResult.projectKey,
+          projectName: projectResult.projectName,
+          status: "ready",
+          integrationBranch: projectResult.integrationBranch,
+          integrationBranchUrl: projectResult.integrationBranchUrl,
+          integrationCommit: projectResult.commit,
+          previewUrl: projectResult.localQaPreview?.previewUrl || "",
+          previewCheckoutPath: projectResult.localQaPreview?.checkoutPath || "",
+          validation: projectResult.validation || [],
+          tasks: [],
+          createdAt: now,
+          readyAt: now,
+          updatedAt: now,
+          notifiedAt: "",
+          notificationAttempts: 0,
+          notificationRetryNotBefore: "",
+        };
+        state.qaBundles.push(bundle);
+      }
+      const existingTaskIds = new Set(bundle.tasks.map((item) => item.id));
+      for (const taskResult of readyTasks) {
+        const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
+        if (!task) continue;
+        task.qaBundleId = bundle.id;
+        task.updatedAt = now;
+        if (!existingTaskIds.has(task.id)) {
+          bundle.tasks.push({
+            id: task.id,
+            title: task.title,
+            prUrl: task.prUrl || "",
+            branchName: task.branchName || "",
+            acceptanceCriteria: task.acceptanceCriteria || [],
+          });
+        }
+      }
+      bundle.updatedAt = now;
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "qa_bundle_ready",
+        projectId: projectResult.projectId,
+        message: `${bundle.id} is ready with ${bundle.tasks.length} task(s) at ${projectResult.commit}.`,
         createdAt: now,
       });
     }

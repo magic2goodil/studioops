@@ -164,9 +164,7 @@ async function readCredentialFile(filePath, label) {
     try {
       return await readFile(filePath, "utf8");
     } catch (error) {
-      if (isMissingPathError(error)) {
-        throw new Error(`missing ${label}`);
-      }
+      if (isMissingPathError(error)) throw new Error(`missing ${label}`);
       if (isTransientReadError(error) && attempt < maxAttempts) {
         await sleep(75 * (2 ** (attempt - 1)));
         continue;

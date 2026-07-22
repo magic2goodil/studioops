@@ -2,6 +2,7 @@ import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -16,21 +17,23 @@ import {
 } from "./github-app-auth.js";
 import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
-import { findProject, findTask, mutateState } from "./store.js";
+import { DATA_DIR, findProject, findTask, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
+import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
   "/Applications/ChatGPT.app/Contents/Resources/codex",
   "/Applications/Codex.app/Contents/Resources/codex",
 ];
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUN_OUTPUT_DIR = path.join(process.cwd(), "data", "run-outputs");
 const DEFAULT_WORKSPACE_ROOT = path.join(os.homedir(), ".mission-control", "run-workspaces");
 const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
 const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
-const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "blocked"]);
+const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "preview_blocked", "blocked"]);
 const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_RUNNER_PATH = [
@@ -59,15 +62,40 @@ function normalizeList(value) {
 }
 
 function normalizeProvider(value) {
-  const provider = String(value || "codex-sdk").trim();
-  if (!provider || provider === "prompt-outbox") return "codex-sdk";
-  return SUPPORTED_PROVIDERS.has(provider) ? provider : "codex-sdk";
+  const provider = String(value || "codex-cli").trim();
+  if (!provider || provider === "prompt-outbox") return "codex-cli";
+  return SUPPORTED_PROVIDERS.has(provider) ? provider : "codex-cli";
 }
 
 export function resolveCodexBin(input = {}) {
   const explicit = String(input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || "").trim();
   if (explicit) return explicit;
   return DEFAULT_CODEX_BINS.find((candidate) => existsSync(candidate)) || "codex";
+}
+
+function pidIsAlive(pid) {
+  const parsed = Number(pid);
+  if (!Number.isInteger(parsed) || parsed <= 0) return false;
+  try {
+    process.kill(parsed, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+export function activeRunStaleReason(run, input = {}) {
+  if (run.completedAt) return "completed_at_recorded";
+  const nowMs = Number(input.nowMs || Date.now());
+  const startedMs = Date.parse(run.startedAt || "");
+  const ageMs = Number.isFinite(startedMs) ? nowMs - startedMs : 0;
+  const pidGraceMs = Math.max(1_000, Number(input.pidGraceMs || 30_000));
+  if (ageMs >= pidGraceMs && run.runnerPid && !pidIsAlive(run.runnerPid)) {
+    return `runner_pid_not_alive:${run.runnerPid}`;
+  }
+  const staleRunMs = Math.max(60_000, Number(run.staleRunMs || input.staleRunMs || DEFAULT_EXECUTION_POLICY.staleRunMs));
+  if (ageMs > staleRunMs) return `run_exceeded_${staleRunMs}ms`;
+  return "";
 }
 
 function projectAllowed(run, project, options) {
@@ -90,27 +118,17 @@ function runLaneContext(state, run) {
   };
 }
 
-function activeRunIsFresh(run, input = {}) {
-  if (!ACTIVE_STATUSES.has(run.status)) return false;
-  const startedAt = Date.parse(run.startedAt || run.updatedAt || run.createdAt || "");
-  if (!Number.isFinite(startedAt)) return true;
-  const configuredStaleMs = Number(input.staleRunAfterMs || 0);
-  const timeoutMs = Math.max(60_000, Number(input.timeoutMs || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS || DEFAULT_RUN_TIMEOUT_MS));
-  const staleAfterMs = configuredStaleMs > 0 ? configuredStaleMs : timeoutMs + (5 * 60 * 1000);
-  return Number(input.nowMs || Date.now()) - startedAt <= staleAfterMs;
-}
-
-function activeLaneContexts(state, extraRuns = [], input = {}) {
+function activeLaneContexts(state, extraRuns = []) {
   return [
-    ...(state.runs || []).filter((run) => activeRunIsFresh(run, input)),
+    ...(state.runs || []).filter((run) => ACTIVE_STATUSES.has(run.status)),
     ...extraRuns,
   ].map((run) => runLaneContext(state, run)).filter(Boolean);
 }
 
-function findRunnableLaneConflict(state, run, extraRuns = [], input = {}) {
+function findRunnableLaneConflict(state, run, extraRuns = []) {
   const current = runLaneContext(state, run);
   if (!current) return null;
-  return activeLaneContexts(state, extraRuns, input).find((item) => laneProfilesConflict(current, item)) || null;
+  return activeLaneContexts(state, extraRuns).find((item) => laneProfilesConflict(current, item)) || null;
 }
 
 function staleRunReason(state, run) {
@@ -382,9 +400,9 @@ function withExecutionWorkspace(run, workspace) {
 
 export function planRunnableRuns(state, input = {}) {
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
-  const activeRuns = (state.runs || []).filter((run) => activeRunIsFresh(run, input));
-  const staleActiveCount = (state.runs || []).filter((run) => ACTIVE_STATUSES.has(run.status)).length - activeRuns.length;
-  const activeCount = activeRuns.length;
+  const activeCount = (state.runs || []).filter((run) => (
+    ACTIVE_STATUSES.has(run.status) && !activeRunStaleReason(run, input)
+  )).length;
   const available = Math.max(0, limit - activeCount);
   const selfUpdateLease = activeSelfUpdateLease(state, input);
   const runnable = [];
@@ -415,7 +433,7 @@ export function planRunnableRuns(state, input = {}) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "missing_repo_path" });
       continue;
     }
-    const laneConflict = findRunnableLaneConflict(state, run, plannedRuns, input);
+    const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
     if (laneConflict) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `lane_conflict:${laneConflict.taskId || laneConflict.id}` });
       continue;
@@ -434,11 +452,7 @@ export function planRunnableRuns(state, input = {}) {
   return {
     generatedAt: new Date().toISOString(),
     limit,
-    provider: normalizeProvider(input.provider),
-    model: input.model || "",
-    modelReasoningEffort: input.modelReasoningEffort || "",
     activeCount,
-    staleActiveCount,
     available,
     runnable,
     skipped,
@@ -446,7 +460,7 @@ export function planRunnableRuns(state, input = {}) {
 }
 
 function runnerPrompt(run, project, authContext = null) {
-  const missionControlCli = path.join(process.cwd(), "src", "mission-control-cli.js");
+  const missionControlCli = path.join(MODULE_DIR, "mission-control-cli.js");
   const taskUrl = run.taskUrl || `http://127.0.0.1:4317/tasks/${run.taskId}`;
   const sourceRepoPath = project?.sourceRepoPath || project?.repoPath || "(not recorded)";
   const executionRepoPath = run.executionRepoPath || project?.repoPath || "(not recorded)";
@@ -468,6 +482,9 @@ Run details:
 - Task URL: ${taskUrl}
 - Branch: ${run.branchName || "(not recorded)"}
 - PR: ${run.prUrl || "(not recorded)"}
+- Model: ${run.model || DEFAULT_EXECUTION_POLICY.model}
+- Reasoning effort: ${run.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort}
+- Attempt: ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts}
 
 ${formatGitHubAppAuthForPrompt(authContext)}
 
@@ -486,11 +503,100 @@ Automation rules:
 - When implementation/review work is ready, update the task and leave a clear Mission Control comment with changed files, validation, known gaps, branch/PR, and next review step.
 - If blocked, add a Mission Control comment explaining the blocker and set the task to an appropriate blocked/needs_changes state.
 - The runner will mark this run completed or failed based on your process exit code.
+- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. Mission Control verifies this handoff after the process exits.
 
 Original prompt:
 
 ${run.prompt || ""}
 `;
+}
+
+function restoreTaskStatusForRun(run, task) {
+  if (["start_builder_fix", "return_to_builder"].includes(run.actionType)) return "needs_changes";
+  if (["start_builder", "unblock_task"].includes(run.actionType)) return "queued";
+  if (run.actionType === "qa_integration_blocked") return "qa_review";
+  if (["start_review", "continue_review"].includes(run.actionType)) return task.status || "builder_review";
+  return task.status || "queued";
+}
+
+function reviewerRecordedOutcome(state, run) {
+  const startedAt = Date.parse(run.startedAt || "");
+  return (state.reviews || []).some((review) => {
+    if (review.taskId !== run.taskId || review.role !== run.role) return false;
+    const createdAt = Date.parse(review.createdAt || "");
+    return !Number.isFinite(startedAt) || (Number.isFinite(createdAt) && createdAt >= startedAt - 1_000);
+  });
+}
+
+function successfulHandoffFailure(state, run, task) {
+  if (!task) return "task_missing_after_run";
+  if (run.group === "builder") {
+    if (task.status !== "in_progress" && task.status !== "qa_review") return "";
+    if (task.branchName && task.prUrl && run.actionType !== "qa_integration_blocked") return "";
+    if (run.actionType === "qa_integration_blocked" && !BLOCKED_QA_INTEGRATION_STATUSES.has(task.integrationStatus)) return "";
+    return "builder_handoff_missing";
+  }
+  if (run.group === "reviewer" && !reviewerRecordedOutcome(state, run)) return "review_outcome_missing";
+  return "";
+}
+
+function applySuccessfulHandoff(state, run, task, now) {
+  if (!task) return;
+  task.retryNotBefore = "";
+  task.lastAutomationFailure = "";
+  delete task.automationBlocker;
+  if (
+    run.group === "builder"
+    && task.status === "in_progress"
+    && task.branchName
+    && task.prUrl
+  ) {
+    task.status = "builder_review";
+    task.assignedAgentRole = "";
+    task.reviewerThreadId = "";
+    task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+    task.updatedAt = now;
+  }
+}
+
+function applyFailedRunToTask(task, run, reason, now) {
+  if (!task || task.automationBlocker?.type === "configuration") return { blocked: true, retryAt: "" };
+  const attempt = Math.max(1, Number(run.attempt || 1));
+  const maxAttempts = Math.max(1, Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts));
+  task.lastAutomationFailure = reason;
+  task.lastAutomationFailureRunId = run.id;
+  task.updatedAt = now;
+  if (attempt >= maxAttempts) {
+    const resumeStatus = restoreTaskStatusForRun(run, task);
+    task.status = "blocked";
+    task.assignedAgentRole = "owner";
+    task.retryNotBefore = "";
+    const recoveryCount = Math.max(0, Number(task.lastAutomationRecoveryCount || 0));
+    const recoveryDelayMs = Math.min(2 * 60 * 60 * 1000, 15 * 60 * 1000 * (2 ** recoveryCount));
+    task.automationBlocker = {
+      type: "transient",
+      reason,
+      runId: run.id,
+      attempts: attempt,
+      resumeStatus,
+      blockedAt: now,
+      retryAt: new Date(Date.parse(now) + recoveryDelayMs).toISOString(),
+      recoveryCount,
+    };
+    return { blocked: true, retryAt: "" };
+  }
+  const backoffMs = Math.max(1_000, Number(run.retryBackoffMs || DEFAULT_EXECUTION_POLICY.retryBackoffMs)) * attempt;
+  task.status = restoreTaskStatusForRun(run, task);
+  task.assignedAgentRole = run.group === "reviewer" ? run.role : "builder";
+  task.retryNotBefore = new Date(Date.parse(now) + backoffMs).toISOString();
+  return { blocked: false, retryAt: task.retryNotBefore };
+}
+
+function runFailureComment(run, reason, disposition) {
+  if (disposition.blocked) {
+    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Rapid retries are paused; Mission Control will automatically probe this transient failure again after its recovery delay.`;
+  }
+  return `${run.id} failed: ${reason}. Mission Control will retry no earlier than ${disposition.retryAt}.`;
 }
 
 async function appendTaskComment(state, run, body, now, author = "Mission Control Runner") {
@@ -586,7 +692,9 @@ export async function claimRuns(input = {}) {
     state.events = state.events || [];
     state.comments = state.comments || [];
     const now = new Date().toISOString();
-    const activeCount = state.runs.filter((run) => activeRunIsFresh(run, input)).length;
+    const activeCount = state.runs.filter((run) => (
+      ACTIVE_STATUSES.has(run.status) && !activeRunStaleReason(run, input)
+    )).length;
     const available = Math.max(0, limit - activeCount);
     if (available <= 0) return [];
     if (activeSelfUpdateLease(state, input)) return [];
@@ -617,7 +725,7 @@ export async function claimRuns(input = {}) {
         });
         continue;
       }
-      const laneConflict = findRunnableLaneConflict(state, run, plannedRuns, input);
+      const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
       if (laneConflict) continue;
       if (!project?.repoPath) {
         run.status = "failed";
@@ -634,6 +742,14 @@ export async function claimRuns(input = {}) {
       run.conflictGroup = run.conflictGroup || profile.conflictGroup;
       run.fileScope = Array.isArray(run.fileScope) && run.fileScope.length ? run.fileScope : profile.fileScope;
       run.provider = normalizeProvider(input.provider || run.provider);
+      const executionPolicy = resolveExecutionPolicy(findTask(state, run.taskId) || {}, run, input);
+      run.model = run.model || executionPolicy.model || input.model;
+      run.modelReasoningEffort = run.modelReasoningEffort || executionPolicy.reasoningEffort || input.modelReasoningEffort;
+      run.modelSelectionReason = run.modelSelectionReason || executionPolicy.selectionReason;
+      run.attempt = Math.max(1, Number(run.attempt || 1));
+      run.maxAttempts = Math.max(1, Number(run.maxAttempts || executionPolicy.maxAttempts));
+      run.retryBackoffMs = Math.max(1_000, Number(run.retryBackoffMs || executionPolicy.retryBackoffMs));
+      run.staleRunMs = Math.max(60_000, Number(run.staleRunMs || executionPolicy.staleRunMs));
       run.startedAt = now;
       run.completedAt = "";
       run.exitCode = "";
@@ -655,7 +771,7 @@ export async function claimRuns(input = {}) {
         message: `${run.id} claimed by Mission Control runner`,
         createdAt: now,
       });
-      await appendTaskComment(state, run, `${run.id} started by Mission Control Runner using ${run.provider}.`, now);
+      await appendTaskComment(state, run, `${run.id} started by Mission Control Runner using ${run.provider}, ${run.model}, ${run.modelReasoningEffort} reasoning (attempt ${run.attempt}/${run.maxAttempts}).`, now);
       claimed.push({
         ...run,
         project,
@@ -682,10 +798,36 @@ export async function completeRun(runId, input = {}) {
     run.lastMessagePath = input.lastMessagePath || run.lastMessagePath || "";
     run.notes = String(input.notes || run.notes || "").trim();
 
+    const task = findTask(state, run.taskId);
+    let handoffFailure = "";
+    if (run.status === "completed") {
+      handoffFailure = successfulHandoffFailure(state, run, task);
+      if (handoffFailure) {
+        run.status = "failed";
+        run.exitCode = handoffFailure;
+        run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
+      } else {
+        applySuccessfulHandoff(state, run, task, now);
+      }
+    }
+
+    let failureDisposition = null;
+    if (run.status === "failed") {
+      failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
+    }
+
     const summary = run.status === "completed"
       ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
       : `${run.id} failed with exit code ${run.exitCode || "unknown"}. Output: ${run.outputPath || "(not recorded)"}`;
     await appendTaskComment(state, run, summary, now);
+    if (failureDisposition) {
+      await appendTaskComment(
+        state,
+        run,
+        runFailureComment(run, run.exitCode || run.notes || "runner_failed", failureDisposition),
+        now,
+      );
+    }
 
     state.events.push({
       id: nextId(state.events, "event"),
@@ -697,6 +839,38 @@ export async function completeRun(runId, input = {}) {
     });
 
     return run;
+  });
+}
+
+export async function reconcileStaleRuns(input = {}) {
+  return mutateState(async (state) => {
+    state.events = state.events || [];
+    state.comments = state.comments || [];
+    const now = new Date(Number(input.nowMs || Date.now())).toISOString();
+    const recovered = [];
+    for (const run of state.runs || []) {
+      if (run.status !== "running") continue;
+      const reason = activeRunStaleReason(run, input);
+      if (!reason) continue;
+      run.status = "failed";
+      run.exitCode = `orphaned_run:${reason}`;
+      run.completedAt = now;
+      run.updatedAt = now;
+      const task = findTask(state, run.taskId);
+      const disposition = applyFailedRunToTask(task, run, run.exitCode, now);
+      const message = `${run.id} recovered from stale running state: ${reason}.`;
+      await appendTaskComment(state, run, `${message}\n\n${runFailureComment(run, run.exitCode, disposition)}`, now);
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "stale_run_recovered",
+        projectId: run.projectId,
+        taskId: run.taskId,
+        message,
+        createdAt: now,
+      });
+      recovered.push({ runId: run.id, taskId: run.taskId, reason, blocked: disposition.blocked });
+    }
+    return recovered;
   });
 }
 
@@ -736,8 +910,10 @@ export function sdkThreadOptions(run, input = {}) {
     sandboxMode: input.sandboxMode || "danger-full-access",
     approvalPolicy: input.approvalPolicy || "never",
     networkAccessEnabled: input.networkAccessEnabled ?? true,
-    ...(input.model ? { model: input.model } : {}),
-    ...(input.modelReasoningEffort ? { modelReasoningEffort: input.modelReasoningEffort } : {}),
+    ...((run.model || input.model) ? { model: run.model || input.model } : {}),
+    ...((run.modelReasoningEffort || input.modelReasoningEffort)
+      ? { modelReasoningEffort: run.modelReasoningEffort || input.modelReasoningEffort }
+      : {}),
     ...(input.webSearchMode ? { webSearchMode: input.webSearchMode } : {}),
   };
 }
@@ -748,6 +924,9 @@ export function sdkClientOptions(input = {}, authContext = null) {
   const env = githubAppAuthEnv(authContext, {
     ...process.env,
     PATH: childPath,
+    MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || process.cwd(),
+    MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || process.cwd(),
+    MISSION_CONTROL_DATA_DIR: DATA_DIR,
   });
   if (!booleanOption(input.allowApiKeyAuth, false)) {
     delete env.OPENAI_API_KEY;
@@ -757,11 +936,6 @@ export function sdkClientOptions(input = {}, authContext = null) {
     codexPathOverride,
     env,
   };
-}
-
-export async function loadCodexSdk() {
-  const sdkUrl = import.meta.resolve("@openai/codex-sdk");
-  return import(sdkUrl);
 }
 
 async function runClaimedRunWithSdk(run, input = {}) {
@@ -788,9 +962,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
   try {
     log.write(`Mission Control SDK Runner started ${run.id} at ${new Date().toISOString()}\n`);
     log.write(`Provider: codex-sdk\n`);
-    log.write(`Model: ${input.model || "Codex default"}\n`);
-    log.write(`Reasoning: ${input.modelReasoningEffort || "Codex default"}\n`);
-    log.write(`Authentication: ${booleanOption(input.allowApiKeyAuth, false) ? "environment allowed" : "ChatGPT sign-in only"}\n`);
+    log.write(`Model: ${run.model || input.model || DEFAULT_EXECUTION_POLICY.model}\n`);
+    log.write(`Reasoning: ${run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort}\n`);
     authContext = await prepareGitHubAppAuth(run, input);
     log.write(formatGitHubAppAuthForLog(authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
@@ -800,7 +973,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Existing thread: ${run.threadId || "(new thread)"}\n`);
     log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
 
-    const { Codex } = await loadCodexSdk();
+    const { Codex } = await import("@openai/codex-sdk");
     const codex = new Codex(sdkClientOptions(input, authContext));
     const options = sdkThreadOptions(executionRun, input);
     const thread = run.threadId
@@ -893,6 +1066,10 @@ async function runClaimedRunWithCli(run, input = {}) {
   }
   const args = [
     "exec",
+    "--model",
+    run.model || input.model || DEFAULT_EXECUTION_POLICY.model,
+    "--config",
+    `model_reasoning_effort=${JSON.stringify(run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort)}`,
     "--cd",
     executionRun.project.repoPath,
     "--dangerously-bypass-approvals-and-sandbox",
@@ -924,6 +1101,11 @@ async function runClaimedRunWithCli(run, input = {}) {
         MISSION_CONTROL_WORKSPACE_PATH: executionRun.project.repoPath,
         MISSION_CONTROL_SOURCE_REPO_PATH: executionRun.project.sourceRepoPath || run.project.repoPath,
         MISSION_CONTROL_WORK_LANE: run.lane || "",
+        MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || process.cwd(),
+        MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || process.cwd(),
+        MISSION_CONTROL_DATA_DIR: DATA_DIR,
+        MISSION_CONTROL_RUN_MODEL: run.model || input.model || DEFAULT_EXECUTION_POLICY.model,
+        MISSION_CONTROL_RUN_REASONING_EFFORT: run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort,
       }),
     });
 
@@ -995,10 +1177,12 @@ export async function runClaimedRun(run, input = {}) {
 }
 
 export async function runQueuedRuns(input = {}) {
+  const recovered = await reconcileStaleRuns(input);
   const claimed = await claimRuns(input);
   const results = await Promise.all(claimed.map((run) => runClaimedRun(run, input)));
   return {
     generatedAt: new Date().toISOString(),
+    recovered,
     claimed: claimed.map((run) => run.id),
     results,
   };
@@ -1007,9 +1191,13 @@ export async function runQueuedRuns(input = {}) {
 export function formatRunnerReport(report) {
   const lines = [
     `Mission Control runner sweep (${report.generatedAt})`,
-    `Claimed: ${report.claimed.length}  Finished: ${report.results.length}`,
+    `Recovered: ${(report.recovered || []).length}  Claimed: ${report.claimed.length}  Finished: ${report.results.length}`,
     "",
   ];
+  for (const item of report.recovered || []) {
+    lines.push(`[recovered] ${item.runId}: ${item.reason}${item.blocked ? " (retry limit reached)" : ""}`);
+  }
+  if (report.recovered?.length) lines.push("");
   if (!report.claimed.length) {
     lines.push("No queued runs claimed.");
     return lines.join("\n");
@@ -1027,8 +1215,7 @@ export function formatRunnerReport(report) {
 export function formatRunnerPlan(plan) {
   const lines = [
     `Mission Control runner plan (${plan.generatedAt})`,
-    `Limit: ${plan.limit}  Active: ${plan.activeCount}  Stale active: ${plan.staleActiveCount || 0}  Available: ${plan.available}  Runnable: ${plan.runnable.length}`,
-    `Provider: ${plan.provider || "codex-sdk"}  Model: ${plan.model || "Codex default"}  Reasoning: ${plan.modelReasoningEffort || "Codex default"}`,
+    `Limit: ${plan.limit}  Active: ${plan.activeCount}  Available: ${plan.available}  Runnable: ${plan.runnable.length}`,
     "",
   ];
   if (!plan.runnable.length) {
@@ -1040,6 +1227,7 @@ export function formatRunnerPlan(plan) {
     lines.push(`  Task: ${run.taskId}`);
     lines.push(`  Repo: ${run.project?.repoPath || "(missing)"}`);
     lines.push(`  Provider: ${normalizeProvider(run.provider)}`);
+    lines.push(`  Model: ${run.model || DEFAULT_EXECUTION_POLICY.model} (${run.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort})`);
     if (run.threadId) lines.push(`  Thread: ${run.threadId}`);
     lines.push("");
   }

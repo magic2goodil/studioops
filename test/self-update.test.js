@@ -97,6 +97,7 @@ test("clean self-update dry-run detects origin/main ahead and live run fast-forw
     const applied = await runSelfUpdate({
       repoPath: fixture.repoPath,
       state: applyState,
+      deployRuntime: false,
       restartAgents: false,
       record: false,
       notify: false,

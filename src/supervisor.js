@@ -187,6 +187,17 @@ function taskActions(state, task, options = {}) {
   }
 
   const missingDependencies = incompleteDependencies(state, task);
+  const retryNotBefore = Date.parse(task.retryNotBefore || "");
+  if (Number.isFinite(retryNotBefore) && retryNotBefore > Date.now()) {
+    return [actionBase(
+      state,
+      task,
+      "waiting_for_retry",
+      "",
+      `Automatic retry is paused until ${task.retryNotBefore} after ${task.lastAutomationFailure || "a worker failure"}.`,
+      options,
+    )];
+  }
 
   if (BUILDABLE_STATUSES.has(task.status)) {
     if (missingDependencies.length) {
@@ -206,14 +217,27 @@ function taskActions(state, task, options = {}) {
   }
 
   if (task.status === "blocked") {
-    if (task.automationBlocker?.type === "configuration") {
+    if (task.automationBlocker) {
       const blocker = task.automationBlocker;
+      if (["execution", "transient"].includes(blocker.type)) {
+        return [actionBase(
+          state,
+          task,
+          "waiting_for_transient_recovery",
+          "",
+          `Mission Control will automatically retry this transient failure${blocker.retryAt ? ` after ${blocker.retryAt}` : " after its recovery delay"}: ${blocker.reason || "worker error"}.`,
+          {
+            ...options,
+            nextStatus: blocker.resumeStatus || "queued",
+          },
+        )];
+      }
       return [actionBase(
         state,
         task,
         "repair_automation_config",
         "owner",
-        `Automation is paused after ${blocker.runId || "a runner failure"}: ${blocker.reason || "configuration error"}. Repair the runner configuration, then restore the task to ${blocker.resumeStatus || "its prior workflow state"}.`,
+        `Automation is paused after ${blocker.runId || "a runner failure"}: ${blocker.reason || "worker error"}. Repair the blocker or add owner guidance, then restore the task to ${blocker.resumeStatus || "its prior workflow state"}.`,
         {
           ...options,
           nextStatus: blocker.resumeStatus || "queued",
@@ -311,6 +335,9 @@ function taskActions(state, task, options = {}) {
     if (task.integrationStatus === "ready") {
       return [actionBase(state, task, "qa_bundle_ready", "owner", "QA integration branch is validated and ready for local owner testing.", options)];
     }
+    if (task.integrationStatus === "preview_blocked") {
+      return [actionBase(state, task, "repair_qa_preview", "owner", "The QA branch is validated, but the configured local preview did not restart or pass its health check. Repair the preview service without rebuilding the feature PR.", options)];
+    }
     if (["conflict", "validation_failed", "push_failed", "blocked"].includes(task.integrationStatus)) {
       return [actionBase(state, task, "qa_integration_blocked", "builder", `QA integration is blocked with status ${task.integrationStatus}. Review task comments and update the PR branch before rerunning integration.`, options)];
     }
@@ -321,6 +348,9 @@ function taskActions(state, task, options = {}) {
   }
 
   if (task.status === "user_review") {
+    if (task.qaBundleId && task.promotionPrUrl) {
+      return [actionBase(state, task, "release_candidate_ready", "", "A validated release-candidate PR is ready for owner review.", options)];
+    }
     return [actionBase(state, task, "notify_owner", "owner", "Task is ready for final human review.", options)];
   }
 
@@ -337,7 +367,7 @@ function sortActions(actions) {
 
 export function createSupervisorReport(state, options = {}) {
   const allActions = sortActions((state.tasks || []).flatMap((task) => taskActions(state, task, options)));
-  const passiveActionTypes = new Set(["waiting_on_dependency", "blocked"]);
+  const passiveActionTypes = new Set(["waiting_on_dependency", "waiting_for_retry", "blocked", "release_candidate_ready"]);
   const actions = options.includeWaiting || options.all
     ? allActions
     : allActions.filter((action) => !passiveActionTypes.has(action.type));

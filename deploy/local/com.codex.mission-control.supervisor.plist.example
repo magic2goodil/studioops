@@ -9,7 +9,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>__NODE_PATH__</string>
-    <string>__MISSION_CONTROL_REPO__/src/mission-control-supervisor.js</string>
+    <string>__MISSION_CONTROL_RUNTIME__/src/mission-control-supervisor.js</string>
     <string>--watch</string>
     <string>--interval</string>
     <string>300</string>

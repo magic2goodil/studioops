@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { readState } from "./store.js";
 import {
@@ -8,6 +7,7 @@ import {
   planRunnableRuns,
   runQueuedRuns,
 } from "./runner.js";
+import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
 const DEFAULT_INTERVAL_SECONDS = 300;
 const DEFAULT_LIMIT = 1;
@@ -57,17 +57,23 @@ async function optionsFrom(args) {
     limit: numberFrom(args.limit || args["max-runs"] || defaults.limit || defaults.maxRuns, DEFAULT_LIMIT),
     provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER || defaults.provider || defaults.runProvider,
     codexBin: args["codex-bin"] || defaults.codexBin,
-    model: args.model || process.env.MISSION_CONTROL_RUNNER_MODEL || defaults.model,
+    model: args.model || process.env.MISSION_CONTROL_RUNNER_MODEL || defaults.model || "gpt-5.6-sol",
     modelReasoningEffort: args["model-reasoning-effort"]
       || args.reasoning
       || process.env.MISSION_CONTROL_RUNNER_REASONING_EFFORT
-      || defaults.modelReasoningEffort,
+      || defaults.modelReasoningEffort
+      || "high",
     allowApiKeyAuth: args["allow-api-key-auth"]
       || process.env.MISSION_CONTROL_RUNNER_ALLOW_API_KEY_AUTH
       || defaults.allowApiKeyAuth,
+    executionPolicy: {
+      ...(config?.defaults?.executionPolicy || {}),
+      ...(config?.executionPolicy || {}),
+    },
     useWorkspaces: args["no-workspace"] ? false : (args.workspaces || defaults.useWorkspaces || defaults.isolatedWorkspaces),
     workspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
     timeoutMs: numberFrom(args["timeout-ms"] || defaults.timeoutMs, 0) || undefined,
+    staleRunMs: numberFrom(args["stale-run-ms"] || defaults.staleRunMs || config?.defaults?.executionPolicy?.staleRunMs, 0) || undefined,
     githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || process.env.MISSION_CONTROL_GITHUB_APP_AUTH || defaults.githubAppAuth),
     githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir || config?.githubApps?.credentialsDir,
     githubAppRoleMap: config?.githubApps?.roleMap,
@@ -98,11 +104,14 @@ async function runOnce(args) {
 
 async function runWatch(args) {
   const options = await optionsFrom(args);
-  while (true) {
-    await runOnce(args);
-    await sleep(options.intervalSeconds * 1000);
-    console.log("");
-  }
+  await runResilientWorkerLoop({
+    worker: "runner",
+    intervalSeconds: options.intervalSeconds,
+    runOnce: async () => {
+      await runOnce(args);
+      console.log("");
+    },
+  });
 }
 
 async function main() {
@@ -116,20 +125,19 @@ Usage:
   mission-control-runner --watch --interval 300 --limit 1
   mission-control-runner --watch --timeout-ms 7200000
   mission-control-runner --provider codex-sdk
-  mission-control-runner --model gpt-5.6-sol --model-reasoning-effort xhigh
+  mission-control-runner --model gpt-5.6-sol --model-reasoning-effort high
   mission-control-runner --workspace-root .mission-control/run-workspaces
   mission-control-runner --no-workspace
   mission-control-runner --github-apps-dir .mission-control/github-apps
   mission-control-runner --no-github-app-auth
   MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk mission-control-runner
-  MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=xhigh mission-control-runner
+  MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=high mission-control-runner
   mission-control runner --project event-horizons-web --limit 1
 
 The runner claims queued builder/reviewer dispatch runs and launches a Codex
 provider against the target project repository. Providers: codex-cli, codex-sdk.
-The SDK provider can pin a model and reasoning effort and resumes the stored
-Codex thread for subsequent runs. API-key environment variables are removed
-unless --allow-api-key-auth is explicitly supplied.
+Every run records and explicitly pins its model and reasoning effort; the default
+is gpt-5.6-sol with high reasoning, while lead and complex-risk work can use xhigh.
 It uses GitHub App installation tokens by default for GitHub push, PR, and
 review/comment activity. It does not merge PRs, deploy production, or bypass
 the human owner gate.

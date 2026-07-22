@@ -4,7 +4,12 @@ node_modules/
 mission-control.config.md
 .mission-control/
 data/workspaces/
-data/mission-control.json
+data/mission-control*.json
+!data/mission-control.example.json
+data/mission-control.sqlite3*
+data/backups/
+data/heartbeats/
+data/launch-agents/
 data/.mission-control.lock/
 data/local-attachments/
 data/run-outputs/

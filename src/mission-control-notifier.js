@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
+import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
 const DEFAULT_INTERVAL_SECONDS = 60;
 
@@ -66,11 +66,14 @@ async function runOnce(args) {
 
 async function runWatch(args) {
   const options = await optionsFrom(args);
-  while (true) {
-    await runOnce(args);
-    await sleep(options.intervalSeconds * 1000);
-    console.log("");
-  }
+  await runResilientWorkerLoop({
+    worker: "notifier",
+    intervalSeconds: options.intervalSeconds,
+    runOnce: async () => {
+      await runOnce(args);
+      console.log("");
+    },
+  });
 }
 
 async function main() {

@@ -10,9 +10,10 @@ The always-on stack includes:
 - `dispatcher`: creates durable builder, reviewer, and owner-handoff runs
 - `runner`: launches queued builder/reviewer runs with a Codex provider
 - `qa-integration`: merges `qa_review` PR heads into opted-in non-production integration branches after validation
-- `promotion`: merges owner-QA-passed work into the project target branch after validation
+- `promotion`: assembles owner-QA-passed work into a validated release-candidate PR
 - `notifier`: sends local owner-review and failure notifications
 - `self-update`: fetches `origin/main`, fast-forwards Mission Control itself when safe, and restarts worker LaunchAgents
+- `watchdog`: reconciles stranded task state, watches worker heartbeats, and restarts stale workers
 
 ## Install
 
@@ -21,6 +22,20 @@ npm install
 npm run setup
 npm run install-agents
 ```
+
+The installer publishes a stable runtime under `~/.mission-control/runtime`, creates a clean `main` checkout under `~/.mission-control/source` for self-updates, and points LaunchAgents at the immutable runtime. Local config and SQLite state remain in the working root. This prevents workers from executing half-synced files or depending on the branch currently open in a developer checkout. Re-running the installer atomically updates the runtime and restarts all workers. The installer prefers an available supported even-numbered Node.js LTS runtime; `MISSION_CONTROL_NODE_PATH` remains the explicit override.
+
+## Self-Healing Invariants
+
+Long-running workers write atomic heartbeats under `data/heartbeats/` every 30 seconds, including while a Codex run is active. The watchdog runs independently every two minutes and:
+
+- restarts a worker whose heartbeat is missing or stale
+- wakes the runner when queued durable runs have waited too long
+- wakes the dispatcher when dispatchable tasks have waited too long
+- returns a non-epic `in_progress` task to the queue when it has no queued or running durable run
+- automatically releases transient SDK, process, timeout, and orphan-run blockers after a bounded recovery delay
+
+Configuration blockers such as missing or invalid GitHub App credentials remain owner-gated. Tracking epics are exempt from the active-run invariant because their status represents child-task progress rather than direct builder execution.
 
 By default, the web UI is only available on the local machine:
 
@@ -48,29 +63,19 @@ npm run promotion -- --plan
 npm run self-update -- --plan
 ```
 
-The runner defaults to persistent `codex-sdk` threads. To run one explicitly:
+The runner defaults to `codex-cli`. To test SDK-backed Codex threads:
 
 ```bash
 npm run runner -- --provider codex-sdk --limit 1
 ```
 
-To make LaunchAgent runs use persistent Codex threads, set `defaults.runner.provider` to `codex-sdk`, `defaults.runner.model` to `gpt-5.6-sol`, and `defaults.runner.modelReasoningEffort` to `xhigh` in `mission-control.config.md`, then restart the local agents. Keep `allowApiKeyAuth` false unless API billing is explicitly authorized.
+To make LaunchAgent runs use the SDK provider, set `defaults.runner.provider` to `codex-sdk` in `mission-control.config.md`, then restart the local agents.
 
 For an ad hoc shell or service override, set:
 
 ```bash
 MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk
-MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol
-MISSION_CONTROL_RUNNER_REASONING_EFFORT=xhigh
 ```
-
-When installing on macOS, pin the worker services to a stable Node.js binary instead of whatever Node happens to invoke npm:
-
-```bash
-MISSION_CONTROL_NODE_PATH=/path/to/node npm run install-agents
-```
-
-Continuous LaunchAgents include a 60-second restart throttle so a startup failure cannot create a resource-exhausting crash loop.
 
 Runner workspace preparation is serialized per source repository with a local
 Git lock under `~/.mission-control/locks/git` by default. This prevents
@@ -102,7 +107,7 @@ npm run qa-integrate -- --plan
 npm run qa-integrate -- --project myapp
 ```
 
-Tasks already marked with `integrationStatus: ready` are skipped on later sweeps. Use `--force` only when a branch has changed and a deliberate revalidation is required.
+Tasks already marked with `integrationStatus: ready` are skipped on later sweeps. Use `--force` only when a branch has changed and deliberate revalidation is required.
 
 The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It prepares each QA bundle in an isolated workspace under `~/.mission-control/qa-workspaces/` by default, so the registered project checkout can stay on the owner's active branch with local changes. Override the workspace root with `MISSION_CONTROL_QA_WORKSPACE_ROOT` when needed, but keep it outside the registered project checkout.
 
@@ -120,7 +125,12 @@ Projects can also opt into keeping their QA branch and local preview checkout cu
       "branch": "qa/integration",
       "stashDirty": true,
       "postUpdateCommands": ["npm run check"],
-      "restartLaunchAgents": ["com.example.myapp.local"]
+      "restartLaunchAgents": ["com.example.myapp.local"],
+      "launchAgentPlists": {
+        "com.example.myapp.local": "~/Library/LaunchAgents/com.example.myapp.local.plist"
+      },
+      "previewUrl": "http://127.0.0.1:4174/",
+      "healthCheckUrl": "http://127.0.0.1:4174/health"
     }
   }
 }
@@ -139,7 +149,7 @@ mission-control update-project myapp \
 
 `syncDefaultBranchIntoIntegration` merges the latest configured default branch into the non-production QA branch before task PR heads are integrated. This is useful after the owner merges a PR to `main`: the QA branch catches up on the next sweep instead of leaving the local preview stale.
 
-`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, Mission Control preserves them in a Git stash before fast-forwarding. `restartLaunchAgents` is intended for local preview servers only.
+`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, Mission Control preserves them in a Git stash before fast-forwarding. Missing preview LaunchAgents are bootstrapped from the configured plist (or the standard `~/Library/LaunchAgents/<label>.plist` path), restarted, and health-checked before the bundle is marked ready.
 
 ## Main Promotion
 
@@ -171,7 +181,7 @@ npm run promotion -- --plan
 npm run promotion -- --project myapp
 ```
 
-The promotion worker uses an isolated clone under `~/.mission-control/promotion-workspaces/`, fetches the task branch or PR head, merges it into the target branch, runs validation, and performs a non-force push only after validation passes. It records conflicts, validation failures, push failures, and successful target-branch commits back on the task.
+The promotion worker uses an isolated clone under `~/.mission-control/promotion-workspaces/`, fetches the task branch or PR head, merges it locally on top of the target branch, runs validation, pushes a uniquely named release-candidate branch, and opens a ready PR against the target. It never pushes directly to the protected target branch. It records conflicts, validation failures, push failures, and the release-candidate PR back on the task and QA bundle.
 
 Promotion does not deploy production. It prepares the target branch for owner release-candidate review. Production deploys should remain behind explicit release or tag workflows.
 
@@ -193,11 +203,15 @@ The self-updater only fast-forwards the configured branch, `main` by default. It
 
 Running builder/reviewer runs are ignored only when they are stale, such as a missing runner process when PID checks are enabled or a `startedAt` timestamp older than the configured stale-run window. After a successful update, the updater restarts these LaunchAgents:
 
+- `com.codex.mission-control.web`
+- `com.codex.mission-control.steward`
+- `com.codex.mission-control.supervisor`
 - `com.codex.mission-control.dispatcher`
 - `com.codex.mission-control.runner`
 - `com.codex.mission-control.notifier`
 - `com.codex.mission-control.qa-integration`
 - `com.codex.mission-control.promotion`
+- `com.codex.mission-control.watchdog`
 
 During an applied update, Mission Control records a short-lived self-update lease in local state. The runner checks that lease before claiming queued builder/reviewer work, so queued runs wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
 
@@ -225,7 +239,7 @@ data/run-outputs/
 
 ## Safety
 
-The always-on stack may create branches, run validation, commit, push, open or update pull requests, and merge owner-QA-passed task heads into a configured target branch when a project allows that behavior.
+The always-on stack may create branches, run validation, commit, push, and open or update pull requests. It may assemble owner-QA-passed task heads on a release-candidate branch, but it does not merge that branch into the protected target.
 
 It must not:
 
@@ -235,6 +249,6 @@ It must not:
 - commit secrets or private data
 - bypass the human owner review or Trust Leads QA gate
 
-The runner defaults to isolated workspaces and one active Codex run. Increase the limit only after validating that the host and repository lanes can safely support more concurrency.
+The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
 
 Mission Control treats backend and frontend work as compatible by default. Design conflicts with frontend, and devops/project-wide work conflicts with other lanes in the same project. That keeps parallel agents from editing the same UI/CSS/deployment surface while still allowing a real team-style flow.

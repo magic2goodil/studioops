@@ -68,11 +68,11 @@ The dispatcher should be the durable runner for a machine. The supervisor can ke
 
 ## Provider Model
 
-The default provider is `codex-sdk`.
+The default provider is `prompt-outbox`.
 
-Mission Control stores the generated Codex prompt on the run record. The local SDK runner then creates or resumes the actual builder/reviewer Codex task and records its thread ID.
+That means Mission Control stores the generated Codex prompt on the run record. A Codex-capable runner can then pick up the run and create or resume the actual builder/reviewer task.
 
-The `prompt-outbox` provider remains available when a deployment needs a vendor-neutral work packet:
+This is intentional for the open-source project:
 
 - it does not require private Codex APIs
 - it does not hard-code one AI vendor

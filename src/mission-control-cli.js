@@ -30,6 +30,7 @@ import {
   projectFromConfig,
   writeConfig,
 } from "./config.js";
+import { backupStateDatabase } from "./state-database.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -138,6 +139,15 @@ async function setup() {
         },
       },
       defaults: {
+        executionPolicy: {
+          model: "gpt-5.6-sol",
+          reasoningEffort: "high",
+          leadReasoningEffort: "xhigh",
+          complexReasoningEffort: "xhigh",
+          maxAttempts: 2,
+          retryBackoffMs: 300000,
+          staleRunMs: 7200000,
+        },
         supervisor: {
           intervalSeconds: 300,
           baseUrl: "http://127.0.0.1:4317",
@@ -153,7 +163,7 @@ async function setup() {
         },
         dispatcher: {
           intervalSeconds: 300,
-          provider: "codex-sdk",
+          provider: "prompt-outbox",
           maxDispatchesPerSweep: 6,
           builderConcurrency: 3,
           reviewerConcurrency: 3,
@@ -163,11 +173,10 @@ async function setup() {
         },
         runner: {
           intervalSeconds: 300,
-          limit: 1,
-          provider: "codex-sdk",
+          limit: 3,
+          provider: "codex-cli",
           model: "gpt-5.6-sol",
-          modelReasoningEffort: "xhigh",
-          allowApiKeyAuth: false,
+          modelReasoningEffort: "high",
           useWorkspaces: true,
           workspaceRoot: "~/.mission-control/run-workspaces",
           timeoutMs: 7200000,
@@ -362,6 +371,7 @@ Commands:
   promote                       Merge owner-QA-passed PR heads into target branches
   notifier                      Send local owner/failure notifications
   self-update                   Fast-forward Mission Control main and restart workers
+  backup [--output PATH]        Create a transactionally consistent SQLite backup
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
@@ -409,6 +419,12 @@ Automation:
 
   if (command === "import-config") {
     await importConfig();
+    return;
+  }
+
+  if (command === "backup") {
+    const outputPath = await backupStateDatabase(args.output || args.path || "");
+    console.log(`Mission Control backup created: ${outputPath}`);
     return;
   }
 
@@ -507,10 +523,13 @@ Automation:
         status: run.status,
         role: run.role,
         action: run.actionType,
+        model: run.model || "",
+        effort: run.modelReasoningEffort || "",
+        attempt: run.attempt ? `${run.attempt}/${run.maxAttempts || "?"}` : "",
         thread: run.threadId || "",
         title: task?.title || "",
       };
-    }), ["id", "project", "task", "status", "role", "action", "thread", "title"]);
+    }), ["id", "project", "task", "status", "role", "action", "model", "effort", "attempt", "thread", "title"]);
     return;
   }
 
@@ -688,12 +707,8 @@ Automation:
   }
 
   if (command === "dispatcher" || command === "dispatch") {
-    const config = await loadConfig();
-    const defaults = {
-      ...(config?.defaults?.dispatcher || {}),
-      ...(config?.dispatcher || {}),
-    };
     const state = await readState();
+    const config = await loadConfig();
     const supervisor = createSupervisorReport(state, {
       baseUrl: args["base-url"] || "http://127.0.0.1:4317",
       intervalSeconds: args.interval || args["interval-seconds"] || 300,
@@ -701,11 +716,15 @@ Automation:
     const options = {
       project: args.project || args.projects,
       dryRun: args["dry-run"] || args.dryRun,
-      provider: args.provider || defaults.provider || "codex-sdk",
-      maxDispatchesPerSweep: args.limit || args["max-dispatches"] || defaults.maxDispatchesPerSweep,
-      builderConcurrency: args["builder-concurrency"] || defaults.builderConcurrency,
-      reviewerConcurrency: args["reviewer-concurrency"] || defaults.reviewerConcurrency,
-      ownerConcurrency: args["owner-concurrency"] || defaults.ownerConcurrency,
+      provider: args.provider || "prompt-outbox",
+      maxDispatchesPerSweep: args.limit || args["max-dispatches"],
+      builderConcurrency: args["builder-concurrency"],
+      reviewerConcurrency: args["reviewer-concurrency"],
+      ownerConcurrency: args["owner-concurrency"],
+      executionPolicy: {
+        ...(config?.defaults?.executionPolicy || {}),
+        ...(config?.executionPolicy || {}),
+      },
     };
     if (args.plan) {
       const plan = planDispatches(state, supervisor.actions, options);
@@ -728,28 +747,26 @@ Automation:
 
   if (command === "runner" || command === "run") {
     const config = await loadConfig();
-    const defaults = {
+    const runnerDefaults = {
       ...(config?.defaults?.runner || {}),
       ...(config?.runner || {}),
     };
     const options = {
-      project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
-      limit: args.limit || args["max-runs"] || defaults.limit,
-      provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER || defaults.provider,
-      codexBin: args["codex-bin"] || defaults.codexBin,
-      model: args.model || process.env.MISSION_CONTROL_RUNNER_MODEL || defaults.model,
-      modelReasoningEffort: args["model-reasoning-effort"]
-        || args.reasoning
-        || process.env.MISSION_CONTROL_RUNNER_REASONING_EFFORT
-        || defaults.modelReasoningEffort,
-      allowApiKeyAuth: args["allow-api-key-auth"]
-        || process.env.MISSION_CONTROL_RUNNER_ALLOW_API_KEY_AUTH
-        || defaults.allowApiKeyAuth,
-      useWorkspaces: args["no-workspace"] ? false : (args.workspaces || defaults.useWorkspaces),
-      workspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
-      timeoutMs: args["timeout-ms"] || defaults.timeoutMs,
-      githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || defaults.githubAppAuth),
-      githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir,
+      project: args.project || args.projects,
+      limit: args.limit || args["max-runs"],
+      provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER || runnerDefaults.provider,
+      codexBin: args["codex-bin"],
+      model: args.model || process.env.MISSION_CONTROL_RUNNER_MODEL || runnerDefaults.model || "gpt-5.6-sol",
+      modelReasoningEffort: args["model-reasoning-effort"] || args.reasoning || process.env.MISSION_CONTROL_RUNNER_REASONING_EFFORT || runnerDefaults.modelReasoningEffort || "high",
+      executionPolicy: {
+        ...(config?.defaults?.executionPolicy || {}),
+        ...(config?.executionPolicy || {}),
+      },
+      useWorkspaces: args["no-workspace"] ? false : args.workspaces,
+      workspaceRoot: args["workspace-root"],
+      timeoutMs: args["timeout-ms"],
+      githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
+      githubAppCredentialsDir: args["github-apps-dir"],
     };
     if (args.plan || args["dry-run"] || args.dryRun) {
       const state = await readState();
