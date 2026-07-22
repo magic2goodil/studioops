@@ -25,6 +25,8 @@ npm run install-agents
 
 The installer publishes a stable runtime under `~/.mission-control/runtime`, creates a clean `main` checkout under `~/.mission-control/source` for self-updates, and points LaunchAgents at the immutable runtime. Local config and SQLite state remain in the working root. This prevents workers from executing half-synced files or depending on the branch currently open in a developer checkout. Re-running the installer atomically updates the runtime and restarts all workers. The installer prefers an available supported even-numbered Node.js LTS runtime; `MISSION_CONTROL_NODE_PATH` remains the explicit override.
 
+Existing installations from the project rename are migrated from the retired `codex-mission-control` source remote to `studioops` only when the checkout is clean, on `main`, and fast-forwardable. The installer refuses dirty, divergent, detached, or unrelated source checkouts instead of rewriting them.
+
 ## Self-Healing Invariants
 
 Long-running workers write atomic heartbeats under `data/heartbeats/` every 30 seconds, including while a Codex run is active. The watchdog runs independently every two minutes and:
