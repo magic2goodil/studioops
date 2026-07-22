@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +25,7 @@ const COMMAND_TIMEOUT_MS = 120_000;
 const VALIDATION_TIMEOUT_MS = 10 * 60_000;
 const MAX_OUTPUT_CHARS = 4_000;
 const WORKSPACE_COMMAND_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_QA_RETRY_DELAY_MS = 15 * 60_000;
 const DEFAULT_QA_WORKSPACE_ROOT = path.join(os.homedir(), ".mission-control", "qa-workspaces");
 const DEFAULT_QA_INTEGRATION_PATH = [
   "/opt/homebrew/bin",
@@ -781,7 +783,13 @@ function taskMatches(task, options = {}) {
   return taskFilter.includes(task.id);
 }
 
+function retryWindowElapsed(task, nowMs) {
+  const retryAt = Date.parse(task.integrationRetryNotBefore || "");
+  return !Number.isFinite(retryAt) || retryAt <= nowMs;
+}
+
 export function planQaIntegrations(state, input = {}) {
+  const nowMs = Number(input.nowMs || Date.now());
   const projectPlans = (state.projects || [])
     .filter((project) => projectMatches(project, input))
     .map((project) => {
@@ -792,6 +800,7 @@ export function planQaIntegrations(state, input = {}) {
         .filter((task) => task.projectId === project.id)
         .filter((task) => task.status === "qa_review")
         .filter((task) => input.force || task.integrationStatus !== "ready")
+        .filter((task) => input.force || retryWindowElapsed(task, nowMs))
         .filter((task) => taskMatches(task, input));
       return {
         projectId: project.id,
@@ -816,6 +825,7 @@ export function planQaIntegrations(state, input = {}) {
           branchName: task.branchName || "",
           prUrl: task.prUrl || "",
           integrationStatus: task.integrationStatus || "",
+          integrationRetryNotBefore: task.integrationRetryNotBefore || "",
         })),
       };
     });
@@ -1104,7 +1114,41 @@ function commentForTask(projectResult, taskResult) {
   return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}`;
 }
 
-function taskPatchForResult(projectResult, taskResult, now) {
+function stableQaOutput(value, workspacePath) {
+  const output = String(value || "");
+  return workspacePath ? output.split(workspacePath).join("<qa-workspace>") : output;
+}
+
+export function qaResultFingerprint(projectResult, taskResult) {
+  const workspacePath = projectResult.workspacePath || "";
+  const payload = {
+    taskStatus: taskResult.status || "",
+    source: taskResult.source || "",
+    taskOutput: stableQaOutput(taskResult.output, workspacePath),
+    conflicts: [...(taskResult.conflicts || [])].sort(),
+    projectStatus: projectResult.status || "",
+    integrationBranch: projectResult.integrationBranch || "",
+    commit: projectResult.commit || "",
+    projectOutput: stableQaOutput(projectResult.output, workspacePath),
+    localPreview: projectResult.localQaPreview ? {
+      status: projectResult.localQaPreview.status || "",
+      before: projectResult.localQaPreview.before || "",
+      after: projectResult.localQaPreview.after || "",
+      output: stableQaOutput(projectResult.localQaPreview.output, workspacePath),
+    } : null,
+    validation: (projectResult.validation || []).map((item) => ({
+      command: item.command || "",
+      ok: !!item.ok,
+      output: stableQaOutput(item.output, workspacePath),
+    })),
+  };
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
+  const integrationRetryNotBefore = taskResult.status === "ready"
+    ? ""
+    : new Date(Date.parse(now) + DEFAULT_QA_RETRY_DELAY_MS).toISOString();
   return {
     integrationStatus: taskResult.status,
     integrationBranch: projectResult.integrationBranch,
@@ -1115,6 +1159,8 @@ function taskPatchForResult(projectResult, taskResult, now) {
     integrationWorkspaceStrategy: projectResult.workspaceStrategy || "",
     localQaPreview: projectResult.localQaPreview || null,
     integrationUpdatedAt: now,
+    integrationReportFingerprint: reportFingerprint,
+    integrationRetryNotBefore,
     integrationConflictFiles: taskResult.conflicts || [],
     integrationValidation: {
       status: projectResult.status,
@@ -1135,23 +1181,27 @@ async function recordProjectResult(projectResult) {
     for (const taskResult of projectResult.tasks || []) {
       const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
       if (!task) continue;
-      Object.assign(task, taskPatchForResult(projectResult, taskResult, now));
+      const reportFingerprint = qaResultFingerprint(projectResult, taskResult);
+      const reportChanged = task.integrationReportFingerprint !== reportFingerprint;
+      Object.assign(task, taskPatchForResult(projectResult, taskResult, now, reportFingerprint));
       task.updatedAt = now;
-      state.comments.push({
-        id: nextId(state.comments, "comment"),
-        taskId: task.id,
-        author: "StudioOps QA Integration",
-        body: commentForTask(projectResult, taskResult),
-        createdAt: now,
-      });
-      state.events.push({
-        id: nextId(state.events, "event"),
-        type: `qa_integration_${taskResult.status}`,
-        projectId: task.projectId,
-        taskId: task.id,
-        message: `${task.title}: QA integration ${taskResult.status}`,
-        createdAt: now,
-      });
+      if (reportChanged) {
+        state.comments.push({
+          id: nextId(state.comments, "comment"),
+          taskId: task.id,
+          author: "StudioOps QA Integration",
+          body: commentForTask(projectResult, taskResult),
+          createdAt: now,
+        });
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: `qa_integration_${taskResult.status}`,
+          projectId: task.projectId,
+          taskId: task.id,
+          message: `${task.title}: QA integration ${taskResult.status}`,
+          createdAt: now,
+        });
+      }
     }
 
     const readyTasks = (projectResult.tasks || []).filter((task) => task.status === "ready");

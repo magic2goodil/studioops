@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -153,6 +154,57 @@ test("SQLite migration reconstructs bundles for previously integrated QA tasks",
     assert.equal(persisted.qaBundles[0].integrationBranchUrl, "https://github.com/example/demo/tree/qa/demo");
     assert.equal(persisted.tasks[0].qaBundleId, persisted.qaBundles[0].id);
     assert.deepEqual(persisted.qaBundles[0].tasks.map((task) => task.id), ["task_1"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite archives excess machine QA history without compacting human comments", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-history-compaction-"));
+  try {
+    const state = baseState();
+    state.comments = Array.from({ length: 30 }, (_, index) => ({
+      id: `comment_${index + 1}`,
+      taskId: "task_1",
+      author: "Mission Control QA Integration",
+      body: `Automated QA report ${index + 1}`,
+      createdAt: new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
+    }));
+    state.comments.splice(5, 0, {
+      id: "comment_human",
+      taskId: "task_1",
+      author: "Owner",
+      body: "Keep this human decision.",
+      createdAt: "2026-07-01T00:05:30.000Z",
+    });
+    state.events = Array.from({ length: 50 }, (_, index) => ({
+      id: `event_${index + 1}`,
+      type: "qa_integration_blocked",
+      projectId: "project_1",
+      taskId: "task_1",
+      message: `Blocked ${index + 1}`,
+      createdAt: new Date(Date.UTC(2026, 6, 1, 1, index)).toISOString(),
+    }));
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.comments.filter((item) => item.author === "Mission Control QA Integration").length, 20);
+    assert.equal(persisted.comments.filter((item) => item.author === "Owner").length, 1);
+    assert.equal(persisted.events.filter((item) => item.type === "qa_integration_blocked").length, 40);
+
+    const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
+    try {
+      const archived = db.prepare("SELECT entity_type, count(*) count FROM operational_archive GROUP BY entity_type ORDER BY entity_type")
+        .all()
+        .map((row) => ({ ...row }));
+      assert.deepEqual(archived, [
+        { entity_type: "comments", count: 10 },
+        { entity_type: "events", count: 10 },
+      ]);
+    } finally {
+      db.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

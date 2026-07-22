@@ -13,7 +13,7 @@ import {
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
-import { planQaIntegrations } from "../src/qa-integration.js";
+import { planQaIntegrations, qaResultFingerprint } from "../src/qa-integration.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -97,6 +97,61 @@ test("QA integration skips already-ready tasks unless forced", () => {
 
   assert.equal(planQaIntegrations(state, { project: "demo" }).taskCount, 0);
   assert.equal(planQaIntegrations(state, { project: "demo", force: true }).taskCount, 1);
+});
+
+test("QA integration honors retry windows for unchanged blocked work", () => {
+  const nowMs = Date.parse("2026-07-22T20:00:00.000Z");
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath: "/tmp/demo",
+      defaultBranch: "main",
+      reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/demo" },
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Blocked task",
+      status: "qa_review",
+      integrationStatus: "conflict",
+      integrationRetryNotBefore: "2026-07-22T20:15:00.000Z",
+      branchName: "codex/demo-task",
+    }],
+  };
+
+  assert.equal(planQaIntegrations(state, { project: "demo", nowMs }).taskCount, 0);
+  assert.equal(planQaIntegrations(state, { project: "demo", nowMs: nowMs + 16 * 60_000 }).taskCount, 1);
+  assert.equal(planQaIntegrations(state, { project: "demo", nowMs, force: true }).taskCount, 1);
+});
+
+test("QA result fingerprints ignore isolated workspace names but detect material changes", () => {
+  const task = { status: "validation_failed", source: "codex/demo", output: "Tests failed" };
+  const first = qaResultFingerprint({
+    status: "validation_failed",
+    integrationBranch: "qa/demo",
+    workspacePath: "/tmp/qa-one",
+    output: "Failure in /tmp/qa-one",
+    validation: [{ command: "npm test", ok: false, output: "at /tmp/qa-one/test.js" }],
+  }, task);
+  const repeated = qaResultFingerprint({
+    status: "validation_failed",
+    integrationBranch: "qa/demo",
+    workspacePath: "/tmp/qa-two",
+    output: "Failure in /tmp/qa-two",
+    validation: [{ command: "npm test", ok: false, output: "at /tmp/qa-two/test.js" }],
+  }, task);
+  const changed = qaResultFingerprint({
+    status: "validation_failed",
+    integrationBranch: "qa/demo",
+    workspacePath: "/tmp/qa-three",
+    output: "Different assertion failed in /tmp/qa-three",
+    validation: [{ command: "npm test", ok: false, output: "at /tmp/qa-three/test.js" }],
+  }, task);
+
+  assert.equal(first, repeated);
+  assert.notEqual(first, changed);
 });
 
 test("validation commands use the QA integration PATH override", async () => {
