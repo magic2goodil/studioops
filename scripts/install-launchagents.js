@@ -4,7 +4,12 @@ import { access, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promise
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { defaultRuntimeRoot, deployRuntime } from "../src/runtime-install.js";
+import {
+  defaultRuntimeRoot,
+  deployRuntime,
+  planSourceRemoteMigration,
+  sourceCheckoutSafetyError,
+} from "../src/runtime-install.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(process.cwd());
@@ -132,27 +137,90 @@ async function resolveNodePath() {
 
 async function ensureSourceCheckout() {
   if (sourceRoot === repoRoot) return sourceRoot;
-  const gitMarker = path.join(sourceRoot, ".git");
-  try {
-    await access(gitMarker);
-    return sourceRoot;
-  } catch {
-    // Create the canonical checkout below.
-  }
-  try {
-    await access(sourceRoot);
-    throw new Error(`StudioOps source root exists but is not a Git checkout: ${sourceRoot}`);
-  } catch (error) {
-    if (!String(error?.message || "").includes("ENOENT") && error?.code !== "ENOENT") throw error;
-  }
-  const { stdout: originUrl } = await execFileAsync("git", ["remote", "get-url", "origin"], {
+  const { stdout: originOutput } = await execFileAsync("git", ["remote", "get-url", "origin"], {
     cwd: repoRoot,
     timeout: 15_000,
   });
-  await mkdir(path.dirname(sourceRoot), { recursive: true, mode: 0o700 });
-  await execFileAsync("git", ["clone", "--no-tags", "--branch", sourceBranch, originUrl.trim(), sourceRoot], {
-    timeout: 5 * 60_000,
+  const desiredOrigin = originOutput.trim();
+  const gitMarker = path.join(sourceRoot, ".git");
+  try {
+    await access(gitMarker);
+  } catch {
+    // Create the canonical checkout below.
+    try {
+      await access(sourceRoot);
+      throw new Error(`StudioOps source root exists but is not a Git checkout: ${sourceRoot}`);
+    } catch (error) {
+      if (!String(error?.message || "").includes("ENOENT") && error?.code !== "ENOENT") throw error;
+    }
+    await mkdir(path.dirname(sourceRoot), { recursive: true, mode: 0o700 });
+    await execFileAsync("git", ["clone", "--no-tags", "--branch", sourceBranch, desiredOrigin, sourceRoot], {
+      timeout: 5 * 60_000,
+    });
+    return sourceRoot;
+  }
+
+  const { stdout: statusOutput } = await execFileAsync("git", ["status", "--porcelain"], {
+    cwd: sourceRoot,
+    timeout: 15_000,
   });
+  const { stdout: branchOutput } = await execFileAsync("git", ["symbolic-ref", "--short", "HEAD"], {
+    cwd: sourceRoot,
+    timeout: 15_000,
+  }).catch(() => ({ stdout: "" }));
+  const currentBranch = branchOutput.trim();
+  const initialSafetyError = sourceCheckoutSafetyError({ statusOutput, currentBranch, sourceBranch });
+  if (initialSafetyError) throw new Error(`StudioOps source checkout ${initialSafetyError}: ${sourceRoot}`);
+
+  const { stdout: existingOriginOutput } = await execFileAsync("git", ["remote", "get-url", "origin"], {
+    cwd: sourceRoot,
+    timeout: 15_000,
+  });
+  const existingOrigin = existingOriginOutput.trim();
+  const migration = planSourceRemoteMigration(existingOrigin, desiredOrigin);
+  if (migration.action === "reject") {
+    throw new Error(`StudioOps source checkout uses an unrelated origin and will not be rewritten: ${sourceRoot}`);
+  }
+
+  if (migration.action === "migrate") {
+    await execFileAsync("git", ["remote", "set-url", "origin", desiredOrigin], {
+      cwd: sourceRoot,
+      timeout: 15_000,
+    });
+  }
+
+  try {
+    await execFileAsync("git", ["fetch", "--no-tags", "origin", sourceBranch], {
+      cwd: sourceRoot,
+      timeout: 5 * 60_000,
+    });
+    const { stdout: divergenceOutput } = await execFileAsync(
+      "git",
+      ["rev-list", "--left-right", "--count", `HEAD...origin/${sourceBranch}`],
+      { cwd: sourceRoot, timeout: 15_000 },
+    );
+    const [ahead, behind] = divergenceOutput.trim().split(/\s+/).map(Number);
+    const divergenceError = sourceCheckoutSafetyError({ currentBranch, sourceBranch, ahead });
+    if (divergenceError) throw new Error(`StudioOps source checkout ${divergenceError}: ${sourceRoot}`);
+    if (behind > 0) {
+      await execFileAsync("git", ["merge", "--ff-only", `origin/${sourceBranch}`], {
+        cwd: sourceRoot,
+        timeout: 60_000,
+      });
+    }
+  } catch (error) {
+    if (migration.action === "migrate") {
+      await execFileAsync("git", ["remote", "set-url", "origin", existingOrigin], {
+        cwd: sourceRoot,
+        timeout: 15_000,
+      }).catch(() => {});
+    }
+    throw error;
+  }
+
+  if (migration.action === "migrate") {
+    console.log(`Migrated StudioOps self-update source from ${migration.existing} to ${migration.desired}.`);
+  }
   return sourceRoot;
 }
 
@@ -173,8 +241,8 @@ async function install() {
   await access(nodePath);
   await mkdir(launchAgentDir, { recursive: true });
   await mkdir(logDir, { recursive: true });
-  const runtime = await deployRuntime({ sourceRoot: repoRoot, runtimeRoot });
   const canonicalSourceRoot = await ensureSourceCheckout();
+  const runtime = await deployRuntime({ sourceRoot: repoRoot, runtimeRoot });
 
   const installed = [];
   for (const template of await templates()) {

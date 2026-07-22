@@ -6,6 +6,59 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const RUNTIME_ITEMS = ["src", "public", "scripts", "deploy", "package.json", "package-lock.json"];
+const LEGACY_REPOSITORY_NAME = "codex-mission-control";
+const CURRENT_REPOSITORY_NAME = "studioops";
+
+export function normalizeGitRemoteUrl(value) {
+  let remote = String(value || "").trim();
+  if (!remote) return "";
+
+  const scpStyle = remote.match(/^(?:[^@/]+@)?([^:]+):(.+)$/);
+  if (scpStyle && !remote.includes("://")) {
+    remote = `${scpStyle[1]}/${scpStyle[2]}`;
+  } else {
+    try {
+      const parsed = new URL(remote);
+      remote = `${parsed.hostname}${parsed.pathname}`;
+    } catch {
+      remote = remote.replace(/^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?/i, "");
+    }
+  }
+
+  return remote
+    .replace(/^\/+|\/+$/g, "")
+    .replace(/\.git$/i, "")
+    .toLowerCase();
+}
+
+export function planSourceRemoteMigration(existingOrigin, desiredOrigin) {
+  const existing = normalizeGitRemoteUrl(existingOrigin);
+  const desired = normalizeGitRemoteUrl(desiredOrigin);
+  if (!existing || !desired) return { action: "reject", reason: "missing_origin" };
+  if (existing === desired) return { action: "keep", existing, desired };
+
+  const existingParts = existing.split("/");
+  const desiredParts = desired.split("/");
+  const sameOwner = existingParts.length === desiredParts.length
+    && existingParts.slice(0, -1).join("/") === desiredParts.slice(0, -1).join("/");
+  const recognizedRename = sameOwner
+    && existingParts.at(-1) === LEGACY_REPOSITORY_NAME
+    && desiredParts.at(-1) === CURRENT_REPOSITORY_NAME;
+
+  if (recognizedRename) return { action: "migrate", existing, desired };
+  return { action: "reject", reason: "unrecognized_origin", existing, desired };
+}
+
+export function sourceCheckoutSafetyError(input = {}) {
+  if (String(input.statusOutput || "").trim()) return "has uncommitted changes";
+  const sourceBranch = String(input.sourceBranch || "main").trim();
+  const currentBranch = String(input.currentBranch || "").trim();
+  if (currentBranch !== sourceBranch) {
+    return `must be on ${sourceBranch}, but is on ${currentBranch || "a detached HEAD"}`;
+  }
+  if (Number(input.ahead || 0) > 0) return "has local commits and cannot be fast-forwarded safely";
+  return "";
+}
 
 function safeSegment(value) {
   return String(value || "runtime").replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80);
@@ -105,4 +158,3 @@ export async function deployRuntime(input = {}) {
     version,
   };
 }
-
