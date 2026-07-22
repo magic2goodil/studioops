@@ -146,6 +146,31 @@ test("local state migration refuses to overwrite an existing target database", a
   }
 });
 
+test("local state migration refuses to merge into an existing target root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-local-migration-root-"));
+  const sourceRoot = path.join(root, "legacy");
+  const targetRoot = path.join(root, "studioops", "control-plane");
+  try {
+    const sourceDatabase = await createLegacyRoot(sourceRoot);
+    const db = new DatabaseSync(sourceDatabase);
+    db.prepare("UPDATE runs SET status = 'completed'").run();
+    db.close();
+    await mkdir(targetRoot, { recursive: true });
+    await writeFile(path.join(targetRoot, "keep.txt"), "existing", "utf8");
+    await assert.rejects(
+      migrateLocalStudioOpsState({
+        sourceRoot,
+        targetRoot,
+        credentialsRoot: path.join(root, "studioops", "credentials", "github-apps"),
+      }),
+      /Refusing to merge migration state into an existing StudioOps working root/,
+    );
+    assert.equal(await readFile(path.join(targetRoot, "keep.txt"), "utf8"), "existing");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy operational workspaces move under the StudioOps home without overwriting targets", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-legacy-home-"));
   const sourceHome = path.join(root, ".mission-control");

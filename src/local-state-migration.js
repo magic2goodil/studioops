@@ -313,6 +313,9 @@ export async function migrateLocalStudioOpsState(input) {
   if (await exists(targetDatabase)) {
     throw new Error(`Refusing to overwrite an existing StudioOps database at ${targetDatabase}.`);
   }
+  if (await exists(targetRoot)) {
+    throw new Error(`Refusing to merge migration state into an existing StudioOps working root at ${targetRoot}.`);
+  }
 
   await mkdir(targetRoot, { recursive: true, mode: 0o700 });
   await chmod(targetRoot, 0o700).catch(() => {});
