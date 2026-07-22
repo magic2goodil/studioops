@@ -1,10 +1,16 @@
 # StudioOps
 
+<p align="center">
+  <img src="plugins/studioops/assets/studioops-logo.png" width="128" alt="StudioOps workflow hub icon">
+</p>
+
 StudioOps installs a senior AI engineering team around your software project. It turns intent into structured work, routes that work through isolated builders and specialist reviewers, assembles lead-approved changes in non-production QA, and keeps releases under human control.
 
 It is for developers who want an AI coding workflow to behave more like an accountable engineering team: tasks have acceptance criteria, builders work on separate branches, domain reviewers check the result, a lead makes the final automation decision, and the owner reviews a coherent local QA build instead of chasing individual agents.
 
 > **Project status:** developer preview. StudioOps is useful today on a single developer machine, but its interfaces and data model may still change. Read [Current Limitations](#current-limitations) before relying on it for critical work.
+
+![StudioOps routes structured work through builders, specialist review, QA, and a human release gate](plugins/studioops/assets/screenshot-flow-overview.png)
 
 ## What It Does
 
@@ -32,6 +38,16 @@ flowchart LR
 ```
 
 StudioOps automates the middle of the process. The human owner remains the authority for product acceptance, protected-branch merges, releases, and production deployment.
+
+## The AI Does Not Approve Itself
+
+Every builder and reviewer receives the same project standards. A passing backend review does not override missing frontend, accessibility, performance, or QA evidence; material findings send the PR back through the workflow.
+
+![StudioOps project standards and specialist review gates](plugins/studioops/assets/screenshot-standards-contract.png)
+
+This is a real StudioOps task: backend review approved PR #41, then frontend review requested changes because responsive captures, keyboard and accessibility checks, browser-console evidence, and Core Web Vitals were still missing.
+
+![A real StudioOps task with backend approval followed by frontend changes requested](plugins/studioops/assets/screenshot-review-gate.png)
 
 ## Requirements
 

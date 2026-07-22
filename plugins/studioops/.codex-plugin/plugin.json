@@ -1,6 +1,6 @@
 {
   "name": "studioops",
-  "version": "0.1.0+codex.20260722184227",
+  "version": "0.1.0+codex.20260722185504",
   "description": "Run software work through a senior AI engineering team and a structured delivery board.",
   "author": {
     "name": "Jason Robison",
@@ -28,6 +28,14 @@
       "Engineering workflow"
     ],
     "websiteURL": "https://github.com/magic2goodil/studioops",
+    "composerIcon": "./assets/studioops-composer-icon.png",
+    "logo": "./assets/studioops-logo.png",
+    "logoDark": "./assets/studioops-logo.png",
+    "screenshots": [
+      "./assets/screenshot-flow-overview.png",
+      "./assets/screenshot-standards-contract.png",
+      "./assets/screenshot-review-gate.png"
+    ],
     "defaultPrompt": [
       "Create this project in StudioOps.",
       "Run this feature through StudioOps.",

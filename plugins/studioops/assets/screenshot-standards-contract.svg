@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#131322"/>
+      <stop offset="1" stop-color="#24174a"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9b6cff"/>
+      <stop offset="1" stop-color="#30d9ff"/>
+    </linearGradient>
+    <filter id="s2" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#070711" flood-opacity="0.5"/></filter>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg2)"/>
+  <circle cx="1070" cy="110" r="250" fill="#2edcff" opacity="0.055"/>
+
+  <text x="60" y="72" fill="#a8a1bd" font-family="Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="1.8">STUDIOOPS · PROJECT STANDARDS</text>
+  <text x="60" y="124" fill="#ffffff" font-family="Arial, sans-serif" font-size="42" font-weight="800">Every agent reads the same engineering contract.</text>
+  <text x="60" y="160" fill="#bcb6cf" font-family="Arial, sans-serif" font-size="19">Standards are attached to the project, injected into builder and reviewer prompts, and enforced before release.</text>
+
+  <g transform="translate(60 205)" font-family="Arial, sans-serif" filter="url(#s2)">
+    <rect width="410" height="440" rx="24" fill="#191928" stroke="#3a3650"/>
+    <text x="28" y="41" fill="#ffffff" font-size="20" font-weight="800">17 standards loaded</text>
+    <text x="28" y="68" fill="#8f88a7" font-size="14">Virginia Beach Winery Redesign</text>
+    <g transform="translate(28 92)" font-size="15">
+      <rect width="354" height="42" rx="11" fill="#242238"/><circle cx="22" cy="21" r="7" fill="#6de5a5"/><text x="42" y="27" fill="#d8d3e3">engineering.md</text>
+      <rect y="50" width="354" height="42" rx="11" fill="#242238"/><circle cx="22" cy="71" r="7" fill="#6de5a5"/><text x="42" y="77" fill="#d8d3e3">security-privacy.md</text>
+      <rect y="100" width="354" height="42" rx="11" fill="#242238"/><circle cx="22" cy="121" r="7" fill="#6de5a5"/><text x="42" y="127" fill="#d8d3e3">accessibility.md</text>
+      <rect y="150" width="354" height="42" rx="11" fill="#242238"/><circle cx="22" cy="171" r="7" fill="#6de5a5"/><text x="42" y="177" fill="#d8d3e3">performance.md</text>
+      <rect y="200" width="354" height="42" rx="11" fill="#242238"/><circle cx="22" cy="221" r="7" fill="#6de5a5"/><text x="42" y="227" fill="#d8d3e3">testing.md</text>
+      <rect y="250" width="354" height="42" rx="11" fill="#242238"/><circle cx="22" cy="271" r="7" fill="#6de5a5"/><text x="42" y="277" fill="#d8d3e3">release-deployment.md</text>
+      <rect y="300" width="354" height="42" rx="11" fill="#1e1c31" stroke="#443d64"/><text x="177" y="327" fill="#aca4bf" text-anchor="middle" font-weight="700">+ 11 more project rules</text>
+    </g>
+  </g>
+
+  <g stroke="url(#line)" stroke-width="3" fill="none">
+    <path d="M486 352 C540 352 540 305 586 305"/>
+    <path d="M486 425 C540 425 540 425 586 425"/>
+    <path d="M486 500 C540 500 540 545 586 545"/>
+  </g>
+
+  <g transform="translate(585 232)" font-family="Arial, sans-serif" filter="url(#s2)">
+    <rect width="255" height="145" rx="21" fill="#211b38" stroke="#694ab5"/>
+    <rect x="20" y="20" width="88" height="25" rx="12" fill="#17343b"/><circle cx="34" cy="32.5" r="4" fill="#52e5c4"/><text x="46" y="37" fill="#80f0d7" font-size="11" font-weight="700">RUNNING</text>
+    <text x="20" y="76" fill="#ffffff" font-size="21" font-weight="800">Builder</text>
+    <text x="20" y="103" fill="#bbb5cb" font-size="14">Implements + validates</text>
+    <text x="20" y="126" fill="#9a93ad" font-size="13">Opens PR #41</text>
+
+    <rect y="170" width="255" height="145" rx="21" fill="#211b38" stroke="#4f456d"/>
+    <rect x="20" y="190" width="94" height="25" rx="12" fill="#1a382e"/><text x="67" y="207" fill="#85eeb7" font-size="11" text-anchor="middle" font-weight="700">APPROVED</text>
+    <text x="20" y="246" fill="#ffffff" font-size="21" font-weight="800">Backend reviewer</text>
+    <text x="20" y="273" fill="#bbb5cb" font-size="14">Fixes deterministic issue</text>
+    <text x="20" y="296" fill="#9a93ad" font-size="13">Validates data + security</text>
+
+    <rect y="340" width="255" height="145" rx="21" fill="#2b1c32" stroke="#b34f74"/>
+    <rect x="20" y="360" width="157" height="25" rx="12" fill="#4a2337"/><text x="98" y="377" fill="#ff9db5" font-size="11" text-anchor="middle" font-weight="700">CHANGES REQUESTED</text>
+    <text x="20" y="416" fill="#ffffff" font-size="21" font-weight="800">Frontend reviewer</text>
+    <text x="20" y="443" fill="#d8bdc7" font-size="14">Rejects missing evidence</text>
+    <text x="20" y="466" fill="#b99daa" font-size="13">Responsive · a11y · CWV</text>
+  </g>
+
+  <g transform="translate(880 232)" font-family="Arial, sans-serif" filter="url(#s2)">
+    <rect width="340" height="315" rx="24" fill="#171825" stroke="#3a3650"/>
+    <text x="26" y="42" fill="#a49db8" font-size="12" font-weight="700" letter-spacing="1.5">THE RESULT</text>
+    <text x="26" y="82" fill="#ffffff" font-size="27" font-weight="800">The AI does not</text>
+    <text x="26" y="114" fill="#ffffff" font-size="27" font-weight="800">approve itself.</text>
+    <line x1="26" y1="142" x2="314" y2="142" stroke="#3a3650"/>
+    <circle cx="44" cy="177" r="11" fill="#4b2740"/><text x="44" y="182" fill="#ff98b0" font-size="16" text-anchor="middle" font-weight="800">×</text>
+    <text x="68" y="182" fill="#d7d2e1" font-size="15">PR returns to the builder</text>
+    <circle cx="44" cy="219" r="11" fill="#2b3048"/><text x="44" y="224" fill="#8ecfff" font-size="16" text-anchor="middle" font-weight="800">↻</text>
+    <text x="68" y="224" fill="#d7d2e1" font-size="15">Evidence gaps stay visible</text>
+    <circle cx="44" cy="261" r="11" fill="#244033"/><text x="44" y="266" fill="#8ce8b5" font-size="16" text-anchor="middle" font-weight="800">✓</text>
+    <text x="68" y="266" fill="#d7d2e1" font-size="15">Human owns release</text>
+  </g>
+
+  <g transform="translate(880 572)" font-family="Arial, sans-serif">
+    <rect width="340" height="73" rx="20" fill="#20332d" stroke="#396b59"/>
+    <text x="24" y="30" fill="#83edb9" font-size="12" font-weight="700" letter-spacing="1.3">QUALITY GATE ACTIVE</text>
+    <text x="24" y="53" fill="#d6f7e5" font-size="15">No auto-merge · No production deploy</text>
+  </g>
+</svg>
