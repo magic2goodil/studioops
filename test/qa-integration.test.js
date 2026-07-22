@@ -954,7 +954,12 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
       const report = await runQaIntegration({ workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))} });
       console.log(JSON.stringify(report));
     `;
-    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: root,
+      env: {
+        STUDIOOPS_GITHUB_APPS_DIR: path.join(root, "missing-github-apps"),
+      },
+    });
     const report = JSON.parse(runResult.stdout.trim());
 
     assert.equal(report.projects[0].status, "blocked");
