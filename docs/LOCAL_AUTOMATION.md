@@ -62,7 +62,20 @@ Run maintenance commands from the same working root used during `npm run install
 
 ### Migrating a legacy or cloud-synchronized installation
 
-Do not relocate an active database by copying its live SQLite files. First let active builder and reviewer runs finish, prevent new claims, and run `npm run backup` from the existing working root. Verify the backup exists and is owner-readable only. Then copy the configuration, credentials, attachments, and the SQLite backup into `~/.codex/studioops/control-plane`, install agents with `STUDIOOPS_WORKING_ROOT=~/.codex/studioops/control-plane`, and verify `npm run status-agents`, `/api/health`, task counts, and queued-run recovery before retiring the old root. Keep the old root unchanged until those checks pass.
+Do not relocate an active database by copying its live SQLite files. The installer reads the existing web LaunchAgent to find its installed working root and refuses to stop any agents while a builder or reviewer run is active. Once idle, it stops all StudioOps writers together and uses SQLite's backup API to create:
+
+- `~/.codex/studioops/control-plane/data/backups/pre-local-root-migration-*.sqlite3`, mode `0600`
+- `~/.codex/studioops/control-plane/data/mission-control.sqlite3`, mode `0600`
+
+It also copies configuration and attachments under `~/.codex/studioops/control-plane`, migrates GitHub App credentials to `~/.codex/studioops/credentials/github-apps`, applies owner-only directory permissions, and then installs the new agent definitions. If migration or installation fails, the previous LaunchAgent files are restored and restarted. An existing destination database is never overwritten.
+
+For an installation without an existing web LaunchAgent, select the legacy working root explicitly:
+
+```bash
+STUDIOOPS_MIGRATE_FROM=/absolute/path/to/legacy-control-plane npm run install-agents
+```
+
+After installation, verify `npm run status-agents`, `http://127.0.0.1:4317/api/health`, project/task counts, migrated attachments, GitHub App access, and queued-run recovery before retiring the old root. The old source remains unchanged as a rollback copy.
 
 ## Status
 

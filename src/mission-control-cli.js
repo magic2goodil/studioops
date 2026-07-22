@@ -31,6 +31,11 @@ import {
   writeConfig,
 } from "./config.js";
 import { backupStateDatabase } from "./state-database.js";
+import {
+  defaultStudioOpsCredentialsRoot,
+  defaultStudioOpsGitLockRoot,
+  defaultStudioOpsWorkspaceRoot,
+} from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -127,7 +132,7 @@ async function setup() {
         root: workspaceRoot.trim() || "~/.codex/workspaces",
       },
       githubApps: {
-        credentialsDir: "~/.codex/studioops/credentials/github-apps",
+        credentialsDir: defaultStudioOpsCredentialsRoot(),
         defaultRole: "default",
         roleMap: {
           builder: "default",
@@ -178,17 +183,21 @@ async function setup() {
           model: "gpt-5.6-sol",
           modelReasoningEffort: "high",
           useWorkspaces: true,
-          workspaceRoot: "~/.codex/studioops/run-workspaces",
+          workspaceRoot: defaultStudioOpsWorkspaceRoot("run"),
+          gitLock: {
+            lockRoot: defaultStudioOpsGitLockRoot(),
+          },
           timeoutMs: 7200000,
         },
         qaIntegration: {
           intervalSeconds: 300,
           validationTimeoutMs: 600000,
+          workspaceRoot: defaultStudioOpsWorkspaceRoot("qa"),
         },
         promotion: {
           intervalSeconds: 300,
           validationTimeoutMs: 600000,
-          workspaceRoot: "~/.codex/studioops/promotion-workspaces",
+          workspaceRoot: defaultStudioOpsWorkspaceRoot("promotion"),
           githubAppAuth: true,
           githubAppRole: "promotion-worker",
         },

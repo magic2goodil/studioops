@@ -52,11 +52,13 @@ Notifier docs:
 docs/NOTIFIER.md
 ```
 
-Default local repo path for this machine:
+Default installed source checkout:
 
 ```text
-/Users/jrobison/Documents/Codex/2026-07-15/studioops
+~/.codex/studioops/source
 ```
+
+Persistent control-plane state, worker workspaces, runtime releases, logs, and credentials also live below `~/.codex/studioops`. Do not place StudioOps operational state in Documents, Desktop, or another cloud-synchronized directory.
 
 ## What The User Can Say
 

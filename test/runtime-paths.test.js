@@ -9,6 +9,8 @@ import {
   defaultStudioOpsSourceRoot,
   defaultStudioOpsWorkingRoot,
   defaultStudioOpsWorkspaceRoot,
+  missionControlDataDir,
+  missionControlRoot,
   studioOpsHome,
 } from "../src/runtime-paths.js";
 
@@ -40,5 +42,22 @@ test("STUDIOOPS_HOME supports an explicit home-relative local root", () => {
   } finally {
     if (previous === undefined) delete process.env.STUDIOOPS_HOME;
     else process.env.STUDIOOPS_HOME = previous;
+  }
+});
+
+test("STUDIOOPS_WORKING_ROOT selects the CLI and maintenance database instance", () => {
+  const previousRoot = process.env.STUDIOOPS_ROOT;
+  const previousWorkingRoot = process.env.STUDIOOPS_WORKING_ROOT;
+  delete process.env.STUDIOOPS_ROOT;
+  process.env.STUDIOOPS_WORKING_ROOT = "~/.codex/studioops-test-control-plane";
+  try {
+    const expected = path.join(os.homedir(), ".codex", "studioops-test-control-plane");
+    assert.equal(missionControlRoot(), expected);
+    assert.equal(missionControlDataDir(), path.join(expected, "data"));
+  } finally {
+    if (previousRoot === undefined) delete process.env.STUDIOOPS_ROOT;
+    else process.env.STUDIOOPS_ROOT = previousRoot;
+    if (previousWorkingRoot === undefined) delete process.env.STUDIOOPS_WORKING_ROOT;
+    else process.env.STUDIOOPS_WORKING_ROOT = previousWorkingRoot;
   }
 });

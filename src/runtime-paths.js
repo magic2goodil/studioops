@@ -40,7 +40,11 @@ export function defaultStudioOpsCredentialsRoot() {
 
 export function missionControlRoot() {
   return path.resolve(expandLocalPath(
-    process.env.STUDIOOPS_ROOT || process.env.MISSION_CONTROL_ROOT || process.cwd(),
+    process.env.STUDIOOPS_ROOT
+      || process.env.MISSION_CONTROL_ROOT
+      || process.env.STUDIOOPS_WORKING_ROOT
+      || process.env.MISSION_CONTROL_WORKING_ROOT
+      || defaultStudioOpsWorkingRoot(),
   ));
 }
 

@@ -21,7 +21,7 @@ import { DATA_DIR, findProject, findTask, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
-import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
+import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -937,8 +937,10 @@ export function sdkClientOptions(input = {}, authContext = null) {
   const env = githubAppAuthEnv(authContext, {
     ...process.env,
     PATH: childPath,
-    MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || process.cwd(),
-    MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || process.cwd(),
+    STUDIOOPS_ROOT: process.env.STUDIOOPS_ROOT || missionControlRoot(),
+    MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || missionControlRoot(),
+    STUDIOOPS_CONFIG_ROOT: process.env.STUDIOOPS_CONFIG_ROOT || missionControlRoot(),
+    MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || missionControlRoot(),
     MISSION_CONTROL_DATA_DIR: DATA_DIR,
   });
   if (!booleanOption(input.allowApiKeyAuth, false)) {
@@ -1114,8 +1116,10 @@ async function runClaimedRunWithCli(run, input = {}) {
         MISSION_CONTROL_WORKSPACE_PATH: executionRun.project.repoPath,
         MISSION_CONTROL_SOURCE_REPO_PATH: executionRun.project.sourceRepoPath || run.project.repoPath,
         MISSION_CONTROL_WORK_LANE: run.lane || "",
-        MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || process.cwd(),
-        MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || process.cwd(),
+        STUDIOOPS_ROOT: process.env.STUDIOOPS_ROOT || missionControlRoot(),
+        MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || missionControlRoot(),
+        STUDIOOPS_CONFIG_ROOT: process.env.STUDIOOPS_CONFIG_ROOT || missionControlRoot(),
+        MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || missionControlRoot(),
         MISSION_CONTROL_DATA_DIR: DATA_DIR,
         MISSION_CONTROL_RUN_MODEL: run.model || input.model || DEFAULT_EXECUTION_POLICY.model,
         MISSION_CONTROL_RUN_REASONING_EFFORT: run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort,

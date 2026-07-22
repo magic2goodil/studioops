@@ -1,4 +1,4 @@
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -64,8 +64,11 @@ export async function loadConfig(rootDir = missionControlConfigRoot()) {
 }
 
 export async function writeConfig(config, rootDir = missionControlConfigRoot()) {
+  await mkdir(rootDir, { recursive: true, mode: 0o700 });
+  await chmod(rootDir, 0o700).catch(() => {});
   const configPath = path.join(rootDir, CONFIG_FILE);
-  await writeFile(configPath, renderConfigMarkdown(config), "utf8");
+  await writeFile(configPath, renderConfigMarkdown(config), { encoding: "utf8", mode: 0o600 });
+  await chmod(configPath, 0o600).catch(() => {});
   return configPath;
 }
 

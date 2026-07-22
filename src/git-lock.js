@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
@@ -41,7 +41,7 @@ async function writeLockOwner(lockPath, repoPath) {
     pid: process.pid,
     repoPath: path.resolve(repoPath),
     acquiredAt: new Date().toISOString(),
-  }, null, 2), "utf8");
+  }, null, 2), { encoding: "utf8", mode: 0o600 });
 }
 
 function ownerAgeMs(owner, nowMs) {
@@ -63,11 +63,12 @@ export async function withGitRepositoryLock(repoPath, callback, options = {}) {
   const lockPath = lockPathFor(repoPath, options);
   const startedMs = Date.now();
 
-  await mkdir(path.dirname(lockPath), { recursive: true });
+  await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  await chmod(path.dirname(lockPath), 0o700).catch(() => {});
 
   while (true) {
     try {
-      await mkdir(lockPath);
+      await mkdir(lockPath, { mode: 0o700 });
       await writeLockOwner(lockPath, repoPath);
       try {
         return await callback();
