@@ -821,6 +821,7 @@ Automation:
       project: args.project || args.projects,
       task: args.task || args.tasks || args["task-id"],
       dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
+      force: Boolean(args.force || args.reintegrate),
       validationTimeoutMs: args["validation-timeout-ms"],
       githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
       githubAppCredentialsDir: args["github-apps-dir"],

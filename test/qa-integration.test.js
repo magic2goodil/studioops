@@ -13,6 +13,7 @@ import {
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
+import { planQaIntegrations } from "../src/qa-integration.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -72,6 +73,30 @@ test("review policy Trust Leads settings override stale top-level mirrors", () =
   );
   assert.equal(imported.reviewPolicy.trustLeadApprovals, true);
   assert.equal(imported.reviewPolicy.integrationBranch, "qa/imported");
+});
+
+test("QA integration skips already-ready tasks unless forced", () => {
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath: "/tmp/demo",
+      defaultBranch: "main",
+      reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/demo" },
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Ready task",
+      status: "qa_review",
+      integrationStatus: "ready",
+      branchName: "codex/demo-task",
+    }],
+  };
+
+  assert.equal(planQaIntegrations(state, { project: "demo" }).taskCount, 0);
+  assert.equal(planQaIntegrations(state, { project: "demo", force: true }).taskCount, 1);
 });
 
 test("validation commands use the QA integration PATH override", async () => {

@@ -791,6 +791,7 @@ export function planQaIntegrations(state, input = {}) {
       const tasks = (state.tasks || [])
         .filter((task) => task.projectId === project.id)
         .filter((task) => task.status === "qa_review")
+        .filter((task) => input.force || task.integrationStatus !== "ready")
         .filter((task) => taskMatches(task, input));
       return {
         projectId: project.id,
