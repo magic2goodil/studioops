@@ -8,6 +8,7 @@ import {
   defaultRuntimeRoot,
   deployRuntime,
   planSourceRemoteMigration,
+  sourceCheckoutSafetyError,
 } from "../src/runtime-install.js";
 
 const execFileAsync = promisify(execFile);
@@ -163,18 +164,13 @@ async function ensureSourceCheckout() {
     cwd: sourceRoot,
     timeout: 15_000,
   });
-  if (statusOutput.trim()) {
-    throw new Error(`StudioOps source checkout has uncommitted changes and cannot be updated safely: ${sourceRoot}`);
-  }
-
   const { stdout: branchOutput } = await execFileAsync("git", ["symbolic-ref", "--short", "HEAD"], {
     cwd: sourceRoot,
     timeout: 15_000,
   }).catch(() => ({ stdout: "" }));
   const currentBranch = branchOutput.trim();
-  if (currentBranch !== sourceBranch) {
-    throw new Error(`StudioOps source checkout must be on ${sourceBranch}, but is on ${currentBranch || "a detached HEAD"}: ${sourceRoot}`);
-  }
+  const initialSafetyError = sourceCheckoutSafetyError({ statusOutput, currentBranch, sourceBranch });
+  if (initialSafetyError) throw new Error(`StudioOps source checkout ${initialSafetyError}: ${sourceRoot}`);
 
   const { stdout: existingOriginOutput } = await execFileAsync("git", ["remote", "get-url", "origin"], {
     cwd: sourceRoot,
@@ -204,9 +200,8 @@ async function ensureSourceCheckout() {
       { cwd: sourceRoot, timeout: 15_000 },
     );
     const [ahead, behind] = divergenceOutput.trim().split(/\s+/).map(Number);
-    if (ahead > 0) {
-      throw new Error(`StudioOps source checkout has local commits and cannot be fast-forwarded safely: ${sourceRoot}`);
-    }
+    const divergenceError = sourceCheckoutSafetyError({ currentBranch, sourceBranch, ahead });
+    if (divergenceError) throw new Error(`StudioOps source checkout ${divergenceError}: ${sourceRoot}`);
     if (behind > 0) {
       await execFileAsync("git", ["merge", "--ff-only", `origin/${sourceBranch}`], {
         cwd: sourceRoot,

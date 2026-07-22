@@ -49,6 +49,17 @@ export function planSourceRemoteMigration(existingOrigin, desiredOrigin) {
   return { action: "reject", reason: "unrecognized_origin", existing, desired };
 }
 
+export function sourceCheckoutSafetyError(input = {}) {
+  if (String(input.statusOutput || "").trim()) return "has uncommitted changes";
+  const sourceBranch = String(input.sourceBranch || "main").trim();
+  const currentBranch = String(input.currentBranch || "").trim();
+  if (currentBranch !== sourceBranch) {
+    return `must be on ${sourceBranch}, but is on ${currentBranch || "a detached HEAD"}`;
+  }
+  if (Number(input.ahead || 0) > 0) return "has local commits and cannot be fast-forwarded safely";
+  return "";
+}
+
 function safeSegment(value) {
   return String(value || "runtime").replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80);
 }

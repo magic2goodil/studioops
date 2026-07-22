@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeGitRemoteUrl, planSourceRemoteMigration } from "../src/runtime-install.js";
+import {
+  normalizeGitRemoteUrl,
+  planSourceRemoteMigration,
+  sourceCheckoutSafetyError,
+} from "../src/runtime-install.js";
 
 test("Git remote normalization treats supported GitHub URL forms as equivalent", () => {
   assert.equal(
@@ -45,4 +49,12 @@ test("source migration rejects unrelated repositories and owners", () => {
     ).action,
     "reject",
   );
+});
+
+test("source checkout safety rejects dirty, detached, wrong-branch, and divergent states", () => {
+  assert.match(sourceCheckoutSafetyError({ statusOutput: " M file.js", currentBranch: "main" }), /uncommitted/);
+  assert.match(sourceCheckoutSafetyError({ currentBranch: "" }), /detached HEAD/);
+  assert.match(sourceCheckoutSafetyError({ currentBranch: "feature", sourceBranch: "main" }), /must be on main/);
+  assert.match(sourceCheckoutSafetyError({ currentBranch: "main", ahead: 1 }), /local commits/);
+  assert.equal(sourceCheckoutSafetyError({ currentBranch: "main", ahead: 0 }), "");
 });
