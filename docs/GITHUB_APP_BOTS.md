@@ -23,7 +23,7 @@ Click **Create StudioOps Bot**, approve the GitHub App registration, then instal
 Credentials are written locally under:
 
 ```text
-.mission-control/github-apps/default/
+~/.codex/studioops/credentials/github-apps/default/
 ```
 
 That directory is ignored by git.
@@ -63,7 +63,7 @@ Webhooks are not requested by default. StudioOps can add webhook handling later 
 
 ## Security
 
-Do not commit anything from `.mission-control/`.
+Do not commit anything from `~/.codex/studioops/credentials/`.
 
 The setup helper stores:
 
@@ -78,7 +78,7 @@ Private keys and secrets are written with owner-only file permissions where the 
 
 When the runner claims a builder or reviewer run, it:
 
-- reads the role's app metadata from `.mission-control/github-apps/`
+- reads the role's app metadata from `~/.codex/studioops/credentials/github-apps/`
 - signs a GitHub App JWT with the local private key
 - resolves the app installation for the run's `github.com` repository
 - creates a repository-scoped installation token with only the role permissions needed for branch, PR, comment, and review activity
@@ -144,7 +144,7 @@ For a smoke test, use a harmless documentation-only branch, push it through the 
 
 ## Role Mapping
 
-With `npm run setup-github-app`, all roles use `.mission-control/github-apps/default/`.
+With `npm run setup-github-app`, all roles use `~/.codex/studioops/credentials/github-apps/default/`.
 
 With `npm run setup-github-role-apps`, StudioOps looks for these directories:
 
@@ -159,7 +159,7 @@ You can override the mapping in `studioops.config.md`:
 
 ```json
 "githubApps": {
-  "credentialsDir": ".mission-control/github-apps",
+  "credentialsDir": "~/.codex/studioops/credentials/github-apps",
   "defaultRole": "default",
   "roleMap": {
     "builder": "default",
@@ -200,8 +200,8 @@ To rotate a private key:
 
 1. Open the GitHub App settings page from the app's `app.json` or `install-url.txt`.
 2. Generate a new private key in GitHub.
-3. Replace only the matching local `private-key.pem` file under `.mission-control/github-apps/<role>/`.
-4. Keep file permissions owner-only, for example `chmod 600 .mission-control/github-apps/<role>/private-key.pem`.
+3. Replace only the matching local `private-key.pem` file under `~/.codex/studioops/credentials/github-apps/<role>/`.
+4. Keep file permissions owner-only, for example `chmod 600 ~/.codex/studioops/credentials/github-apps/<role>/private-key.pem`.
 5. Delete the old private key in GitHub after a runner sweep succeeds with the new key.
 
-If an app is compromised or no longer needed, uninstall it from the repository and remove the matching local directory under `.mission-control/github-apps/`.
+If an app is compromised or no longer needed, uninstall it from the repository and remove the matching local directory under `~/.codex/studioops/credentials/github-apps/`.

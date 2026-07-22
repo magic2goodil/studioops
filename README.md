@@ -152,7 +152,7 @@ npm run install-agents
 npm run status-agents
 ```
 
-This publishes an immutable runtime under `~/.mission-control/runtime`, keeps a clean self-update checkout under `~/.mission-control/source`, and stores local state in the configured working root. See [Local Automation](docs/LOCAL_AUTOMATION.md) for worker responsibilities, QA preview setup, promotion, status commands, logs, and uninstall instructions.
+This publishes an immutable runtime under `~/.codex/studioops/runtime`, keeps a clean self-update checkout under `~/.codex/studioops/source`, and stores local state under `~/.codex/studioops/control-plane` by default. See [Local Automation](docs/LOCAL_AUTOMATION.md) for worker responsibilities, QA preview setup, promotion, status commands, logs, and uninstall instructions.
 
 ## GitHub Identities
 
@@ -174,7 +174,7 @@ StudioOps fails closed when GitHub App authentication is required but unavailabl
 
 The authoritative local state is `data/mission-control.sqlite3`. SQLite WAL mode and immediate transactions protect concurrent dispatcher, runner, review, QA, promotion, and notifier writes. Existing JSON state is imported once during migration and is not maintained as a second writable source of truth.
 
-The database, `~/.mission-control` runtime directory, environment variables, and LaunchAgent labels retain their legacy names in the first StudioOps release so existing installations upgrade without losing state or duplicating background workers.
+All new operational state defaults to the local-only `~/.codex/studioops` tree rather than `Documents`, Desktop, iCloud Drive, or another synchronized folder. Legacy `MISSION_CONTROL_*` environment variables, database filenames, and LaunchAgent labels remain supported so existing installations can migrate without losing state or duplicating workers.
 
 Create a consistent backup while workers are running:
 

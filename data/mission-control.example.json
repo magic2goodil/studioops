@@ -33,7 +33,7 @@
       "promotion": {
         "enabled": true,
         "targetBranch": "main",
-        "workspaceRoot": "~/.mission-control/promotion-workspaces",
+        "workspaceRoot": "~/.codex/studioops/promotion-workspaces",
         "validationCommands": [
           "npm run check"
         ]

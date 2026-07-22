@@ -575,10 +575,33 @@ export async function readDatabaseState() {
   return readStateFromOpenDatabase(db);
 }
 
+export function maintenanceWriteBlocker(state, input = {}) {
+  const lease = state?.meta?.selfUpdateLease;
+  if (!lease || typeof lease !== "object") return null;
+  const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
+  const expiresAt = Date.parse(lease.expiresAt || "");
+  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) return null;
+  const ownerPid = String(input.ownerPid || process.pid);
+  const authorizedLeaseId = String(
+    input.leaseId || process.env.STUDIOOPS_MAINTENANCE_LEASE_ID || "",
+  );
+  if (String(lease.ownerPid || "") === ownerPid || authorizedLeaseId === String(lease.id || "")) return null;
+  return lease;
+}
+
+function assertMaintenanceWriteAllowed(state) {
+  const lease = maintenanceWriteBlocker(state);
+  if (!lease) return;
+  const error = new Error(`StudioOps maintenance is in progress until ${lease.expiresAt}.`);
+  error.code = "STUDIOOPS_MAINTENANCE";
+  throw error;
+}
+
 export async function writeDatabaseState(state) {
   const db = await ensureStateDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
+    assertMaintenanceWriteAllowed(readStateFromOpenDatabase(db));
     reconcileStateIntegrity(state);
     const archived = compactOperationalHistory(state);
     if (archivedItemCount(archived)) {
@@ -601,6 +624,7 @@ export async function mutateDatabaseState(mutator) {
   db.exec("BEGIN IMMEDIATE");
   try {
     const state = readStateFromOpenDatabase(db);
+    assertMaintenanceWriteAllowed(state);
     const snapshot = mutationSnapshot(state);
     reconcileStateIntegrity(state);
     const result = await mutator(state);

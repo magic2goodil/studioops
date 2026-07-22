@@ -31,6 +31,11 @@ import {
   writeConfig,
 } from "./config.js";
 import { backupStateDatabase } from "./state-database.js";
+import {
+  defaultStudioOpsCredentialsRoot,
+  defaultStudioOpsGitLockRoot,
+  defaultStudioOpsWorkspaceRoot,
+} from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -107,7 +112,7 @@ async function setup() {
     console.log("This will write the local StudioOps configuration. It will not ask for or store private keys.\n");
     const displayName = await rl.question("Your display name: ");
     const githubOwner = await rl.question("GitHub user or organization for repos: ");
-    const workspaceRoot = await rl.question("Local workspace root [~/Development]: ");
+    const workspaceRoot = await rl.question("Local workspace root [~/.codex/workspaces]: ");
     const preferredProtocol = await rl.question("Git protocol [ssh]: ");
     const aiToolsRaw = await rl.question("AI tools to generate prompts for [codex]: ");
     const addFirstProject = (await rl.question("Add a first project now? [Y/n]: ")).trim().toLowerCase() !== "n";
@@ -124,10 +129,10 @@ async function setup() {
       },
       aiTools: (aiToolsRaw.trim() || "codex").split(",").map((tool) => tool.trim()).filter(Boolean),
       workspace: {
-        root: workspaceRoot.trim() || "~/Development",
+        root: workspaceRoot.trim() || "~/.codex/workspaces",
       },
       githubApps: {
-        credentialsDir: ".mission-control/github-apps",
+        credentialsDir: defaultStudioOpsCredentialsRoot(),
         defaultRole: "default",
         roleMap: {
           builder: "default",
@@ -178,17 +183,21 @@ async function setup() {
           model: "gpt-5.6-sol",
           modelReasoningEffort: "high",
           useWorkspaces: true,
-          workspaceRoot: "~/.mission-control/run-workspaces",
+          workspaceRoot: defaultStudioOpsWorkspaceRoot("run"),
+          gitLock: {
+            lockRoot: defaultStudioOpsGitLockRoot(),
+          },
           timeoutMs: 7200000,
         },
         qaIntegration: {
           intervalSeconds: 300,
           validationTimeoutMs: 600000,
+          workspaceRoot: defaultStudioOpsWorkspaceRoot("qa"),
         },
         promotion: {
           intervalSeconds: 300,
           validationTimeoutMs: 600000,
-          workspaceRoot: "~/.mission-control/promotion-workspaces",
+          workspaceRoot: defaultStudioOpsWorkspaceRoot("promotion"),
           githubAppAuth: true,
           githubAppRole: "promotion-worker",
         },

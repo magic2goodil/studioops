@@ -7,10 +7,35 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+import { maintenanceWriteBlocker } from "../src/state-database.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
 const storeModuleUrl = pathToFileURL(path.join(process.cwd(), "src/store.js")).href;
+
+test("maintenance lease blocks non-owner writes until it expires", () => {
+  const state = {
+    meta: {
+      selfUpdateLease: {
+        id: "lease_1",
+        ownerPid: "100",
+        expiresAt: "2026-07-22T22:00:00.000Z",
+      },
+    },
+  };
+  assert.equal(maintenanceWriteBlocker(state, {
+    nowMs: Date.parse("2026-07-22T21:00:00.000Z"),
+    ownerPid: "200",
+  })?.id, "lease_1");
+  assert.equal(maintenanceWriteBlocker(state, {
+    nowMs: Date.parse("2026-07-22T21:00:00.000Z"),
+    ownerPid: "100",
+  }), null);
+  assert.equal(maintenanceWriteBlocker(state, {
+    nowMs: Date.parse("2026-07-22T22:00:01.000Z"),
+    ownerPid: "200",
+  }), null);
+});
 
 function baseState() {
   return {

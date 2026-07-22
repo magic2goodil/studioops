@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
-import { cp, lstat, mkdir, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
-import os from "node:os";
+import { chmod, cp, lstat, mkdir, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { defaultStudioOpsRuntimeRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const RUNTIME_ITEMS = ["src", "public", "scripts", "deploy", "package.json", "package-lock.json"];
@@ -108,17 +108,49 @@ async function pruneOldReleases(runtimeRoot, currentRelease, keep = 3) {
 }
 
 export function defaultRuntimeRoot() {
-  return path.join(os.homedir(), ".mission-control", "runtime");
+  return defaultStudioOpsRuntimeRoot();
+}
+
+export async function activateRuntime(runtime, input = {}) {
+  await swapCurrentLink(runtime.runtimeRoot, runtime.releasePath);
+  if (input.prune !== false) {
+    await pruneOldReleases(runtime.runtimeRoot, runtime.releasePath, Number(input.keepReleases || 3));
+  }
+  return {
+    ...runtime,
+    currentPath: path.join(runtime.runtimeRoot, "current"),
+    currentTarget: await readlink(path.join(runtime.runtimeRoot, "current")),
+  };
+}
+
+export async function restoreRuntimeCurrent(runtime) {
+  const currentPath = path.join(runtime.runtimeRoot, "current");
+  if (runtime.previousCurrentTarget) {
+    await swapCurrentLink(runtime.runtimeRoot, runtime.previousCurrentTarget);
+  } else {
+    await rm(currentPath, { force: true });
+  }
+}
+
+export async function pruneRuntimeReleases(runtime, input = {}) {
+  await pruneOldReleases(runtime.runtimeRoot, runtime.releasePath, Number(input.keepReleases || 3));
 }
 
 export async function deployRuntime(input = {}) {
   const sourceRoot = path.resolve(input.sourceRoot || process.cwd());
-  const runtimeRoot = path.resolve(input.runtimeRoot || process.env.MISSION_CONTROL_RUNTIME_ROOT || defaultRuntimeRoot());
+  const runtimeRoot = path.resolve(
+    input.runtimeRoot
+      || process.env.STUDIOOPS_RUNTIME_ROOT
+      || process.env.MISSION_CONTROL_RUNTIME_ROOT
+      || defaultRuntimeRoot(),
+  );
   const version = await sourceVersion(sourceRoot);
   const releasesRoot = path.join(runtimeRoot, "releases");
   const releasePath = path.join(releasesRoot, version);
   const stagePath = path.join(releasesRoot, `.stage-${version}-${process.pid}-${Date.now()}`);
-  await mkdir(releasesRoot, { recursive: true });
+  await mkdir(releasesRoot, { recursive: true, mode: 0o700 });
+  await chmod(runtimeRoot, 0o700).catch(() => {});
+  await chmod(releasesRoot, 0o700).catch(() => {});
 
   let ready = false;
   try {
@@ -146,15 +178,22 @@ export async function deployRuntime(input = {}) {
     });
   }
 
-  await swapCurrentLink(runtimeRoot, releasePath);
-  await pruneOldReleases(runtimeRoot, releasePath, Number(input.keepReleases || 3));
   const currentPath = path.join(runtimeRoot, "current");
-  return {
+  let previousCurrentTarget = "";
+  try {
+    previousCurrentTarget = await readlink(currentPath);
+  } catch {
+    previousCurrentTarget = "";
+  }
+  const runtime = {
     sourceRoot,
     runtimeRoot,
     releasePath,
     currentPath,
-    currentTarget: await readlink(currentPath),
+    currentTarget: "",
+    previousCurrentTarget,
     version,
   };
+  if (input.activate === false) return runtime;
+  return activateRuntime(runtime, input);
 }

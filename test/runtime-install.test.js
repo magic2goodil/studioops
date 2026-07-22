@@ -1,10 +1,37 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readlink, rm, symlink } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
+  activateRuntime,
   normalizeGitRemoteUrl,
   planSourceRemoteMigration,
+  restoreRuntimeCurrent,
   sourceCheckoutSafetyError,
 } from "../src/runtime-install.js";
+
+test("staged runtime activation can restore the previous immutable release", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-runtime-"));
+  const oldRelease = path.join(root, "releases", "old");
+  const newRelease = path.join(root, "releases", "new");
+  try {
+    await mkdir(oldRelease, { recursive: true });
+    await mkdir(newRelease, { recursive: true });
+    await symlink(oldRelease, path.join(root, "current"), "dir");
+    const runtime = {
+      runtimeRoot: root,
+      releasePath: newRelease,
+      previousCurrentTarget: oldRelease,
+    };
+    await activateRuntime(runtime, { prune: false });
+    assert.equal(await readlink(path.join(root, "current")), newRelease);
+    await restoreRuntimeCurrent(runtime);
+    assert.equal(await readlink(path.join(root, "current")), oldRelease);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("Git remote normalization treats supported GitHub URL forms as equivalent", () => {
   assert.equal(

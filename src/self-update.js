@@ -587,7 +587,7 @@ export async function runSelfUpdate(input = {}) {
       try {
         updatedReport.runtimeDeployment = await deployRuntime({
           sourceRoot: finalPlan.repoPath,
-          runtimeRoot: input.runtimeRoot || process.env.MISSION_CONTROL_RUNTIME_ROOT,
+          runtimeRoot: input.runtimeRoot || process.env.STUDIOOPS_RUNTIME_ROOT || process.env.MISSION_CONTROL_RUNTIME_ROOT,
         });
       } catch (error) {
         updatedReport.status = "runtime_deploy_failed";

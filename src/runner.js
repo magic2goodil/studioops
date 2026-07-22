@@ -21,6 +21,7 @@ import { DATA_DIR, findProject, findTask, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
+import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -29,7 +30,7 @@ const DEFAULT_CODEX_BINS = [
 ];
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUN_OUTPUT_DIR = path.join(DATA_DIR, "run-outputs");
-const DEFAULT_WORKSPACE_ROOT = path.join(os.homedir(), ".mission-control", "run-workspaces");
+const DEFAULT_WORKSPACE_ROOT = defaultStudioOpsWorkspaceRoot("run");
 const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
 const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
@@ -336,7 +337,13 @@ export function cloneFallbackSource(repoPath, originUrl) {
 
 async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
   const gitEnv = githubAppAuthEnv(authContext, process.env);
-  const enabled = booleanOption(input.useWorkspaces ?? input.workspaces ?? process.env.MISSION_CONTROL_USE_WORKSPACES, true);
+  const enabled = booleanOption(
+    input.useWorkspaces
+      ?? input.workspaces
+      ?? process.env.STUDIOOPS_USE_WORKSPACES
+      ?? process.env.MISSION_CONTROL_USE_WORKSPACES,
+    true,
+  );
   if (!enabled) {
     return {
       executionRepoPath: run.project.repoPath,
@@ -345,7 +352,12 @@ async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
     };
   }
 
-  const workspaceRoot = resolveWorkspaceRoot(input.workspaceRoot || process.env.MISSION_CONTROL_WORKSPACE_ROOT || DEFAULT_WORKSPACE_ROOT);
+  const workspaceRoot = resolveWorkspaceRoot(
+    input.workspaceRoot
+      || process.env.STUDIOOPS_WORKSPACE_ROOT
+      || process.env.MISSION_CONTROL_WORKSPACE_ROOT
+      || DEFAULT_WORKSPACE_ROOT,
+  );
   const branch = branchNameForRun(run);
   const defaultBranch = run.project.defaultBranch || "main";
   const projectKey = slugify(run.project.key || run.projectId || "project");
@@ -925,8 +937,10 @@ export function sdkClientOptions(input = {}, authContext = null) {
   const env = githubAppAuthEnv(authContext, {
     ...process.env,
     PATH: childPath,
-    MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || process.cwd(),
-    MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || process.cwd(),
+    STUDIOOPS_ROOT: process.env.STUDIOOPS_ROOT || missionControlRoot(),
+    MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || missionControlRoot(),
+    STUDIOOPS_CONFIG_ROOT: process.env.STUDIOOPS_CONFIG_ROOT || missionControlRoot(),
+    MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || missionControlRoot(),
     MISSION_CONTROL_DATA_DIR: DATA_DIR,
   });
   if (!booleanOption(input.allowApiKeyAuth, false)) {
@@ -1102,8 +1116,10 @@ async function runClaimedRunWithCli(run, input = {}) {
         MISSION_CONTROL_WORKSPACE_PATH: executionRun.project.repoPath,
         MISSION_CONTROL_SOURCE_REPO_PATH: executionRun.project.sourceRepoPath || run.project.repoPath,
         MISSION_CONTROL_WORK_LANE: run.lane || "",
-        MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || process.cwd(),
-        MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || process.cwd(),
+        STUDIOOPS_ROOT: process.env.STUDIOOPS_ROOT || missionControlRoot(),
+        MISSION_CONTROL_ROOT: process.env.MISSION_CONTROL_ROOT || missionControlRoot(),
+        STUDIOOPS_CONFIG_ROOT: process.env.STUDIOOPS_CONFIG_ROOT || missionControlRoot(),
+        MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || missionControlRoot(),
         MISSION_CONTROL_DATA_DIR: DATA_DIR,
         MISSION_CONTROL_RUN_MODEL: run.model || input.model || DEFAULT_EXECUTION_POLICY.model,
         MISSION_CONTROL_RUN_REASONING_EFFORT: run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort,

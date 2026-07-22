@@ -11,13 +11,14 @@ import {
   redactSecrets,
 } from "./github-app-auth.js";
 import { mutateState, readState } from "./store.js";
+import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 120_000;
 const VALIDATION_TIMEOUT_MS = 10 * 60_000;
 const WORKSPACE_COMMAND_TIMEOUT_MS = 5 * 60_000;
 const MAX_OUTPUT_CHARS = 4_000;
-const DEFAULT_PROMOTION_WORKSPACE_ROOT = path.join(os.homedir(), ".mission-control", "promotion-workspaces");
+const DEFAULT_PROMOTION_WORKSPACE_ROOT = defaultStudioOpsWorkspaceRoot("promotion");
 const DEFAULT_PROMOTION_PATH = [
   "/opt/homebrew/bin",
   "/usr/local/bin",
@@ -242,6 +243,7 @@ async function preparePromotionWorkspace(sourceRepoPath, projectPlan, options = 
   const workspaceRoot = resolveWorkspaceRoot(
     options.promotionWorkspaceRoot
       || options.workspaceRoot
+      || process.env.STUDIOOPS_PROMOTION_WORKSPACE_ROOT
       || process.env.MISSION_CONTROL_PROMOTION_WORKSPACE_ROOT,
   );
   if (pathContains(sourceRepoPath, workspaceRoot)) {

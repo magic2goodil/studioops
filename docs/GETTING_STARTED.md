@@ -169,7 +169,7 @@ npm run install-agents
 npm run status-agents
 ```
 
-The installer publishes a stable runtime under `~/.mission-control/runtime`, creates a clean self-update checkout under `~/.mission-control/source`, and installs user LaunchAgents for the web UI and workflow workers. It does not require sudo or install a system daemon.
+The installer publishes a stable runtime under `~/.codex/studioops/runtime`, creates a clean self-update checkout under `~/.codex/studioops/source`, stores the control plane under `~/.codex/studioops/control-plane`, and installs user LaunchAgents for the web UI and workflow workers. It does not require sudo or install a system daemon.
 
 See [LOCAL_AUTOMATION.md](LOCAL_AUTOMATION.md) before configuring Trust Leads, local QA integration, preview restarts, or promotion.
 

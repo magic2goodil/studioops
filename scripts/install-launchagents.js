@@ -1,20 +1,40 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
-import { access, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
+  activateRuntime,
   defaultRuntimeRoot,
   deployRuntime,
   planSourceRemoteMigration,
+  pruneRuntimeReleases,
+  restoreRuntimeCurrent,
   sourceCheckoutSafetyError,
 } from "../src/runtime-install.js";
+import {
+  acquireStudioOpsMaintenanceLease,
+  migrateLegacyStudioOpsHome,
+  migrateLocalStudioOpsState,
+  releaseStudioOpsMaintenanceLease,
+} from "../src/local-state-migration.js";
+import {
+  defaultStudioOpsCredentialsRoot,
+  defaultStudioOpsSourceRoot,
+  defaultStudioOpsWorkingRoot,
+  expandLocalPath,
+  studioOpsHome,
+} from "../src/runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(process.cwd());
 const workingRoot = path.resolve(
-  process.env.STUDIOOPS_WORKING_ROOT || process.env.MISSION_CONTROL_WORKING_ROOT || repoRoot,
+  expandLocalPath(
+    process.env.STUDIOOPS_WORKING_ROOT
+      || process.env.MISSION_CONTROL_WORKING_ROOT
+      || defaultStudioOpsWorkingRoot(),
+  ),
 );
 const templateDir = path.join(repoRoot, "deploy", "local");
 const launchAgentDir = path.join(os.homedir(), "Library", "LaunchAgents");
@@ -24,9 +44,11 @@ const defaultHost = process.env.STUDIOOPS_HOST || process.env.MISSION_CONTROL_HO
 const defaultPort = process.env.STUDIOOPS_PORT || process.env.MISSION_CONTROL_PORT || "4317";
 const runtimeRoot = process.env.STUDIOOPS_RUNTIME_ROOT || process.env.MISSION_CONTROL_RUNTIME_ROOT || defaultRuntimeRoot();
 const sourceRoot = path.resolve(
-  process.env.STUDIOOPS_SOURCE_ROOT
-    || process.env.MISSION_CONTROL_SOURCE_ROOT
-    || path.join(os.homedir(), ".mission-control", "source"),
+  expandLocalPath(
+    process.env.STUDIOOPS_SOURCE_ROOT
+      || process.env.MISSION_CONTROL_SOURCE_ROOT
+      || defaultStudioOpsSourceRoot(),
+  ),
 );
 const sourceBranch = process.env.STUDIOOPS_SOURCE_BRANCH || process.env.MISSION_CONTROL_SOURCE_BRANCH || "main";
 
@@ -39,18 +61,122 @@ Usage:
   npm run status-agents
 
 Optional environment:
+  STUDIOOPS_HOME=~/.codex/studioops  Local-only root for all StudioOps operational state
   STUDIOOPS_HOST=0.0.0.0        Bind web UI to the local network
   STUDIOOPS_PORT=4317           Web UI port
   STUDIOOPS_WORKING_ROOT=...    Persistent config and SQLite state root
+  STUDIOOPS_MIGRATE_FROM=...    Legacy working root to migrate after active runs finish
+  STUDIOOPS_LEGACY_HOME=...     Legacy operational workspace root; defaults to ~/.mission-control
   STUDIOOPS_RUNTIME_ROOT=...    Immutable installed runtime root
   STUDIOOPS_SOURCE_ROOT=...     Clean main checkout used by self-update
   MISSION_CONTROL_HOST=0.0.0.0   Bind web UI to the local network
   MISSION_CONTROL_PORT=4317      Web UI port
   MISSION_CONTROL_NODE_PATH=...  Stable Node.js binary for every LaunchAgent
-  MISSION_CONTROL_RUNTIME_ROOT=~/.mission-control/runtime
+  MISSION_CONTROL_RUNTIME_ROOT=...  Legacy alias for STUDIOOPS_RUNTIME_ROOT
   MISSION_CONTROL_WORKING_ROOT=... Use a separate source/config/data checkout
-  MISSION_CONTROL_SOURCE_ROOT=~/.mission-control/source Clean main checkout used by self-update
+  MISSION_CONTROL_SOURCE_ROOT=... Legacy alias for STUDIOOPS_SOURCE_ROOT
 `);
+}
+
+async function pathExists(filePath) {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureWorkingRoot() {
+  await mkdir(studioOpsHome(), { recursive: true, mode: 0o700 });
+  await chmod(studioOpsHome(), 0o700).catch(() => {});
+  await mkdir(workingRoot, { recursive: true, mode: 0o700 });
+  await chmod(workingRoot, 0o700).catch(() => {});
+  if (workingRoot === repoRoot) return;
+
+  const configNames = ["studioops.config.md", "mission-control.config.md"];
+  for (const name of configNames) {
+    if (await pathExists(path.join(workingRoot, name))) return;
+  }
+  for (const name of configNames) {
+    const source = path.join(repoRoot, name);
+    if (!(await pathExists(source))) continue;
+    const destination = path.join(workingRoot, name);
+    await copyFile(source, destination);
+    await chmod(destination, 0o600).catch(() => {});
+    console.log(`Copied local StudioOps configuration to ${destination}.`);
+    return;
+  }
+  throw new Error(
+    `No StudioOps configuration found. Run \`studioops setup\` in ${repoRoot} before installing agents, or place studioops.config.md in ${workingRoot}.`,
+  );
+}
+
+async function installedWorkingRoot() {
+  const webPlist = targetPathForLabel("com.codex.mission-control.web");
+  if (!(await pathExists(webPlist))) return "";
+  try {
+    const { stdout } = await execFileAsync(
+      "/usr/bin/plutil",
+      ["-extract", "WorkingDirectory", "raw", "-o", "-", webPlist],
+      { timeout: 10_000 },
+    );
+    return path.resolve(String(stdout || "").trim());
+  } catch {
+    return "";
+  }
+}
+
+async function rootHasLocalState(root) {
+  if (!root) return false;
+  for (const candidate of [
+    path.join(root, "data", "mission-control.sqlite3"),
+    path.join(root, "studioops.config.md"),
+    path.join(root, "mission-control.config.md"),
+  ]) {
+    if (await pathExists(candidate)) return true;
+  }
+  return false;
+}
+
+async function snapshotLaunchAgentFiles(templateList) {
+  const snapshots = new Map();
+  for (const template of templateList) {
+    const target = targetPathForLabel(template.label);
+    snapshots.set(target, (await pathExists(target)) ? await readFile(target, "utf8") : null);
+  }
+  return snapshots;
+}
+
+async function restoreLaunchAgentFiles(snapshots) {
+  for (const [target, contents] of snapshots) {
+    if (contents === null) await rm(target, { force: true });
+    else await writeFile(target, contents, "utf8");
+  }
+}
+
+async function setPlistEnvironment(target) {
+  const values = {
+    STUDIOOPS_HOME: studioOpsHome(),
+    STUDIOOPS_ROOT: workingRoot,
+    STUDIOOPS_CONFIG_ROOT: workingRoot,
+    STUDIOOPS_DATA_DIR: path.join(workingRoot, "data"),
+    STUDIOOPS_RUNTIME_ROOT: runtimeRoot,
+    STUDIOOPS_SOURCE_ROOT: sourceRoot,
+  };
+  try {
+    await execFileAsync("/usr/bin/plutil", ["-extract", "EnvironmentVariables", "xml1", "-o", "-", target]);
+  } catch {
+    await execFileAsync("/usr/bin/plutil", ["-insert", "EnvironmentVariables", "-xml", "<dict/>", target]);
+  }
+  for (const [key, value] of Object.entries(values)) {
+    const plistKey = `EnvironmentVariables.${key}`;
+    try {
+      await execFileAsync("/usr/bin/plutil", ["-replace", plistKey, "-string", value, target]);
+    } catch {
+      await execFileAsync("/usr/bin/plutil", ["-insert", plistKey, "-string", value, target]);
+    }
+  }
 }
 
 function ensureMac() {
@@ -75,6 +201,31 @@ async function launchctl(args, options = {}) {
     if (options.ignoreErrors) return `${error.stdout || ""}${error.stderr || error.message}`.trim();
     throw error;
   }
+}
+
+async function labelIsLoaded(label) {
+  try {
+    await launchctl(["print", `gui/${uid}/${label}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function assertLabelsUnloaded(labels) {
+  const loaded = [];
+  for (const label of labels) {
+    if (await labelIsLoaded(label)) loaded.push(label);
+  }
+  if (loaded.length) throw new Error(`StudioOps agents did not stop cleanly: ${loaded.join(", ")}`);
+}
+
+async function assertLabelsLoaded(labels) {
+  const missing = [];
+  for (const label of labels) {
+    if (!(await labelIsLoaded(label))) missing.push(label);
+  }
+  if (missing.length) throw new Error(`StudioOps agents did not load cleanly: ${missing.join(", ")}`);
 }
 
 async function templates() {
@@ -240,27 +391,141 @@ async function install() {
   const nodePath = await resolveNodePath();
   await access(nodePath);
   await mkdir(launchAgentDir, { recursive: true });
-  await mkdir(logDir, { recursive: true });
-  const canonicalSourceRoot = await ensureSourceCheckout();
-  const runtime = await deployRuntime({ sourceRoot: repoRoot, runtimeRoot });
-
+  const templateList = await templates();
+  const previousWorkingRoot = await installedWorkingRoot();
+  const explicitMigrationRoot = expandLocalPath(process.env.STUDIOOPS_MIGRATE_FROM || "");
+  const repoHasState = await rootHasLocalState(repoRoot);
+  const migrationRoot = explicitMigrationRoot
+    ? path.resolve(explicitMigrationRoot)
+    : previousWorkingRoot || (repoHasState ? repoRoot : "");
+  const maintenanceId = `local_root_install_${process.pid}_${Date.now()}`;
+  const maintenanceRoots = [...new Set([migrationRoot, workingRoot].filter(Boolean).map((item) => path.resolve(item)))];
   const installed = [];
-  for (const template of await templates()) {
-    const target = targetPathForLabel(template.label);
-    const rendered = renderTemplate(await readFile(template.source, "utf8"), runtime, canonicalSourceRoot, nodePath);
-    await launchctl(["bootout", `gui/${uid}`, target], { ignoreErrors: true });
-    await writeFile(target, rendered, "utf8");
-    await launchctl(["bootstrap", `gui/${uid}`, target]);
-    await launchctl(["enable", `gui/${uid}/${template.label}`], { ignoreErrors: true });
-    installed.push(template.label);
+  let previousPlists = null;
+  let agentsStopped = false;
+  let maintenanceReleased = false;
+  let migrationResult = null;
+  let migrationAttempted = false;
+  let migrationTargetExisted = false;
+  let stagedRuntime = null;
+  let runtimeActivated = false;
+
+  const releaseMaintenance = async () => {
+    if (maintenanceReleased) return;
+    for (const root of [...new Set([...maintenanceRoots, workingRoot])]) {
+      await releaseStudioOpsMaintenanceLease(root, maintenanceId);
+    }
+    maintenanceReleased = true;
+  };
+
+  try {
+    for (const root of maintenanceRoots) {
+      await acquireStudioOpsMaintenanceLease(root, { id: maintenanceId });
+    }
+    const canonicalSourceRoot = await ensureSourceCheckout();
+    stagedRuntime = await deployRuntime({ sourceRoot: repoRoot, runtimeRoot, activate: false });
+    previousPlists = await snapshotLaunchAgentFiles(templateList);
+    agentsStopped = true;
+    for (const template of templateList) {
+      await launchctl(["bootout", `gui/${uid}`, targetPathForLabel(template.label)], { ignoreErrors: true });
+    }
+    await assertLabelsUnloaded(templateList.map((template) => template.label));
+
+    const legacyHome = path.resolve(expandLocalPath(
+      process.env.STUDIOOPS_LEGACY_HOME || path.join(os.homedir(), ".mission-control"),
+    ));
+    const homeMigration = await migrateLegacyStudioOpsHome({
+      sourceHome: legacyHome,
+      targetHome: studioOpsHome(),
+    });
+    if (homeMigration.copied.length) {
+      console.log(`Migrated legacy StudioOps workspace directories: ${homeMigration.copied.join(", ")}.`);
+    }
+    if (migrationRoot && path.resolve(migrationRoot) !== workingRoot) {
+      migrationAttempted = true;
+      migrationTargetExisted = await pathExists(workingRoot);
+      migrationResult = await migrateLocalStudioOpsState({
+        sourceRoot: migrationRoot,
+        targetRoot: workingRoot,
+        credentialsRoot: defaultStudioOpsCredentialsRoot(),
+        legacyHome,
+        studioHome: studioOpsHome(),
+      });
+      console.log(`Migrated StudioOps working state from ${migrationRoot} to ${workingRoot}.`);
+      if (migrationResult.backupPath) console.log(`Migration backup: ${migrationResult.backupPath}`);
+    }
+    await ensureWorkingRoot();
+    await mkdir(logDir, { recursive: true, mode: 0o700 });
+    await chmod(logDir, 0o700).catch(() => {});
+    for (const template of templateList) {
+      const target = targetPathForLabel(template.label);
+      const rendered = renderTemplate(await readFile(template.source, "utf8"), stagedRuntime, canonicalSourceRoot, nodePath);
+      await writeFile(target, rendered, "utf8");
+      await setPlistEnvironment(target);
+    }
+    await activateRuntime(stagedRuntime, { prune: false });
+    runtimeActivated = true;
+    for (const template of templateList) {
+      const target = targetPathForLabel(template.label);
+      await launchctl(["bootstrap", `gui/${uid}`, target]);
+      await launchctl(["enable", `gui/${uid}/${template.label}`], { ignoreErrors: true });
+      installed.push(template.label);
+    }
+    await assertLabelsLoaded(templateList.map((template) => template.label));
+    await releaseMaintenance();
+    await pruneRuntimeReleases(stagedRuntime).catch((pruneError) => {
+      console.error(`StudioOps runtime cleanup deferred: ${pruneError.message}`);
+    });
+  } catch (error) {
+    let rollbackError = null;
+    try {
+      if (agentsStopped && previousPlists) {
+        for (const template of templateList) {
+          await launchctl(["bootout", `gui/${uid}`, targetPathForLabel(template.label)], { ignoreErrors: true });
+        }
+        await assertLabelsUnloaded(templateList.map((template) => template.label));
+        if (runtimeActivated && stagedRuntime) {
+          await restoreRuntimeCurrent(stagedRuntime);
+          runtimeActivated = false;
+        }
+        await restoreLaunchAgentFiles(previousPlists);
+        const previousLabels = templateList
+          .filter((template) => previousPlists.get(targetPathForLabel(template.label)) !== null)
+          .map((template) => template.label);
+        for (const label of previousLabels) {
+          const target = targetPathForLabel(label);
+          await launchctl(["bootstrap", `gui/${uid}`, target]);
+          await launchctl(["enable", `gui/${uid}/${label}`], { ignoreErrors: true });
+        }
+        await assertLabelsLoaded(previousLabels);
+      }
+      await releaseMaintenance();
+      if (
+        (migrationResult?.status === "migrated" || (migrationAttempted && !migrationTargetExisted))
+        && await pathExists(workingRoot)
+      ) {
+        const quarantinePath = `${workingRoot}.failed-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+        await rename(workingRoot, quarantinePath);
+        console.error(`Quarantined failed StudioOps migration at ${quarantinePath}.`);
+      }
+    } catch (rollbackFailure) {
+      rollbackError = rollbackFailure;
+    }
+    if (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        `StudioOps installation failed and rollback could not be verified. Maintenance remains active: ${error.message}; rollback: ${rollbackError.message}`,
+      );
+    }
+    throw error;
   }
 
   console.log(`Installed ${installed.length} StudioOps LaunchAgents:`);
   for (const label of installed) console.log(`- ${label}`);
   console.log(`Logs: ${logDir}`);
-  console.log(`Runtime: ${runtime.releasePath}`);
+  console.log(`Runtime: ${runtimeRoot}`);
   console.log(`Node: ${nodePath}`);
-  console.log(`Self-update source: ${canonicalSourceRoot}`);
+  console.log(`Self-update source: ${sourceRoot}`);
 }
 
 async function uninstall() {

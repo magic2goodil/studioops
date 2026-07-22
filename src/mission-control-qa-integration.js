@@ -47,6 +47,7 @@ async function optionsFrom(args) {
     dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
     force: Boolean(args.force || args.reintegrate),
     validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
+    qaWorkspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
     githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || defaults.githubAppAuth),
     githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir,
     githubAppRole: args["github-app-role"] || defaults.githubAppRole,
@@ -93,7 +94,7 @@ Usage:
   studioops-qa-integration --project myapp --force
   studioops-qa-integration --watch --interval 300
   studioops qa-integrate --plan
-  studioops qa-integrate --github-apps-dir .mission-control/github-apps
+  studioops qa-integrate --github-apps-dir ~/.codex/studioops/credentials/github-apps
 
 The worker merges qa_review task PR heads into a project's configured
 non-production integrationBranch only when trustLeadApprovals is enabled. It

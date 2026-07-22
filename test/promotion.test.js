@@ -18,6 +18,7 @@ async function run(command, args, options = {}) {
     env: {
       ...process.env,
       GIT_TERMINAL_PROMPT: "0",
+      ...(options.cwd ? { STUDIOOPS_ROOT: options.cwd } : {}),
       ...(options.env || {}),
     },
     timeout: options.timeout || 60_000,
