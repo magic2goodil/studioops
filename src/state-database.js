@@ -1,4 +1,5 @@
 import { backup, DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileExists } from "./config.js";
@@ -7,13 +8,17 @@ import { missionControlDataDir, missionControlRoot } from "./runtime-paths.js";
 const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles"]);
-const STATE_INTEGRITY_VERSION = 2;
+const STATE_INTEGRITY_VERSION = 3;
+const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
+const ACTIVE_QA_COMMENTS_PER_TASK = 20;
+const ACTIVE_QA_EVENTS_PER_TASK = 40;
 const DATA_DIR = missionControlDataDir();
 export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
 
 let database = null;
 let integrityMigrated = false;
+let integrityMigrationPromise = null;
 
 async function secureStoragePaths() {
   await chmod(DATA_DIR, 0o700).catch(() => {});
@@ -94,6 +99,16 @@ function openDatabase() {
       updated_at TEXT NOT NULL DEFAULT '',
       payload TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS operational_archive (
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      project_id TEXT NOT NULL DEFAULT '',
+      task_id TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT '',
+      archived_at TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      PRIMARY KEY(entity_type, entity_id)
+    );
     CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
     CREATE INDEX IF NOT EXISTS idx_comments_task_created ON comments(task_id, created_at);
@@ -102,8 +117,98 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_runs_status_updated ON runs(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
     CREATE INDEX IF NOT EXISTS idx_qa_bundles_project_status ON qa_bundles(project_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
   `);
   return database;
+}
+
+function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
+  const counts = new Map();
+  const keep = new Array(items.length).fill(true);
+  const archived = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!matches(item)) continue;
+    const key = groupKey(item);
+    const count = counts.get(key) || 0;
+    counts.set(key, count + 1);
+    if (count >= limit) {
+      keep[index] = false;
+      archived.push(item);
+    }
+  }
+  return {
+    active: items.filter((_, index) => keep[index]),
+    archived: archived.reverse(),
+  };
+}
+
+export function compactOperationalHistory(state, input = {}) {
+  const commentLimit = Math.max(1, Number(input.commentLimit || ACTIVE_QA_COMMENTS_PER_TASK));
+  const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
+  const qaEventEvidence = new Set((Array.isArray(state.events) ? state.events : [])
+    .filter((event) => /^qa_integration_/.test(event.type || ""))
+    .map((event) => `${event.taskId || ""}|${event.createdAt || ""}`));
+  const comments = archiveOldestBeyondLimit(
+    Array.isArray(state.comments) ? state.comments : [],
+    (comment) => (
+      (comment.systemGenerated === true && comment.kind === "qa_integration")
+      || (
+        QA_COMMENT_AUTHORS.has(comment.author)
+        && /^QA integration\b/.test(comment.body || "")
+        && qaEventEvidence.has(`${comment.taskId || ""}|${comment.createdAt || ""}`)
+      )
+    ),
+    (comment) => comment.taskId || "unassigned",
+    commentLimit,
+  );
+  const events = archiveOldestBeyondLimit(
+    Array.isArray(state.events) ? state.events : [],
+    (event) => /^qa_(?:integration|bundle)_/.test(event.type || ""),
+    (event) => event.taskId || `${event.projectId || "unassigned"}:${event.type || "qa"}`,
+    eventLimit,
+  );
+  state.comments = comments.active;
+  state.events = events.active;
+  return { comments: comments.archived, events: events.archived };
+}
+
+function archiveOperationalHistory(db, archived, now) {
+  const statement = db.prepare(`
+    INSERT OR IGNORE INTO operational_archive(
+      entity_type, entity_id, project_id, task_id, created_at, archived_at, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const [entityType, items] of Object.entries(archived)) {
+    for (const item of items) {
+      statement.run(
+        entityType,
+        item.id,
+        item.projectId || "",
+        item.taskId || "",
+        item.createdAt || "",
+        now,
+        JSON.stringify(item),
+      );
+    }
+  }
+}
+
+function archivedItemCount(archived) {
+  return Object.values(archived).reduce((count, items) => count + items.length, 0);
+}
+
+function recordOperationalArchiveMetadata(state, archived, now, backupPath = "") {
+  const previous = state.meta?.operationalArchive || {};
+  state.meta.operationalArchive = {
+    migratedAt: previous.migratedAt || now,
+    updatedAt: now,
+    backupPath: backupPath || previous.backupPath || "",
+    comments: Number(previous.comments || 0) + archived.comments.length,
+    events: Number(previous.events || 0) + archived.events.length,
+    activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
+    activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
+  };
 }
 
 function parsePayload(value, fallback) {
@@ -365,13 +470,30 @@ function writeMutationToOpenDatabase(db, state, snapshot) {
   }
 }
 
-function migrateStateIntegrity(db) {
+async function preMigrationBackup(db) {
+  const backupDir = path.join(DATA_DIR, "backups");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const outputPath = path.join(
+    backupDir,
+    `pre-integrity-v${STATE_INTEGRITY_VERSION}-${timestamp}-${process.pid}-${randomUUID()}.sqlite3`,
+  );
+  await mkdir(backupDir, { recursive: true, mode: 0o700 });
+  await backup(db, outputPath);
+  await chmod(outputPath, 0o600);
+  return outputPath;
+}
+
+async function runStateIntegrityMigration(db) {
   if (integrityMigrated) return;
   const currentMeta = db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
   if (Number(parsePayload(currentMeta?.payload, {}).stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION) {
     integrityMigrated = true;
     return;
   }
+  // Node's SQLite backup API cannot run on a connection with an active write
+  // transaction. Serialize migration attempts in-process, take the recovery
+  // snapshot first, then acquire the database write lock before any mutation.
+  const backupPath = await preMigrationBackup(db);
   db.exec("BEGIN IMMEDIATE");
   try {
     const state = readStateFromOpenDatabase(db);
@@ -382,11 +504,15 @@ function migrateStateIntegrity(db) {
     }
     const snapshot = mutationSnapshot(state);
     reconcileStateIntegrity(state);
-    backfillIntegratedQaBundles(state, new Date().toISOString());
+    const now = new Date().toISOString();
+    backfillIntegratedQaBundles(state, now);
     reconcileStateIntegrity(state);
+    const archived = compactOperationalHistory(state);
+    archiveOperationalHistory(db, archived, now);
     state.meta = state.meta || {};
     state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
-    state.meta.updatedAt = new Date().toISOString();
+    recordOperationalArchiveMetadata(state, archived, now, backupPath);
+    state.meta.updatedAt = now;
     writeMutationToOpenDatabase(db, state, snapshot);
     db.exec("COMMIT");
     integrityMigrated = true;
@@ -394,6 +520,16 @@ function migrateStateIntegrity(db) {
     db.exec("ROLLBACK");
     throw error;
   }
+}
+
+async function migrateStateIntegrity(db) {
+  if (integrityMigrated) return;
+  if (!integrityMigrationPromise) {
+    integrityMigrationPromise = runStateIntegrityMigration(db).finally(() => {
+      integrityMigrationPromise = null;
+    });
+  }
+  return integrityMigrationPromise;
 }
 
 async function initialState() {
@@ -429,7 +565,7 @@ export async function ensureStateDatabase() {
       throw error;
     }
   }
-  migrateStateIntegrity(db);
+  await migrateStateIntegrity(db);
   await secureStoragePaths();
   return db;
 }
@@ -444,6 +580,13 @@ export async function writeDatabaseState(state) {
   db.exec("BEGIN IMMEDIATE");
   try {
     reconcileStateIntegrity(state);
+    const archived = compactOperationalHistory(state);
+    if (archivedItemCount(archived)) {
+      const now = new Date().toISOString();
+      archiveOperationalHistory(db, archived, now);
+      state.meta = state.meta || {};
+      recordOperationalArchiveMetadata(state, archived, now);
+    }
     writeStateToOpenDatabase(db, state);
     db.exec("COMMIT");
     await secureStoragePaths();
@@ -463,6 +606,12 @@ export async function mutateDatabaseState(mutator) {
     const result = await mutator(state);
     reconcileStateIntegrity(state);
     state.meta = state.meta || {};
+    const archived = compactOperationalHistory(state);
+    if (archivedItemCount(archived)) {
+      const now = new Date().toISOString();
+      archiveOperationalHistory(db, archived, now);
+      recordOperationalArchiveMetadata(state, archived, now);
+    }
     state.meta.updatedAt = new Date().toISOString();
     state.meta.storageBackend = "sqlite";
     writeMutationToOpenDatabase(db, state, snapshot);
