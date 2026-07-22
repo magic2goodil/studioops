@@ -1,6 +1,19 @@
 # Getting Started
 
-This guide takes a new installation from clone to a working local task board. Start manually, verify the workflow, and only then enable always-on automation.
+This guide takes a new installation from the Codex plugin or a manual clone to a working local task board. Start locally, verify the workflow, and only then enable always-on automation.
+
+## Plugin-First Community Setup
+
+```bash
+codex plugin marketplace add magic2goodil/studioops
+codex plugin add studioops@studioops-marketplace
+```
+
+Start a new Codex task from the repository you want to manage and ask `Set up StudioOps Community for this project.` The plugin checks prerequisites, installs into `~/.studioops/community`, registers the repository, and starts the local board. Continue below from automation preview if you later want builders and reviewers to execute work.
+
+The plugin-first setup does not install system packages and does not enable GitHub writes, cloud connectivity, always-on agents, merges, releases, or deployment.
+
+## Manual Setup
 
 ## 1. Install Prerequisites
 

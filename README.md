@@ -59,7 +59,26 @@ This is a real StudioOps task: backend review approved PR #41, then frontend rev
 
 The UI and CLI can be run manually on other platforms supported by Node.js. The packaged background-service installer is currently macOS-only.
 
-## Quick Start
+## Quick Start With The Codex Plugin
+
+Add the public StudioOps marketplace and install the plugin:
+
+```bash
+codex plugin marketplace add magic2goodil/studioops
+codex plugin add studioops@studioops-marketplace
+```
+
+Start a new Codex task in the repository you want StudioOps to manage, then ask:
+
+```text
+Set up StudioOps Community for this project.
+```
+
+The plugin checks Node.js, npm, and Git; installs the Community engine under `~/.studioops/community`; creates a private local configuration and SQLite workspace; registers the active repository; and starts the board at [http://127.0.0.1:4317](http://127.0.0.1:4317). GitHub CLI and Codex CLI are reported as optional readiness checks for later automation.
+
+Community bootstrap does not enable GitHub writes, unattended workers, cloud connectivity, automatic merges, releases, or deployment. Those remain separate, explicit setup steps.
+
+## Manual Quick Start
 
 ```bash
 git clone https://github.com/magic2goodil/studioops.git
@@ -75,22 +94,22 @@ The setup wizard writes a local `studioops.config.md`, registers an optional fir
 
 For a complete first-run walkthrough, GitHub bot setup, manual operation, and always-on installation, see [Getting Started](docs/GETTING_STARTED.md).
 
-## Install The Codex Plugin
+## Install The Codex Plugin From A Local Checkout
 
-The repository is also a Codex plugin marketplace. After cloning StudioOps and starting the local app:
+For plugin development, the repository can also be installed as a local marketplace:
 
 ```bash
 codex plugin marketplace add /absolute/path/to/studioops
 codex plugin add studioops@studioops-marketplace
 ```
 
-Start a new Codex task after installation, then ask:
+Start a new Codex task after installation. The same Community bootstrap works from the locally installed plugin.
 
 ```text
 Create this project in StudioOps.
 ```
 
-The bundled `run-studioops` skill inspects the current repository, creates or reuses the matching StudioOps project, and writes a structured task with user story, expected outcome, acceptance criteria, work lane, validation, and security/privacy notes. See [Plugin Development](docs/PLUGIN.md).
+The bundled `run-studioops` skill installs or starts the local Community engine when necessary, inspects the current repository, creates or reuses the matching StudioOps project, and writes a structured task with user story, expected outcome, acceptance criteria, work lane, validation, and security/privacy notes. See [Plugin Development](docs/PLUGIN.md).
 
 ## Community And Paid Plans
 
@@ -172,7 +191,7 @@ StudioOps fails closed when GitHub App authentication is required but unavailabl
 
 ## State And Backups
 
-The authoritative local state is `data/mission-control.sqlite3`. SQLite WAL mode and immediate transactions protect concurrent dispatcher, runner, review, QA, promotion, and notifier writes. Existing JSON state is imported once during migration and is not maintained as a second writable source of truth.
+The authoritative local state is `data/mission-control.sqlite3` for a manual checkout and `~/.studioops/community/workspace/data/mission-control.sqlite3` for plugin-first Community setup. SQLite WAL mode and immediate transactions protect concurrent dispatcher, runner, review, QA, promotion, and notifier writes. Existing JSON state is imported once during migration and is not maintained as a second writable source of truth.
 
 The database, `~/.mission-control` runtime directory, environment variables, and LaunchAgent labels retain their legacy names in the first StudioOps release so existing installations upgrade without losing state or duplicating background workers.
 

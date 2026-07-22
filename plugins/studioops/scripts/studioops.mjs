@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
 const command = args.shift() || "help";
+const bootstrapPath = fileURLToPath(new URL("./community.mjs", import.meta.url));
 
 function option(name, fallback = "") {
   const index = args.indexOf(`--${name}`);
@@ -40,7 +42,7 @@ async function request(pathname, init = {}) {
       headers: { "Content-Type": "application/json", ...(init.headers || {}) },
     });
   } catch (error) {
-    throw new Error(`StudioOps is not reachable at ${baseUrl}. Start it with \`npm run dev\` from the StudioOps checkout, then retry. ${error.message}`);
+    throw new Error(`StudioOps is not reachable at ${baseUrl}. Run the local Community bootstrap with \`node ${JSON.stringify(bootstrapPath)} bootstrap --project ${JSON.stringify(process.cwd())}\`, then retry. ${error.message}`);
   }
   const text = await response.text();
   let body;

@@ -40,6 +40,8 @@ On first startup, an existing `data/mission-control.json` is imported once. The 
 
 StudioOps accepts `STUDIOOPS_ROOT`, `STUDIOOPS_DATA_DIR`, and `STUDIOOPS_CONFIG_ROOT`. The corresponding `MISSION_CONTROL_*` variables and legacy database/runtime filenames remain supported for migration safety.
 
+Plugin-first Community setup keeps the updatable application checkout under `~/.studioops/community/source` and the user's configuration, SQLite database, logs, and server process record under `~/.studioops/community/workspace`. The bootstrap starts the server with explicit root, config, and data environment variables so application updates cannot replace local state.
+
 `npm run backup` uses SQLite's online backup API, so it remains consistent while workers are active.
 
 Postgres is a future backend option when StudioOps needs multiple machines or remote team access. Local installations do not need a database daemon.

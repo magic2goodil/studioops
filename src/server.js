@@ -3,7 +3,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordQaBundleDecision, recordQaDecision, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, projectFromConfig } from "./config.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
@@ -164,7 +164,10 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/projects") {
-    sendJson(res, 201, { project: await addProject(await readJsonBody(req)) });
+    const input = await readJsonBody(req);
+    const config = await loadConfig();
+    const projectInput = config ? projectFromConfig(input, config.defaults) : input;
+    sendJson(res, 201, { project: await addProject(projectInput) });
     return;
   }
 
