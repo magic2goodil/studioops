@@ -16,7 +16,19 @@ import {
 async function createLegacyRoot(root) {
   const dataDir = path.join(root, "data");
   await mkdir(path.join(dataDir, "local-attachments"), { recursive: true });
-  await writeFile(path.join(root, "mission-control.config.md"), "# legacy config\n", "utf8");
+  await writeFile(path.join(root, "mission-control.config.md"), `# legacy config
+
+\`\`\`json mission-control-config
+${JSON.stringify({
+  defaults: {
+    runner: {
+      workspaceRoot: "~/.mission-control/run-workspaces",
+      githubAppCredentialsDir: ".mission-control/github-apps",
+    },
+  },
+})}
+\`\`\`
+`, "utf8");
   await writeFile(path.join(dataDir, "local-attachments", "task-image.txt"), "attachment", "utf8");
   const credentials = path.join(root, ".mission-control", "github-apps", "default");
   await mkdir(credentials, { recursive: true });
@@ -83,7 +95,14 @@ test("local state migration refuses active runs and preserves state securely onc
     );
     assert.equal(await releaseStudioOpsMaintenanceLease(sourceRoot, maintenance.lease.id), true);
 
-    const result = await migrateLocalStudioOpsState({ sourceRoot, targetRoot, credentialsRoot });
+    const studioHome = path.join(root, "studioops");
+    const result = await migrateLocalStudioOpsState({
+      sourceRoot,
+      targetRoot,
+      credentialsRoot,
+      legacyHome: path.join(root, ".mission-control"),
+      studioHome,
+    });
     assert.equal(result.status, "migrated");
     assert.equal((await stat(result.backupPath)).mode & 0o777, 0o600);
     assert.equal((await stat(result.databasePath)).mode & 0o777, 0o600);
@@ -94,10 +113,9 @@ test("local state migration refuses active runs and preserves state securely onc
       await readFile(path.join(targetRoot, "data", "local-attachments", "task-image.txt"), "utf8"),
       "attachment",
     );
-    assert.equal(
-      await readFile(path.join(targetRoot, "mission-control.config.md"), "utf8"),
-      "# legacy config\n",
-    );
+    const migratedConfig = await readFile(path.join(targetRoot, "studioops.config.md"), "utf8");
+    assert.match(migratedConfig, new RegExp(path.join(studioHome, "run-workspaces").replaceAll("\\", "\\\\")));
+    assert.match(migratedConfig, new RegExp(credentialsRoot.replaceAll("\\", "\\\\")));
     assert.equal((await activeStudioOpsRuns(targetRoot)).length, 0);
   } finally {
     await rm(root, { recursive: true, force: true });

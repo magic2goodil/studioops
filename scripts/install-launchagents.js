@@ -389,6 +389,8 @@ async function install() {
         sourceRoot: migrationRoot,
         targetRoot: workingRoot,
         credentialsRoot: defaultStudioOpsCredentialsRoot(),
+        legacyHome,
+        studioHome: studioOpsHome(),
       });
       console.log(`Migrated StudioOps working state from ${migrationRoot} to ${workingRoot}.`);
       if (migration.backupPath) console.log(`Migration backup: ${migration.backupPath}`);

@@ -6,10 +6,13 @@ import {
   copyFile,
   cp,
   mkdir,
+  readFile,
   readdir,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { extractConfigJson, renderConfigMarkdown } from "./config.js";
 
 const DATABASE_NAME = "mission-control.sqlite3";
 const DATABASE_SIDECARS = new Set([
@@ -172,6 +175,15 @@ async function secureTree(root) {
   }
 }
 
+async function secureDirectoryTree(root) {
+  if (!(await exists(root))) return;
+  await chmod(root, 0o700).catch(() => {});
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    await secureDirectoryTree(path.join(root, entry.name));
+  }
+}
+
 async function copyConfig(sourceRoot, targetRoot) {
   for (const name of CONFIG_NAMES) {
     const destination = path.join(targetRoot, name);
@@ -186,6 +198,51 @@ async function copyConfig(sourceRoot, targetRoot) {
     return destination;
   }
   return "";
+}
+
+function replacePathPrefix(value, mappings) {
+  const raw = String(value || "");
+  for (const mapping of mappings) {
+    if (!mapping.from) continue;
+    if (raw === mapping.from) return mapping.to;
+    if (raw.startsWith(`${mapping.from}${path.sep}`)) {
+      return path.join(mapping.to, raw.slice(mapping.from.length + 1));
+    }
+  }
+  return raw;
+}
+
+function rewriteConfigValue(value, mappings, credentialsRoot) {
+  if (Array.isArray(value)) return value.map((item) => rewriteConfigValue(item, mappings, credentialsRoot));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, rewriteConfigValue(item, mappings, credentialsRoot)]),
+    );
+  }
+  if (typeof value !== "string") return value;
+  if ([".mission-control/github-apps", "~/.mission-control/github-apps"].includes(value)) {
+    return credentialsRoot;
+  }
+  return replacePathPrefix(value, mappings);
+}
+
+async function migrateConfigPaths(input) {
+  if (!input.configPath) return "";
+  try {
+    const config = extractConfigJson(await readFile(input.configPath, "utf8"));
+    const mappings = [
+      { from: input.sourceRoot, to: input.targetRoot },
+      { from: input.legacyHome, to: input.studioHome },
+      { from: "~/.mission-control", to: input.studioHome },
+    ];
+    const migrated = rewriteConfigValue(config, mappings, input.credentialsRoot);
+    const destination = path.join(input.targetRoot, "studioops.config.md");
+    await writeFile(destination, renderConfigMarkdown(migrated), { encoding: "utf8", mode: 0o600 });
+    await chmod(destination, 0o600).catch(() => {});
+    return destination;
+  } catch {
+    return input.configPath;
+  }
 }
 
 async function copyDataExceptDatabase(sourceRoot, targetRoot) {
@@ -242,7 +299,7 @@ export async function migrateLocalStudioOpsState(input) {
 
   await mkdir(targetRoot, { recursive: true, mode: 0o700 });
   await chmod(targetRoot, 0o700).catch(() => {});
-  const configPath = await copyConfig(sourceRoot, targetRoot);
+  const copiedConfigPath = await copyConfig(sourceRoot, targetRoot);
   await copyDataExceptDatabase(sourceRoot, targetRoot);
 
   let backupPath = "";
@@ -265,6 +322,14 @@ export async function migrateLocalStudioOpsState(input) {
   }
 
   const migratedCredentials = await migrateCredentials(sourceRoot, credentialsRoot);
+  const configPath = await migrateConfigPaths({
+    configPath: copiedConfigPath,
+    sourceRoot,
+    targetRoot,
+    legacyHome: path.resolve(input.legacyHome || path.join(path.dirname(credentialsRoot), "..", "..", "..", ".mission-control")),
+    studioHome: path.resolve(input.studioHome || path.join(targetRoot, "..")),
+    credentialsRoot,
+  });
   await secureTree(targetData);
   return {
     status: "migrated",
@@ -291,6 +356,7 @@ export async function migrateLegacyStudioOpsHome(input) {
     const destination = path.join(targetHome, name);
     if (!(await exists(source)) || await exists(destination)) continue;
     await cp(source, destination, { recursive: true, force: false, errorOnExist: false });
+    await secureDirectoryTree(destination);
     copied.push(name);
   }
   return { status: copied.length ? "migrated" : "not_needed", sourceHome, targetHome, copied };
