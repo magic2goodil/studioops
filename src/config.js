@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { integrationBranchName, trustLeadApprovalsEnabled } from "./integration-policy.js";
+import { missionControlConfigRoot } from "./runtime-paths.js";
 
 export const CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "mission-control.config.example.md";
@@ -52,14 +53,14 @@ ${JSON.stringify(config, null, 2)}
 `;
 }
 
-export async function loadConfig(rootDir = process.cwd()) {
+export async function loadConfig(rootDir = missionControlConfigRoot()) {
   const configPath = path.join(rootDir, CONFIG_FILE);
   if (!(await fileExists(configPath))) return null;
   const markdown = await readFile(configPath, "utf8");
   return extractConfigJson(markdown);
 }
 
-export async function writeConfig(config, rootDir = process.cwd()) {
+export async function writeConfig(config, rootDir = missionControlConfigRoot()) {
   const configPath = path.join(rootDir, CONFIG_FILE);
   await writeFile(configPath, renderConfigMarkdown(config), "utf8");
   return configPath;

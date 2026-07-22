@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +13,7 @@ import {
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
+import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
 const qaIntegrationModuleUrl = pathToFileURL(path.join(process.cwd(), "src/qa-integration.js")).href;
@@ -153,7 +155,7 @@ test("validation commands use the QA integration PATH override", async () => {
     assert.equal(report.projects[0].status, "ready");
     assert.equal(report.projects[0].tasks[0].status, "ready");
 
-    const state = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8"));
+    const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "ready");
     assert.equal(state.tasks[0].integrationValidation.commands[0].ok, true);
   } finally {
@@ -238,7 +240,7 @@ test("QA integration redacts GitHub token values from validation output before s
     const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
     const report = JSON.parse(runResult.stdout.trim());
     const reportText = JSON.stringify(report);
-    const stateText = await readFile(path.join(root, "data", "mission-control.json"), "utf8");
+    const stateText = JSON.stringify(readPersistedState(root));
 
     assert.equal(report.projects[0].status, "ready");
     assert.equal(report.projects[0].tasks[0].status, "ready");
@@ -329,7 +331,7 @@ test("failed validation leaves the owner checkout untouched and does not push", 
     assert.equal(await git(repoPath, ["symbolic-ref", "--short", "HEAD"]), "owner/work");
     assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
 
-    const state = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8"));
+    const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "validation_failed");
     assert.equal(state.tasks[0].integrationWorkspacePath, report.projects[0].workspacePath);
     assert.equal(state.tasks[0].integrationWorkspaceStrategy, "isolated_clone");
@@ -398,6 +400,16 @@ test("successful QA integration uses an isolated workspace without switching the
       events: [],
       reviews: [],
       runs: [],
+      qaBundles: [
+        {
+          id: "qa_bundle_1",
+          projectId: "legacy_project",
+          projectKey: "legacy",
+          status: "ready",
+          integrationCommit: "legacy-commit",
+          tasks: [],
+        },
+      ],
     }, null, 2)}\n`, "utf8");
 
     const script = `
@@ -416,10 +428,12 @@ test("successful QA integration uses an isolated workspace without switching the
     assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
     assert.equal(await git(remotePath, ["show", "refs/heads/qa/integration:app.txt"]), "feature");
 
-    const state = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8"));
+    const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "ready");
     assert.equal(state.tasks[0].integrationWorkspacePath, report.projects[0].workspacePath);
     assert.match(state.comments[0].body, /Workspace:/);
+    assert.deepEqual(state.qaBundles.map((bundle) => bundle.id), ["qa_bundle_1", "qa_bundle_2"]);
+    assert.equal(state.tasks[0].qaBundleId, "qa_bundle_2");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -430,8 +444,14 @@ test("QA integration can sync default branch changes into QA and refresh a local
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const previewPath = path.join(root, "preview");
+  const healthServer = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"ok":true}');
+  });
 
   try {
+    await new Promise((resolve) => healthServer.listen(0, "127.0.0.1", resolve));
+    const healthPort = healthServer.address().port;
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
@@ -474,6 +494,8 @@ test("QA integration can sync default branch changes into QA and refresh a local
               checkoutPath: previewPath,
               branch: "qa/integration",
               stashDirty: true,
+              previewUrl: `http://127.0.0.1:${healthPort}/`,
+              healthCheckUrl: `http://127.0.0.1:${healthPort}/health`,
             },
           },
         },
@@ -497,10 +519,12 @@ test("QA integration can sync default branch changes into QA and refresh a local
     assert.equal(report.projects[0].defaultBranchSync.status, "merged");
     assert.equal(report.projects[0].localQaPreview.stashed, true);
     assert.match(report.projects[0].localQaPreview.status, /^(updated|current)$/);
+    assert.equal(report.projects[0].localQaPreview.healthCheckUrl, `http://127.0.0.1:${healthPort}/health`);
     assert.equal(await git(remotePath, ["show", "refs/heads/qa/integration:app.txt"]), "main update");
     assert.equal(await readFile(path.join(previewPath, "app.txt"), "utf8"), "main update\n");
     assert.match(await git(previewPath, ["stash", "list"]), /Mission Control local QA preview sync/);
   } finally {
+    await new Promise((resolve) => healthServer.close(resolve));
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -659,7 +683,7 @@ test("QA integration refuses a repo without origin instead of pushing back into 
     assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
     assert.equal(await git(repoPath, ["rev-parse", "refs/heads/qa/integration"]), qaHeadBefore);
 
-    const state = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8"));
+    const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "blocked");
     assert.equal(state.tasks[0].integrationWorkspacePath, "");
   } finally {
@@ -807,7 +831,7 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
     assert.match(report.projects[0].output, /credentials/);
     assert.doesNotMatch(report.projects[0].output, /could not read Username/);
 
-    const state = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8"));
+    const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "blocked");
     assert.match(state.comments[0].body, /GitHub App auth failed/);
   } finally {

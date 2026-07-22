@@ -6,7 +6,8 @@ It sends macOS notifications when:
 
 - a task reaches owner review through a `notify_owner` run
 - a task reaches Trust Leads local QA through a `notify_qa_review` run
-- a Trust Leads QA integration bundle is validated through a `qa_bundle_ready` run
+- a coherent Trust Leads QA integration bundle is validated and its local preview passes health checks
+- owner-QA-passed work has a validated release-candidate PR ready
 - an automated runner run fails
 
 It does not:
@@ -54,11 +55,11 @@ Failed runner notifications are marked with:
 - `notificationStatus`
 - `notificationChannel`
 
-That prevents repeat notifications every sweep.
+That prevents repeat notifications every sweep. Delivery failures retry up to three times with backoff; they are then retained as visible failures rather than retried forever.
 
-`notify_qa_review` and `qa_bundle_ready` use the same notification marker fields. They mean "review the local QA bundle before production," not "deploy this."
+QA and release-candidate notifications are stored on the QA bundle, so one coherent batch creates one owner interruption instead of one notification per task. They mean "review this bundle or PR," not "deploy this."
 
-QA integration blockers should not sit silently. The dispatcher routes `qa_integration_blocked` actions back to a builder remediation run so conflicts, dirty worktrees, validation failures, and push failures can be fixed before owner QA.
+Feature merge conflicts and validation failures route to builder remediation. A local preview restart or health failure routes to infrastructure repair, not back through the feature builder loop.
 
 ## Safety
 

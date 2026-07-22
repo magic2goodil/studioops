@@ -62,6 +62,22 @@ The app reads the first fenced `json mission-control-config` block in this file.
     }
   },
   "defaults": {
+    "executionPolicy": {
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "high",
+      "leadReasoningEffort": "xhigh",
+      "complexReasoningEffort": "xhigh",
+      "maxAttempts": 2,
+      "retryBackoffMs": 300000,
+      "staleRunMs": 7200000,
+      "roles": {
+        "builder": { "reasoningEffort": "high" },
+        "backend-reviewer": { "reasoningEffort": "high" },
+        "frontend-reviewer": { "reasoningEffort": "high" },
+        "accessibility-reviewer": { "reasoningEffort": "high" },
+        "lead-reviewer": { "reasoningEffort": "xhigh" }
+      }
+    },
     "supervisor": {
       "intervalSeconds": 300,
       "baseUrl": "http://127.0.0.1:4317",
@@ -85,6 +101,8 @@ The app reads the first fenced `json mission-control-config` block in this file.
       "intervalSeconds": 300,
       "limit": 3,
       "provider": "codex-cli",
+      "model": "gpt-5.6-sol",
+      "modelReasoningEffort": "high",
       "useWorkspaces": true,
       "workspaceRoot": "~/.mission-control/run-workspaces",
       "timeoutMs": 7200000,
@@ -108,7 +126,10 @@ The app reads the first fenced `json mission-control-config` block in this file.
         "stashDirty": false,
         "createIfMissing": false,
         "postUpdateCommands": [],
-        "restartLaunchAgents": []
+        "restartLaunchAgents": [],
+        "launchAgentPlists": {},
+        "previewUrl": "",
+        "healthCheckUrl": ""
       }
     },
     "promotion": {
@@ -221,7 +242,12 @@ The app reads the first fenced `json mission-control-config` block in this file.
           ],
           "restartLaunchAgents": [
             "com.example.local-preview"
-          ]
+          ],
+          "launchAgentPlists": {
+            "com.example.local-preview": "~/Library/LaunchAgents/com.example.local-preview.plist"
+          },
+          "previewUrl": "http://127.0.0.1:4174/",
+          "healthCheckUrl": "http://127.0.0.1:4174/health"
         }
       },
       "promotion": {

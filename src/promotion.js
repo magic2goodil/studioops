@@ -417,6 +417,11 @@ function promotionValidationCommands(project = {}) {
   return normalizeList(promotionConfig(project).validationCommands || project.validationCommands);
 }
 
+function promotionBranchName(projectPlan) {
+  const project = safeRefSegment(projectPlan.projectKey || projectPlan.projectId || "project");
+  return `qa/promotion-${project}-${Date.now()}`;
+}
+
 function hasUnmetPromotionDependency(task, tasksById, selectedIds, completedIds) {
   for (const dependencyId of task.dependsOnTaskIds || []) {
     if (selectedIds.has(dependencyId) && !completedIds.has(dependencyId)) return true;
@@ -516,6 +521,8 @@ async function promoteProject(projectPlan, options = {}) {
     output: "",
     commit: "",
     validation: [],
+    promotionBranch: "",
+    prUrl: "",
     sourceRepoPath: repoPath,
     workspacePath: "",
     workspaceStrategy: "",
@@ -583,17 +590,45 @@ async function promoteProject(projectPlan, options = {}) {
     const commit = await branchHead(executionRepoPath, "HEAD", gitOptions);
     result.commit = commit;
 
-    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${projectPlan.targetBranch}`], { ...gitOptions, allowFailure: true });
+    result.promotionBranch = promotionBranchName(projectPlan);
+    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${result.promotionBranch}`], { ...gitOptions, allowFailure: true });
     if (!push.ok) {
       result.status = "push_failed";
-      result.output = `Non-force push to ${projectPlan.targetBranch} failed. The remote branch may have changed; rerun promotion after fetching/reconciling it.\n${truncateOutput(push.output)}`;
+      result.output = `Non-force push to release-candidate branch ${result.promotionBranch} failed.\n${truncateOutput(push.output)}`;
       for (const task of mergedTasks) task.status = "push_failed";
       return result;
     }
 
-    result.status = "ready";
-    result.output = truncateOutput(push.output || `Pushed ${projectPlan.targetBranch}.`);
-    for (const task of mergedTasks) task.status = "promoted";
+    const taskList = projectPlan.tasks.map((task) => `- ${task.id}: ${task.title}${task.prUrl ? ` (${task.prUrl})` : ""}`).join("\n");
+    const pr = await runCommand("gh", [
+      "pr",
+      "create",
+      "--base",
+      projectPlan.targetBranch,
+      "--head",
+      result.promotionBranch,
+      "--title",
+      `QA-approved release candidate: ${projectPlan.projectName || projectPlan.projectKey}`,
+      "--body",
+      `## QA-approved tasks\n\n${taskList}\n\nValidation passed in Mission Control. Production deployment remains release/tag gated.`,
+    ], {
+      cwd: executionRepoPath,
+      env: options.env,
+      secrets: options.secrets,
+      timeoutMs: 60_000,
+      allowFailure: true,
+    });
+    if (!pr.ok) {
+      result.status = "pr_failed";
+      result.output = `Release-candidate branch was pushed, but the pull request could not be created.\n${truncateOutput(pr.output)}`;
+      for (const task of mergedTasks) task.status = "pr_failed";
+      return result;
+    }
+
+    result.prUrl = String(pr.output || "").trim().split(/\s+/).find((value) => /^https:\/\/github\.com\/.+\/pull\/\d+/.test(value)) || "";
+    result.status = "pr_ready";
+    result.output = truncateOutput(pr.output || `Created release-candidate PR from ${result.promotionBranch}.`);
+    for (const task of mergedTasks) task.status = "pr_ready";
     return result;
   } catch (error) {
     result.status = "blocked";
@@ -654,8 +689,8 @@ function commentForTask(projectResult, taskResult) {
     : `\n\nTarget branch: ${projectResult.targetBranch}`;
   const workspaceLine = workspaceSummary(projectResult);
 
-  if (taskResult.status === "promoted") {
-    return `Promoted to ${projectResult.targetBranch} at ${projectResult.commit}.${targetLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
+  if (taskResult.status === "pr_ready") {
+    return `QA-approved release-candidate PR is ready for ${projectResult.targetBranch} at ${projectResult.commit}.${projectResult.prUrl ? `\n\nPR: ${projectResult.prUrl}` : ""}${targetLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
   }
 
   if (taskResult.status === "conflict") {
@@ -669,6 +704,10 @@ function commentForTask(projectResult, taskResult) {
 
   if (taskResult.status === "push_failed") {
     return `Promotion could not update ${projectResult.targetBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
+  }
+
+  if (taskResult.status === "pr_failed") {
+    return `Release-candidate branch ${projectResult.promotionBranch || ""} was pushed, but its pull request could not be created.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (taskResult.status === "dependency_blocked") {
@@ -692,13 +731,15 @@ function taskPatchForPromotion(projectResult, taskResult, now) {
     promotionConflictFiles: taskResult.conflicts || [],
   };
 
-  if (taskResult.status === "promoted") {
+  if (taskResult.status === "pr_ready") {
     return {
       ...patch,
-      status: "merged",
-      assignedAgentRole: "",
+      status: "user_review",
+      assignedAgentRole: "owner",
       reviewerThreadId: "",
       promotionCommit: projectResult.commit || "",
+      promotionBranch: projectResult.promotionBranch || "",
+      promotionPrUrl: projectResult.prUrl || "",
     };
   }
 
@@ -708,6 +749,16 @@ function taskPatchForPromotion(projectResult, taskResult, now) {
       status: "promotion_blocked",
       assignedAgentRole: "promotion-worker",
       reviewerThreadId: "",
+    };
+  }
+
+  if (["push_failed", "pr_failed"].includes(taskResult.status)) {
+    return {
+      ...patch,
+      status: "promotion_blocked",
+      assignedAgentRole: "owner",
+      reviewerThreadId: "",
+      promotionBranch: projectResult.promotionBranch || "",
     };
   }
 
@@ -742,7 +793,9 @@ async function recordProjectResult(projectResult) {
     const now = new Date().toISOString();
     state.comments = state.comments || [];
     state.events = state.events || [];
+    state.qaBundles = state.qaBundles || [];
     let promotedCount = 0;
+    const promotedTaskIds = new Set();
 
     for (const taskResult of projectResult.tasks || []) {
       const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
@@ -750,7 +803,10 @@ async function recordProjectResult(projectResult) {
       const patch = taskPatchForPromotion(projectResult, taskResult, now);
       Object.assign(task, patch);
       task.updatedAt = now;
-      if (taskResult.status === "promoted") promotedCount += 1;
+      if (taskResult.status === "pr_ready") {
+        promotedCount += 1;
+        promotedTaskIds.add(task.id);
+      }
       state.comments.push({
         id: nextId(state.comments, "comment"),
         taskId: task.id,
@@ -769,12 +825,28 @@ async function recordProjectResult(projectResult) {
     }
 
     if (promotedCount > 0) {
+      for (const bundle of state.qaBundles) {
+        const bundleTaskIds = (bundle.tasks || []).map((task) => task.id);
+        const includedTaskIds = bundleTaskIds.filter((taskId) => promotedTaskIds.has(taskId));
+        if (!includedTaskIds.length) continue;
+        bundle.status = "release_candidate_ready";
+        bundle.promotionBranch = projectResult.promotionBranch || "";
+        bundle.promotionPrUrl = projectResult.prUrl || "";
+        bundle.promotionCommit = projectResult.commit || "";
+        bundle.promotedTaskIds = includedTaskIds;
+        bundle.promotionReadyAt = now;
+        bundle.promotionNotifiedAt = "";
+        bundle.notificationStatus = "";
+        bundle.notificationAttempts = 0;
+        bundle.notificationRetryNotBefore = "";
+        bundle.updatedAt = now;
+      }
       state.events.push({
         id: nextId(state.events, "event"),
         type: "release_candidate_ready",
         projectId: projectResult.projectId,
         taskId: "",
-        message: `${projectResult.projectName || projectResult.projectKey}: ${promotedCount} task(s) merged into ${projectResult.targetBranch}. Main is ready for release-candidate review.`,
+        message: `${projectResult.projectName || projectResult.projectKey}: release-candidate PR ready with ${promotedCount} QA-approved task(s).`,
         createdAt: now,
       });
     }

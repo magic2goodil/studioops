@@ -156,6 +156,14 @@ test("accessibility reviewer prompt includes the required checklist and breakpoi
   assert.match(prompt, /mission-control review task_1 --stage accessibility/);
 });
 
+test("prompt generation resolves relative project standards without crashing", () => {
+  const prompt = generatePrompt(fixtureState({}, [], {
+    standards: ["standards/accessibility.md"],
+  }), "task_1", "builder");
+
+  assert.match(prompt, /standards\/accessibility\.md/);
+});
+
 test("accessibility reviewer runs use the frontend lane profile", () => {
   const task = fixtureState({ lane: "" }).tasks[0];
   const profile = laneProfile(task, { role: "accessibility-reviewer" });

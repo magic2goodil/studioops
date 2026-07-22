@@ -1,5 +1,6 @@
 import { findTask, generatePrompt, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
+import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_builder",
@@ -7,7 +8,6 @@ const DISPATCHABLE_ACTIONS = new Set([
   "return_to_builder",
   "start_review",
   "continue_review",
-  "qa_bundle_ready",
   "qa_integration_blocked",
   "notify_qa_review",
   "notify_owner",
@@ -249,6 +249,9 @@ function makeRun(state, task, action, options, now) {
     : role === "owner" ? ownerPrompt(action) : generatePrompt(state, task.id, role);
   const threadId = action.threadId || (group === "reviewer" ? task.reviewerThreadId : task.assignedThreadId) || "";
   const profile = laneProfile(task, action);
+  const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const attemptKey = executionAttemptKey(task, action);
+  const attempt = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length + 1;
   return {
     id: nextId(state.runs, "run"),
     taskId: task.id,
@@ -262,6 +265,14 @@ function makeRun(state, task, action, options, now) {
     conflictGroup: profile.conflictGroup,
     fileScope: profile.fileScope,
     provider: options.provider || DEFAULTS.provider,
+    model: executionPolicy.model,
+    modelReasoningEffort: executionPolicy.reasoningEffort,
+    modelSelectionReason: executionPolicy.selectionReason,
+    attemptKey,
+    attempt,
+    maxAttempts: executionPolicy.maxAttempts,
+    retryBackoffMs: executionPolicy.retryBackoffMs,
+    staleRunMs: executionPolicy.staleRunMs,
     status: dispatchStatusFor(action),
     prompt,
     promptCommand: action.promptCommand || "",
@@ -373,6 +384,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       const nextStatus = taskStatusFor(item.action);
       if (nextStatus) task.status = nextStatus;
       task.assignedAgentRole = run.role;
+      task.retryNotBefore = "";
       task.updatedAt = now;
 
       state.comments.push({
@@ -388,7 +400,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         type: "dispatch_created",
         projectId: task.projectId,
         taskId: task.id,
-        message: `${task.title} dispatched to ${run.role} as ${run.id}`,
+        message: `${task.title} dispatched to ${run.role} as ${run.id} (${run.model}, ${run.modelReasoningEffort})`,
         createdAt: now,
       });
     }
@@ -417,6 +429,7 @@ export function formatDispatchReport(report) {
   for (const run of report.runs) {
     lines.push(`[${run.id}] ${run.actionType} -> ${run.role} (${run.status})`);
     lines.push(`  Task: ${run.taskId}`);
+    lines.push(`  Model: ${run.model} (${run.modelReasoningEffort})  Attempt: ${run.attempt}/${run.maxAttempts}`);
     if (run.lane) lines.push(`  Lane: ${run.lane}${run.conflictGroup ? ` (${run.conflictGroup})` : ""}`);
     if (run.prUrl) lines.push(`  PR: ${run.prUrl}`);
     lines.push("");

@@ -9,6 +9,8 @@ const OWNER_NOTIFICATION_ACTIONS = new Set([
   "notify_qa_review",
   "qa_bundle_ready",
 ]);
+const MAX_NOTIFICATION_ATTEMPTS = 3;
+const NOTIFICATION_RETRY_MS = 5 * 60 * 1000;
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -42,12 +44,19 @@ function needsNotification(run) {
     && run.group === "owner"
     && OWNER_NOTIFICATION_ACTIONS.has(run.actionType)
   ) {
-    return !run.externalNotifiedAt && run.notificationStatus !== "failed";
+    return !run.externalNotifiedAt && notificationRetryReady(run);
   }
   if (run.status === "failed") {
-    return !run.failureNotifiedAt && run.notificationStatus !== "failed";
+    return !run.failureNotifiedAt && notificationRetryReady(run);
   }
   return false;
+}
+
+export function notificationRetryReady(item) {
+  if (item.notificationStatus !== "failed") return true;
+  if (Number(item.notificationAttempts || 0) >= MAX_NOTIFICATION_ATTEMPTS) return false;
+  const retryAt = Date.parse(item.notificationRetryNotBefore || "");
+  return !Number.isFinite(retryAt) || retryAt <= Date.now();
 }
 
 function notificationFor(state, run) {
@@ -76,6 +85,20 @@ function notificationFor(state, run) {
   };
 }
 
+export function notificationForBundle(bundle) {
+  const taskSummary = (bundle.tasks || [])
+    .slice(0, 4)
+    .map((task) => `${task.id} ${task.title}`)
+    .join("; ");
+  const remainder = Math.max(0, (bundle.tasks || []).length - 4);
+  const releaseCandidate = bundle.status === "release_candidate_ready";
+  return {
+    title: releaseCandidate ? "Mission Control release candidate ready" : "Mission Control QA bundle ready",
+    subtitle: `${bundle.projectKey || bundle.projectId} · ${bundle.tasks?.length || 0} task(s)`,
+    body: `${taskSummary}${remainder ? `; and ${remainder} more` : ""}${releaseCandidate ? ` · ${bundle.promotionPrUrl || bundle.promotionBranch || "PR ready"}` : bundle.previewUrl ? ` · ${bundle.previewUrl}` : ""}`,
+  };
+}
+
 function appleScriptString(value) {
   return `"${String(value || "")
     .replaceAll("\\", "\\\\")
@@ -100,6 +123,25 @@ export async function planNotifications(input = {}) {
   const pending = [];
   const skipped = [];
   const limit = Math.max(1, Number(input.limit || input.maxNotifications || 10));
+  for (const bundle of state.qaBundles || []) {
+    const qaReady = bundle.status === "ready" && !bundle.notifiedAt;
+    const promotionReady = bundle.status === "release_candidate_ready" && !bundle.promotionNotifiedAt;
+    if ((!qaReady && !promotionReady) || !notificationRetryReady(bundle)) continue;
+    const project = findProject(state, bundle.projectId);
+    if (!projectAllowed(bundle, project, input)) {
+      skipped.push({ bundleId: bundle.id, reason: "project_filter" });
+      continue;
+    }
+    if (pending.length >= limit) {
+      skipped.push({ bundleId: bundle.id, reason: "notifier_limit" });
+      continue;
+    }
+    pending.push({
+      ...bundle,
+      notificationType: "qa_bundle",
+      notification: notificationForBundle(bundle),
+    });
+  }
   for (const run of state.runs || []) {
     if (!needsNotification(run)) continue;
     const project = findProject(state, run.projectId);
@@ -123,11 +165,36 @@ export async function planNotifications(input = {}) {
   };
 }
 
-export async function markNotificationAttempt(runId, statusPatch) {
+export async function markNotificationAttempt(itemId, statusPatch, notificationType = "run") {
   return mutateState(async (state) => {
     state.events = state.events || [];
-    const run = (state.runs || []).find((item) => item.id === runId);
-    if (!run) throw new Error(`Unknown run: ${runId}`);
+    if (notificationType === "qa_bundle") {
+      const bundle = (state.qaBundles || []).find((item) => item.id === itemId);
+      if (!bundle) throw new Error(`Unknown QA bundle: ${itemId}`);
+      const now = new Date().toISOString();
+      bundle.notificationStatus = statusPatch.notificationStatus || "sent";
+      bundle.notificationChannel = statusPatch.notificationChannel || "macos";
+      bundle.notificationError = statusPatch.notificationError || "";
+      bundle.notificationAttempts = Number(bundle.notificationAttempts || 0) + 1;
+      bundle.updatedAt = now;
+      if (bundle.notificationStatus === "sent") {
+        if (bundle.status === "release_candidate_ready") bundle.promotionNotifiedAt = now;
+        else bundle.notifiedAt = now;
+        bundle.notificationRetryNotBefore = "";
+      } else if (bundle.notificationAttempts < MAX_NOTIFICATION_ATTEMPTS) {
+        bundle.notificationRetryNotBefore = new Date(Date.now() + NOTIFICATION_RETRY_MS).toISOString();
+      }
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "qa_bundle_notification",
+        projectId: bundle.projectId,
+        message: `${bundle.id} notification ${bundle.notificationStatus} via ${bundle.notificationChannel}`,
+        createdAt: now,
+      });
+      return bundle;
+    }
+    const run = (state.runs || []).find((item) => item.id === itemId);
+    if (!run) throw new Error(`Unknown run: ${itemId}`);
     const now = new Date().toISOString();
     if (statusPatch.notificationStatus === "sent") {
       if (run.status === "failed") run.failureNotifiedAt = now;
@@ -138,6 +205,11 @@ export async function markNotificationAttempt(runId, statusPatch) {
     run.notificationStatus = statusPatch.notificationStatus || "sent";
     run.notificationChannel = statusPatch.notificationChannel || "macos";
     run.notificationError = statusPatch.notificationError || "";
+    run.notificationAttempts = Number(run.notificationAttempts || 0) + 1;
+    if (run.notificationStatus === "sent") run.notificationRetryNotBefore = "";
+    else if (run.notificationAttempts < MAX_NOTIFICATION_ATTEMPTS) {
+      run.notificationRetryNotBefore = new Date(Date.now() + NOTIFICATION_RETRY_MS).toISOString();
+    }
     run.updatedAt = now;
     state.events.push({
       id: nextId(state.events, "event"),
@@ -154,20 +226,20 @@ export async function markNotificationAttempt(runId, statusPatch) {
 export async function sendPendingNotifications(input = {}) {
   const plan = await planNotifications(input);
   const sent = [];
-  for (const run of plan.pending) {
+  for (const item of plan.pending) {
     if (input.dryRun) continue;
     try {
-      await sendMacNotification(run.notification);
-      sent.push(await markNotificationAttempt(run.id, {
+      await sendMacNotification(item.notification);
+      sent.push(await markNotificationAttempt(item.id, {
         notificationStatus: "sent",
         notificationChannel: "macos",
-      }));
+      }, item.notificationType));
     } catch (error) {
-      sent.push(await markNotificationAttempt(run.id, {
+      sent.push(await markNotificationAttempt(item.id, {
         notificationStatus: "failed",
         notificationChannel: "macos",
         notificationError: error.message,
-      }));
+      }, item.notificationType));
     }
   }
   return {
@@ -188,10 +260,10 @@ export function formatNotificationReport(report) {
   if (!report.pending.length) {
     lines.push("No owner, QA bundle, or failure notifications need to be sent.");
   }
-  for (const run of report.pending) {
-    lines.push(`[${run.id}] ${run.notification.title}`);
-    lines.push(`  ${run.notification.subtitle}`);
-    lines.push(`  ${run.notification.body}`);
+  for (const item of report.pending) {
+    lines.push(`[${item.id}] ${item.notification.title}`);
+    lines.push(`  ${item.notification.subtitle}`);
+    lines.push(`  ${item.notification.body}`);
     lines.push("");
   }
   const skippedSummary = (report.skipped || []).reduce((counts, item) => {

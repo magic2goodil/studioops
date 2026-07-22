@@ -205,6 +205,40 @@ h2 {
   gap: 10px;
 }
 
+.qa-bundle-card {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 12px;
+  border: 1px solid rgba(93, 224, 184, 0.28);
+  border-radius: 12px;
+  background: rgba(93, 224, 184, 0.08);
+}
+
+.qa-bundle-heading,
+.qa-bundle-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.qa-bundle-tasks {
+  display: grid;
+  gap: 6px;
+}
+
+.qa-bundle-tasks button {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.qa-task-heading {
+  margin-top: 18px;
+}
+
 .qa-review-item {
   display: grid;
   overflow: hidden;

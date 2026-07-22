@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { readState } from "./store.js";
 import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
+import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
 const DEFAULT_INTERVAL_SECONDS = 300;
 
@@ -69,13 +69,20 @@ async function runOnce(args) {
 }
 
 async function runWatch(args) {
-  const firstReport = await runOnce(args);
-  const intervalSeconds = firstReport.intervalSeconds || DEFAULT_INTERVAL_SECONDS;
-  while (true) {
-    await sleep(intervalSeconds * 1000);
-    console.log("");
-    await runOnce(args);
-  }
+  const config = await loadConfig();
+  const defaults = configSupervisorDefaults(config);
+  const intervalSeconds = secondsFrom(
+    args.interval || args["interval-seconds"] || defaults.intervalSeconds,
+    DEFAULT_INTERVAL_SECONDS,
+  );
+  await runResilientWorkerLoop({
+    worker: "supervisor",
+    intervalSeconds,
+    runOnce: async () => {
+      await runOnce(args);
+      console.log("");
+    },
+  });
 }
 
 async function main() {

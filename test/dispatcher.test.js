@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { planDispatches } from "../src/dispatcher.js";
+import { createSupervisorReport } from "../src/supervisor.js";
 
 function fixtureState() {
   return {
@@ -34,7 +35,7 @@ function fixtureState() {
   };
 }
 
-test("QA-ready bundles are dispatchable owner notifications", () => {
+test("QA-ready tasks do not create duplicate per-task owner notification runs", () => {
   const state = fixtureState();
   const report = planDispatches(state, [
     {
@@ -54,10 +55,8 @@ test("QA-ready bundles are dispatchable owner notifications", () => {
     },
   ]);
 
-  assert.equal(report.selected.length, 1);
-  assert.equal(report.selected[0].action.type, "qa_bundle_ready");
-  assert.equal(report.selected[0].group, "owner");
-  assert.equal(report.skipped.length, 0);
+  assert.equal(report.selected.length, 0);
+  assert.equal(report.skipped[0].reason, "not_dispatchable");
 });
 
 test("blocked QA integrations are dispatchable builder remediation runs", () => {
@@ -171,4 +170,16 @@ test("queued runs still block duplicate dispatches", () => {
   assert.equal(report.selected.length, 0);
   assert.equal(report.skipped.length, 1);
   assert.equal(report.skipped[0].reason, "already_dispatched");
+});
+
+test("preview service failures route to infrastructure repair instead of rebuilding feature code", () => {
+  const state = fixtureState();
+  state.projects[0].reviewPolicy = { trustLeadApprovals: true, integrationBranch: "qa/demo" };
+  state.tasks[0].integrationStatus = "preview_blocked";
+  const report = createSupervisorReport(state);
+  const action = report.actions.find((item) => item.taskId === "task_1");
+
+  assert.equal(action.type, "repair_qa_preview");
+  assert.equal(action.role, "owner");
+  assert.match(action.reason, /preview/i);
 });

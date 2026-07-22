@@ -48,10 +48,13 @@ Do not use review as an endless polish loop:
 For UI work, reviewers should specifically ask:
 
 - Was mobile verified?
+- For dense navigation, were both the closed and open states visually inspected at 375px, 390px, and 430px?
+- Does the mobile header preserve the first viewport instead of wrapping desktop navigation into a disproportionate block?
 - Was tablet verified?
 - Was desktop verified?
 - Was the direct URL/refresh path verified?
 - Was the full visible page considered, not just the smallest component?
+- Does the UI merely fit without overflow, or are its hierarchy, proportions, spacing, and focal point genuinely appropriate at each breakpoint?
 - Did an accessibility reviewer approve the work or explicitly skip it because there is no user-visible accessibility surface?
 - Are contrast, readable typography, visible focus, keyboard tab order, semantic headings, link/button names, alt text, title text, form labels, ARIA use, and screen-reader basics acceptable?
 

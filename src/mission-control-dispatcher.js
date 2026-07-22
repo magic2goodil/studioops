@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { readState } from "./store.js";
 import { createSupervisorReport } from "./supervisor.js";
 import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
+import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
 const DEFAULT_INTERVAL_SECONDS = 300;
 
@@ -59,6 +59,10 @@ function optionsFrom(args, config) {
     ownerConcurrency: numberFrom(args["owner-concurrency"] || defaults.ownerConcurrency, 10),
     maxDispatchesPerSweep: numberFrom(args.limit || args["max-dispatches"] || defaults.maxDispatchesPerSweep, 6),
     provider: args.provider || defaults.provider || "prompt-outbox",
+    executionPolicy: {
+      ...(config?.defaults?.executionPolicy || {}),
+      ...(config?.executionPolicy || {}),
+    },
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     dryRun: Boolean(args["dry-run"] || args.dryRun),
     intervalSeconds,
@@ -100,15 +104,16 @@ async function runOnce(args) {
 }
 
 async function runWatch(args) {
-  const firstReport = await runOnce(args);
-  const intervalSeconds = secondsFrom(args.interval || args["interval-seconds"], DEFAULT_INTERVAL_SECONDS)
-    || firstReport.intervalSeconds
-    || DEFAULT_INTERVAL_SECONDS;
-  while (true) {
-    await sleep(intervalSeconds * 1000);
-    console.log("");
-    await runOnce(args);
-  }
+  const config = await loadConfig();
+  const options = optionsFrom(args, config);
+  await runResilientWorkerLoop({
+    worker: "dispatcher",
+    intervalSeconds: options.intervalSeconds,
+    runOnce: async () => {
+      await runOnce(args);
+      console.log("");
+    },
+  });
 }
 
 async function main() {
