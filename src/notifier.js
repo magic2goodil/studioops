@@ -66,20 +66,20 @@ function notificationFor(state, run) {
     const failureNote = String(run.notes || run.exitCode || "").trim();
     const logHint = run.outputPath ? ` Log: ${run.outputPath}` : "";
     return {
-      title: "Mission Control run failed",
+      title: "StudioOps run failed",
       subtitle: `${project?.key || run.projectId} · ${run.id}`,
       body: `${task?.title || run.taskId}.${failureNote ? ` ${failureNote}` : ""}${logHint}`,
     };
   }
   if (run.actionType === "notify_qa_review" || run.actionType === "qa_bundle_ready") {
     return {
-      title: "Mission Control QA review ready",
+      title: "StudioOps QA review ready",
       subtitle: `${project?.key || run.projectId} · ${run.taskId}`,
       body: `${task?.title || "Task ready for local QA"}${run.integrationBranch ? ` · ${run.integrationBranch}` : ""}${run.prUrl ? ` · ${run.prUrl}` : ""}`,
     };
   }
   return {
-    title: "Mission Control needs your review",
+    title: "StudioOps needs your review",
     subtitle: `${project?.key || run.projectId} · ${run.taskId}`,
     body: `${task?.title || "Task ready for owner review"}${run.prUrl ? ` · ${run.prUrl}` : ""}`,
   };
@@ -93,7 +93,7 @@ export function notificationForBundle(bundle) {
   const remainder = Math.max(0, (bundle.tasks || []).length - 4);
   const releaseCandidate = bundle.status === "release_candidate_ready";
   return {
-    title: releaseCandidate ? "Mission Control release candidate ready" : "Mission Control QA bundle ready",
+    title: releaseCandidate ? "StudioOps release candidate ready" : "StudioOps QA bundle ready",
     subtitle: `${bundle.projectKey || bundle.projectId} · ${bundle.tasks?.length || 0} task(s)`,
     body: `${taskSummary}${remainder ? `; and ${remainder} more` : ""}${releaseCandidate ? ` · ${bundle.promotionPrUrl || bundle.promotionBranch || "PR ready"}` : bundle.previewUrl ? ` · ${bundle.previewUrl}` : ""}`,
   };
@@ -253,7 +253,7 @@ export async function sendPendingNotifications(input = {}) {
 
 export function formatNotificationReport(report) {
   const lines = [
-    `Mission Control notifier sweep (${report.generatedAt})`,
+    `StudioOps notifier sweep (${report.generatedAt})`,
     `Pending: ${report.pending.length}  Sent: ${report.sent.length}${report.dryRun ? "  DRY RUN" : ""}`,
     "",
   ];

@@ -1,8 +1,8 @@
 # GitHub App Bots
 
-Mission Control can use GitHub Apps as bot identities for branch pushes, pull requests, comments, and reviewer handoffs.
+StudioOps can use GitHub Apps as bot identities for branch pushes, pull requests, comments, and reviewer handoffs.
 
-GitHub requires one browser approval step to create an App registration. Mission Control provides a local manifest setup helper so the app permissions are prefilled and private credentials are saved outside git.
+GitHub requires one browser approval step to create an App registration. StudioOps provides a local manifest setup helper so the app permissions are prefilled and private credentials are saved outside git.
 
 ## Recommended Setup
 
@@ -18,7 +18,7 @@ This creates a local setup page at:
 http://127.0.0.1:4328/
 ```
 
-Click **Create Mission Control Bot**, approve the GitHub App registration, then install it on the repositories Mission Control should manage.
+Click **Create StudioOps Bot**, approve the GitHub App registration, then install it on the repositories StudioOps should manage.
 
 Credentials are written locally under:
 
@@ -40,7 +40,7 @@ npm run setup-github-role-apps
 
 This creates manifests for:
 
-- `Mission Control Builder`
+- `StudioOps Builder`
 - `MC Backend Reviewer`
 - `MC Frontend Reviewer`
 - `MC Accessibility Reviewer`
@@ -59,7 +59,7 @@ The manifest requests:
 - `checks: read` and `actions: read` for CI/status inspection
 - `metadata: read`, required by GitHub Apps
 
-Webhooks are not requested by default. Mission Control can add webhook handling later if we use a public endpoint or tunnel and want GitHub to actively push events into the local task board.
+Webhooks are not requested by default. StudioOps can add webhook handling later if we use a public endpoint or tunnel and want GitHub to actively push events into the local task board.
 
 ## Security
 
@@ -87,11 +87,11 @@ When the runner claims a builder or reviewer run, it:
 - rewrites GitHub SSH remotes to HTTPS for the child process only, so `git push origin ...` uses HTTPS without changing persistent remotes
 - redacts the installation token from runner logs and last-message files if a child process prints it
 
-Installation tokens are short-lived. GitHub controls the final expiry, and Mission Control rejects expired token responses.
+Installation tokens are short-lived. GitHub controls the final expiry, and StudioOps rejects expired token responses.
 
 ## Pull Request Publish Flow
 
-The supported unattended path is the GitHub CLI running inside a Mission Control builder session with a freshly minted GitHub App installation token. It does not depend on a saved personal `gh` login or a long-lived connector session.
+The supported unattended path is the GitHub CLI running inside a StudioOps builder session with a freshly minted GitHub App installation token. It does not depend on a saved personal `gh` login or a long-lived connector session.
 
 Before starting Codex, the runner:
 
@@ -110,7 +110,7 @@ git push --set-upstream origin "$(git branch --show-current)"
 gh pr view --json url --jq .url 2>/dev/null || \
   gh pr create --draft \
     --base main \
-    --title "Mission Control task title" \
+    --title "StudioOps task title" \
     --body "Primary task: task_123"
 ```
 
@@ -140,13 +140,13 @@ gh --version
 
 No persistent `gh` authentication is required for normal App-authenticated runs. If the runner reports missing App credentials, rerun `npm run setup-github-app` or `npm run setup-github-role-apps` and install the App on the target repository. If token minting fails or GitHub reports an expired token, verify the App installation and local private key; the next runner attempt mints a new token rather than reusing the expired one.
 
-For a smoke test, use a harmless documentation-only branch, push it through the runner session, create a draft PR with the sequence above, and confirm the bot owns the PR. Link that PR to its single primary Mission Control task before moving the task to `builder_review`. Close the test PR after verification if it is not intended to merge.
+For a smoke test, use a harmless documentation-only branch, push it through the runner session, create a draft PR with the sequence above, and confirm the bot owns the PR. Link that PR to its single primary StudioOps task before moving the task to `builder_review`. Close the test PR after verification if it is not intended to merge.
 
 ## Role Mapping
 
 With `npm run setup-github-app`, all roles use `.mission-control/github-apps/default/`.
 
-With `npm run setup-github-role-apps`, Mission Control looks for these directories:
+With `npm run setup-github-role-apps`, StudioOps looks for these directories:
 
 - `builder`
 - `backend-reviewer`
@@ -155,7 +155,7 @@ With `npm run setup-github-role-apps`, Mission Control looks for these directori
 - `lead-reviewer`
 - `promotion-worker`
 
-You can override the mapping in `mission-control.config.md`:
+You can override the mapping in `studioops.config.md`:
 
 ```json
 "githubApps": {

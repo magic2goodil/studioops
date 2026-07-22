@@ -1,10 +1,10 @@
-# Codex Mission Control
+# StudioOps
 
-Codex Mission Control is a local-first orchestration system for turning structured product tasks into isolated Codex builder and reviewer runs, assembling lead-approved work in non-production QA, and preserving human control over releases and production.
+StudioOps installs a senior AI engineering team around your software project. It turns intent into structured work, routes that work through isolated builders and specialist reviewers, assembles lead-approved changes in non-production QA, and keeps releases under human control.
 
 It is for developers who want an AI coding workflow to behave more like an accountable engineering team: tasks have acceptance criteria, builders work on separate branches, domain reviewers check the result, a lead makes the final automation decision, and the owner reviews a coherent local QA build instead of chasing individual agents.
 
-> **Project status:** developer preview. Mission Control is useful today on a single developer machine, but its interfaces and data model may still change. Read [Current Limitations](#current-limitations) before relying on it for critical work.
+> **Project status:** developer preview. StudioOps is useful today on a single developer machine, but its interfaces and data model may still change. Read [Current Limitations](#current-limitations) before relying on it for critical work.
 
 ## What It Does
 
@@ -31,7 +31,7 @@ flowchart LR
     G --> H["Human release or tag"]
 ```
 
-Mission Control automates the middle of the process. The human owner remains the authority for product acceptance, protected-branch merges, releases, and production deployment.
+StudioOps automates the middle of the process. The human owner remains the authority for product acceptance, protected-branch merges, releases, and production deployment.
 
 ## Requirements
 
@@ -46,8 +46,8 @@ The UI and CLI can be run manually on other platforms supported by Node.js. The 
 ## Quick Start
 
 ```bash
-git clone https://github.com/magic2goodil/codex-mission-control.git
-cd codex-mission-control
+git clone https://github.com/magic2goodil/studioops.git
+cd studioops
 npm install
 npm run setup
 npm run dev
@@ -55,17 +55,40 @@ npm run dev
 
 Open [http://127.0.0.1:4317](http://127.0.0.1:4317).
 
-The setup wizard writes a local `mission-control.config.md`, registers an optional first project, and checks GitHub CLI and SSH readiness. It never asks for or stores private SSH keys.
+The setup wizard writes a local `studioops.config.md`, registers an optional first project, and checks GitHub CLI and SSH readiness. Existing `mission-control.config.md` files remain supported during the rebrand. It never asks for or stores private SSH keys.
 
 For a complete first-run walkthrough, GitHub bot setup, manual operation, and always-on installation, see [Getting Started](docs/GETTING_STARTED.md).
 
-## Give This To Codex
+## Install The Codex Plugin
 
-Paste this into a new Codex task when you want Codex to install Mission Control for you:
+The repository is also a Codex plugin marketplace. After cloning StudioOps and starting the local app:
+
+```bash
+codex plugin marketplace add /absolute/path/to/studioops
+codex plugin add studioops@studioops
+```
+
+Start a new Codex task after installation, then ask:
 
 ```text
-Set up Codex Mission Control from
-https://github.com/magic2goodil/codex-mission-control.
+Create this project in StudioOps.
+```
+
+The bundled `run-studioops` skill inspects the current repository, creates or reuses the matching StudioOps project, and writes a structured task with user story, expected outcome, acceptance criteria, work lane, validation, and security/privacy notes. See [Plugin Development](docs/PLUGIN.md).
+
+## Community And Paid Plans
+
+The Community edition is not a teaser: the local board, plugin, standards, builders, review pipeline, QA gates, and human release gate remain free and MIT licensed. Planned Pro and Team services add hosted coordination, shared private standards, managed automation, team policy, audit history, and cross-project reporting through StudioOps Cloud.
+
+The capability boundary and proposed launch packaging are documented in [Product Tiers](docs/PRODUCT_TIERS.md). Paid services extend the open core; they do not retroactively remove rights from published MIT versions.
+
+## Give This To Codex
+
+Paste this into a new Codex task when you want Codex to install StudioOps for you:
+
+```text
+Set up StudioOps from
+https://github.com/magic2goodil/studioops.
 
 Read README.md, docs/GETTING_STARTED.md, and docs/HANDOFF.md first. Install
 dependencies, run the interactive setup, register my first project, and verify
@@ -75,22 +98,22 @@ or customer data. Do not enable network access, GitHub bot writes, automatic
 merges, releases, or production deployment without explaining the boundary first.
 ```
 
-Once Mission Control is configured, useful requests include:
+Once StudioOps is configured, useful requests include:
 
 ```text
-Create a task for this in Mission Control and send me the link.
+Create a task for this in StudioOps and send me the link.
 ```
 
 ```text
-Add this to Mission Control, but do not build it yet.
+Add this to StudioOps, but do not build it yet.
 ```
 
 ```text
-Build this through Mission Control.
+Build this through StudioOps.
 ```
 
 ```text
-Break this mockup into an epic and buildable Mission Control tasks.
+Break this mockup into an epic and buildable StudioOps tasks.
 ```
 
 The expected task shape and cross-chat handoff rules are documented in [docs/HANDOFF.md](docs/HANDOFF.md).
@@ -129,11 +152,13 @@ Separate builder and reviewer identities are also supported:
 npm run setup-github-role-apps
 ```
 
-Mission Control fails closed when GitHub App authentication is required but unavailable; it does not silently fall back to a personal GitHub identity. See [GitHub App Bots](docs/GITHUB_APP_BOTS.md).
+StudioOps fails closed when GitHub App authentication is required but unavailable; it does not silently fall back to a personal GitHub identity. See [GitHub App Bots](docs/GITHUB_APP_BOTS.md).
 
 ## State And Backups
 
 The authoritative local state is `data/mission-control.sqlite3`. SQLite WAL mode and immediate transactions protect concurrent dispatcher, runner, review, QA, promotion, and notifier writes. Existing JSON state is imported once during migration and is not maintained as a second writable source of truth.
+
+The database, `~/.mission-control` runtime directory, environment variables, and LaunchAgent labels retain their legacy names in the first StudioOps release so existing installations upgrade without losing state or duplicating background workers.
 
 Create a consistent backup while workers are running:
 
@@ -145,7 +170,7 @@ State files, backups, heartbeats, run output, local attachments, credentials, an
 
 ## Safety Boundary
 
-By default, Mission Control:
+By default, StudioOps:
 
 - binds the UI to `127.0.0.1`
 - stores state locally with restrictive file permissions
@@ -159,12 +184,12 @@ Do not place secrets, access tokens, private keys, customer data, or unnecessary
 
 ## Current Limitations
 
-- Mission Control is a local, single-owner control plane, not a hosted multi-user service.
+- StudioOps is a local, single-owner control plane, not a hosted multi-user service.
 - The web UI does not provide internet-facing authentication. Do not expose it directly to the public internet.
 - Always-on worker installation and local notifications currently use macOS LaunchAgents.
 - GitHub automation requires GitHub App installation and local credentials configured outside the repository.
 - A configured builder can edit code, execute project validation commands, push branches, and open PRs. Review project safety rules before enabling unattended runs.
-- Production deployment is deliberately outside Mission Control's automatic worker loop.
+- Production deployment is deliberately outside StudioOps's automatic worker loop.
 
 ## Documentation
 

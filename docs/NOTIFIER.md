@@ -1,4 +1,4 @@
-# Mission Control Notifier
+# StudioOps Notifier
 
 The notifier is the local handoff layer.
 

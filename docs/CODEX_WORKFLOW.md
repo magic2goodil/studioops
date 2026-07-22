@@ -1,6 +1,6 @@
 # Codex Workflow
 
-Mission Control is built around four roles.
+StudioOps is built around four roles.
 
 ## Intake
 
@@ -40,7 +40,7 @@ Use the generated builder prompt. The builder should:
 4. Implement the task.
 5. Run validation.
 6. Commit and push only when asked or when the project workflow allows it.
-7. Link the feature branch and PR on the Mission Control task.
+7. Link the feature branch and PR on the StudioOps task.
 8. Add a task comment with changed files, validation results, known gaps, and the PR URL.
 
 ## Review Pipeline
@@ -67,7 +67,7 @@ Backend, frontend, and accessibility review can be explicitly skipped only when 
 
 Reviewers should fix small deterministic issues directly when project policy allows it, then document the fix and continue the review. Material issues use `changes_requested`. The default review policy allows two routine builder review cycles; after that, non-lead change requests route to the primary lead reviewer for the final automation decision instead of creating another builder-review loop.
 
-Default PR rule: one PR should have one primary Mission Control task. Related tasks can be referenced, but they should not all be moved to `user_review` unless the PR satisfies each task's acceptance criteria.
+Default PR rule: one PR should have one primary StudioOps task. Related tasks can be referenced, but they should not all be moved to `user_review` unless the PR satisfies each task's acceptance criteria.
 
 Run the steward manually with:
 
@@ -160,6 +160,6 @@ Use the generated domain reviewer prompts. The reviewer should:
 
 The human owner is the final product and production-release authority. Tasks should reach the human owner only after backend/frontend/accessibility review has been completed or explicitly skipped and the primary team lead has approved the work into `user_review` or, when Trust Leads is enabled, `qa_review`.
 
-When a task reaches `user_review`, Mission Control emits an `owner_review_requested` event and assigns the owner role. When Trust Leads routes a task to `qa_review`, Mission Control emits `qa_review_requested` and the supervisor reports `notify_qa_review`. External notifications should be built from those events rather than arbitrary status polling.
+When a task reaches `user_review`, StudioOps emits an `owner_review_requested` event and assigns the owner role. When Trust Leads routes a task to `qa_review`, StudioOps emits `qa_review_requested` and the supervisor reports `notify_qa_review`. External notifications should be built from those events rather than arbitrary status polling.
 
-When local QA passes, Mission Control emits `qa_passed`, assigns the promotion worker, and queues target-branch promotion. When promotion succeeds, it emits `release_candidate_ready` for the project. That event means the target branch is ready for owner release-candidate review; it does not mean production has deployed.
+When local QA passes, StudioOps emits `qa_passed`, assigns the promotion worker, and queues target-branch promotion. When promotion succeeds, it emits `release_candidate_ready` for the project. That event means the target branch is ready for owner release-candidate review; it does not mean production has deployed.

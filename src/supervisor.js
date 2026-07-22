@@ -225,7 +225,7 @@ function taskActions(state, task, options = {}) {
           task,
           "waiting_for_transient_recovery",
           "",
-          `Mission Control will automatically retry this transient failure${blocker.retryAt ? ` after ${blocker.retryAt}` : " after its recovery delay"}: ${blocker.reason || "worker error"}.`,
+          `StudioOps will automatically retry this transient failure${blocker.retryAt ? ` after ${blocker.retryAt}` : " after its recovery delay"}: ${blocker.reason || "worker error"}.`,
           {
             ...options,
             nextStatus: blocker.resumeStatus || "queued",
@@ -392,7 +392,7 @@ export function createSupervisorReport(state, options = {}) {
 
 export function formatSupervisorReport(report) {
   const lines = [
-    `Mission Control supervisor sweep (${report.generatedAt})`,
+    `StudioOps supervisor sweep (${report.generatedAt})`,
     `Projects: ${report.totals.projects}  Tasks: ${report.totals.tasks}  Actions: ${report.totals.actions}  Waiting: ${report.totals.waiting}`,
     "",
   ];

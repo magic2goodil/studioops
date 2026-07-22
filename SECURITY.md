@@ -1,6 +1,6 @@
 # Security Policy
 
-Codex Mission Control executes coding agents against local repositories. Treat its configuration, task content, workspaces, GitHub credentials, logs, and state database as sensitive development infrastructure.
+StudioOps executes coding agents against local repositories. Treat its configuration, task content, workspaces, GitHub credentials, logs, and state database as sensitive development infrastructure.
 
 ## Supported Versions
 
@@ -26,13 +26,13 @@ If private reporting is unavailable, open a public issue that only asks the main
 - The web server binds to `127.0.0.1` by default and does not currently provide internet-facing multi-user authentication.
 - Do not expose the UI directly to the public internet.
 - Binding to `0.0.0.0` exposes task content to the reachable local network. Use it only on a trusted network with host firewall controls.
-- Mission Control must not be used as a public webhook endpoint without an authenticated gateway designed for that purpose.
+- StudioOps must not be used as a public webhook endpoint without an authenticated gateway designed for that purpose.
 
 ## Secrets And PII
 
 Never store secrets, access tokens, private keys, passwords, customer records, or unnecessary PII in:
 
-- `mission-control.config.md`
+- `studioops.config.md`
 - tasks, comments, acceptance criteria, or attachments
 - builder or reviewer prompts
 - sample data
@@ -55,7 +55,7 @@ Builders and reviewers may read and edit local repository files, execute project
 6. Require owner QA before promotion.
 7. Require an explicit release or tag before production deployment.
 
-Mission Control intentionally does not authorize direct production deployment. Do not weaken that boundary in a routine task or pull request.
+StudioOps intentionally does not authorize direct production deployment. Do not weaken that boundary in a routine task or pull request.
 
 ## Local State
 

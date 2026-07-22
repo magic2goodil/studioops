@@ -1,4 +1,4 @@
-# Mission Control Dispatcher
+# StudioOps Dispatcher
 
 The dispatcher is the next layer after the supervisor.
 
@@ -70,7 +70,7 @@ The dispatcher should be the durable runner for a machine. The supervisor can ke
 
 The default provider is `prompt-outbox`.
 
-That means Mission Control stores the generated Codex prompt on the run record. A Codex-capable runner can then pick up the run and create or resume the actual builder/reviewer task.
+That means StudioOps stores the generated Codex prompt on the run record. A Codex-capable runner can then pick up the run and create or resume the actual builder/reviewer task.
 
 This is intentional for the open-source project:
 
@@ -78,7 +78,7 @@ This is intentional for the open-source project:
 - it does not hard-code one AI vendor
 - it gives Codex, Claude, Antigravity, or another runner the same durable work packet
 
-Mission Control also includes a local Codex CLI runner. It consumes queued builder/reviewer runs created by the dispatcher and executes the stored prompt inside the target project repo. See [RUNNER.md](RUNNER.md).
+StudioOps also includes a local Codex CLI runner. It consumes queued builder/reviewer runs created by the dispatcher and executes the stored prompt inside the target project repo. See [RUNNER.md](RUNNER.md).
 
 When a native thread API is available, it should plug in at the provider boundary by:
 
@@ -90,7 +90,7 @@ When a native thread API is available, it should plug in at the provider boundar
 
 ## Run Statuses
 
-- `queued`: Mission Control created the run and stored the prompt.
+- `queued`: StudioOps created the run and stored the prompt.
 - `running`: an external worker thread has started.
 - `notified`: owner handoff was recorded.
 - `completed`: the worker finished and recorded output.
@@ -133,7 +133,7 @@ Queued and running runs count toward concurrency. Completed, failed, and cancell
 
 The dispatcher also deduplicates by task, role, action type, review cycle, and target status so the same task is not re-dispatched every five minutes.
 
-The dispatcher also attaches a work lane and file-scope hint to each builder/reviewer run. If a task does not explicitly set `lane` or `workAreas`, Mission Control infers the lane from task type, area, title, story, expected outcome, and reviewer role.
+The dispatcher also attaches a work lane and file-scope hint to each builder/reviewer run. If a task does not explicitly set `lane` or `workAreas`, StudioOps infers the lane from task type, area, title, story, expected outcome, and reviewer role.
 
 Lane conflict rules:
 

@@ -41,7 +41,7 @@ function emptyState(runs = []) {
 
 async function configureRepo(repoPath) {
   await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-  await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+  await git(repoPath, ["config", "user.name", "StudioOps Test"]);
 }
 
 async function commitFile(repoPath, fileName, body, message) {

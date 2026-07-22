@@ -22,6 +22,7 @@ const refreshButton = document.querySelector("#refreshButton");
 const statusFilter = document.querySelector("#statusFilter");
 const projectCount = document.querySelector("#projectCount");
 const configStatus = document.querySelector("#configStatus");
+const productPlan = document.querySelector("#productPlan");
 const detailPanel = document.querySelector(".detail-panel");
 const detailHeading = document.querySelector(".detail-panel .panel-header h2");
 const imageModal = document.querySelector("#imageModal");
@@ -295,6 +296,10 @@ async function loadState() {
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
   state.qaBundles = data.qaBundles || [];
+  state.productAccess = data.productAccess || null;
+  if (productPlan && state.productAccess) {
+    productPlan.textContent = `${state.productAccess.planName} · ${state.productAccess.connectedToCloud ? "cloud" : "local"}`;
+  }
   state.routeTaskId = routeTaskId();
   const linkedTask = state.routeTaskId ? state.tasks.find((task) => task.id === state.routeTaskId) : null;
   if (linkedTask) {
@@ -307,8 +312,8 @@ async function loadState() {
   if (!state.routeTaskId && !state.selectedProjectId && state.projects[0]) state.selectedProjectId = state.projects[0].id;
   if (!state.routeTaskId && !state.selectedTaskId && state.tasks[0]) state.selectedTaskId = state.tasks[0].id;
   configStatus.textContent = data.configLoaded
-    ? "Local config loaded from mission-control.config.md"
-    : "No mission-control.config.md yet. Run npm run setup or mission-control setup.";
+    ? "Local StudioOps configuration loaded"
+    : "No local configuration yet. Run npm run setup or studioops setup.";
   render();
 }
 
@@ -1120,5 +1125,5 @@ statusFilter.addEventListener("change", () => {
 });
 
 loadState().catch((error) => {
-  document.body.innerHTML = `<main class="panel"><h1>Mission Control failed to load</h1><p>${escapeHtml(error.message)}</p></main>`;
+  document.body.innerHTML = `<main class="panel"><h1>StudioOps failed to load</h1><p>${escapeHtml(error.message)}</p></main>`;
 });

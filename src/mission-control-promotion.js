@@ -90,14 +90,14 @@ async function runWatch(args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args._[0] === "help") {
-    console.log(`Mission Control Promotion Worker
+    console.log(`StudioOps Promotion Worker
 
 Usage:
-  mission-control-promotion --plan
-  mission-control-promotion --project myapp
-  mission-control-promotion --watch --interval 300
-  mission-control promote --plan
-  mission-control promote --github-apps-dir .mission-control/github-apps
+  studioops-promotion --plan
+  studioops-promotion --project myapp
+  studioops-promotion --watch --interval 300
+  studioops promote --plan
+  studioops promote --github-apps-dir .mission-control/github-apps
 
 The worker merges owner-QA-passed task branches or PR heads into the project's
 configured target branch, defaulting to the project default branch. It uses an

@@ -1,6 +1,6 @@
-# Mission Control Supervisor
+# StudioOps Supervisor
 
-The supervisor is the always-on layer for Mission Control.
+The supervisor is the always-on layer for StudioOps.
 
 It checks every registered project, reads task status, and reports the next action needed for builders, reviewers, dependency blockers, and owner handoff.
 

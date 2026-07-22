@@ -88,14 +88,14 @@ async function runWatch(args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args._[0] === "help") {
-    console.log(`Mission Control Supervisor
+    console.log(`StudioOps Supervisor
 
 Usage:
-  mission-control-supervisor
-  mission-control-supervisor --json
-  mission-control-supervisor --watch --interval 300
-  mission-control-supervisor --all
-  mission-control supervisor --watch --interval 300
+  studioops-supervisor
+  studioops-supervisor --json
+  studioops-supervisor --watch --interval 300
+  studioops-supervisor --all
+  studioops supervisor --watch --interval 300
 
 The supervisor is read-oriented. It inspects every project and task, then prints the
 next builder, reviewer, dependency, or owner handoff action. It does not merge,

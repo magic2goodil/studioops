@@ -1,6 +1,6 @@
 # Contributing
 
-Codex Mission Control is an early open-source project. Contributions should preserve its local-first architecture, human release authority, durable workflow state, and explicit security boundaries.
+StudioOps is an early open-source project. Contributions should preserve its local-first architecture, human release authority, durable workflow state, and explicit security boundaries.
 
 ## Before You Start
 
@@ -18,8 +18,8 @@ Security reports must follow [SECURITY.md](SECURITY.md), not the public issue tr
 ## Development Setup
 
 ```bash
-git clone https://github.com/magic2goodil/codex-mission-control.git
-cd codex-mission-control
+git clone https://github.com/magic2goodil/studioops.git
+cd studioops
 npm install
 npm run check
 npm run dev
@@ -29,7 +29,7 @@ Use Node.js `22.5` or newer. Keep local configuration and runtime state out of G
 
 ## Change Expectations
 
-- Keep work scoped to one primary issue or Mission Control task per PR.
+- Keep work scoped to one primary issue or StudioOps task per PR.
 - Add or update tests for workflow, persistence, worker, security, or recovery changes.
 - Preserve SQLite transactions, indexes, file permissions, and one authoritative source of state.
 - Preserve isolated workspaces and bounded retry/review behavior.
@@ -47,7 +47,7 @@ Read [AGENTS.md](AGENTS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs
 3. Run `npm run check`.
 4. Inspect the complete diff for secrets, runtime data, generated files, and unrelated edits.
 5. Explain what changed, why, user impact, validation, migration requirements, and known limitations.
-6. Link the issue or Mission Control task.
+6. Link the issue or StudioOps task.
 
 PRs that change persistence, authentication, GitHub permissions, worker execution, self-update, QA integration, promotion, or release gates should include explicit failure-mode and rollback notes.
 
@@ -57,7 +57,7 @@ PRs that change persistence, authentication, GitHub permissions, worker executio
 - Prefer existing modules and patterns over parallel abstractions.
 - Keep comments focused on non-obvious constraints.
 - Avoid unrelated formatting or metadata churn.
-- Never commit local SQLite files, backups, heartbeats, task attachments, run output, credentials, or `mission-control.config.md`.
+- Never commit local SQLite files, backups, heartbeats, task attachments, run output, credentials, or `studioops.config.md`.
 
 ## License
 

@@ -1,6 +1,6 @@
 # Local Automation
 
-Mission Control can run manually from the CLI or continuously through macOS user LaunchAgents.
+StudioOps can run manually from the CLI or continuously through macOS user LaunchAgents.
 
 The always-on stack includes:
 
@@ -12,7 +12,7 @@ The always-on stack includes:
 - `qa-integration`: merges `qa_review` PR heads into opted-in non-production integration branches after validation
 - `promotion`: assembles owner-QA-passed work into a validated release-candidate PR
 - `notifier`: sends local owner-review and failure notifications
-- `self-update`: fetches `origin/main`, fast-forwards Mission Control itself when safe, and restarts worker LaunchAgents
+- `self-update`: fetches `origin/main`, fast-forwards StudioOps itself when safe, and restarts worker LaunchAgents
 - `watchdog`: reconciles stranded task state, watches worker heartbeats, and restarts stale workers
 
 ## Install
@@ -69,7 +69,7 @@ The runner defaults to `codex-cli`. To test SDK-backed Codex threads:
 npm run runner -- --provider codex-sdk --limit 1
 ```
 
-To make LaunchAgent runs use the SDK provider, set `defaults.runner.provider` to `codex-sdk` in `mission-control.config.md`, then restart the local agents.
+To make LaunchAgent runs use the SDK provider, set `defaults.runner.provider` to `codex-sdk` in `studioops.config.md`, then restart the local agents.
 
 For an ad hoc shell or service override, set:
 
@@ -139,7 +139,7 @@ Projects can also opt into keeping their QA branch and local preview checkout cu
 The same local preview can be configured without hand-editing the data file:
 
 ```bash
-mission-control update-project myapp \
+studioops update-project myapp \
   --local-qa-preview \
   --local-qa-preview-checkout ~/.mission-control/qa-workspaces/myapp/myapp-clean \
   --local-qa-preview-branch qa/integration \
@@ -149,15 +149,15 @@ mission-control update-project myapp \
 
 `syncDefaultBranchIntoIntegration` merges the latest configured default branch into the non-production QA branch before task PR heads are integrated. This is useful after the owner merges a PR to `main`: the QA branch catches up on the next sweep instead of leaving the local preview stale.
 
-`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, Mission Control preserves them in a Git stash before fast-forwarding. Missing preview LaunchAgents are bootstrapped from the configured plist (or the standard `~/Library/LaunchAgents/<label>.plist` path), restarted, and health-checked before the bundle is marked ready.
+`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, StudioOps preserves them in a Git stash before fast-forwarding. Missing preview LaunchAgents are bootstrapped from the configured plist (or the standard `~/Library/LaunchAgents/<label>.plist` path), restarted, and health-checked before the bundle is marked ready.
 
 ## Main Promotion
 
 After the owner reviews the local QA preview, mark the task from the UI or CLI:
 
 ```bash
-mission-control qa-pass task_123 --body "Checked locally."
-mission-control qa-fail task_123 --body "Hero image still covers the full page."
+studioops qa-pass task_123 --body "Checked locally."
+studioops qa-fail task_123 --body "Hero image still covers the full page."
 ```
 
 `qa-pass` moves the task to `approved_for_main` and queues it for the promotion worker. `qa-fail` moves it back to `needs_changes` with the owner notes preserved as a task comment.
@@ -187,7 +187,7 @@ Promotion does not deploy production. It prepares the target branch for owner re
 
 ## Self Update
 
-Mission Control can update its own local checkout after a control-plane PR is merged to `origin/main`:
+StudioOps can update its own local checkout after a control-plane PR is merged to `origin/main`:
 
 ```bash
 npm run self-update -- --plan
@@ -213,9 +213,9 @@ Running builder/reviewer runs are ignored only when they are stale, such as a mi
 - `com.codex.mission-control.promotion`
 - `com.codex.mission-control.watchdog`
 
-During an applied update, Mission Control records a short-lived self-update lease in local state. The runner checks that lease before claiming queued builder/reviewer work, so queued runs wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
+During an applied update, StudioOps records a short-lived self-update lease in local state. The runner checks that lease before claiming queued builder/reviewer work, so queued runs wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
 
-Use `mission-control.config.md` `defaults.selfUpdate` or CLI flags such as `--branch`, `--remote`, `--stale-run-ms`, `--task`, `--notify`, and `--no-restart` to tune local behavior. `--task` records a Mission Control comment on that task; all material non-dry-run outcomes are recorded as Mission Control events.
+Use `studioops.config.md` `defaults.selfUpdate` or CLI flags such as `--branch`, `--remote`, `--stale-run-ms`, `--task`, `--notify`, and `--no-restart` to tune local behavior. `--task` records a StudioOps comment on that task; all material non-dry-run outcomes are recorded as StudioOps events.
 
 ## Uninstall
 
@@ -251,4 +251,4 @@ It must not:
 
 The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
 
-Mission Control treats backend and frontend work as compatible by default. Design conflicts with frontend, and devops/project-wide work conflicts with other lanes in the same project. That keeps parallel agents from editing the same UI/CSS/deployment surface while still allowing a real team-style flow.
+StudioOps treats backend and frontend work as compatible by default. Design conflicts with frontend, and devops/project-wide work conflicts with other lanes in the same project. That keeps parallel agents from editing the same UI/CSS/deployment surface while still allowing a real team-style flow.

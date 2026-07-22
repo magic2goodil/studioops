@@ -1,0 +1,20 @@
+{
+  "name": "studioops",
+  "interface": {
+    "displayName": "StudioOps"
+  },
+  "plugins": [
+    {
+      "name": "studioops",
+      "source": {
+        "source": "local",
+        "path": "./plugins/studioops"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

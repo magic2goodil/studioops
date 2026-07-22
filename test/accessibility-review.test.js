@@ -153,7 +153,7 @@ test("accessibility reviewer prompt includes the required checklist and breakpoi
   assert.match(prompt, /ARIA use/);
   assert.match(prompt, /screen-reader basics/);
   assert.match(prompt, /mobile, tablet, and desktop/);
-  assert.match(prompt, /mission-control review task_1 --stage accessibility/);
+  assert.match(prompt, /studioops review task_1 --stage accessibility/);
 });
 
 test("prompt generation resolves relative project standards without crashing", () => {
@@ -173,7 +173,7 @@ test("accessibility reviewer runs use the frontend lane profile", () => {
 });
 
 test("example config imports accessibility review before lead review", async () => {
-  const markdown = await readFile("mission-control.config.example.md", "utf8");
+  const markdown = await readFile("studioops.config.example.md", "utf8");
   const config = extractConfigJson(markdown);
 
   assert.equal(config.githubApps.roleMap["accessibility-reviewer"], "default");

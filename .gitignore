@@ -1,6 +1,7 @@
 node_modules/
 .DS_Store
 .env
+studioops.config.md
 mission-control.config.md
 .mission-control/
 data/workspaces/

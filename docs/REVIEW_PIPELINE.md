@@ -1,10 +1,10 @@
 # Review Pipeline
 
-Mission Control uses staged review so the human owner only sees work after the builder and reviewer agents have done their jobs.
+StudioOps uses staged review so the human owner only sees work after the builder and reviewer agents have done their jobs.
 
 ## Automation Steward
 
-Mission Control has a bounded automation steward. It advances ticket ownership and review gates; it does not silently approve work, merge PRs, deploy, or replace real code review.
+StudioOps has a bounded automation steward. It advances ticket ownership and review gates; it does not silently approve work, merge PRs, deploy, or replace real code review.
 
 Run one pass manually with:
 
@@ -53,7 +53,7 @@ node src/mission-control-cli.js review task_123 --stage lead --outcome changes_r
 
 Valid outcomes are `approved`, `skipped`, and `changes_requested`.
 
-Each time a builder moves work into `builder_review`, Mission Control increments the task's review cycle. Review outcomes are scoped to that cycle, so an old approval cannot carry forward after a reviewer requests changes and the builder resubmits.
+Each time a builder moves work into `builder_review`, StudioOps increments the task's review cycle. Review outcomes are scoped to that cycle, so an old approval cannot carry forward after a reviewer requests changes and the builder resubmits.
 
 ## Default Flow
 
@@ -131,7 +131,7 @@ Expected reviewer outcomes:
 
 - No issues: record an `approved` review outcome with reviewed scope, validation reviewed, residual risk, and next status.
 - No relevant surface: record a `skipped` review outcome with the reason the lane does not apply.
-- Issues found: record a `changes_requested` review outcome with findings. Mission Control returns the task to `needs_changes` and assigns the builder unless the task has reached the configured review-cycle limit, in which case unresolved non-lead findings route to lead review.
+- Issues found: record a `changes_requested` review outcome with findings. StudioOps returns the task to `needs_changes` and assigns the builder unless the task has reached the configured review-cycle limit, in which case unresolved non-lead findings route to lead review.
 - Wrong scope: request a PR split or task split.
 - Incomplete acceptance criteria: record `changes_requested`.
 - Missing review lane: let automation route to the required review status, or record a `skipped` outcome when the lane truly does not apply.
@@ -139,13 +139,13 @@ Expected reviewer outcomes:
 
 ## Review Loop Limits
 
-Default policy: Mission Control allows two routine builder review cycles.
+Default policy: StudioOps allows two routine builder review cycles.
 
 The first material `changes_requested` outcome returns the task to `needs_changes` and assigns the builder to update the same branch/PR unless the reviewer asks for a split.
 
-At the configured cycle limit, Mission Control stops normal builder-review ping-pong:
+At the configured cycle limit, StudioOps stops normal builder-review ping-pong:
 
-- Non-lead reviewers still record `changes_requested` for material unresolved issues, but Mission Control routes the task to `lead_review` instead of back to the builder.
+- Non-lead reviewers still record `changes_requested` for material unresolved issues, but StudioOps routes the task to `lead_review` instead of back to the builder.
 - The primary lead reviewer makes the final automation decision for that cycle.
 - The lead should fix small deterministic issues directly when practical, approve with residual risk documented when acceptable, or send the task to human owner review when it is unsafe or genuinely blocked.
 - A lead `changes_requested` outcome at the cycle limit requests human owner review instead of starting another routine builder pass.
@@ -167,7 +167,7 @@ Projects can override the default with:
 
 Trust Leads is a project-level option for reducing owner review fatigue.
 
-When `reviewPolicy.trustLeadApprovals` is `true`, Mission Control trusts the primary lead's `approved` or `skipped` outcome after backend/frontend/accessibility review is complete. The task moves to `qa_review` instead of `user_review`, and the supervisor reports `notify_qa_review`.
+When `reviewPolicy.trustLeadApprovals` is `true`, StudioOps trusts the primary lead's `approved` or `skipped` outcome after backend/frontend/accessibility review is complete. The task moves to `qa_review` instead of `user_review`, and the supervisor reports `notify_qa_review`.
 
 Use `reviewPolicy.integrationBranch` to name the non-production branch or bundle target that should collect lead-approved work for local testing, for example `qa/event-horizons-web`.
 
@@ -175,7 +175,7 @@ Trust Leads does not allow production deploys. It only changes the handoff from 
 
 ## One PR Versus Multiple Tasks
 
-Default rule: one PR should have one primary Mission Control task.
+Default rule: one PR should have one primary StudioOps task.
 
 Related tasks may be referenced in comments, PR body, or as dependencies, but they should not all be moved to `user_review` unless the PR actually satisfies each task's acceptance criteria.
 
@@ -199,7 +199,7 @@ The human owner should receive only tasks in `user_review` or `qa_review`.
 
 `user_review` and `qa_review` are stop points. Automation should not merge to `main`, deploy production, or mark final completion. The human owner approves, requests changes, or merges.
 
-Before a task reaches `user_review`, Mission Control should show:
+Before a task reaches `user_review`, StudioOps should show:
 
 - branch link
 - PR link

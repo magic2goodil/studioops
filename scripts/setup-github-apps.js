@@ -9,7 +9,7 @@ import { URL } from "node:url";
 const DEFAULT_PORT = 4328;
 const DEFAULT_OWNER = "magic2goodil";
 const CONFIG_DIR = path.join(process.cwd(), ".mission-control", "github-apps");
-const REPO_URL = "https://github.com/magic2goodil/codex-mission-control";
+const REPO_URL = "https://github.com/magic2goodil/studioops";
 const GITHUB_API_VERSION = "2026-03-10";
 
 const ROLE_SETS = {
@@ -17,16 +17,16 @@ const ROLE_SETS = {
     {
       key: "default",
       role: "default",
-      name: "Mission Control Bot",
-      description: "Creates branches, pull requests, comments, and review handoffs for Mission Control.",
+      name: "StudioOps Bot",
+      description: "Creates branches, pull requests, comments, and review handoffs for StudioOps.",
     },
   ],
   roles: [
     {
       key: "builder",
       role: "builder",
-      name: "Mission Control Builder",
-      description: "Creates implementation branches and pull requests for Mission Control tasks.",
+      name: "StudioOps Builder",
+      description: "Creates implementation branches and pull requests for StudioOps tasks.",
     },
     {
       key: "backend-reviewer",
@@ -82,7 +82,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  console.log(`Mission Control GitHub App setup
+  console.log(`StudioOps GitHub App setup
 
 Usage:
   npm run setup-github-app
@@ -183,7 +183,7 @@ async function exchangeManifestCode(code) {
     method: "POST",
     headers: {
       Accept: "application/vnd.github+json",
-      "User-Agent": "codex-mission-control",
+      "User-Agent": "studioops",
       "X-GitHub-Api-Version": GITHUB_API_VERSION,
     },
   });
@@ -219,7 +219,7 @@ function page({ apps, states, endpoint, baseUrl, owner, org }) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mission Control GitHub App Setup</title>
+  <title>StudioOps GitHub App Setup</title>
   <style>
     body { background: #07111f; color: #e8ecf6; font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 40px; }
     main { max-width: 920px; margin: 0 auto; }
@@ -234,9 +234,9 @@ function page({ apps, states, endpoint, baseUrl, owner, org }) {
 </head>
 <body>
   <main>
-    <h1>Mission Control GitHub App Setup</h1>
+    <h1>StudioOps GitHub App Setup</h1>
     <p>Owner target: <code>${htmlEscape(org ? `organization/${owner}` : `user/${owner}`)}</code></p>
-    <p>Click each app you want GitHub to create. GitHub will redirect back here, Mission Control will exchange the one-time code, and private credentials will be stored locally under <code>.mission-control/github-apps/</code>.</p>
+    <p>Click each app you want GitHub to create. GitHub will redirect back here, StudioOps will exchange the one-time code, and private credentials will be stored locally under <code>.mission-control/github-apps/</code>.</p>
     <div class="grid">${forms}</div>
   </main>
 </body>
@@ -262,7 +262,7 @@ function successPage(config) {
     <h1>${htmlEscape(config.name)} created</h1>
     <p>Credentials were saved locally at <code>${htmlEscape(config.credentialsDir)}</code>.</p>
     <p>Next step: <a href="${htmlEscape(config.installUrl)}">install the app on the repositories it should manage</a>.</p>
-    <p>After installation, Mission Control can use this app registration to request short-lived installation tokens.</p>
+    <p>After installation, StudioOps can use this app registration to request short-lived installation tokens.</p>
   </main>
 </body>
 </html>`;
@@ -328,7 +328,7 @@ async function main() {
   await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
   await mkdir(CONFIG_DIR, { recursive: true });
   const url = `${baseUrl}/`;
-  console.log(`Mission Control GitHub App setup is running: ${url}`);
+  console.log(`StudioOps GitHub App setup is running: ${url}`);
   console.log(`Mode: ${mode}`);
   console.log(`Credentials will be written under: ${CONFIG_DIR}`);
   console.log("Keep this process running until GitHub redirects back after app creation.");

@@ -702,7 +702,7 @@ export async function recordReview(taskId, input = {}) {
       createdAt: now,
     });
     if (outcome === "changes_requested") {
-      const actions = routeChangesRequestedInState(state, task, project, stage, now, "Mission Control Automation", []);
+      const actions = routeChangesRequestedInState(state, task, project, stage, now, "StudioOps Automation", []);
       state.events.push({
         id: nextId(state.events, "event"),
         type: "review_changes_requested",
@@ -715,7 +715,7 @@ export async function recordReview(taskId, input = {}) {
     }
     const actions = advanceTaskWorkflowInState(state, task, {
       now,
-      author: "Mission Control Automation",
+      author: "StudioOps Automation",
       reason: `${stage.key} review ${outcome}`,
     });
     state.events.push({
@@ -757,7 +757,7 @@ export async function automationTick(input = {}) {
       const before = `${task.status}|${task.assignedAgentRole || ""}|${task.reviewCycle || 0}`;
       const taskActions = advanceTaskWorkflowInState(state, task, {
         now,
-        author: "Mission Control Automation",
+        author: "StudioOps Automation",
         reason: "automation tick",
       });
       const after = `${task.status}|${task.assignedAgentRole || ""}|${task.reviewCycle || 0}`;
@@ -794,7 +794,7 @@ function transientRecoveryAt(blocker, input = {}) {
 function recordRecovery(state, task, body, eventType, now) {
   state.comments = state.comments || [];
   state.events = state.events || [];
-  addAutomationComment(state, task, body, now, "Mission Control Resilience");
+  addAutomationComment(state, task, body, now, "StudioOps Resilience");
   state.events.push({
     id: nextId(state.events, "event"),
     type: eventType,
@@ -1047,7 +1047,7 @@ function incompleteDependencies(state, task) {
   return dependencyTasks(state, task).filter((dependency) => !DEPENDENCY_COMPLETE_STATUSES.has(dependency.status));
 }
 
-function addAutomationComment(state, task, body, now, author = "Mission Control Automation") {
+function addAutomationComment(state, task, body, now, author = "StudioOps Automation") {
   const exists = (state.comments || []).some((comment) => (
     comment.taskId === task.id
     && comment.author === author
@@ -1205,7 +1205,7 @@ function routeChangesRequestedInState(state, task, project, stage, now, author, 
 
 function advanceTaskWorkflowInState(state, task, options = {}) {
   const now = options.now || new Date().toISOString();
-  const author = options.author || "Mission Control Automation";
+  const author = options.author || "StudioOps Automation";
   const actions = [];
   const project = findProject(state, task.projectId);
   if (!project) return actions;
@@ -1391,14 +1391,14 @@ export function generatePrompt(state, taskId, role = "builder") {
 
   if (role !== "builder") {
     const reviewerProfile = reviewerProfileForRole(role);
-    return `You are the ${reviewerProfile.label} for Mission Control task ${task.id}.
+    return `You are the ${reviewerProfile.label} for StudioOps task ${task.id}.
 
 Project: ${project.name}
 Repository path: ${project.repoPath || "(not recorded)"}
 Feature branch: ${task.branchName || "(not recorded)"}
 PR: ${task.prUrl || "(not recorded)"}
 Task type: ${task.type || "task"}
-Work lane: ${task.lane || task.area || "(inferred by Mission Control)"}
+Work lane: ${task.lane || task.area || "(inferred by StudioOps)"}
 Work areas:
 ${(task.workAreas || []).map((item) => `- ${item}`).join("\n") || "- Not explicitly scoped."}
 Review cycle: ${currentReviewCycle(task)}
@@ -1455,23 +1455,23 @@ ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
 - If you find small deterministic issues and the project policy allows reviewer fixes, fix them directly on the PR branch, run relevant validation, comment with exactly what changed, then continue the review.
 - Use \`changes_requested\` only for material, risky, ambiguous, security/privacy-sensitive, or product-shaping problems that should not be quietly fixed inside review.
 - Do not create an endless builder-review loop. If this is review cycle ${reviewPolicy.maxBuilderReviewCycles} or later, routine bounce-backs are exhausted.
-- At or beyond the review-cycle limit, non-lead reviewers should record \`changes_requested\` only for material unresolved issues; Mission Control will route the task to lead review for the final decision.
+- At or beyond the review-cycle limit, non-lead reviewers should record \`changes_requested\` only for material unresolved issues; StudioOps will route the task to lead review for the final decision.
 - At or beyond the review-cycle limit, the lead reviewer should make the final call: fix and approve, approve with residual risk documented, or hand the task to the human owner if it is unsafe or genuinely blocked. Do not send it back for another routine builder pass.
-- Record the result with \`mission-control review ${task.id} --stage ${reviewerProfile.stageHint} --outcome approved|skipped|changes_requested --body "..."\`
+- Record the result with \`studioops review ${task.id} --stage ${reviewerProfile.stageHint} --outcome approved|skipped|changes_requested --body "..."\`
 - Use \`changes_requested\` for material issues and include concrete findings.
 - Use \`skipped\` only when this review lane truly has no relevant surface.
 - Use \`approved\` when this lane is complete, with validation reviewed and residual risk summarized.
 `;
   }
 
-  return `You are the builder for Mission Control task ${task.id}.
+  return `You are the builder for StudioOps task ${task.id}.
 
 Project: ${project.name}
 Repository path: ${project.repoPath || "(not recorded)"}
 Default branch: ${project.defaultBranch || "main"}
 Suggested branch: ${task.branchName || `codex/${project.key}-${task.id}-${slugify(task.title)}`}
 Task type: ${task.type || "task"}
-Work lane: ${task.lane || task.area || "(inferred by Mission Control)"}
+Work lane: ${task.lane || task.area || "(inferred by StudioOps)"}
 Work areas:
 ${(task.workAreas || []).map((item) => `- ${item}`).join("\n") || "- Not explicitly scoped."}
 Review cycle: ${currentReviewCycle(task)}
@@ -1521,7 +1521,7 @@ Builder instructions:
 - For location, auth, social, notification, behavioral analytics, personalization, AI training, or persuasion/coaching features, define the consent path, opt-out/revocation behavior, data minimization, and privacy notes before implementation.
 - For deployment/release tasks, keep PR and protected integration branch workflows to validation, artifacts, previews, or staging by default; require production deployment to run only from explicit releases/tags with safety checks; verify the release/tag commit is reachable from the protected integration branch; make \`workflow_dispatch\` dry-run/preview unless explicitly approved for an emergency production path; and avoid broad delete/sync cleanup against production.
 - Keep changes scoped to this task.
-- Keep changes inside the task's lane and work areas. If you need to touch files outside that scope, add a Mission Control comment and either create a dependent task or explain why the scope must expand.
+- Keep changes inside the task's lane and work areas. If you need to touch files outside that scope, add a StudioOps comment and either create a dependent task or explain why the scope must expand.
 - Do not commit secrets, private customer data, or unrelated refactors.
 - Run validation before reporting ready.
 - Commit and push only if the user/project workflow asks for that.

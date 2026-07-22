@@ -170,7 +170,7 @@ async function acquireSelfUpdateLease(plan, input = {}) {
         status: "blocked_self_update_in_progress",
         canUpdate: false,
         selfUpdateLease: activeLease,
-        reason: `Another Mission Control self-update is already in progress until ${activeLease.expiresAt}.`,
+        reason: `Another StudioOps self-update is already in progress until ${activeLease.expiresAt}.`,
       };
     }
 
@@ -423,8 +423,8 @@ async function sendSelfUpdateNotification(report, input = {}) {
   if (process.platform !== "darwin") return { status: "skipped", reason: "not_macos" };
 
   const title = report.status === "updated"
-    ? "Mission Control updated"
-    : "Mission Control self-update skipped";
+    ? "StudioOps updated"
+    : "StudioOps self-update skipped";
   const body = selfUpdateSummary(report);
   const script = [
     "display notification",
@@ -460,7 +460,7 @@ function selfUpdateSummary(report) {
 
 function selfUpdateComment(report) {
   const lines = [
-    `Mission Control self-update ${report.status}.`,
+    `StudioOps self-update ${report.status}.`,
     "",
     selfUpdateSummary(report),
   ];
@@ -514,7 +514,7 @@ async function recordSelfUpdateResult(report, input = {}) {
         comment = {
           id: nextId(state.comments, "comment"),
           taskId,
-          author: "Mission Control Self Update",
+          author: "StudioOps Self Update",
           body,
           createdAt: now,
         };
@@ -611,7 +611,7 @@ export async function runSelfUpdate(input = {}) {
 
 export function formatSelfUpdateReport(report) {
   const lines = [
-    `Mission Control self-update (${report.generatedAt})`,
+    `StudioOps self-update (${report.generatedAt})`,
     `Status: ${report.status}${report.dryRun ? "  DRY RUN" : ""}`,
     `Repo: ${report.repoPath}`,
     `Branch: ${report.branch}  Remote: ${report.remoteRef}`,

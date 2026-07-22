@@ -117,22 +117,22 @@ async function runWatch(args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args._[0] === "help") {
-    console.log(`Mission Control Runner
+    console.log(`StudioOps Runner
 
 Usage:
-  mission-control-runner --plan
-  mission-control-runner
-  mission-control-runner --watch --interval 300 --limit 1
-  mission-control-runner --watch --timeout-ms 7200000
-  mission-control-runner --provider codex-sdk
-  mission-control-runner --model gpt-5.6-sol --model-reasoning-effort high
-  mission-control-runner --workspace-root .mission-control/run-workspaces
-  mission-control-runner --no-workspace
-  mission-control-runner --github-apps-dir .mission-control/github-apps
-  mission-control-runner --no-github-app-auth
-  MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk mission-control-runner
-  MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=high mission-control-runner
-  mission-control runner --project event-horizons-web --limit 1
+  studioops-runner --plan
+  studioops-runner
+  studioops-runner --watch --interval 300 --limit 1
+  studioops-runner --watch --timeout-ms 7200000
+  studioops-runner --provider codex-sdk
+  studioops-runner --model gpt-5.6-sol --model-reasoning-effort high
+  studioops-runner --workspace-root .mission-control/run-workspaces
+  studioops-runner --no-workspace
+  studioops-runner --github-apps-dir .mission-control/github-apps
+  studioops-runner --no-github-app-auth
+  MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk studioops-runner
+  MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=high studioops-runner
+  studioops runner --project event-horizons-web --limit 1
 
 The runner claims queued builder/reviewer dispatch runs and launches a Codex
 provider against the target project repository. Providers: codex-cli, codex-sdk.

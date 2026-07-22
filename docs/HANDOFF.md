@@ -1,13 +1,13 @@
 # Future Chat Handoff
 
-Use this document when a new or existing AI chat needs to coordinate work through Codex Mission Control.
+Use this document when a new or existing AI chat needs to coordinate work through StudioOps.
 
 ## Canonical Project Reference
 
 Repository:
 
 ```text
-https://github.com/magic2goodil/codex-mission-control
+https://github.com/magic2goodil/studioops
 ```
 
 Local app URL when running:
@@ -55,7 +55,7 @@ docs/NOTIFIER.md
 Default local repo path for this machine:
 
 ```text
-/Users/jrobison/Documents/Codex/2026-07-15/codex-mission-control
+/Users/jrobison/Documents/Codex/2026-07-15/studioops
 ```
 
 ## What The User Can Say
@@ -63,25 +63,25 @@ Default local repo path for this machine:
 Create a task only:
 
 ```text
-Create a task for this in Mission Control and send me the link.
+Create a task for this in StudioOps and send me the link.
 ```
 
 Create a task, then wait:
 
 ```text
-Add this to Mission Control. Do not build it yet.
+Add this to StudioOps. Do not build it yet.
 ```
 
 Create and build:
 
 ```text
-Build this through Mission Control.
+Build this through StudioOps.
 ```
 
 Break a mockup into tasks:
 
 ```text
-Break this mockup into Mission Control tasks, one task per screen or functional slice.
+Break this mockup into StudioOps tasks, one task per screen or functional slice.
 ```
 
 Review existing work:
@@ -215,13 +215,13 @@ Twig is acceptable and preferred for PHP/Drupal-style projects when already avai
 
 When the user says to build:
 
-1. Create or update the Mission Control task.
+1. Create or update the StudioOps task.
 2. Confirm parent epic and dependency links when this is part of larger work.
 3. If the task depends on foundation/design-system/data-access work, do not start the builder until that dependency is ready.
 4. Set task status to `ready` or `queued`.
 5. Let the scheduled dispatcher create a durable builder run, or run `npm run dispatcher`.
 6. Let the scheduled runner consume the queued builder/reviewer run, or run `npm run runner`.
-7. If automated runner support is unavailable, generate the builder prompt from Mission Control and hand it to a Codex builder task/thread.
+7. If automated runner support is unavailable, generate the builder prompt from StudioOps and hand it to a Codex builder task/thread.
 8. Builder creates a feature branch using:
 
 ```text
@@ -239,7 +239,7 @@ codex/<project-key>-<task-id>-<short-title>
 17. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
 18. Accessibility reviewer runs before lead review for UI/frontend work and checks contrast, typography, focus-visible states, keyboard tab order, semantic headings, link/button names, alt text, title text, form labels, ARIA use, screen-reader basics, and mobile/tablet/desktop behavior. Otherwise, record a `skipped` accessibility review.
 19. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
-20. Reviewers record outcomes with `mission-control review <task-id> --stage backend|frontend|accessibility|lead --outcome approved|skipped|changes_requested --body "..."`.
+20. Reviewers record outcomes with `studioops review <task-id> --stage backend|frontend|accessibility|lead --outcome approved|skipped|changes_requested --body "..."`.
 21. A first routine `changes_requested` outcome returns the task to `needs_changes` and assigns the builder. At the configured review-cycle limit, non-lead `changes_requested` routes to lead review instead of another builder loop.
 22. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review`, or to `qa_review` when Trust Leads is enabled.
 23. The supervisor reports `notify_owner` for final human review or `notify_qa_review` for local QA bundle review.
@@ -248,7 +248,7 @@ codex/<project-key>-<task-id>-<short-title>
 
 Default PR rule:
 
-- One PR should have one primary Mission Control task.
+- One PR should have one primary StudioOps task.
 - Related tasks can be referenced in the PR body or task comments.
 - Do not mark several independent tasks `user_review` from one PR unless the PR satisfies each task's acceptance criteria.
 - In Trust Leads mode, do not treat `qa_review` as production approval; it is a local QA bundle gate.
@@ -265,7 +265,7 @@ When asked to break a mockup into tasks:
 5. Identify editable content, dynamic content, and hard-coded design-only elements.
 6. Audit navigation and subnavigation against the product requirements; create tasks for valid pages and call out placeholders or AI-invented items.
 7. Group the work into coherent slices that one builder can finish on a feature branch.
-8. Create one Mission Control task per slice.
+8. Create one StudioOps task per slice.
 9. Attach the relevant image crop or full mockup reference.
 10. Include mobile, tablet, and desktop expectations for each visual slice.
 11. Include the applicable product requirement, not just the visual appearance.
@@ -319,7 +319,7 @@ Those tasks must say how consent is requested, what the user is told, how consen
 
 ## Anti-Slop Quality Standard
 
-Mission Control should prevent rushed AI output from becoming production architecture.
+StudioOps should prevent rushed AI output from becoming production architecture.
 
 Default rules:
 
@@ -330,7 +330,7 @@ Default rules:
 - Large rewrites should be split into reviewable chunks with feature branches and PRs.
 - Reviewers should send work back when it looks complete visually but is brittle, duplicated, slow, inaccessible, insecure, or hard for a human to maintain.
 
-## If Mission Control Is Not Running
+## If StudioOps Is Not Running
 
 From the repo:
 

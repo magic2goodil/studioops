@@ -103,8 +103,8 @@ async function bestEffortCheck(command, args) {
 async function setup() {
   const rl = readline.createInterface({ input, output });
   try {
-    console.log("Codex Mission Control setup");
-    console.log("This will write mission-control.config.md. It will not ask for or store private keys.\n");
+    console.log("StudioOps setup");
+    console.log("This will write the local StudioOps configuration. It will not ask for or store private keys.\n");
     const displayName = await rl.question("Your display name: ");
     const githubOwner = await rl.question("GitHub user or organization for repos: ");
     const workspaceRoot = await rl.question("Local workspace root [~/Development]: ");
@@ -332,7 +332,7 @@ async function setup() {
 
 async function importConfig() {
   const config = await loadConfig();
-  if (!config) throw new Error("No mission-control.config.md found. Run `mission-control setup` first.");
+  if (!config) throw new Error("No local StudioOps configuration found. Run `studioops setup` first.");
   let count = 0;
   for (const rawProject of config.projects || []) {
     const project = projectFromConfig(rawProject, config.defaults);
@@ -347,11 +347,11 @@ async function main() {
   const command = args._[0] || "help";
 
   if (command === "help" || args.help) {
-    console.log(`Codex Mission Control
+    console.log(`StudioOps
 
 Commands:
-  setup                         Create mission-control.config.md interactively
-  import-config                 Register projects from mission-control.config.md
+  setup                         Create studioops.config.md interactively
+  import-config                 Register projects from StudioOps configuration
   projects                      List projects
   tasks                         List tasks, optionally --project key and --status value
   add-project --key --name      Add a project
@@ -370,7 +370,7 @@ Commands:
   qa-fail TASK_ID --body        Mark local QA failed and return the task for changes
   promote                       Merge owner-QA-passed PR heads into target branches
   notifier                      Send local owner/failure notifications
-  self-update                   Fast-forward Mission Control main and restart workers
+  self-update                   Fast-forward StudioOps main and restart workers
   backup [--output PATH]        Create a transactionally consistent SQLite backup
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
@@ -396,18 +396,18 @@ Task fields:
   --depends-on                  Dependency task IDs, comma or newline separated
 
 Automation:
-  mission-control automation-tick --project dollos --limit 10
-  mission-control supervisor --json
-  mission-control dispatcher --plan
-  mission-control runner --plan
-  mission-control runner --provider codex-sdk
-  mission-control qa-integrate --plan
-  mission-control promote --plan
-  mission-control notifier --plan
-  mission-control self-update --plan
-  mission-control runs --status queued
-  mission-control review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
-  mission-control qa-pass task_1 --body "Looks good locally."
+  studioops automation-tick --project dollos --limit 10
+  studioops supervisor --json
+  studioops dispatcher --plan
+  studioops runner --plan
+  studioops runner --provider codex-sdk
+  studioops qa-integrate --plan
+  studioops promote --plan
+  studioops notifier --plan
+  studioops self-update --plan
+  studioops runs --status queued
+  studioops review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
+  studioops qa-pass task_1 --body "Looks good locally."
 `);
     return;
   }
@@ -424,7 +424,7 @@ Automation:
 
   if (command === "backup") {
     const outputPath = await backupStateDatabase(args.output || args.path || "");
-    console.log(`Mission Control backup created: ${outputPath}`);
+    console.log(`StudioOps backup created: ${outputPath}`);
     return;
   }
 

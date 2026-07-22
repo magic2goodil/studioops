@@ -92,14 +92,14 @@ async function runWatch(args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args._[0] === "help") {
-    console.log(`Mission Control Self Update
+    console.log(`StudioOps Self Update
 
 Usage:
-  mission-control-self-update --plan
-  mission-control-self-update
-  mission-control-self-update --branch main --remote origin
-  mission-control-self-update --task task_101 --notify
-  mission-control self-update --plan
+  studioops-self-update --plan
+  studioops-self-update
+  studioops-self-update --branch main --remote origin
+  studioops-self-update --task task_101 --notify
+  studioops self-update --plan
 
 The self-updater fetches origin, fast-forwards the local main branch only from
 a clean and fast-forwardable work tree, refuses to restart while active

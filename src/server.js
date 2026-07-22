@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordQaBundleDecision, recordQaDecision, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
 import { loadConfig } from "./config.js";
+import { localProductAccess, productCatalog } from "./product-tiers.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4317);
@@ -146,7 +147,13 @@ async function handleApi(req, res, url) {
       tasks: state.tasks || [],
       qaBundles: state.qaBundles || [],
       configLoaded: !!config,
+      productAccess: localProductAccess(),
     });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/product") {
+    sendJson(res, 200, { access: localProductAccess(), tiers: productCatalog() });
     return;
   }
 
@@ -272,5 +279,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Codex Mission Control running at http://${HOST}:${PORT}`);
+  console.log(`StudioOps running at http://${HOST}:${PORT}`);
 });

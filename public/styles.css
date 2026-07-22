@@ -117,7 +117,21 @@ h2 {
 
 .topbar-actions {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
+}
+
+.plan-badge {
+  border: 1px solid rgba(94, 224, 141, 0.28);
+  border-radius: 999px;
+  background: rgba(94, 224, 141, 0.1);
+  color: var(--green);
+  padding: 8px 12px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .layout {

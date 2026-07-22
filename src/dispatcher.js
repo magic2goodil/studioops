@@ -155,7 +155,7 @@ function findLaneConflict(state, selected, action, task) {
 
 function ownerPrompt(action) {
   if (action.type === "notify_qa_review" || action.type === "qa_bundle_ready") {
-    return `Mission Control local QA review requested.
+    return `StudioOps local QA review requested.
 
 Project: ${action.projectName}
 Task: ${action.taskId} - ${action.taskTitle}
@@ -177,7 +177,7 @@ Local QA decision needed:
 `;
   }
 
-  return `Mission Control owner handoff requested.
+  return `StudioOps owner handoff requested.
 
 Project: ${action.projectName}
 Task: ${action.taskId} - ${action.taskTitle}
@@ -196,7 +196,7 @@ Human owner decision needed:
 }
 
 function qaIntegrationBlockedPrompt(action) {
-  return `Mission Control QA integration remediation requested.
+  return `StudioOps QA integration remediation requested.
 
 Project: ${action.projectName}
 Task: ${action.taskId} - ${action.taskTitle}
@@ -217,7 +217,7 @@ Remediation expectations:
 - For validation failures, fix the actual failing code or test configuration.
 - Rerun the relevant validation and QA integration command when safe:
   ${action.integrationCommand || "npm run qa-integrate"}
-- Leave a Mission Control comment explaining the change, validation result, and next state.
+- Leave a StudioOps comment explaining the change, validation result, and next state.
 - Do not merge PRs, deploy production, or remove unrelated production files.
 `;
 }
@@ -227,7 +227,7 @@ function dispatchComment(run, action) {
     return `Local QA review notification queued as dispatch ${run.id}. Trust Leads accepted the lead review decision; this task is ready for non-production visual QA.${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
   }
   if (action.type === "qa_integration_blocked") {
-    return `QA integration remediation queued as dispatch ${run.id}. Mission Control found a blocker before owner QA and routed it back to a builder.${action.integrationStatus ? `\n\nIntegration status: ${action.integrationStatus}` : ""}${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
+    return `QA integration remediation queued as dispatch ${run.id}. StudioOps found a blocker before owner QA and routed it back to a builder.${action.integrationStatus ? `\n\nIntegration status: ${action.integrationStatus}` : ""}${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
   }
   if (action.type === "notify_owner") {
     return `Owner review notification queued as dispatch ${run.id}. Task is ready for final human review.${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
@@ -390,7 +390,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       state.comments.push({
         id: nextId(state.comments, "comment"),
         taskId: task.id,
-        author: "Mission Control Dispatcher",
+        author: "StudioOps Dispatcher",
         body: dispatchComment(run, item.action),
         createdAt: now,
       });
@@ -417,7 +417,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
 
 export function formatDispatchReport(report) {
   const lines = [
-    `Mission Control dispatcher sweep (${report.generatedAt})`,
+    `StudioOps dispatcher sweep (${report.generatedAt})`,
     `Created runs: ${report.runs.length}  Selected: ${report.selected.length}  Skipped: ${report.skipped.length}${report.dryRun ? "  DRY RUN" : ""}`,
     "",
   ];

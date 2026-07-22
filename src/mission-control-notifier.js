@@ -79,13 +79,13 @@ async function runWatch(args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args._[0] === "help") {
-    console.log(`Mission Control Notifier
+    console.log(`StudioOps Notifier
 
 Usage:
-  mission-control-notifier --plan
-  mission-control-notifier
-  mission-control-notifier --watch --interval 60
-  mission-control notifier --project event-horizons-web
+  studioops-notifier --plan
+  studioops-notifier
+  studioops-notifier --watch --interval 60
+  studioops notifier --project event-horizons-web
 
 The notifier sends local macOS notifications when a task reaches owner review,
 Trust Leads QA review, or when an automated run fails. It does not approve,

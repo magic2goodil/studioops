@@ -1,6 +1,6 @@
-# Mission Control Local Configuration
+# StudioOps Local Configuration
 
-Copy this file to `mission-control.config.md` and customize it for your machine.
+Copy this file to `studioops.config.md` and customize it for your machine.
 
 This file is intentionally Markdown so a human, Codex, Claude, Antigravity, or another coding agent can read it before doing work.
 
@@ -10,7 +10,7 @@ Do not paste private keys, API tokens, passwords, customer data, or secrets into
 
 When an AI agent or setup wizard configures this project, ask:
 
-1. What name should Mission Control use for you?
+1. What name should StudioOps use for you?
 2. What GitHub user or organization owns your repos?
 3. Do you use GitHub CLI, SSH, HTTPS, or a mix?
 4. Where do you keep local project checkouts?
@@ -22,16 +22,16 @@ When an AI agent or setup wizard configures this project, ask:
 ## Security Rules
 
 - Verify GitHub access with `gh auth status` or `ssh -T git@github.com`.
-- Never ask users to paste a private SSH key into Mission Control.
+- Never ask users to paste a private SSH key into StudioOps.
 - Prefer the user's existing SSH agent, GitHub CLI login, or OS keychain.
 - Keep this file local. It is ignored by Git.
 - Keep secrets in each project's normal secret manager or environment files, not here.
 
 ## Machine-Readable Config
 
-The app reads the first fenced `json mission-control-config` block in this file.
+The app reads the first fenced `json studioops-config` block in this file.
 
-```json mission-control-config
+```json studioops-config
 {
   "owner": {
     "displayName": "Your Name",

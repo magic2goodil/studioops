@@ -1,6 +1,6 @@
-# Mission Control Default Standards
+# StudioOps Default Standards
 
-These standards are the default project-quality contract for Codex Mission Control tasks.
+These standards are the default project-quality contract for StudioOps tasks.
 
 Projects can reference all of them or only the files that apply. Builders must read the referenced standards before editing. Reviewers must treat material violations as review findings, not style preferences.
 

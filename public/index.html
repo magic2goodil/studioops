@@ -3,20 +3,21 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Codex Mission Control</title>
+    <title>StudioOps</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <header class="topbar">
       <div>
         <p class="eyebrow">Local-first AI work orchestration</p>
-        <h1>Codex Mission Control</h1>
+        <h1>StudioOps</h1>
       </div>
       <div class="topbar-actions">
+        <span id="productPlan" class="plan-badge">Community · local</span>
         <button id="newTaskButton" type="button">New Task</button>
         <button id="automationButton" type="button">Run Automation Tick</button>
         <button id="refreshButton" type="button">Refresh</button>
-        <a href="https://github.com/magic2goodil/codex-mission-control" target="_blank" rel="noreferrer">GitHub</a>
+        <a href="https://github.com/magic2goodil/studioops" target="_blank" rel="noreferrer">GitHub</a>
       </div>
     </header>
 
@@ -83,7 +84,7 @@
         <div id="taskDetail" class="task-detail">
           <p>Select a task to view prompts and review metadata.</p>
         </div>
-        <form id="taskForm" class="stacked-form" aria-label="Add Mission Control task">
+        <form id="taskForm" class="stacked-form" aria-label="Add StudioOps task">
           <h3>Add Task</h3>
           <label>Project <select name="project" required></select></label>
           <label>Title <input name="title" placeholder="Build the thing" required></label>

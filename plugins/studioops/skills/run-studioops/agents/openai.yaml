@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run StudioOps"
+  short_description: "Run work through a senior AI engineering team"
+  default_prompt: "Use $run-studioops to turn this request into a structured StudioOps project."

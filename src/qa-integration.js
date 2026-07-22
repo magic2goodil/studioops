@@ -567,7 +567,7 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
       result.output = "Local QA preview checkout has uncommitted changes. Enable localQaPreview.stashDirty or clean the checkout before syncing.";
       return result;
     }
-    const stash = await git(preview.checkoutPath, ["stash", "push", "-u", "-m", `Mission Control local QA preview sync ${new Date().toISOString()}`], { ...gitOptions, allowFailure: true });
+    const stash = await git(preview.checkoutPath, ["stash", "push", "-u", "-m", `StudioOps local QA preview sync ${new Date().toISOString()}`], { ...gitOptions, allowFailure: true });
     if (!stash.ok) {
       result.status = "blocked";
       result.output = `Could not stash local QA preview changes: ${truncateOutput(stash.output)}`;
@@ -1094,7 +1094,7 @@ function commentForTask(projectResult, taskResult) {
   }
 
   if (taskResult.status === "validation_missing") {
-    return `QA integration paused after merging ${taskResult.source}: the project has no validationCommands configured, so Mission Control did not push or mark the QA bundle ready.${workspaceLine}\n\nAdd validation commands and rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
+    return `QA integration paused after merging ${taskResult.source}: the project has no validationCommands configured, so StudioOps did not push or mark the QA bundle ready.${workspaceLine}\n\nAdd validation commands and rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
   }
 
   if (taskResult.status === "push_failed") {
@@ -1140,7 +1140,7 @@ async function recordProjectResult(projectResult) {
       state.comments.push({
         id: nextId(state.comments, "comment"),
         taskId: task.id,
-        author: "Mission Control QA Integration",
+        author: "StudioOps QA Integration",
         body: commentForTask(projectResult, taskResult),
         createdAt: now,
       });
@@ -1282,7 +1282,7 @@ export async function runQaIntegration(input = {}) {
 
 export function formatQaIntegrationReport(report) {
   const lines = [
-    `Mission Control QA integration sweep (${report.generatedAt})${report.dryRun ? " DRY RUN" : ""}`,
+    `StudioOps QA integration sweep (${report.generatedAt})${report.dryRun ? " DRY RUN" : ""}`,
     `Projects: ${(report.projects || []).length}  Tasks: ${report.taskCount || 0}`,
     "",
   ];

@@ -4,7 +4,7 @@ Describe the behavior and files changed.
 
 ## Why
 
-Link the issue or Mission Control task and explain the user or operator impact.
+Link the issue or StudioOps task and explain the user or operator impact.
 
 ## Validation
 

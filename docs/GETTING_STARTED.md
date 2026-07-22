@@ -15,7 +15,7 @@ Recommended for the full GitHub workflow:
 - [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login`
 - GitHub SSH or HTTPS access to every registered repository
 - Codex CLI or a local ChatGPT/Codex installation authenticated to the account that should run builders and reviewers
-- macOS if you want Mission Control to install its worker stack as LaunchAgents
+- macOS if you want StudioOps to install its worker stack as LaunchAgents
 
 Verify the local tools:
 
@@ -26,18 +26,18 @@ git --version
 gh auth status
 ```
 
-Mission Control does not need Postgres, Redis, Docker, or a hosted service for a local installation.
+StudioOps does not need Postgres, Redis, Docker, or a hosted service for a local installation.
 
 ## 2. Clone And Validate
 
 ```bash
-git clone https://github.com/magic2goodil/codex-mission-control.git
-cd codex-mission-control
+git clone https://github.com/magic2goodil/studioops.git
+cd studioops
 npm install
 npm run check
 ```
 
-`npm run check` performs syntax checks and runs the automated test suite. Resolve failures before connecting Mission Control to a real project.
+`npm run check` performs syntax checks and runs the automated test suite. Resolve failures before connecting StudioOps to a real project.
 
 ## 3. Create Local Configuration
 
@@ -54,7 +54,7 @@ The setup wizard asks for:
 - the AI coding tools you use
 - an optional first project and its validation command
 
-It writes `mission-control.config.md`, which is excluded from Git. The file contains operational settings and project paths, but it must not contain private keys, tokens, passwords, customer data, or other secrets.
+It writes `studioops.config.md`, which is excluded from Git. The file contains operational settings and project paths, but it must not contain private keys, tokens, passwords, customer data, or other secrets.
 
 The wizard registers the first project immediately. If you later edit the config and add projects, import them with:
 
@@ -121,7 +121,7 @@ npm run dispatcher -- --plan
 npm run runner -- --plan
 ```
 
-The plan commands show what Mission Control would queue or execute without starting a Codex builder or reviewer.
+The plan commands show what StudioOps would queue or execute without starting a Codex builder or reviewer.
 
 When the project paths, task prompt, work lane, validation commands, and safety rules are correct, run one stage at a time:
 
@@ -134,7 +134,7 @@ The runner uses isolated Git workspaces by default. It may edit files, run proje
 
 ## 7. Configure GitHub Bot Identity
 
-The recommended automation identity is a private GitHub App installed only on repositories Mission Control should access:
+The recommended automation identity is a private GitHub App installed only on repositories StudioOps should access:
 
 ```bash
 npm run setup-github-app
@@ -150,7 +150,7 @@ Follow [GITHUB_APP_BOTS.md](GITHUB_APP_BOTS.md) to select permissions, install t
 
 ## 8. Choose A Codex Provider
 
-Mission Control supports queued prompt output, the local Codex CLI, and the Codex SDK. Provider behavior is documented in [RUNNER.md](RUNNER.md).
+StudioOps supports queued prompt output, the local Codex CLI, and the Codex SDK. Provider behavior is documented in [RUNNER.md](RUNNER.md).
 
 Preview an SDK run:
 
@@ -183,7 +183,7 @@ npm run backup
 
 The backup is written under the local data directory unless another output path is supplied. Runtime state and backups are ignored by Git.
 
-For an always-on installation, Mission Control can fast-forward its clean source checkout after a control-plane change is merged to `main`:
+For an always-on installation, StudioOps can fast-forward its clean source checkout after a control-plane change is merged to `main`:
 
 ```bash
 npm run self-update -- --plan
@@ -195,7 +195,7 @@ The updater refuses dirty or divergent checkouts and active non-stale builder/re
 ## Give This Guide To Codex
 
 ```text
-Clone https://github.com/magic2goodil/codex-mission-control and read
+Clone https://github.com/magic2goodil/studioops and read
 README.md, docs/GETTING_STARTED.md, docs/HANDOFF.md, and SECURITY.md.
 Set it up locally, register my project, run npm run check, and start the UI on
 localhost. Use plan/dry-run commands before enabling builders. Ask for project

@@ -20,7 +20,7 @@ const sourceRoot = path.resolve(process.env.MISSION_CONTROL_SOURCE_ROOT || path.
 const sourceBranch = process.env.MISSION_CONTROL_SOURCE_BRANCH || "main";
 
 function usage() {
-  console.log(`Mission Control LaunchAgent installer
+  console.log(`StudioOps LaunchAgent installer
 
 Usage:
   npm run install-agents
@@ -114,7 +114,7 @@ async function resolveNodePath() {
     const rightLts = right.major % 2 === 0 ? 1 : 0;
     return rightLts - leftLts || right.major - left.major || right.minor - left.minor || right.patch - left.patch;
   });
-  if (!supported.length) throw new Error("Mission Control requires Node.js 22.5 or newer.");
+  if (!supported.length) throw new Error("StudioOps requires Node.js 22.5 or newer.");
   return supported[0].candidate;
 }
 
@@ -129,7 +129,7 @@ async function ensureSourceCheckout() {
   }
   try {
     await access(sourceRoot);
-    throw new Error(`Mission Control source root exists but is not a Git checkout: ${sourceRoot}`);
+    throw new Error(`StudioOps source root exists but is not a Git checkout: ${sourceRoot}`);
   } catch (error) {
     if (!String(error?.message || "").includes("ENOENT") && error?.code !== "ENOENT") throw error;
   }
@@ -175,7 +175,7 @@ async function install() {
     installed.push(template.label);
   }
 
-  console.log(`Installed ${installed.length} Mission Control LaunchAgents:`);
+  console.log(`Installed ${installed.length} StudioOps LaunchAgents:`);
   for (const label of installed) console.log(`- ${label}`);
   console.log(`Logs: ${logDir}`);
   console.log(`Runtime: ${runtime.releasePath}`);
@@ -192,7 +192,7 @@ async function uninstall() {
     await rm(target, { force: true });
     removed.push(template.label);
   }
-  console.log(`Removed ${removed.length} Mission Control LaunchAgents:`);
+  console.log(`Removed ${removed.length} StudioOps LaunchAgents:`);
   for (const label of removed) console.log(`- ${label}`);
 }
 

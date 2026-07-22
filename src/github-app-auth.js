@@ -182,7 +182,7 @@ async function githubJson(pathname, { method = "GET", token, body } = {}) {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
-      "User-Agent": "codex-mission-control",
+      "User-Agent": "studioops",
       "X-GitHub-Api-Version": GITHUB_API_VERSION,
     },
     body: body ? JSON.stringify(body) : undefined,

@@ -1,6 +1,6 @@
 # Architecture
 
-Codex Mission Control is a local-first Node.js control plane with transactional SQLite persistence.
+StudioOps is a local-first Node.js control plane with transactional SQLite persistence.
 
 ```mermaid
 flowchart TB
@@ -38,9 +38,11 @@ SQLite keeps setup friction low without accepting the lost-update and split-stat
 
 On first startup, an existing `data/mission-control.json` is imported once. The JSON file is not a live mirror and is not written afterward. Use SQLite backup tooling for backups; do not maintain two writable sources of truth.
 
+StudioOps accepts `STUDIOOPS_ROOT`, `STUDIOOPS_DATA_DIR`, and `STUDIOOPS_CONFIG_ROOT`. The corresponding `MISSION_CONTROL_*` variables and legacy database/runtime filenames remain supported for migration safety.
+
 `npm run backup` uses SQLite's online backup API, so it remains consistent while workers are active.
 
-Postgres is a future backend option when Mission Control needs multiple machines or remote team access. Local installations do not need a database daemon.
+Postgres is a future backend option when StudioOps needs multiple machines or remote team access. Local installations do not need a database daemon.
 
 ## Runtime
 
@@ -54,7 +56,7 @@ Builders create feature PRs. Leads approve work into a non-production QA branch.
 
 ## Privacy
 
-Mission Control may contain sensitive project context. By default the server binds to `127.0.0.1`.
+StudioOps may contain sensitive project context. By default the server binds to `127.0.0.1`.
 
 The browser UI is not an internet-facing authenticated multi-user application. Do not expose it directly to the public internet. Binding to a LAN address should be limited to a trusted network with host firewall controls.
 
@@ -62,7 +64,7 @@ The data directory is mode `0700`; the database, WAL, shared-memory, and migrate
 
 ## Trust Boundaries
 
-- Mission Control state and configuration are trusted local inputs.
+- StudioOps state and configuration are trusted local inputs.
 - Project repositories and validation commands are executable inputs; register only repositories and commands the owner trusts.
 - Codex builders and reviewers are privileged development workers, not sandboxed production services.
 - GitHub Apps should have access only to intended repositories and only the permissions documented in `docs/GITHUB_APP_BOTS.md`.

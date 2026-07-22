@@ -32,7 +32,7 @@ async function git(repoPath, args) {
 
 async function configureRepo(repoPath) {
   await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-  await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+  await git(repoPath, ["config", "user.name", "StudioOps Test"]);
 }
 
 function baseState(overrides = {}) {

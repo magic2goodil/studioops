@@ -8,12 +8,12 @@ When working in this repository:
 - Treat project safety rules as first-class instructions.
 - Prefer small, reviewable branches.
 - Keep generated task prompts clear enough to paste into a fresh Codex thread.
-- Use `docs/HANDOFF.md` when a user asks to create, build, review, or split work through Mission Control.
+- Use `docs/HANDOFF.md` when a user asks to create, build, review, or split work through StudioOps.
 - Use `docs/STEWARD.md` when a user asks for scheduled workflow routing or status advancement across projects.
 - Use `docs/SUPERVISOR.md` when a user asks for continuous coordination, scheduled checks, or what should move next across projects.
-- Use `docs/DISPATCHER.md` when a user asks Mission Control to actually queue builder, reviewer, or owner handoff work.
-- Use `docs/RUNNER.md` when a user asks Mission Control to execute queued builder/reviewer runs through Codex CLI.
-- Use `docs/NOTIFIER.md` when a user asks Mission Control to notify them when owner review or failures need attention.
+- Use `docs/DISPATCHER.md` when a user asks StudioOps to actually queue builder, reviewer, or owner handoff work.
+- Use `docs/RUNNER.md` when a user asks StudioOps to execute queued builder/reviewer runs through Codex CLI.
+- Use `docs/NOTIFIER.md` when a user asks StudioOps to notify them when owner review or failures need attention.
 - For non-trivial tasks, capture user story, expected outcome, acceptance criteria, visual attachments when relevant, and privacy/security notes before implementation.
 - Attach project standards to tasks and enforce them in builder/reviewer prompts.
 - For UI work, require mobile-first implementation plus tablet and desktop expectations unless a task explicitly scopes one breakpoint only.

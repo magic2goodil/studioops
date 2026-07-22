@@ -114,7 +114,7 @@ test("validation commands use the QA integration PATH override", async () => {
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -198,7 +198,7 @@ test("QA integration redacts GitHub token values from validation output before s
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -287,7 +287,7 @@ test("failed validation leaves the owner checkout untouched and does not push", 
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -376,7 +376,7 @@ test("successful QA integration uses an isolated workspace without switching the
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -480,7 +480,7 @@ test("QA integration can sync default branch changes into QA and refresh a local
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -547,7 +547,7 @@ test("QA integration can sync default branch changes into QA and refresh a local
     assert.equal(report.projects[0].localQaPreview.healthCheckUrl, `http://127.0.0.1:${healthPort}/health`);
     assert.equal(await git(remotePath, ["show", "refs/heads/qa/integration:app.txt"]), "main update");
     assert.equal(await readFile(path.join(previewPath, "app.txt"), "utf8"), "main update\n");
-    assert.match(await git(previewPath, ["stash", "list"]), /Mission Control local QA preview sync/);
+    assert.match(await git(previewPath, ["stash", "list"]), /StudioOps local QA preview sync/);
   } finally {
     await new Promise((resolve) => healthServer.close(resolve));
     await rm(root, { recursive: true, force: true });
@@ -565,7 +565,7 @@ test("QA integration preserves a distinct origin push URL in the isolated worksp
     await git(root, ["init", "--bare", pushRemotePath]);
     await git(root, ["clone", fetchRemotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -642,7 +642,7 @@ test("QA integration refuses a repo without origin instead of pushing back into 
   try {
     await git(root, ["init", repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -725,7 +725,7 @@ test("QA integration refuses workspace roots inside the registered repo", async 
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -802,7 +802,7 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
@@ -874,7 +874,7 @@ test("QA integration keeps sanitized project workspace segments inside the works
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
-    await git(repoPath, ["config", "user.name", "Mission Control Test"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);

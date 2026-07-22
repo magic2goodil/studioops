@@ -119,14 +119,14 @@ async function runWatch(args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args._[0] === "help") {
-    console.log(`Mission Control Dispatcher
+    console.log(`StudioOps Dispatcher
 
 Usage:
-  mission-control-dispatcher --plan
-  mission-control-dispatcher --dry-run
-  mission-control-dispatcher
-  mission-control-dispatcher --watch --interval 300
-  mission-control dispatcher --project event-horizons-web --limit 3
+  studioops-dispatcher --plan
+  studioops-dispatcher --dry-run
+  studioops-dispatcher
+  studioops-dispatcher --watch --interval 300
+  studioops dispatcher --project event-horizons-web --limit 3
 
 The dispatcher consumes supervisor actions and creates durable run records. It
 does not merge PRs, deploy production, or send external notifications.

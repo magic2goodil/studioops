@@ -85,15 +85,15 @@ async function runWatch(args) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || args._[0] === "help") {
-    console.log(`Mission Control QA Integration Worker
+    console.log(`StudioOps QA Integration Worker
 
 Usage:
-  mission-control-qa-integration --plan
-  mission-control-qa-integration --project myapp
-  mission-control-qa-integration --project myapp --force
-  mission-control-qa-integration --watch --interval 300
-  mission-control qa-integrate --plan
-  mission-control qa-integrate --github-apps-dir .mission-control/github-apps
+  studioops-qa-integration --plan
+  studioops-qa-integration --project myapp
+  studioops-qa-integration --project myapp --force
+  studioops-qa-integration --watch --interval 300
+  studioops qa-integrate --plan
+  studioops qa-integrate --github-apps-dir .mission-control/github-apps
 
 The worker merges qa_review task PR heads into a project's configured
 non-production integrationBranch only when trustLeadApprovals is enabled. It

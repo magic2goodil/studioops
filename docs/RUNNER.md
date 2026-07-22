@@ -1,8 +1,8 @@
-# Mission Control Runner
+# StudioOps Runner
 
 The runner is the execution layer after the dispatcher.
 
-It claims queued builder/reviewer runs and launches a Codex provider against the target project repository with the stored Mission Control prompt.
+It claims queued builder/reviewer runs and launches a Codex provider against the target project repository with the stored StudioOps prompt.
 
 It can:
 
@@ -48,7 +48,7 @@ The default limit is one active Codex run. This keeps parallel builders from ind
 
 Every dispatched run is explicitly pinned to `gpt-5.6-sol`. Ordinary work uses `high` reasoning; lead reviews and architecture, auth, privacy, data, security, migration, and deployment work use `xhigh`. Configure role overrides under `defaults.executionPolicy.roles`.
 
-Each workflow action gets two attempts by default with a five-minute backoff. After the limit, Mission Control blocks the task with the run ID and failure reason for visible owner repair. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
+Each workflow action gets two attempts by default with a five-minute backoff. After the limit, StudioOps blocks the task with the run ID and failure reason for visible owner repair. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
 
 ## Run Continuously
 
@@ -81,7 +81,7 @@ Or with an environment variable, which is useful for LaunchAgents and shells:
 MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk npm run runner
 ```
 
-Or make it the default in `mission-control.config.md`:
+Or make it the default in `studioops.config.md`:
 
 ```json
 {
@@ -93,7 +93,7 @@ Or make it the default in `mission-control.config.md`:
 }
 ```
 
-The SDK currently wraps the Codex CLI's structured JSON mode and persists threads in `~/.codex/sessions`. Mission Control records the returned thread ID on the run and on the task so later dispatches can resume it. If Codex Desktop surfaces those SDK-created sessions in the sidebar, they should appear as visible tasks; if not, the thread IDs still remain resumable through Mission Control.
+The SDK currently wraps the Codex CLI's structured JSON mode and persists threads in `~/.codex/sessions`. StudioOps records the returned thread ID on the run and on the task so later dispatches can resume it. If Codex Desktop surfaces those SDK-created sessions in the sidebar, they should appear as visible tasks; if not, the thread IDs still remain resumable through StudioOps.
 
 ## Codex CLI
 
@@ -137,7 +137,7 @@ Credentials live outside git under:
 .mission-control/github-apps/
 ```
 
-The runner maps roles to app identities using `mission-control.config.md` `githubApps.roleMap`, or these default directories:
+The runner maps roles to app identities using `studioops.config.md` `githubApps.roleMap`, or these default directories:
 
 - `default`
 - `builder`
@@ -146,7 +146,7 @@ The runner maps roles to app identities using `mission-control.config.md` `githu
 - `accessibility-reviewer`
 - `lead-reviewer`
 
-For each claimed run, Mission Control mints a short-lived repository-scoped installation token, configures `GH_TOKEN`/`GITHUB_TOKEN` for GitHub CLI calls, configures `GIT_ASKPASS` for HTTPS pushes, and rewrites GitHub SSH remotes to HTTPS only inside the runner child process. Tokens are not written into git remotes or command arguments, and runner logs redact them if a child process prints one.
+For each claimed run, StudioOps mints a short-lived repository-scoped installation token, configures `GH_TOKEN`/`GITHUB_TOKEN` for GitHub CLI calls, configures `GIT_ASKPASS` for HTTPS pushes, and rewrites GitHub SSH remotes to HTTPS only inside the runner child process. Tokens are not written into git remotes or command arguments, and runner logs redact them if a child process prints one.
 
 Use a custom app directory:
 
@@ -222,11 +222,11 @@ The runner passes these environment variables to Codex:
 - `MISSION_CONTROL_CONFIG_ROOT`
 - `MISSION_CONTROL_DATA_DIR`
 
-The explicit state paths are important: a worker can execute inside any project workspace while still updating the one authoritative Mission Control database.
+The explicit state paths are important: a worker can execute inside any project workspace while still updating the one authoritative StudioOps database.
 
 ## Work Lanes
 
-Mission Control assigns each run a lane:
+StudioOps assigns each run a lane:
 
 - `backend`
 - `frontend`
@@ -241,7 +241,7 @@ Tasks can set this explicitly:
 node src/mission-control-cli.js update-task task_1 --lane frontend --work-area "public/**,src/styles/**"
 ```
 
-If no lane is set, Mission Control infers one from task type, area, title, story, expected outcome, and reviewer role.
+If no lane is set, StudioOps infers one from task type, area, title, story, expected outcome, and reviewer role.
 
 Dispatch and runner claim both enforce lane conflicts:
 

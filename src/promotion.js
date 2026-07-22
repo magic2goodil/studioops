@@ -610,7 +610,7 @@ async function promoteProject(projectPlan, options = {}) {
       "--title",
       `QA-approved release candidate: ${projectPlan.projectName || projectPlan.projectKey}`,
       "--body",
-      `## QA-approved tasks\n\n${taskList}\n\nValidation passed in Mission Control. Production deployment remains release/tag gated.`,
+      `## QA-approved tasks\n\n${taskList}\n\nValidation passed in StudioOps. Production deployment remains release/tag gated.`,
     ], {
       cwd: executionRepoPath,
       env: options.env,
@@ -810,7 +810,7 @@ async function recordProjectResult(projectResult) {
       state.comments.push({
         id: nextId(state.comments, "comment"),
         taskId: task.id,
-        author: "Mission Control Promotion",
+        author: "StudioOps Promotion",
         body: commentForTask(projectResult, taskResult),
         createdAt: now,
       });
@@ -893,7 +893,7 @@ export async function runPromotion(input = {}) {
 
 export function formatPromotionReport(report) {
   const lines = [
-    `Mission Control promotion sweep (${report.generatedAt})${report.dryRun ? " DRY RUN" : ""}`,
+    `StudioOps promotion sweep (${report.generatedAt})${report.dryRun ? " DRY RUN" : ""}`,
     `Projects: ${(report.projects || []).length}  Tasks: ${report.taskCount || 0}`,
     "",
   ];

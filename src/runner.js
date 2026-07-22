@@ -464,9 +464,9 @@ function runnerPrompt(run, project, authContext = null) {
   const taskUrl = run.taskUrl || `http://127.0.0.1:4317/tasks/${run.taskId}`;
   const sourceRepoPath = project?.sourceRepoPath || project?.repoPath || "(not recorded)";
   const executionRepoPath = run.executionRepoPath || project?.repoPath || "(not recorded)";
-  return `Mission Control automation run: ${run.id}
+  return `StudioOps automation run: ${run.id}
 
-You are being launched automatically by Mission Control.
+You are being launched automatically by StudioOps.
 
 Run details:
 - Run ID: ${run.id}
@@ -488,7 +488,7 @@ Run details:
 
 ${formatGitHubAppAuthForPrompt(authContext)}
 
-Mission Control CLI:
+StudioOps CLI:
 \`node ${missionControlCli}\`
 
 Automation rules:
@@ -497,13 +497,13 @@ Automation rules:
 - Do not deploy production.
 - Do not send emails, push notifications, Discord messages, SMS, payment actions, toy/device actions, or other external side effects unless the task explicitly authorizes that action.
 - Do not commit secrets, tokens, .env files, private user data, or unrelated changes.
-- If you discover necessary follow-up work, add it to Mission Control with \`node ${missionControlCli} add-task ...\`, including user story and acceptance criteria.
+- If you discover necessary follow-up work, add it to StudioOps with \`node ${missionControlCli} add-task ...\`, including user story and acceptance criteria.
 - Keep code edits inside the repository path for this run. If it differs from the source repository path, you are in an isolated workspace; do not edit the source checkout directly.
 - Keep edits inside the work lane and file scope unless the task comment explicitly authorizes expanding scope.
-- When implementation/review work is ready, update the task and leave a clear Mission Control comment with changed files, validation, known gaps, branch/PR, and next review step.
-- If blocked, add a Mission Control comment explaining the blocker and set the task to an appropriate blocked/needs_changes state.
+- When implementation/review work is ready, update the task and leave a clear StudioOps comment with changed files, validation, known gaps, branch/PR, and next review step.
+- If blocked, add a StudioOps comment explaining the blocker and set the task to an appropriate blocked/needs_changes state.
 - The runner will mark this run completed or failed based on your process exit code.
-- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. Mission Control verifies this handoff after the process exits.
+- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. StudioOps verifies this handoff after the process exits.
 
 Original prompt:
 
@@ -594,12 +594,12 @@ function applyFailedRunToTask(task, run, reason, now) {
 
 function runFailureComment(run, reason, disposition) {
   if (disposition.blocked) {
-    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Rapid retries are paused; Mission Control will automatically probe this transient failure again after its recovery delay.`;
+    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Rapid retries are paused; StudioOps will automatically probe this transient failure again after its recovery delay.`;
   }
-  return `${run.id} failed: ${reason}. Mission Control will retry no earlier than ${disposition.retryAt}.`;
+  return `${run.id} failed: ${reason}. StudioOps will retry no earlier than ${disposition.retryAt}.`;
 }
 
-async function appendTaskComment(state, run, body, now, author = "Mission Control Runner") {
+async function appendTaskComment(state, run, body, now, author = "StudioOps Runner") {
   state.comments = state.comments || [];
   state.comments.push({
     id: nextId(state.comments, "comment"),
@@ -667,7 +667,7 @@ async function pauseTaskForAutomationConfig(run, reason, notes) {
     await appendTaskComment(
       state,
       run,
-      `${run.id} paused automation for this task: ${reason}.\n\n${notes}\n\nFix the Mission Control runner configuration, then move the task back to the appropriate ready/review state to retry.`,
+      `${run.id} paused automation for this task: ${reason}.\n\n${notes}\n\nFix the StudioOps runner configuration, then move the task back to the appropriate ready/review state to retry.`,
       now,
     );
     state.events.push({
@@ -768,10 +768,10 @@ export async function claimRuns(input = {}) {
         type: "run_claimed",
         projectId: run.projectId,
         taskId: run.taskId,
-        message: `${run.id} claimed by Mission Control runner`,
+        message: `${run.id} claimed by StudioOps runner`,
         createdAt: now,
       });
-      await appendTaskComment(state, run, `${run.id} started by Mission Control Runner using ${run.provider}, ${run.model}, ${run.modelReasoningEffort} reasoning (attempt ${run.attempt}/${run.maxAttempts}).`, now);
+      await appendTaskComment(state, run, `${run.id} started by StudioOps Runner using ${run.provider}, ${run.model}, ${run.modelReasoningEffort} reasoning (attempt ${run.attempt}/${run.maxAttempts}).`, now);
       claimed.push({
         ...run,
         project,
@@ -960,7 +960,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
   timeout.unref();
 
   try {
-    log.write(`Mission Control SDK Runner started ${run.id} at ${new Date().toISOString()}\n`);
+    log.write(`StudioOps SDK Runner started ${run.id} at ${new Date().toISOString()}\n`);
     log.write(`Provider: codex-sdk\n`);
     log.write(`Model: ${run.model || input.model || DEFAULT_EXECUTION_POLICY.model}\n`);
     log.write(`Reasoning: ${run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort}\n`);
@@ -1010,7 +1010,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     }
   } finally {
     clearTimeout(timeout);
-    log.write(`\nMission Control SDK Runner finished ${run.id} at ${new Date().toISOString()} with status ${status}\n`);
+    log.write(`\nStudioOps SDK Runner finished ${run.id} at ${new Date().toISOString()} with status ${status}\n`);
     log.end();
     await cleanupGitHubAppAuth(authContext);
   }
@@ -1083,7 +1083,7 @@ async function runClaimedRunWithCli(run, input = {}) {
     const secrets = githubAppAuthSecrets(authContext);
     const stdoutRedactor = createSecretRedactor(secrets);
     const stderrRedactor = createSecretRedactor(secrets);
-    log.write(`Mission Control Runner started ${run.id} at ${new Date().toISOString()}\n`);
+    log.write(`StudioOps Runner started ${run.id} at ${new Date().toISOString()}\n`);
     log.write(`Command: ${codexBin} ${args.join(" ")}\n\n`);
     log.write(`PATH: ${childPath}\n`);
     log.write(`Repo: ${executionRun.project.repoPath}\n`);
@@ -1154,7 +1154,7 @@ async function runClaimedRunWithCli(run, input = {}) {
       }
       stdoutRedactor.flush((text) => log.write(text));
       stderrRedactor.flush((text) => log.write(text));
-      log.write(`\nMission Control Runner finished ${run.id} at ${new Date().toISOString()} with code ${code}\n`);
+      log.write(`\nStudioOps Runner finished ${run.id} at ${new Date().toISOString()} with code ${code}\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
       const completed = await completeRun(run.id, {
@@ -1190,7 +1190,7 @@ export async function runQueuedRuns(input = {}) {
 
 export function formatRunnerReport(report) {
   const lines = [
-    `Mission Control runner sweep (${report.generatedAt})`,
+    `StudioOps runner sweep (${report.generatedAt})`,
     `Recovered: ${(report.recovered || []).length}  Claimed: ${report.claimed.length}  Finished: ${report.results.length}`,
     "",
   ];
@@ -1214,7 +1214,7 @@ export function formatRunnerReport(report) {
 
 export function formatRunnerPlan(plan) {
   const lines = [
-    `Mission Control runner plan (${plan.generatedAt})`,
+    `StudioOps runner plan (${plan.generatedAt})`,
     `Limit: ${plan.limit}  Active: ${plan.activeCount}  Available: ${plan.available}  Runnable: ${plan.runnable.length}`,
     "",
   ];
