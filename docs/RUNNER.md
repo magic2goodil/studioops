@@ -119,6 +119,8 @@ The prompt still forbids merging, production deploys, external messages, secrets
 
 The runner supplies a developer-oriented `PATH` to child Codex sessions so LaunchAgent jobs can find tools installed by Homebrew, including `node`, `npm`, `gh`, and similar project tooling.
 
+`gh` must be installed on the runner host. The runner supplies authentication for each App-authenticated run, so unattended builders should verify the installation token with `gh api /installation/repositories --jq .total_count` but must not run `gh auth login` or rely on a personal keychain session. See [GitHub App Bots](GITHUB_APP_BOTS.md#pull-request-publish-flow) for the copyable push, draft-PR, task-link, and builder-comment procedure.
+
 Runs have a default two-hour timeout. Override it with:
 
 ```bash

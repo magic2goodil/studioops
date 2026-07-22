@@ -89,6 +89,59 @@ When the runner claims a builder or reviewer run, it:
 
 Installation tokens are short-lived. GitHub controls the final expiry, and Mission Control rejects expired token responses.
 
+## Pull Request Publish Flow
+
+The supported unattended path is the GitHub CLI running inside a Mission Control builder session with a freshly minted GitHub App installation token. It does not depend on a saved personal `gh` login or a long-lived connector session.
+
+Before starting Codex, the runner:
+
+1. Mints a repository-scoped installation token for the builder App.
+2. Exposes that token to `gh` as `GH_TOKEN` and `GITHUB_TOKEN`.
+3. Exposes the same token to HTTPS `git` commands through `GIT_ASKPASS`.
+4. Adds common Homebrew locations to the child `PATH`, including `/opt/homebrew/bin` and `/usr/local/bin`.
+
+Inside the builder session, use this noninteractive sequence:
+
+```bash
+command -v gh
+gh api /installation/repositories --jq .total_count
+git push --set-upstream origin "$(git branch --show-current)"
+
+gh pr view --json url --jq .url 2>/dev/null || \
+  gh pr create --draft \
+    --base main \
+    --title "Mission Control task title" \
+    --body "Primary task: task_123"
+```
+
+`gh pr view` returns the existing pull request URL on follow-up builder runs. Only create a new draft when no PR exists for the current branch. Then link the branch and PR and record the builder handoff:
+
+```bash
+node src/mission-control-cli.js update-task task_123 \
+  --branch "$(git branch --show-current)" \
+  --pr-url "https://github.com/owner/repository/pull/123"
+
+node src/mission-control-cli.js comment task_123 \
+  --author "Codex Builder" \
+  --body "Changed files: ... Validation: npm run check passed. Known gaps: none. PR: https://github.com/owner/repository/pull/123. Next: builder review."
+```
+
+Do not run `gh auth login` in an App-authenticated runner. A successful `gh api /installation/repositories --jq .total_count` verifies that `GH_TOKEN` is an active App installation token without printing credential details or repository names. GitHub App installation tokens cannot use the user-profile endpoint, so `gh api user` returning `403 Resource not accessible by integration` does not mean the installation token is invalid.
+
+### Runner Host Readiness
+
+Install GitHub CLI once on each runner host and make it visible to the LaunchAgent environment:
+
+```bash
+brew install gh
+command -v gh
+gh --version
+```
+
+No persistent `gh` authentication is required for normal App-authenticated runs. If the runner reports missing App credentials, rerun `npm run setup-github-app` or `npm run setup-github-role-apps` and install the App on the target repository. If token minting fails or GitHub reports an expired token, verify the App installation and local private key; the next runner attempt mints a new token rather than reusing the expired one.
+
+For a smoke test, use a harmless documentation-only branch, push it through the runner session, create a draft PR with the sequence above, and confirm the bot owns the PR. Link that PR to its single primary Mission Control task before moving the task to `builder_review`. Close the test PR after verification if it is not intended to merge.
+
 ## Role Mapping
 
 With `npm run setup-github-app`, all roles use `.mission-control/github-apps/default/`.
