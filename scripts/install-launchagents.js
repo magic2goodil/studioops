@@ -14,6 +14,7 @@ import {
   defaultStudioOpsSourceRoot,
   defaultStudioOpsWorkingRoot,
   expandLocalPath,
+  studioOpsHome,
 } from "../src/runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -75,6 +76,8 @@ async function pathExists(filePath) {
 }
 
 async function ensureWorkingRoot() {
+  await mkdir(studioOpsHome(), { recursive: true, mode: 0o700 });
+  await chmod(studioOpsHome(), 0o700).catch(() => {});
   await mkdir(workingRoot, { recursive: true, mode: 0o700 });
   await chmod(workingRoot, 0o700).catch(() => {});
   if (workingRoot === repoRoot) return;

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { cp, lstat, mkdir, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { defaultStudioOpsRuntimeRoot } from "./runtime-paths.js";
@@ -123,7 +123,9 @@ export async function deployRuntime(input = {}) {
   const releasesRoot = path.join(runtimeRoot, "releases");
   const releasePath = path.join(releasesRoot, version);
   const stagePath = path.join(releasesRoot, `.stage-${version}-${process.pid}-${Date.now()}`);
-  await mkdir(releasesRoot, { recursive: true });
+  await mkdir(releasesRoot, { recursive: true, mode: 0o700 });
+  await chmod(runtimeRoot, 0o700).catch(() => {});
+  await chmod(releasesRoot, 0o700).catch(() => {});
 
   let ready = false;
   try {

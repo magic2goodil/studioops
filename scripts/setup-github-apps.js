@@ -154,7 +154,9 @@ async function writePrivateFile(filePath, contents) {
 
 async function storeAppRegistration({ app, owner, org, payload }) {
   const appDir = path.join(CONFIG_DIR, app.key);
-  await mkdir(appDir, { recursive: true });
+  await mkdir(appDir, { recursive: true, mode: 0o700 });
+  await chmod(CONFIG_DIR, 0o700).catch(() => {});
+  await chmod(appDir, 0o700).catch(() => {});
 
   const installUrl = installUrlFor(payload.slug);
   const publicConfig = {
@@ -331,7 +333,8 @@ async function main() {
   });
 
   await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
-  await mkdir(CONFIG_DIR, { recursive: true });
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  await chmod(CONFIG_DIR, 0o700).catch(() => {});
   const url = `${baseUrl}/`;
   console.log(`StudioOps GitHub App setup is running: ${url}`);
   console.log(`Mode: ${mode}`);

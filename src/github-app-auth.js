@@ -321,7 +321,8 @@ function permissionsForRole(role) {
 }
 
 async function createRuntimeAskpass(runId, runtimeDir = DEFAULT_RUNTIME_DIR) {
-  await mkdir(runtimeDir, { recursive: true });
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+  await chmod(runtimeDir, 0o700).catch(() => {});
   const askpassPath = path.join(runtimeDir, `${safeName(runId)}.git-askpass.sh`);
   const script = `#!/bin/sh
 case "$1" in
