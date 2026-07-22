@@ -1,7 +1,7 @@
 {
-  "name": "studioops",
+  "name": "studioops-marketplace",
   "interface": {
-    "displayName": "StudioOps"
+    "displayName": "StudioOps Marketplace"
   },
   "plugins": [
     {

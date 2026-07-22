@@ -37,3 +37,5 @@ Use one JSON object with `project` and `task` keys.
 ```
 
 The client matches projects by `key`, `name`, `repoPath`, or `repoUrl`. When it finds a project, it reuses it and does not overwrite project configuration. A new project requires `project.key` and `project.name`. A task requires `task.title`; the client supplies `task.project` from the matched or created project.
+
+Save the object to a JSON file and pass it with `intake --file <payload-file>`. Do not interpolate task text into a shell command: acceptance criteria and descriptions may legitimately contain backticks, dollar signs, quotes, or other shell syntax.

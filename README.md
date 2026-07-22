@@ -65,7 +65,7 @@ The repository is also a Codex plugin marketplace. After cloning StudioOps and s
 
 ```bash
 codex plugin marketplace add /absolute/path/to/studioops
-codex plugin add studioops@studioops
+codex plugin add studioops@studioops-marketplace
 ```
 
 Start a new Codex task after installation, then ask:

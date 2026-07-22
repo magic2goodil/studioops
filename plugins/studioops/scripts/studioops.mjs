@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { readFile } from "node:fs/promises";
+
 const args = process.argv.slice(2);
 const command = args.shift() || "help";
 
@@ -16,6 +18,8 @@ Usage:
   studioops.mjs status [--url http://127.0.0.1:4317]
   studioops.mjs projects [--url URL]
   studioops.mjs tasks [--url URL]
+  studioops.mjs intake --file /path/to/intake.json [--url URL]
+  studioops.mjs intake --stdin [--url URL]
   studioops.mjs intake --json '{"project": {...}, "task": {...}}' [--url URL]
 
 Environment:
@@ -60,10 +64,36 @@ async function state() {
   return request("/api/state");
 }
 
+async function readStandardInput() {
+  let raw = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) raw += chunk;
+  return raw;
+}
+
+async function intakePayload() {
+  const inline = option("json");
+  const file = option("file");
+  const fromStdin = args.includes("--stdin");
+  const selected = [Boolean(inline), Boolean(file), fromStdin].filter(Boolean).length;
+  if (selected !== 1) {
+    throw new Error("intake requires exactly one payload source: --file, --stdin, or --json.");
+  }
+  const raw = file
+    ? await readFile(file, "utf8")
+    : fromStdin
+      ? await readStandardInput()
+      : inline;
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    const source = file ? `file ${file}` : fromStdin ? "standard input" : "--json";
+    throw new Error(`Could not parse the intake payload from ${source}: ${error.message}`);
+  }
+}
+
 async function intake() {
-  const raw = option("json");
-  if (!raw) throw new Error("intake requires --json with project and task objects.");
-  const payload = JSON.parse(raw);
+  const payload = await intakePayload();
   const projectInput = payload.project || {};
   const taskInput = payload.task || {};
   const current = await state();

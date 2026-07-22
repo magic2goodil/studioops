@@ -6,7 +6,7 @@ StudioOps ships as a skills-first Codex plugin. Version 0.1 provides a real loca
 
 ```bash
 codex plugin marketplace add /absolute/path/to/studioops
-codex plugin add studioops@studioops
+codex plugin add studioops@studioops-marketplace
 ```
 
 Start a new Codex task after installing or updating a plugin. Bundled skills are loaded when a new task begins.

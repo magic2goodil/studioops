@@ -1,6 +1,6 @@
 {
   "name": "studioops",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260722184227",
   "description": "Run software work through a senior AI engineering team and a structured delivery board.",
   "author": {
     "name": "Jason Robison",
@@ -9,7 +9,12 @@
   "homepage": "https://github.com/magic2goodil/studioops",
   "repository": "https://github.com/magic2goodil/studioops",
   "license": "MIT",
-  "keywords": ["ai-engineering", "software-delivery", "project-management", "codex"],
+  "keywords": [
+    "ai-engineering",
+    "software-delivery",
+    "project-management",
+    "codex"
+  ],
   "skills": "./skills/",
   "interface": {
     "displayName": "StudioOps",
@@ -17,7 +22,11 @@
     "longDescription": "Turn software ideas into structured projects and tasks, then move them through builders, domain review, lead review, QA, and a human release gate.",
     "developerName": "Jason Robison",
     "category": "Developer Tools",
-    "capabilities": ["Structured intake", "Local project orchestration", "Engineering workflow"],
+    "capabilities": [
+      "Structured intake",
+      "Local project orchestration",
+      "Engineering workflow"
+    ],
     "websiteURL": "https://github.com/magic2goodil/studioops",
     "defaultPrompt": [
       "Create this project in StudioOps.",

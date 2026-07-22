@@ -28,13 +28,13 @@ Turn the user's intent into a durable, reviewable StudioOps work packet and writ
    - visual attachments when supplied;
    - privacy and security notes when the feature touches identity, auth, personal data, analytics, location, notifications, or deployment.
 5. Use `idea` when the user only wants capture or planning. Use `ready` when the user explicitly wants the work built. Do not mark work complete merely because it was added to StudioOps.
-6. Submit one project and task atomically with:
+6. Write the payload as JSON to a temporary or task-local file, then submit one project and task atomically with:
 
    ```bash
-   node <plugin-root>/scripts/studioops.mjs intake --json '<payload>'
+   node <plugin-root>/scripts/studioops.mjs intake --file <payload-file>
    ```
 
-   Read [payloads.md](references/payloads.md) before constructing the payload.
+   Read [payloads.md](references/payloads.md) before constructing the payload. Use `--file` instead of inline shell JSON so Markdown backticks, dollar signs, quotes, and other task text cannot be interpreted by the shell.
 7. Return the created task ID, board URL, status, and the next owner. If the user asked to build, say that StudioOps has accepted the task into the delivery workflow; do not claim a builder has started unless the returned state proves it.
 
 ## Task Sizing
