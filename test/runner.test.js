@@ -164,6 +164,54 @@ test("runner does not plan or claim runs while self-update lease is active", asy
   assert.equal(state.runs[0].status, "queued");
 });
 
+test("runner does not plan or claim runs while the operator pause is active", async () => {
+  const state = fixtureState(
+    {
+      status: "in_progress",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+    },
+    {
+      actionType: "start_builder",
+      integrationStatus: "",
+    },
+  );
+  state.meta = {
+    operatorPause: {
+      active: true,
+      reason: "Incident recovery",
+    },
+  };
+
+  const report = planRunnableRuns(state, { limit: 1 });
+  const claimed = await claimRuns({ state, limit: 1 });
+
+  assert.equal(report.runnable.length, 0);
+  assert.equal(report.skipped[0].reason, "operator_pause");
+  assert.deepEqual(claimed, []);
+  assert.equal(state.runs[0].status, "queued");
+});
+
+test("runner cancels queued work whose task circuit is open", async () => {
+  const state = fixtureState(
+    {
+      status: "blocked",
+      integrationStatus: "",
+      automationCircuit: { state: "open" },
+    },
+    {
+      actionType: "start_builder",
+      integrationStatus: "",
+    },
+  );
+
+  const claimed = await claimRuns({ state, limit: 1 });
+
+  assert.deepEqual(claimed, []);
+  assert.equal(state.runs[0].status, "cancelled");
+  assert.equal(state.runs[0].exitCode, "task_circuit_open");
+});
+
 test("builder runs may continue writing to open linked PR branches", () => {
   assert.equal(branchReuseSafetyReason(builderRun(), {
     state: "OPEN",

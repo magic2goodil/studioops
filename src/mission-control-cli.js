@@ -12,6 +12,9 @@ import {
   recordQaDecision,
   recordReview,
   readState,
+  resetAutomationCircuit,
+  resumeOperatorAutomation,
+  setOperatorPause,
   updateProject,
   updateTask,
   updateRun,
@@ -371,6 +374,9 @@ Commands:
   comment TASK_ID --body        Add a builder/reviewer comment
   review TASK_ID --stage        Record approved, skipped, or changes_requested
   automation-tick               Advance ready, blocked, and review tasks
+  automation-pause              Pause new builder and reviewer work
+  automation-resume             Resume builder and reviewer work after verification
+  circuit-reset                 Reset one verified task or project circuit
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
@@ -407,6 +413,9 @@ Task fields:
 
 Automation:
   studioops automation-tick --project dollos --limit 10
+  studioops automation-pause --reason "Incident investigation"
+  studioops automation-resume --reason "Database and workers verified"
+  studioops circuit-reset --task task_101 --reason "Credentials verified"
   studioops supervisor --json
   studioops dispatcher --plan
   studioops runner --plan
@@ -716,6 +725,35 @@ Automation:
       return;
     }
     for (const action of result.actions) console.log(`- ${action}`);
+    return;
+  }
+
+  if (command === "automation-pause") {
+    const pause = await setOperatorPause({
+      reason: args.reason,
+      author: args.author,
+    });
+    console.log(`StudioOps automation paused: ${pause.reason}`);
+    return;
+  }
+
+  if (command === "automation-resume") {
+    const pause = await resumeOperatorAutomation({
+      reason: args.reason,
+      author: args.author,
+    });
+    console.log(`StudioOps automation resumed: ${pause.resumeReason}`);
+    return;
+  }
+
+  if (command === "circuit-reset") {
+    const target = await resetAutomationCircuit({
+      task: args.task,
+      project: args.project,
+      reason: args.reason,
+      author: args.author,
+    });
+    console.log(`Reset automation circuit for ${target.id}.`);
     return;
   }
 

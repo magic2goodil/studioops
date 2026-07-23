@@ -2,6 +2,7 @@ const state = {
   projects: [],
   tasks: [],
   qaBundles: [],
+  ownerInbox: { count: 0, items: [], operatorPause: null },
   selectedProjectId: "",
   selectedTaskId: "",
   routeTaskId: "",
@@ -23,6 +24,12 @@ const statusFilter = document.querySelector("#statusFilter");
 const projectCount = document.querySelector("#projectCount");
 const configStatus = document.querySelector("#configStatus");
 const productPlan = document.querySelector("#productPlan");
+const attentionButton = document.querySelector("#attentionButton");
+const attentionCount = document.querySelector("#attentionCount");
+const systemStatus = document.querySelector("#systemStatus");
+const ownerInbox = document.querySelector("#ownerInbox");
+const ownerInboxCount = document.querySelector("#ownerInboxCount");
+const ownerInboxList = document.querySelector("#ownerInboxList");
 const detailPanel = document.querySelector(".detail-panel");
 const detailHeading = document.querySelector(".detail-panel .panel-header h2");
 const imageModal = document.querySelector("#imageModal");
@@ -52,6 +59,15 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ""), window.location.origin);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch {
+    return "";
+  }
 }
 
 function truthyFlag(value) {
@@ -296,6 +312,7 @@ async function loadState() {
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
   state.qaBundles = data.qaBundles || [];
+  state.ownerInbox = data.ownerInbox || { count: 0, items: [], operatorPause: null };
   state.productAccess = data.productAccess || null;
   if (productPlan && state.productAccess) {
     productPlan.textContent = `${state.productAccess.planName} · ${state.productAccess.connectedToCloud ? "cloud" : "local"}`;
@@ -353,6 +370,117 @@ function renderProjects() {
 
 function selectedProject() {
   return state.projects.find((project) => project.id === state.selectedProjectId) || null;
+}
+
+function notificationStatusText(notification) {
+  if (!notification) return "Desktop notification pending";
+  if (notification.status === "not_applicable") return "No desktop notification requested";
+  if (notification.status === "sent") {
+    return `Desktop notification sent${notification.attemptedAt ? ` ${new Date(notification.attemptedAt).toLocaleString()}` : ""}`;
+  }
+  if (notification.status === "failed") {
+    return `Desktop notification failed${notification.error ? `: ${notification.error}` : ""}`;
+  }
+  return "Desktop notification pending";
+}
+
+function inboxChecklist(item) {
+  const checklist = Array.isArray(item.checklist) ? item.checklist : [];
+  const label = item.checklistLabel || "Handoff checklist";
+  if (!checklist.length) {
+    return `
+      <div class="owner-inbox-checklist">
+        <strong>${escapeHtml(label)}</strong>
+        <p>No acceptance criteria were recorded for this handoff.</p>
+      </div>
+    `;
+  }
+  return `
+    <div class="owner-inbox-checklist">
+      <strong>${escapeHtml(label)}</strong>
+      <ul>
+        ${checklist.map((entry) => {
+    const text = typeof entry === "string" ? entry : entry.text;
+    const taskId = typeof entry === "string" ? "" : entry.taskId;
+    return `<li>${taskId ? `<span>${escapeHtml(taskId)}</span>` : ""}${escapeHtml(text)}</li>`;
+  }).join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function renderSystemStatus() {
+  const pause = state.ownerInbox?.operatorPause;
+  systemStatus.hidden = !pause;
+  if (!pause) {
+    systemStatus.innerHTML = "";
+    return;
+  }
+  systemStatus.innerHTML = `
+    <div>
+      <strong>Automation is paused</strong>
+      <span>${escapeHtml(pause.reason || "StudioOps is not starting new builder or reviewer runs.")}</span>
+    </div>
+    <button type="button" data-resume-automation>Resume after verification</button>
+  `;
+}
+
+function inboxTaskLinks(item) {
+  if (item.tasks?.length) {
+    return item.tasks.map((task) => `
+      <button type="button" class="inbox-task-link" data-inbox-task-id="${escapeHtml(task.id)}">
+        <span>${escapeHtml(task.id)}</span>
+        <strong>${escapeHtml(task.title)}</strong>
+      </button>
+    `).join("");
+  }
+  if (!item.taskId) return "";
+  return `
+    <button type="button" class="inbox-task-link" data-inbox-task-id="${escapeHtml(item.taskId)}">
+      <span>${escapeHtml(item.taskId)}</span>
+      <strong>Open task details</strong>
+    </button>
+  `;
+}
+
+function renderOwnerInbox() {
+  const inbox = state.ownerInbox || { count: 0, items: [] };
+  const items = inbox.items || [];
+  ownerInbox.hidden = items.length === 0;
+  attentionButton.hidden = items.length === 0;
+  attentionCount.textContent = String(items.length);
+  attentionButton.setAttribute("aria-label", `Action required: ${items.length} item${items.length === 1 ? "" : "s"}`);
+  ownerInboxCount.textContent = `${items.length} item${items.length === 1 ? "" : "s"}`;
+  ownerInboxList.innerHTML = items.map((item) => {
+    const previewUrl = safeHttpUrl(item.previewUrl);
+    const prUrl = safeHttpUrl(item.prUrl);
+    return `
+    <article class="owner-inbox-item ${escapeHtml(item.severity || "action")}">
+      <div class="owner-inbox-item-heading">
+        <div>
+          <span>${escapeHtml(item.projectKey || item.projectName || "project")} · ${escapeHtml(item.taskId || item.bundleId || "")}</span>
+          <h3>${escapeHtml(item.title)}</h3>
+        </div>
+        <span class="inbox-status">${escapeHtml(String(item.status || "").replaceAll("_", " "))}</span>
+      </div>
+      <p>${escapeHtml(item.nextAction || "")}</p>
+      ${item.blocker ? `
+        <div class="inbox-blocker">
+          <strong>${escapeHtml(item.blocker.reason || "Automation blocked")}</strong>
+          ${item.blocker.attempts ? `<span>${escapeHtml(item.blocker.attempts)} attempt${item.blocker.attempts === 1 ? "" : "s"} consumed${item.blocker.maxAttempts ? ` of ${escapeHtml(item.blocker.maxAttempts)}` : ""}</span>` : ""}
+        </div>
+      ` : ""}
+      ${inboxChecklist(item)}
+      <div class="owner-inbox-actions">
+        ${previewUrl ? `<a class="primary-action" href="${escapeHtml(previewUrl)}">Open local QA</a>` : ""}
+        ${prUrl ? `<a href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open pull request</a>` : ""}
+        ${item.integrationBranch ? `<span>${escapeHtml(item.integrationBranch)}</span>` : ""}
+      </div>
+      <div class="owner-inbox-tasks">${inboxTaskLinks(item)}</div>
+      <small class="notification-delivery ${escapeHtml(item.notification?.status || "pending")}">${escapeHtml(notificationStatusText(item.notification))}</small>
+    </article>
+  `;
+  }).join("");
 }
 
 function renderProjectSettings() {
@@ -804,6 +932,8 @@ function render() {
   appLayout.classList.toggle("task-route", isTaskPage);
   detailPanel.classList.toggle("full-detail", isTaskPage);
   detailHeading.textContent = isTaskPage ? "Task Workspace" : "Task Detail";
+  renderSystemStatus();
+  renderOwnerInbox();
   renderProjects();
   renderTasks();
   renderDetail().catch((error) => {
@@ -1072,6 +1202,30 @@ newTaskButton.addEventListener("click", () => {
 });
 
 refreshButton.addEventListener("click", () => {
+  loadState().catch((error) => alert(error.message));
+});
+
+attentionButton.addEventListener("click", () => {
+  ownerInbox.scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+systemStatus.addEventListener("click", async (event) => {
+  if (!event.target.closest("[data-resume-automation]")) return;
+  await api("/api/automation/resume", {
+    method: "POST",
+    body: JSON.stringify({
+      reason: "Owner verified the local StudioOps runtime and resumed automation from the persistent status banner.",
+      author: "StudioOps Owner",
+    }),
+  });
+  await loadState();
+});
+
+ownerInbox.addEventListener("click", (event) => {
+  const taskButton = event.target.closest("[data-inbox-task-id]");
+  if (!taskButton) return;
+  state.selectedTaskId = taskButton.dataset.inboxTaskId;
+  window.history.pushState(null, "", taskPath(state.selectedTaskId));
   loadState().catch((error) => alert(error.message));
 });
 

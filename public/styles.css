@@ -134,6 +134,222 @@ h2 {
   text-transform: uppercase;
 }
 
+.attention-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-color: rgba(255, 181, 71, 0.42);
+  background: rgba(255, 181, 71, 0.14);
+  color: #ffd79b;
+}
+
+.attention-button span {
+  display: grid;
+  place-items: center;
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: 999px;
+  background: var(--amber);
+  color: #171007;
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.system-status,
+.owner-inbox {
+  max-width: 1444px;
+  margin: 0 auto 18px;
+}
+
+.system-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border: 1px solid rgba(255, 92, 122, 0.38);
+  border-radius: 18px;
+  background: rgba(255, 92, 122, 0.12);
+  padding: 16px 18px;
+}
+
+.system-status[hidden],
+.owner-inbox[hidden] {
+  display: none;
+}
+
+.system-status div {
+  display: grid;
+  gap: 4px;
+}
+
+.system-status span {
+  color: rgba(245, 247, 251, 0.76);
+}
+
+.system-status button {
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.owner-inbox {
+  border: 1px solid rgba(255, 181, 71, 0.3);
+  border-radius: 24px;
+  background: rgba(20, 24, 33, 0.9);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.34);
+  padding: 20px;
+}
+
+.owner-inbox-heading,
+.owner-inbox-item-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.owner-inbox-heading {
+  margin-bottom: 16px;
+}
+
+.owner-inbox-heading > span {
+  color: var(--amber);
+  font-weight: 800;
+}
+
+.owner-inbox-list {
+  display: grid;
+  gap: 12px;
+}
+
+.owner-inbox-item {
+  border-left: 3px solid var(--amber);
+  border-radius: 4px 16px 16px 4px;
+  background: rgba(255, 255, 255, 0.055);
+  padding: 16px;
+}
+
+.owner-inbox-item.critical {
+  border-left-color: var(--coral);
+}
+
+.owner-inbox-item-heading span,
+.notification-delivery,
+.inbox-status {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.owner-inbox-item h3 {
+  margin: 5px 0 0;
+  font-size: 1.1rem;
+}
+
+.owner-inbox-item > p {
+  margin: 12px 0;
+  color: rgba(245, 247, 251, 0.8);
+}
+
+.inbox-status {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+
+.inbox-blocker {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+  color: #ffbac7;
+}
+
+.owner-inbox-checklist {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.12);
+  padding: 12px;
+}
+
+.owner-inbox-checklist > strong {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.owner-inbox-checklist p,
+.owner-inbox-checklist ul {
+  margin: 0;
+  color: rgba(245, 247, 251, 0.76);
+}
+
+.owner-inbox-checklist ul {
+  display: grid;
+  gap: 7px;
+  padding-left: 22px;
+}
+
+.owner-inbox-checklist li {
+  padding-left: 2px;
+  overflow-wrap: anywhere;
+}
+
+.owner-inbox-checklist li span {
+  margin-right: 7px;
+  color: var(--amber);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.owner-inbox-actions,
+.owner-inbox-tasks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.owner-inbox-actions a,
+.owner-inbox-actions span,
+.inbox-task-link {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(245, 247, 251, 0.86);
+  padding: 8px 10px;
+}
+
+.owner-inbox-actions .primary-action {
+  border-color: rgba(143, 99, 255, 0.42);
+  background: linear-gradient(135deg, rgba(143, 99, 255, 0.92), rgba(95, 140, 255, 0.82));
+  color: var(--text);
+}
+
+.inbox-task-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+
+.inbox-task-link span {
+  color: var(--amber);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.notification-delivery {
+  display: block;
+  margin-top: 12px;
+}
+
+.notification-delivery.failed {
+  color: var(--coral);
+}
+
+.notification-delivery.sent {
+  color: var(--green);
+}
+
 .layout {
   display: grid;
   grid-template-columns: minmax(260px, 320px) minmax(420px, 1fr) minmax(300px, 400px);
@@ -141,6 +357,11 @@ h2 {
   max-width: 1500px;
   margin: 0 auto;
   padding: 0 28px 30px;
+}
+
+.layout > *,
+.panel {
+  min-width: 0;
 }
 
 .layout.task-route {
@@ -308,6 +529,10 @@ h2 {
 .task-card p,
 .task-card small {
   color: var(--muted);
+}
+
+.project-item span {
+  overflow-wrap: anywhere;
 }
 
 .workflow-owner {
@@ -898,14 +1123,17 @@ label {
 }
 
 .comment-card {
+  min-width: 0;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.045);
   padding: 14px;
+  overflow-wrap: anywhere;
 }
 
 .comment-card div {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 8px;
@@ -1049,5 +1277,35 @@ label {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+}
+
+@media (max-width: 700px) {
+  .topbar,
+  .layout {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .system-status,
+  .owner-inbox {
+    width: auto;
+    margin-right: 16px;
+    margin-left: 16px;
+  }
+
+  .system-status,
+  .owner-inbox-heading,
+  .owner-inbox-item-heading,
+  .inbox-blocker {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .system-status button,
+  .owner-inbox-actions a,
+  .owner-inbox-actions span,
+  .inbox-task-link {
+    width: 100%;
   }
 }

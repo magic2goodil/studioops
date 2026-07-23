@@ -640,6 +640,23 @@ export function planRunnableRuns(state, input = {}) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "project_filter" });
       continue;
     }
+    const task = findTask(state, run.taskId);
+    if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: "operator_pause" });
+      continue;
+    }
+    if (project?.automationCircuit?.state === "open") {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: "project_circuit_open" });
+      continue;
+    }
+    if (task?.automationCircuit?.state === "open") {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: "task_circuit_open" });
+      continue;
+    }
+    if (Number(run.attempt || 1) > Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts)) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: "attempt_budget_exhausted" });
+      continue;
+    }
     const staleReason = staleRunReason(state, run);
     if (staleReason) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `stale_run:${staleReason}` });
@@ -788,17 +805,27 @@ function applyFailedRunToTask(task, run, reason, now) {
     task.status = "blocked";
     task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
-    const recoveryCount = Math.max(0, Number(task.lastAutomationRecoveryCount || 0));
-    const recoveryDelayMs = Math.min(2 * 60 * 60 * 1000, 15 * 60 * 1000 * (2 ** recoveryCount));
     task.automationBlocker = {
-      type: "transient",
+      type: "circuit",
       reason,
       runId: run.id,
       attempts: attempt,
       resumeStatus,
       blockedAt: now,
-      retryAt: new Date(Date.parse(now) + recoveryDelayMs).toISOString(),
-      recoveryCount,
+      retryAt: "",
+    };
+    task.automationCircuit = {
+      state: "open",
+      scope: "task",
+      reasonCode: reason,
+      normalizedReason: `StudioOps stopped after ${attempt}/${maxAttempts} failed execution attempts.`,
+      failureFingerprint: `${task.id}:${run.attemptKey || run.actionType || "run"}:${reason}`,
+      attemptsConsumed: attempt,
+      maxAttempts,
+      openedAt: now,
+      nextCheapProbe: "Inspect the preserved run output and verify the underlying blocker without launching a model.",
+      resumeAction: `studioops circuit-reset --task ${task.id} --reason verified`,
+      remediation: "Repair or verify the underlying blocker, then explicitly reset this task circuit.",
     };
     return { blocked: true, retryAt: "" };
   }
@@ -811,7 +838,7 @@ function applyFailedRunToTask(task, run, reason, now) {
 
 function runFailureComment(run, reason, disposition) {
   if (disposition.blocked) {
-    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Rapid retries are paused; StudioOps will automatically probe this transient failure again after its recovery delay.`;
+    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. The task circuit is open; StudioOps will not spend another model run until the blocker is verified and the circuit is explicitly reset.`;
   }
   return `${run.id} failed: ${reason}. StudioOps will retry no earlier than ${disposition.retryAt}.`;
 }
@@ -979,6 +1006,32 @@ export async function claimRuns(input = {}) {
       if (!RUNNABLE_STATUSES.has(run.status)) continue;
       if (!RUNNABLE_GROUPS.has(run.group)) continue;
       if (!projectAllowed(run, project, input)) continue;
+      if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) continue;
+      const task = findTask(state, run.taskId);
+      const safetyReason = project?.automationCircuit?.state === "open"
+        ? "project_circuit_open"
+        : task?.automationCircuit?.state === "open"
+          ? "task_circuit_open"
+          : Number(run.attempt || 1) > Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts)
+            ? "attempt_budget_exhausted"
+            : "";
+      if (safetyReason) {
+        run.status = "cancelled";
+        run.exitCode = safetyReason;
+        run.completedAt = now;
+        run.updatedAt = now;
+        const message = `${run.id} cancelled before launch: ${safetyReason.replaceAll("_", " ")}.`;
+        await appendTaskComment(state, run, message, now);
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: "run_cancelled",
+          projectId: run.projectId,
+          taskId: run.taskId,
+          message,
+          createdAt: now,
+        });
+        continue;
+      }
       const staleReason = staleRunReason(state, run);
       if (staleReason) {
         run.status = "cancelled";
@@ -1469,6 +1522,18 @@ export async function runQueuedRuns(input = {}) {
       disk,
       paused: true,
       pauseReason: "disk_space_below_safety_threshold",
+      recovered: [],
+      claimed: [],
+      results: [],
+    };
+  }
+  const state = await readState();
+  if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
+    return {
+      generatedAt: new Date().toISOString(),
+      disk,
+      paused: true,
+      pauseReason: state.meta.operatorPause.reason || "operator_pause",
       recovered: [],
       claimed: [],
       results: [],

@@ -39,6 +39,8 @@ flowchart LR
 
 StudioOps automates the middle of the process. The human owner remains the authority for product acceptance, protected-branch merges, releases, and production deployment.
 
+Owner handoffs are persistent. The local board has an **Action required** inbox for tasks awaiting review, validated QA bundles, release candidates, open automation circuits, and operator pauses. Desktop notifications supplement that inbox; they are not treated as proof that the owner saw the handoff.
+
 ## The AI Does Not Approve Itself
 
 Every builder and reviewer receives the same project standards. A passing backend review does not override missing frontend, accessibility, performance, or QA evidence; material findings send the PR back through the workflow.

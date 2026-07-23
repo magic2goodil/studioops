@@ -1,4 +1,4 @@
-import { findTask, generatePrompt, mutateState } from "./store.js";
+import { findProject, findTask, generatePrompt, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 
@@ -151,6 +151,92 @@ function findLaneConflict(state, selected, action, task) {
   };
   const conflict = activeLaneProfiles(state, selected).find((item) => laneProfilesConflict(current, item));
   return conflict ? { conflict, profile } : { conflict: null, profile };
+}
+
+function dispatchSafetyReason(state, task, action, options) {
+  const group = runGroupFor(action);
+  if (group === "owner") return "";
+  if (state.meta?.operatorPause?.active && !options.ignoreOperatorPause) {
+    return "operator_pause";
+  }
+  const project = findProject(state, task.projectId);
+  if (project?.automationCircuit?.state === "open") return "project_circuit_open";
+  if (task.automationCircuit?.state === "open") return "task_circuit_open";
+  const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const attemptKey = executionAttemptKey(task, action);
+  const attemptCount = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length;
+  if (attemptCount >= executionPolicy.maxAttempts) return "attempt_budget_exhausted";
+  return "";
+}
+
+function skippedAction(actions, skipped) {
+  return (actions || []).find((action) => (
+    (skipped.actionId && action.id === skipped.actionId)
+    || (
+      action.taskId === skipped.taskId
+      && action.type === skipped.actionType
+    )
+  )) || null;
+}
+
+function openExhaustedAttemptCircuits(state, actions, skipped, options, now) {
+  const openedTaskIds = new Set();
+  for (const item of skipped || []) {
+    if (item.reason !== "attempt_budget_exhausted" || openedTaskIds.has(item.taskId)) continue;
+    const task = findTask(state, item.taskId);
+    const action = skippedAction(actions, item);
+    if (!task || !action || task.automationCircuit?.state === "open") continue;
+    const policy = resolveExecutionPolicy(task, action, options);
+    const attemptKey = executionAttemptKey(task, action);
+    const attempts = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length;
+    const resumeStatus = task.status;
+    task.status = "blocked";
+    task.assignedAgentRole = "owner";
+    task.retryNotBefore = "";
+    task.lastAutomationFailure = "attempt_budget_exhausted";
+    task.automationBlocker = {
+      type: "circuit",
+      reason: "attempt_budget_exhausted",
+      actionType: action.type,
+      attemptKey,
+      attempts,
+      maxAttempts: policy.maxAttempts,
+      resumeStatus,
+      blockedAt: now,
+      retryAt: "",
+    };
+    task.automationCircuit = {
+      state: "open",
+      scope: "task",
+      reasonCode: "attempt_budget_exhausted",
+      normalizedReason: `StudioOps suppressed ${action.type} after ${attempts}/${policy.maxAttempts} dispatch attempts.`,
+      failureFingerprint: `${task.id}:${attemptKey}:attempt_budget_exhausted`,
+      attemptsConsumed: attempts,
+      maxAttempts: policy.maxAttempts,
+      openedAt: now,
+      nextCheapProbe: "Inspect the preserved run outputs and verify the underlying blocker without launching another model.",
+      resumeAction: `studioops circuit-reset --task ${task.id} --reason verified`,
+      remediation: "Repair or verify the underlying blocker, then explicitly reset this task circuit.",
+    };
+    task.updatedAt = now;
+    state.comments.push({
+      id: nextId(state.comments, "comment"),
+      taskId: task.id,
+      author: "StudioOps Dispatcher",
+      body: `Opened the task automation circuit after suppressing ${action.type}: the ${attempts}/${policy.maxAttempts} dispatch-attempt budget is exhausted. No additional model run will start until the blocker is verified and the circuit is explicitly reset.`,
+      createdAt: now,
+    });
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "automation_circuit_opened",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title}: ${action.type} attempt budget exhausted`,
+      createdAt: now,
+    });
+    openedTaskIds.add(task.id);
+  }
+  return openedTaskIds;
 }
 
 function ownerPrompt(action) {
@@ -315,6 +401,11 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: "missing_task" });
       continue;
     }
+    const safetyReason = dispatchSafetyReason(state, task, action, options);
+    if (safetyReason) {
+      skipped.push({ action, reason: safetyReason });
+      continue;
+    }
     if (hasExistingDispatch(state, action, task)) {
       skipped.push({ action, reason: "already_dispatched" });
       continue;
@@ -354,13 +445,17 @@ export function planDispatches(state, actions, input = {}) {
 }
 
 export async function dispatchSupervisorActions(actions, input = {}) {
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  const { state: _inputState, ...dispatchInput } = input;
+  return mutate(async (state) => {
     state.runs = state.runs || [];
     state.comments = state.comments || [];
     state.events = state.events || [];
 
     const now = new Date().toISOString();
-    const options = { ...DEFAULTS, ...input };
+    const options = { ...DEFAULTS, ...dispatchInput };
     const plan = planDispatches(state, actions, options);
     const runs = [];
 
@@ -374,7 +469,29 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       };
     }
 
-    for (const item of plan.selected) {
+    const openedTaskIds = openExhaustedAttemptCircuits(
+      state,
+      actions,
+      plan.skipped,
+      options,
+      now,
+    );
+    const selected = plan.selected.filter((item) => (
+      !openedTaskIds.has(item.taskId) || item.group === "owner"
+    ));
+    const skipped = [
+      ...plan.skipped,
+      ...plan.selected
+        .filter((item) => openedTaskIds.has(item.taskId) && item.group !== "owner")
+        .map((item) => ({
+          actionId: item.action?.id || "",
+          actionType: item.action?.type || "",
+          taskId: item.taskId,
+          reason: "task_circuit_open",
+        })),
+    ];
+
+    for (const item of selected) {
       const task = findTask(state, item.taskId);
       if (!task) continue;
       const run = makeRun(state, task, item.action, options, now);
@@ -409,8 +526,8 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       generatedAt: now,
       dryRun: false,
       runs,
-      selected: plan.selected,
-      skipped: plan.skipped,
+      selected,
+      skipped,
     };
   });
 }

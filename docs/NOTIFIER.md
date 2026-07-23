@@ -10,6 +10,8 @@ It sends macOS notifications when:
 - owner-QA-passed work has a validated release-candidate PR ready
 - an automated runner run fails
 
+The macOS banner is a convenience channel, not the durable handoff record. StudioOps also derives a persistent **Action required** inbox from task, QA bundle, circuit, and notification state. An item remains there after a banner is sent and disappears only when its workflow state is resolved.
+
 It does not:
 
 - approve work
@@ -56,6 +58,8 @@ Failed runner notifications are marked with:
 - `notificationChannel`
 
 That prevents repeat notifications every sweep. Delivery failures retry up to three times with backoff; they are then retained as visible failures rather than retried forever.
+
+The local board shows whether desktop delivery was sent, failed, or is still pending. Do Not Disturb can suppress the transient banner, but it cannot clear the StudioOps inbox item.
 
 QA and release-candidate notifications are stored on the QA bundle, so one coherent batch creates one owner interruption instead of one notification per task. They mean "review this bundle or PR," not "deploy this."
 

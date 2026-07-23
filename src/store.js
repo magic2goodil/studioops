@@ -75,6 +75,7 @@ const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
 const DEFAULT_ORPHANED_TASK_GRACE_MS = 15 * 60 * 1000;
 const DEFAULT_TRANSIENT_RECOVERY_MS = 15 * 60 * 1000;
 const MAX_TRANSIENT_RECOVERY_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_MAX_TRANSIENT_RECOVERIES = 1;
 
 const DEFAULT_REVIEW_PIPELINE = [
   {
@@ -742,6 +743,13 @@ export async function automationTick(input = {}) {
   return mutate(async (state) => {
     const nowMs = Number(input.nowMs || Date.now());
     const now = new Date(nowMs).toISOString();
+    if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
+      return {
+        actions: [],
+        paused: true,
+        pauseReason: state.meta.operatorPause.reason || "StudioOps automation is paused by the operator.",
+      };
+    }
     const project = input.project || input.projectId ? findProject(state, input.project || input.projectId) : null;
     if ((input.project || input.projectId) && !project) throw new Error(`Unknown project: ${input.project || input.projectId}`);
     const parsedLimit = Number(input.limit || 10);
@@ -826,8 +834,50 @@ export function reconcileAutomationStateInState(state, input = {}) {
       && ["execution", "transient"].includes(blocker.type)
       && transientRecoveryAt(blocker, input) <= nowMs
     ) {
+      const maxRecoveries = Math.max(
+        0,
+        Number(input.maxTransientRecoveries ?? DEFAULT_MAX_TRANSIENT_RECOVERIES),
+      );
+      const completedRecoveries = Math.max(
+        Number(blocker.recoveryCount || 0),
+        Number(task.lastAutomationRecoveryCount || 0),
+      );
+      if (completedRecoveries >= maxRecoveries) {
+        task.assignedAgentRole = "owner";
+        task.retryNotBefore = "";
+        task.automationCircuit = {
+          state: "open",
+          scope: "task",
+          reasonCode: blocker.reason || task.lastAutomationFailure || "automation_attempts_exhausted",
+          normalizedReason: "Automatic recovery attempts were exhausted.",
+          failureFingerprint: `${task.id}:${blocker.runId || task.lastAutomationFailureRunId || "unknown"}`,
+          attemptsConsumed: Number(blocker.attempts || 0),
+          maxAttempts: Number(blocker.attempts || 0),
+          recoveryCount: completedRecoveries,
+          openedAt: now,
+          nextCheapProbe: "Inspect the preserved run output and verify the underlying failure without launching a model.",
+          resumeAction: `studioops circuit-reset --task ${task.id} --reason verified`,
+          remediation: "Repair or verify the underlying blocker, then explicitly reset this task circuit.",
+        };
+        task.automationBlocker = {
+          ...blocker,
+          type: "circuit",
+          retryAt: "",
+          recoveryCount: completedRecoveries,
+        };
+        task.updatedAt = now;
+        recordRecovery(
+          state,
+          task,
+          `Opened the task automation circuit after ${completedRecoveries} recovery cycle(s). No additional model run will start until the circuit is explicitly reset.`,
+          "automation_circuit_opened",
+          now,
+        );
+        actions.push(`${task.id}: opened automation circuit after bounded recovery`);
+        continue;
+      }
       const resumeStatus = VALID_STATUSES.has(blocker.resumeStatus) ? blocker.resumeStatus : "queued";
-      const recoveryCount = Math.max(0, Number(blocker.recoveryCount || 0)) + 1;
+      const recoveryCount = completedRecoveries + 1;
       task.status = resumeStatus;
       task.assignedAgentRole = "";
       task.assignedThreadId = "";
@@ -869,6 +919,113 @@ export function reconcileAutomationStateInState(state, input = {}) {
   }
 
   return actions;
+}
+
+export function setOperatorPauseInState(state, input = {}) {
+  const now = input.now || new Date().toISOString();
+  state.meta = state.meta || {};
+  state.events = state.events || [];
+  state.meta.operatorPause = {
+    active: true,
+    reason: String(input.reason || "Paused by the StudioOps operator.").trim(),
+    pausedAt: now,
+    pausedBy: String(input.author || "StudioOps Owner").trim(),
+    actionRequired: "Run `studioops automation-resume --reason verified` when it is safe to allow new builder and reviewer runs.",
+  };
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "automation_paused",
+    message: state.meta.operatorPause.reason,
+    createdAt: now,
+  });
+  return state.meta.operatorPause;
+}
+
+export async function setOperatorPause(input = {}) {
+  return mutateState(async (state) => setOperatorPauseInState(state, input));
+}
+
+export function resumeOperatorAutomationInState(state, input = {}) {
+  const now = input.now || new Date().toISOString();
+  state.meta = state.meta || {};
+  state.events = state.events || [];
+  const previous = state.meta.operatorPause || {};
+  state.meta.operatorPause = {
+    ...previous,
+    active: false,
+    resumedAt: now,
+    resumedBy: String(input.author || "StudioOps Owner").trim(),
+    resumeReason: String(input.reason || "Operator verified automation may resume.").trim(),
+  };
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "automation_resumed",
+    message: state.meta.operatorPause.resumeReason,
+    createdAt: now,
+  });
+  return state.meta.operatorPause;
+}
+
+export async function resumeOperatorAutomation(input = {}) {
+  return mutateState(async (state) => resumeOperatorAutomationInState(state, input));
+}
+
+export function resetAutomationCircuitInState(state, input = {}) {
+  const now = input.now || new Date().toISOString();
+  const task = input.task ? findTask(state, input.task) : null;
+  const project = input.project ? findProject(state, input.project) : null;
+  if (!task && !project) throw new Error("Circuit reset requires --task or --project.");
+  const target = task || project;
+  if (target.automationCircuit?.state !== "open") {
+    throw new Error(`${task ? task.id : project.id} does not have an open automation circuit.`);
+  }
+  const previousCircuit = { ...target.automationCircuit };
+  target.automationAttemptEpoch = Number(target.automationAttemptEpoch || 0) + 1;
+  if (project) {
+    for (const projectTask of state.tasks || []) {
+      if (projectTask.projectId !== project.id) continue;
+      projectTask.automationAttemptEpoch = Number(projectTask.automationAttemptEpoch || 0) + 1;
+    }
+  }
+  target.automationCircuit = {
+    ...previousCircuit,
+    state: "closed",
+    closedAt: now,
+    closedBy: String(input.author || "StudioOps Owner").trim(),
+    closeReason: String(input.reason || "Underlying blocker verified.").trim(),
+  };
+  target.updatedAt = now;
+  if (task) {
+    const resumeStatus = VALID_STATUSES.has(task.automationBlocker?.resumeStatus)
+      ? task.automationBlocker.resumeStatus
+      : "queued";
+    task.status = resumeStatus;
+    task.assignedAgentRole = "";
+    task.retryNotBefore = "";
+    delete task.automationBlocker;
+    state.comments = state.comments || [];
+    addAutomationComment(
+      state,
+      task,
+      `Automation circuit reset after owner verification. New execution epoch ${task.automationAttemptEpoch}. Reason: ${target.automationCircuit.closeReason}`,
+      now,
+      target.automationCircuit.closedBy,
+    );
+  }
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "automation_circuit_reset",
+    projectId: task?.projectId || project?.id || "",
+    taskId: task?.id || "",
+    message: `${task?.id || project?.id} automation circuit reset: ${target.automationCircuit.closeReason}`,
+    createdAt: now,
+  });
+  return target;
+}
+
+export async function resetAutomationCircuit(input = {}) {
+  return mutateState(async (state) => resetAutomationCircuitInState(state, input));
 }
 
 export async function updateRun(runId, patch = {}) {

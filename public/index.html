@@ -14,12 +14,27 @@
       </div>
       <div class="topbar-actions">
         <span id="productPlan" class="plan-badge">Community · local</span>
+        <button id="attentionButton" class="attention-button" type="button" aria-controls="ownerInbox" hidden>
+          Action required <span id="attentionCount">0</span>
+        </button>
         <button id="newTaskButton" type="button">New Task</button>
         <button id="automationButton" type="button">Run Automation Tick</button>
         <button id="refreshButton" type="button">Refresh</button>
         <a href="https://github.com/magic2goodil/studioops" target="_blank" rel="noreferrer">GitHub</a>
       </div>
     </header>
+
+    <section id="systemStatus" class="system-status" aria-live="polite" hidden></section>
+    <section id="ownerInbox" class="owner-inbox" aria-labelledby="ownerInboxTitle" aria-live="polite" hidden>
+      <div class="owner-inbox-heading">
+        <div>
+          <p class="eyebrow">Persistent handoff</p>
+          <h2 id="ownerInboxTitle">Action required</h2>
+        </div>
+        <span id="ownerInboxCount">0 items</span>
+      </div>
+      <div id="ownerInboxList" class="owner-inbox-list"></div>
+    </section>
 
     <main id="appLayout" class="layout">
       <section class="panel project-panel">

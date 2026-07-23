@@ -60,11 +60,13 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
 }
 
 export function executionAttemptKey(task, action) {
-  return [
+  const key = [
     task.id,
     Number(task.reviewCycle || 0),
     action.type,
     action.role || "builder",
-  ].join(":");
+  ];
+  const epoch = Number(task.automationAttemptEpoch || 0);
+  if (epoch > 0) key.push(`epoch-${epoch}`);
+  return key.join(":");
 }
-
