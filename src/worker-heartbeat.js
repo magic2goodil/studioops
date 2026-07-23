@@ -113,6 +113,31 @@ export function staleWorkerNames(heartbeats, expectedWorkers, input = {}) {
   });
 }
 
+export function createOverlappingSweepStarter(runOnce, input = {}) {
+  if (typeof runOnce !== "function") {
+    throw new TypeError("createOverlappingSweepStarter requires a runOnce function");
+  }
+  const activeSweeps = new Set();
+  const onError = typeof input.onError === "function"
+    ? input.onError
+    : (error) => console.error(`Background sweep failed: ${error?.message || error}`);
+
+  return {
+    get activeCount() {
+      return activeSweeps.size;
+    },
+    start() {
+      let sweep;
+      sweep = Promise.resolve()
+        .then(() => runOnce())
+        .catch((error) => onError(error))
+        .finally(() => activeSweeps.delete(sweep));
+      activeSweeps.add(sweep);
+      return sweep;
+    },
+  };
+}
+
 export async function runResilientWorkerLoop(input) {
   const worker = safeWorkerName(input.worker);
   const intervalSeconds = Math.max(1, Number(input.intervalSeconds || 10));

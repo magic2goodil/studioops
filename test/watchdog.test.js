@@ -4,7 +4,38 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { planWatchdogActions, restartWorker } from "../src/watchdog.js";
-import { readWorkerHeartbeats, staleWorkerNames, writeWorkerHeartbeat } from "../src/worker-heartbeat.js";
+import {
+  createOverlappingSweepStarter,
+  readWorkerHeartbeats,
+  staleWorkerNames,
+  writeWorkerHeartbeat,
+} from "../src/worker-heartbeat.js";
+
+test("overlapping sweep starter keeps polling while a prior sweep owns long-running jobs", async () => {
+  let releaseFirst;
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const started = [];
+  const sweeps = createOverlappingSweepStarter(async () => {
+    const index = started.length + 1;
+    started.push(index);
+    if (index === 1) await firstBlocked;
+  });
+
+  const first = sweeps.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sweeps.activeCount, 1);
+
+  const second = sweeps.start();
+  await second;
+  assert.deepEqual(started, [1, 2]);
+  assert.equal(sweeps.activeCount, 1);
+
+  releaseFirst();
+  await first;
+  assert.equal(sweeps.activeCount, 0);
+});
 
 test("heartbeats are written atomically and stale workers are identified", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mission-control-heartbeat-"));
