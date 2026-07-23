@@ -191,7 +191,6 @@ function taskActions(state, task, options = {}) {
   }
 
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
-  if (task.type === "epic" || hasChildren) return [];
 
   const missingDependencies = incompleteDependencies(state, task);
   const retryNotBefore = Date.parse(task.retryNotBefore || "");
@@ -243,6 +242,8 @@ function taskActions(state, task, options = {}) {
       },
     )];
   }
+
+  if (task.type === "epic" || hasChildren) return [];
 
   if (BUILDABLE_STATUSES.has(task.status)) {
     if (missingDependencies.length) {

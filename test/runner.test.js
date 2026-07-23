@@ -143,7 +143,17 @@ test("runner claim is the transition from queued to in progress", async () => {
     },
   );
 
-  const claimed = await claimRuns({ state, limit: 1 });
+  const claimed = await claimRuns({
+    state,
+    limit: 1,
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "local",
+      originUrl: "",
+      baseRef: "HEAD",
+      baseCommit: "test-commit",
+    }),
+  });
 
   assert.equal(claimed.length, 1);
   assert.equal(state.runs[0].status, "running");
@@ -358,6 +368,40 @@ test("local preflight never prepares GitHub auth and creates an isolated no-orig
     assert.equal(await git(workspace.workspacePath, ["symbolic-ref", "--short", "HEAD"]), "codex/demo-local");
     assert.equal(await git(workspace.workspacePath, ["remote"]), "");
     assert.equal(await readFile(path.join(workspace.workspacePath, "README.md"), "utf8"), "test\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("systems architect preflight validates the source checkout without GitHub credentials", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-architect-preflight-"));
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["remote", "add", "origin", "https://github.com/example/demo.git"]);
+    let authCalls = 0;
+    const result = await preflightRun({
+      id: "run_architect",
+      group: "architect",
+      role: "systems-architect",
+      actionType: "start_architecture",
+      project: {
+        key: "demo",
+        repoPath,
+        repoUrl: "https://github.com/example/demo.git",
+        workflowMode: "github",
+        defaultBranch: "main",
+      },
+    }, {
+      prepareGitHubAppAuth: async () => {
+        authCalls += 1;
+        throw new Error("Architect preflight must not prepare GitHub credentials.");
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.workflowMode, "local");
+    assert.equal(result.originUrl, "https://github.com/example/demo.git");
+    assert.equal(authCalls, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

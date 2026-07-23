@@ -145,7 +145,10 @@ function findRunnableLaneConflict(state, run, extraRuns = []) {
 function staleRunReason(state, run) {
   const task = findTask(state, run.taskId);
   if (!task) return "task_missing";
-  if (task.type === "epic" || (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id)) {
+  if (
+    run.actionType !== "start_architecture"
+    && (task.type === "epic" || (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id))
+  ) {
     return "tracking_container";
   }
 
@@ -398,6 +401,13 @@ export async function preflightRun(run, input = {}) {
   }
 
   const originUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
+  if (run.group === "architect") {
+    return {
+      ok: true,
+      workflowMode: "local",
+      originUrl,
+    };
+  }
   const workflowMode = resolveProjectWorkflowMode(project, originUrl);
   if (workflowMode === "local") {
     const base = await resolveLocalBaseRef(

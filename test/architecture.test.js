@@ -123,7 +123,15 @@ test("architecture is a durable xhigh pre-builder dispatch", async () => {
   assert.equal(report.runs[0].modelReasoningEffort, "xhigh");
   assert.equal(state.tasks[0].status, "architecture_pending");
 
-  const claimed = await claimRuns({ state, limit: 1 });
+  const claimed = await claimRuns({
+    state,
+    limit: 1,
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "local",
+      originUrl: "",
+    }),
+  });
   assert.equal(claimed.length, 1);
   assert.equal(state.tasks[0].status, "architecture_in_progress");
 });
