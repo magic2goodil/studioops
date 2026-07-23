@@ -291,13 +291,14 @@ export function architectureIsCompleteInState(state, task = {}) {
   if (["completed", "not_required"].includes(task.architectureStatus)) return true;
   if (task.architectureStatus !== "inherited") return false;
   const parent = findTask(state, task.architectureParentTaskId);
-  return Boolean(
-    parent
-    && parent.projectId === task.projectId
-    && parent.architectureStatus === "completed"
-    && task.parentTaskId === parent.id
-    && (parent.architectureDecisionTaskIds || []).includes(task.id),
-  );
+  if (
+    !parent
+    || parent.projectId !== task.projectId
+    || parent.architectureStatus !== "completed"
+    || task.parentTaskId !== parent.id
+    || !(parent.architectureDecisionTaskIds || []).includes(task.id)
+  ) return false;
+  return completedArchitectureGraphIsValid(state, parent);
 }
 
 function statusWithArchitectureGate(input, requestedStatus) {
@@ -683,6 +684,17 @@ export async function updateTask(taskId, patch) {
   });
 }
 
+function missingArchitectureChildContractFields(child) {
+  const missing = [];
+  if (!String(child.description || "").trim()) missing.push("architecture constraints/description");
+  if (!String(child.userStory || "").trim()) missing.push("user story");
+  if (!String(child.expectedOutcome || "").trim()) missing.push("expected outcome");
+  if (!(child.acceptanceCriteria || []).length) missing.push("acceptance criteria");
+  if (!String(child.lane || "").trim()) missing.push("work lane");
+  if (!(child.workAreas || []).length) missing.push("work areas");
+  return missing;
+}
+
 function assertArchitectureChildContract(parent, child) {
   if (child.parentTaskId !== parent.id || child.architectureParentTaskId !== parent.id) {
     throw new Error(`Architecture child ${child.id} must be parent-linked to ${parent.id}.`);
@@ -695,13 +707,7 @@ function assertArchitectureChildContract(parent, child) {
   if (!["idea", "architecture_pending"].includes(child.status)) {
     throw new Error(`Architecture child ${child.id} is already beyond the pre-builder architecture gate.`);
   }
-  const missing = [];
-  if (!String(child.description || "").trim()) missing.push("architecture constraints/description");
-  if (!String(child.userStory || "").trim()) missing.push("user story");
-  if (!String(child.expectedOutcome || "").trim()) missing.push("expected outcome");
-  if (!(child.acceptanceCriteria || []).length) missing.push("acceptance criteria");
-  if (!String(child.lane || "").trim()) missing.push("work lane");
-  if (!(child.workAreas || []).length) missing.push("work areas");
+  const missing = missingArchitectureChildContractFields(child);
   if (missing.length) {
     throw new Error(`Architecture child ${child.id} is missing required task contract fields: ${missing.join(", ")}.`);
   }
@@ -739,6 +745,38 @@ function assertArchitectureDependencyGraph(state, parent, childTasks) {
     visited.add(taskId);
   }
   for (const child of childTasks) visit(child.id);
+}
+
+function completedArchitectureGraphIsValid(state, parent) {
+  const decisionTaskIds = parent.architectureDecisionTaskIds || [];
+  if (!decisionTaskIds.length || new Set(decisionTaskIds).size !== decisionTaskIds.length) return false;
+  const childTasks = decisionTaskIds.map((id) => findTask(state, id));
+  if (childTasks.some((child) => (
+    !child
+    || child.projectId !== parent.projectId
+    || child.parentTaskId !== parent.id
+    || child.architectureParentTaskId !== parent.id
+    || !child.architectureRequired
+    || child.architectureStatus !== "inherited"
+    || missingArchitectureChildContractFields(child).length
+  ))) return false;
+
+  const governedChildIds = (state.tasks || [])
+    .filter((child) => child.architectureParentTaskId === parent.id)
+    .map((child) => child.id)
+    .sort();
+  const recordedChildIds = [...decisionTaskIds].sort();
+  if (
+    governedChildIds.length !== recordedChildIds.length
+    || governedChildIds.some((id, index) => id !== recordedChildIds[index])
+  ) return false;
+
+  try {
+    assertArchitectureDependencyGraph(state, parent, childTasks);
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 export function completeArchitectureInState(state, taskId, input = {}) {

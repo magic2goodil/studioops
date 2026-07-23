@@ -46,6 +46,7 @@ const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "preview_blocked", "blocked"]);
 const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
+const ARCHITECTURE_GATED_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
@@ -172,6 +173,12 @@ function staleRunReason(state, run) {
     }
     return "";
   }
+
+  if (
+    ARCHITECTURE_GATED_ACTIONS.has(run.actionType)
+    && task.architectureRequired
+    && !architectureIsCompleteInState(state, task)
+  ) return "architecture_handoff_invalid";
 
   if (["start_builder", "start_builder_fix", "return_to_builder"].includes(run.actionType)) {
     if (!["queued", "in_progress"].includes(task.status)) return `task_status_changed:${task.status || "unknown"}`;

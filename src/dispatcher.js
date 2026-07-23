@@ -1,4 +1,10 @@
-import { findProject, findTask, generatePrompt, mutateState } from "./store.js";
+import {
+  architectureIsCompleteInState,
+  findProject,
+  findTask,
+  generatePrompt,
+  mutateState,
+} from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 
@@ -17,6 +23,12 @@ const DISPATCHABLE_ACTIONS = new Set([
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
 const FINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const ARCHITECTURE_GATED_ACTIONS = new Set([
+  "start_builder",
+  "start_builder_fix",
+  "return_to_builder",
+  "unblock_task",
+]);
 
 const DEFAULTS = {
   provider: "prompt-outbox",
@@ -172,6 +184,11 @@ function findLaneConflict(state, selected, action, task) {
 function dispatchSafetyReason(state, task, action, options) {
   const group = runGroupFor(action);
   if (group === "owner") return "";
+  if (
+    ARCHITECTURE_GATED_ACTIONS.has(action.type)
+    && task.architectureRequired
+    && !architectureIsCompleteInState(state, task)
+  ) return "architecture_handoff_invalid";
   if (state.meta?.operatorPause?.active && !options.ignoreOperatorPause) {
     return "operator_pause";
   }

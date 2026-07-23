@@ -52,7 +52,7 @@ Every dispatched run is explicitly pinned to `gpt-5.6-sol`. Ordinary work uses `
 
 The watch process schedules a fresh durable-claim sweep on every configured interval even while earlier claimed jobs are still running. Transactional claims and the configured runner/concurrency limits bound work; a long builder or reviewer no longer prevents a newly queued independent architect or reviewer from using available capacity.
 
-Each workflow action gets two attempts by default with a five-minute backoff. After the limit, StudioOps blocks the task with the run ID and failure reason for visible owner repair. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
+Each workflow action gets two worker-launch attempts by default with a 30-second base backoff. A cancellation before claim does not consume an attempt. After the launch limit and one bounded transient-recovery cycle, StudioOps opens a visible task circuit with the run ID and failure reason for owner repair. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
 
 Before claiming work, the runner checks the data volume used for SQLite state and run output. The default safety floor is 5 GiB or 2% free, whichever is stricter. Existing builders are not killed by this check; new claims pause until capacity is restored, and the watchdog records the reason instead of entering a restart loop.
 

@@ -221,7 +221,9 @@ function taskActions(state, task, options = {}) {
       "waiting_on_architecture",
       "",
       architectureParent
-        ? `Waiting for parent ${architectureParent.id} to record the durable architecture decision and governed task graph.`
+        ? architectureParent.architectureStatus === "completed"
+          ? `Parent ${architectureParent.id}'s approved architecture graph is no longer valid. Repair the governed child contract or record a new architecture decision before dispatch.`
+          : `Waiting for parent ${architectureParent.id} to record the durable architecture decision and governed task graph.`
         : `Waiting for missing architecture parent ${task.architectureParentTaskId} to be repaired.`,
       options,
     )];
