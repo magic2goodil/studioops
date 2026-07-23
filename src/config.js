@@ -8,6 +8,15 @@ import { missionControlConfigRoot } from "./runtime-paths.js";
 export const CONFIG_FILE = "studioops.config.md";
 export const LEGACY_CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "studioops.config.example.md";
+export const PROJECT_WORKFLOW_MODES = new Set(["auto", "local", "github"]);
+
+export function normalizeProjectWorkflowMode(value, fallback = "auto") {
+  const normalized = String(value || fallback).trim().toLowerCase();
+  if (!PROJECT_WORKFLOW_MODES.has(normalized)) {
+    throw new Error(`Invalid project workflow mode: ${value}. Expected auto, local, or github.`);
+  }
+  return normalized;
+}
 
 export function expandHome(value) {
   if (!value || typeof value !== "string") return value;
@@ -106,6 +115,7 @@ export function projectFromConfig(rawProject, defaults = {}) {
     description: rawProject.description || "",
     repoPath: expandHome(rawProject.repoPath || ""),
     repoUrl: rawProject.repoUrl || "",
+    workflowMode: normalizeProjectWorkflowMode(rawProject.workflowMode || defaults.workflowMode || "auto"),
     defaultBranch: rawProject.defaultBranch || defaults.defaultBranch || "main",
     validationCommands: rawProject.validationCommands || defaults.validationCommands || [],
     contextLinks: rawProject.contextLinks || [],

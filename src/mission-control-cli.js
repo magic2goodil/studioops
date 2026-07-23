@@ -401,6 +401,7 @@ Task fields:
   --trust-lead-approvals        Alias for --trust-leads
   --no-trust-leads              Disable Trust Leads for a project
   --integration-branch          Non-production branch used for QA integration bundles
+  --workflow-mode               Project workflow: auto, local, or github
   --parent                      Parent epic/task ID
   --depends-on                  Dependency task IDs, comma or newline separated
 
@@ -443,10 +444,11 @@ Automation:
       id: project.id,
       key: project.key,
       name: project.name,
+      workflowMode: project.workflowMode || "auto",
       repo: project.repoPath || project.repoUrl,
       trustLeads: project.reviewPolicy?.trustLeadApprovals ? "yes" : "no",
       integrationBranch: project.reviewPolicy?.integrationBranch || "",
-    })), ["id", "key", "name", "repo", "trustLeads", "integrationBranch"]);
+    })), ["id", "key", "name", "workflowMode", "repo", "trustLeads", "integrationBranch"]);
     return;
   }
 
@@ -562,6 +564,7 @@ Automation:
       description: args.description,
       repoPath: expandHome(args["repo-path"] || ""),
       repoUrl: args["repo-url"],
+      workflowMode: args["workflow-mode"] || "auto",
       defaultBranch: args["default-branch"] || "main",
       validationCommands: args.validation,
       contextLinks: args.context,
@@ -585,6 +588,7 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
     if (Object.prototype.hasOwnProperty.call(args, "repo-path")) patch.repoPath = expandHome(args["repo-path"] || "");
     if (Object.prototype.hasOwnProperty.call(args, "repo-url")) patch.repoUrl = args["repo-url"];
+    if (Object.prototype.hasOwnProperty.call(args, "workflow-mode")) patch.workflowMode = args["workflow-mode"];
     if (Object.prototype.hasOwnProperty.call(args, "default-branch")) patch.defaultBranch = args["default-branch"];
     if (Object.prototype.hasOwnProperty.call(args, "validation")) patch.validationCommands = args.validation;
     if (Object.prototype.hasOwnProperty.call(args, "context")) patch.contextLinks = args.context;

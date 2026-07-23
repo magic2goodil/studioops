@@ -54,10 +54,16 @@ async function request(pathname, init = {}) {
 }
 
 function projectMatch(projects, input = {}) {
-  const fields = ["key", "name", "repoPath", "repoUrl"];
-  return projects.find((project) => fields.some((field) => (
-    normalize(input[field]) && normalize(project[field]).toLowerCase() === normalize(input[field]).toLowerCase()
-  ))) || null;
+  const matching = (field) => {
+    const expected = normalize(input[field]).toLowerCase();
+    if (!expected) return null;
+    return projects.find((project) => normalize(project[field]).toLowerCase() === expected) || null;
+  };
+  return matching("key")
+    || matching("name")
+    || matching("repoPath")
+    || matching("repoUrl")
+    || null;
 }
 
 async function state() {

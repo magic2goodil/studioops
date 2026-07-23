@@ -7,6 +7,7 @@ import {
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
 import { missionControlDataDir } from "./runtime-paths.js";
+import { normalizeProjectWorkflowMode } from "./config.js";
 import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
@@ -298,6 +299,7 @@ export async function addProject(input) {
       description: String(input.description || "").trim(),
       repoPath: String(input.repoPath || "").trim(),
       repoUrl: String(input.repoUrl || "").trim(),
+      workflowMode: normalizeProjectWorkflowMode(input.workflowMode || "auto"),
       defaultBranch: String(input.defaultBranch || "main").trim(),
       validationCommands: normalizeList(input.validationCommands),
       contextLinks: normalizeList(input.contextLinks),
@@ -341,6 +343,9 @@ export async function updateProject(projectId, patch = {}) {
       if (Object.prototype.hasOwnProperty.call(patch, key)) {
         project[key] = String(patch[key] || "").trim();
       }
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "workflowMode")) {
+      project.workflowMode = normalizeProjectWorkflowMode(patch.workflowMode || "auto");
     }
     if (Object.prototype.hasOwnProperty.call(patch, "validationCommands")) {
       project.validationCommands = normalizeList(patch.validationCommands);
@@ -841,7 +846,9 @@ export function reconcileAutomationStateInState(state, input = {}) {
       actions.push(`${task.id}: recovered transient automation failure`);
     }
 
-    if (task.status !== "in_progress" || task.type === "epic" || taskHasActiveRun(state, task.id)) continue;
+    const isTrackingContainer = task.type === "epic"
+      || (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
+    if (task.status !== "in_progress" || isTrackingContainer || taskHasActiveRun(state, task.id)) continue;
     const updatedAt = Date.parse(task.updatedAt || task.createdAt || "");
     if (Number.isFinite(updatedAt) && nowMs - updatedAt < orphanGraceMs) continue;
 
@@ -1209,6 +1216,9 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   const actions = [];
   const project = findProject(state, task.projectId);
   if (!project) return actions;
+
+  const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
+  if (task.type === "epic" || hasChildren) return actions;
 
   const missingDependencies = incompleteDependencies(state, task);
   if (missingDependencies.length) {
