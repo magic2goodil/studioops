@@ -40,10 +40,11 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   };
   const role = String(action.role || task.assignedAgentRole || "builder").toLowerCase();
   const rolePolicy = configured.roles?.[role] || {};
+  const systemsArchitect = role.includes("architect");
   const complex = COMPLEX_WORK_PATTERN.test(taskText(task));
   const reasoningEffort = normalizedEffort(
-    rolePolicy.reasoningEffort
-      || (role.includes("architect") ? "xhigh" : "")
+    (systemsArchitect ? "xhigh" : "")
+      || rolePolicy.reasoningEffort
       || (role.includes("lead") ? configured.leadReasoningEffort : "")
       || (complex ? configured.complexReasoningEffort : "")
       || configured.reasoningEffort,
@@ -52,8 +53,8 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
 
   return {
     model: String(
-      rolePolicy.model
-        || (role.includes("architect") ? DEFAULT_EXECUTION_POLICY.model : "")
+      (systemsArchitect ? DEFAULT_EXECUTION_POLICY.model : "")
+        || rolePolicy.model
         || configured.model
         || DEFAULT_EXECUTION_POLICY.model,
     ).trim(),
@@ -61,7 +62,7 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
     maxAttempts: positiveInteger(rolePolicy.maxAttempts || configured.maxAttempts, DEFAULT_EXECUTION_POLICY.maxAttempts),
     retryBackoffMs: positiveInteger(rolePolicy.retryBackoffMs || configured.retryBackoffMs, DEFAULT_EXECUTION_POLICY.retryBackoffMs),
     staleRunMs: positiveInteger(rolePolicy.staleRunMs || configured.staleRunMs, DEFAULT_EXECUTION_POLICY.staleRunMs),
-    selectionReason: role.includes("architect")
+    selectionReason: systemsArchitect
       ? "systems_architect_role"
       : role.includes("lead") ? "lead_role" : complex ? "complex_task" : "default_role",
   };

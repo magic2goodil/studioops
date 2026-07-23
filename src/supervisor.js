@@ -1,4 +1,8 @@
-import { reviewPolicyForProject, reviewStagesForProject } from "./store.js";
+import {
+  architectureIsCompleteInState,
+  reviewPolicyForProject,
+  reviewStagesForProject,
+} from "./store.js";
 import {
   branchWebUrl,
   integrationBranchName,
@@ -199,7 +203,27 @@ function taskActions(state, task, options = {}) {
     )];
   }
 
-  const architectureComplete = ["completed", "inherited", "not_required"].includes(task.architectureStatus);
+  const architectureComplete = architectureIsCompleteInState(state, task);
+  if (
+    task.architectureRequired
+    && !architectureComplete
+    && task.architectureParentTaskId
+  ) {
+    const architectureParent = state.tasks.find((candidate) => (
+      candidate.id === task.architectureParentTaskId
+      && candidate.projectId === task.projectId
+    ));
+    return [actionBase(
+      state,
+      task,
+      "waiting_on_architecture",
+      "",
+      architectureParent
+        ? `Waiting for parent ${architectureParent.id} to record the durable architecture decision and governed task graph.`
+        : `Waiting for missing architecture parent ${task.architectureParentTaskId} to be repaired.`,
+      options,
+    )];
+  }
   if (
     ["architecture_pending", "architecture_in_progress"].includes(task.status)
     || (BUILDABLE_STATUSES.has(task.status) && task.architectureRequired && !architectureComplete)
@@ -385,7 +409,13 @@ function sortActions(actions) {
 
 export function createSupervisorReport(state, options = {}) {
   const allActions = sortActions((state.tasks || []).flatMap((task) => taskActions(state, task, options)));
-  const passiveActionTypes = new Set(["waiting_on_dependency", "waiting_for_retry", "blocked", "release_candidate_ready"]);
+  const passiveActionTypes = new Set([
+    "waiting_on_architecture",
+    "waiting_on_dependency",
+    "waiting_for_retry",
+    "blocked",
+    "release_candidate_ready",
+  ]);
   const actions = options.includeWaiting || options.all
     ? allActions
     : allActions.filter((action) => !passiveActionTypes.has(action.type));

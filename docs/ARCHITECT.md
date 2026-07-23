@@ -10,9 +10,9 @@ StudioOps routes work to `systems-architect` when:
 
 - a task explicitly sets `architectureRequired`
 - an epic is queued for delivery
-- a task includes a visual attachment and describes an app, platform, product, system, dashboard, portal, website, mobile/native experience, mockup, or redesign
+- a task describes an app, platform, product, system, dashboard, portal, website, mobile/native experience, mockup, or redesign, with or without a visual attachment
 
-Small bugs and isolated visual corrections do not require architecture unless the task explicitly asks for it.
+Small bugs and isolated visual corrections can explicitly waive architecture with `--no-architecture-required`.
 
 Tasks move through:
 
@@ -51,7 +51,7 @@ Broad work must be broken into dependency-linked child tasks. Each task receives
 - observable functional acceptance criteria
 - data/API/event contracts
 - validation and local QA expectations
-- `--architecture-approved` so StudioOps knows the child is governed by the parent decision
+- `--parent <architecture-task-id>` and `--architecture-approved` so StudioOps stages the child as governed but non-buildable
 
 After creating the child tasks, the architect records the durable handoff:
 
@@ -61,7 +61,7 @@ studioops architecture-complete task_123 \
   --task-ids "task_124,task_125,task_126"
 ```
 
-An epic cannot complete architecture without at least one implementation child task. The runner treats a process exit without this record as a failed architecture handoff.
+Every architecture pass requires at least one implementation child task. Completion verifies that every listed task is in the same project, parent-linked, explicitly staged, fully shaped with the required delivery fields, and part of an acyclic dependency graph. Only then does one transaction mark the architecture complete and the governed children inherited/ready. The runner treats a process exit without that valid record as a failed architecture handoff.
 
 ## Functional Default
 

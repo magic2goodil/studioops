@@ -277,16 +277,26 @@ export function taskRequiresArchitecture(input = {}) {
   if (Object.prototype.hasOwnProperty.call(input, "architectureRequired")) {
     return normalizeBoolean(input.architectureRequired, false);
   }
-  if (Object.prototype.hasOwnProperty.call(input, "architectureApproved")) {
-    return !normalizeBoolean(input.architectureApproved, false);
-  }
+  if (normalizeBoolean(input.architectureApproved, false)) return true;
   if (String(input.type || "").trim().toLowerCase() === "epic") return true;
-  const attachments = normalizeAttachments(input.attachments || input.attachment);
-  return attachments.length > 0 && ARCHITECTURE_TASK_PATTERN.test(architectureText(input));
+  return ARCHITECTURE_TASK_PATTERN.test(architectureText(input));
 }
 
 function architectureIsComplete(task = {}) {
   return ["completed", "inherited", "not_required"].includes(task.architectureStatus);
+}
+
+export function architectureIsCompleteInState(state, task = {}) {
+  if (["completed", "not_required"].includes(task.architectureStatus)) return true;
+  if (task.architectureStatus !== "inherited") return false;
+  const parent = findTask(state, task.architectureParentTaskId);
+  return Boolean(
+    parent
+    && parent.projectId === task.projectId
+    && parent.architectureStatus === "completed"
+    && task.parentTaskId === parent.id
+    && (parent.architectureDecisionTaskIds || []).includes(task.id),
+  );
 }
 
 function statusWithArchitectureGate(input, requestedStatus) {
@@ -442,25 +452,55 @@ export async function updateProject(projectId, patch = {}) {
   });
 }
 
+function governedArchitectureParent(state, project, parentTaskId, architectureParentTaskId) {
+  const governedParentId = architectureParentTaskId || parentTaskId;
+  if (!parentTaskId || !governedParentId) {
+    throw new Error("Architecture-approved child tasks require a parent task.");
+  }
+  if (parentTaskId !== governedParentId) {
+    throw new Error("Architecture parent must match the child task's parent.");
+  }
+  const parent = findTask(state, governedParentId);
+  if (!parent) throw new Error(`Unknown architecture parent task: ${governedParentId}`);
+  if (parent.projectId !== project.id) {
+    throw new Error(`Architecture parent ${governedParentId} belongs to another project.`);
+  }
+  if (!parent.architectureRequired && !taskRequiresArchitecture(parent)) {
+    throw new Error(`Architecture parent ${governedParentId} does not require systems architecture.`);
+  }
+  return parent;
+}
+
 export async function addTask(input) {
   return mutateState(async (state) => {
     const now = new Date().toISOString();
     const project = findProject(state, input.project || input.projectId);
     if (!project) throw new Error(`Unknown project: ${input.project || input.projectId}`);
-    const architectureRequired = taskRequiresArchitecture(input);
-    const architectureStatus = normalizeBoolean(input.architectureApproved, false)
-      ? "inherited"
-      : architectureRequired ? "pending" : "not_required";
-    const status = statusWithArchitectureGate(
-      { ...input, architectureRequired, architectureStatus },
-      input.status || "idea",
-    );
-    if (!VALID_STATUSES.has(status)) throw new Error(`Invalid status: ${status}`);
     const title = String(input.title || "").trim();
     if (!title) throw new Error("Task title is required.");
     const parentTaskId = String(input.parentTaskId || input.parent || input.epic || "").trim();
     const dependsOnTaskIds = normalizeList(input.dependsOnTaskIds || input.dependsOn || input.dependencies);
     validateTaskRelationships(state, "", parentTaskId, dependsOnTaskIds);
+    const architectureApproved = normalizeBoolean(input.architectureApproved, false);
+    const requestedArchitectureParentTaskId = String(input.architectureParentTaskId || "").trim();
+    const architectureParentTaskId = architectureApproved
+      ? governedArchitectureParent(
+        state,
+        project,
+        parentTaskId,
+        requestedArchitectureParentTaskId,
+      ).id
+      : "";
+    if (requestedArchitectureParentTaskId && !architectureApproved) {
+      throw new Error("Architecture parent requires architectureApproved so the child remains gated until completion.");
+    }
+    const architectureRequired = architectureApproved || taskRequiresArchitecture(input);
+    const architectureStatus = architectureRequired ? "pending" : "not_required";
+    const status = statusWithArchitectureGate(
+      { ...input, architectureRequired, architectureStatus },
+      input.status || "idea",
+    );
+    if (!VALID_STATUSES.has(status)) throw new Error(`Invalid status: ${status}`);
     const task = {
       id: nextId(state.tasks, "task"),
       projectId: project.id,
@@ -481,7 +521,7 @@ export async function addTask(input) {
       deliveryMode: normalizeDeliveryMode(input.deliveryMode),
       architectureRequired,
       architectureStatus,
-      architectureParentTaskId: String(input.architectureParentTaskId || "").trim(),
+      architectureParentTaskId,
       architectureSummary: "",
       architectureDecisionTaskIds: [],
       architectureCompletedAt: "",
@@ -514,8 +554,26 @@ export async function updateTask(taskId, patch) {
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
+    const project = findProject(state, task.projectId);
+    if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     if (patch.status && !VALID_STATUSES.has(patch.status)) {
       throw new Error(`Invalid status: ${patch.status}`);
+    }
+    const architectureCompletionFields = [
+      "architectureStatus",
+      "architectureSummary",
+      "architectureDecisionTaskIds",
+      "architectureCompletedAt",
+      "architectureCompletedBy",
+    ];
+    if (architectureCompletionFields.some((key) => Object.prototype.hasOwnProperty.call(patch, key))) {
+      throw new Error("Architecture completion fields can only be written by completeArchitecture.");
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "architectureParentTaskId")
+      && !normalizeBoolean(patch.architectureApproved, false)
+    ) {
+      throw new Error("Architecture parent requires architectureApproved so the child remains gated until completion.");
     }
     const previousStatus = task.status;
     const allowed = [
@@ -530,11 +588,6 @@ export async function updateTask(taskId, patch) {
       "userStory",
       "expectedOutcome",
       "deliveryMode",
-      "architectureStatus",
-      "architectureParentTaskId",
-      "architectureSummary",
-      "architectureCompletedAt",
-      "architectureCompletedBy",
       "privacyNotes",
       "securityNotes",
       "branchName",
@@ -552,14 +605,28 @@ export async function updateTask(taskId, patch) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, "architectureRequired")) {
       task.architectureRequired = normalizeBoolean(patch.architectureRequired, false);
+      if (!task.architectureRequired) {
+        task.architectureStatus = "not_required";
+        task.architectureParentTaskId = "";
+      } else if (!architectureIsCompleteInState(state, task)) {
+        task.architectureStatus = "pending";
+      }
     }
     if (Object.prototype.hasOwnProperty.call(patch, "architectureApproved")) {
-      task.architectureStatus = normalizeBoolean(patch.architectureApproved, false)
-        ? "inherited"
-        : task.architectureRequired ? "pending" : "not_required";
-    }
-    if (Object.prototype.hasOwnProperty.call(patch, "architectureDecisionTaskIds")) {
-      task.architectureDecisionTaskIds = normalizeList(patch.architectureDecisionTaskIds);
+      if (normalizeBoolean(patch.architectureApproved, false)) {
+        const requestedParentId = String(patch.architectureParentTaskId || "").trim();
+        task.architectureParentTaskId = governedArchitectureParent(
+          state,
+          project,
+          task.parentTaskId,
+          requestedParentId,
+        ).id;
+        task.architectureRequired = true;
+        task.architectureStatus = "pending";
+      } else {
+        task.architectureParentTaskId = "";
+        task.architectureStatus = task.architectureRequired ? "pending" : "not_required";
+      }
     }
     if (Object.prototype.hasOwnProperty.call(patch, "acceptanceCriteria")) {
       task.acceptanceCriteria = normalizeList(patch.acceptanceCriteria);
@@ -578,7 +645,13 @@ export async function updateTask(taskId, patch) {
       Object.prototype.hasOwnProperty.call(patch, "status")
       && ["ready", "queued"].includes(task.status)
       && task.architectureRequired
-      && !architectureIsComplete(task)
+      && !architectureIsCompleteInState(state, task)
+    ) {
+      task.status = "architecture_pending";
+    }
+    if (
+      normalizeBoolean(patch.architectureApproved, false)
+      && ["ready", "queued"].includes(task.status)
     ) {
       task.status = "architecture_pending";
     }
@@ -605,67 +678,136 @@ export async function updateTask(taskId, patch) {
   });
 }
 
-export function completeArchitectureInState(state, taskId, input = {}) {
-    const task = findTask(state, taskId);
-    if (!task) throw new Error(`Unknown task: ${taskId}`);
-    const summary = String(input.body || input.summary || "").trim();
-    if (summary.length < 120) {
-      throw new Error("Architecture completion requires a substantive summary of at least 120 characters.");
-    }
-    const decisionTaskIds = normalizeList(
-      input.taskIds || input.decisionTaskIds || input.architectureDecisionTaskIds,
+function assertArchitectureChildContract(parent, child) {
+  if (child.parentTaskId !== parent.id || child.architectureParentTaskId !== parent.id) {
+    throw new Error(`Architecture child ${child.id} must be parent-linked to ${parent.id}.`);
+  }
+  if (!child.architectureRequired || child.architectureStatus !== "pending") {
+    throw new Error(
+      `Architecture child ${child.id} must be staged with architectureApproved and remain pending until parent completion.`,
     );
-    const childTasks = decisionTaskIds.map((id) => {
-      const child = findTask(state, id);
-      if (!child) throw new Error(`Unknown architecture child task: ${id}`);
-      if (child.projectId !== task.projectId) {
-        throw new Error(`Architecture child ${id} belongs to another project.`);
+  }
+  if (!["idea", "architecture_pending"].includes(child.status)) {
+    throw new Error(`Architecture child ${child.id} is already beyond the pre-builder architecture gate.`);
+  }
+  const missing = [];
+  if (!String(child.description || "").trim()) missing.push("architecture constraints/description");
+  if (!String(child.userStory || "").trim()) missing.push("user story");
+  if (!String(child.expectedOutcome || "").trim()) missing.push("expected outcome");
+  if (!(child.acceptanceCriteria || []).length) missing.push("acceptance criteria");
+  if (!String(child.lane || "").trim()) missing.push("work lane");
+  if (!(child.workAreas || []).length) missing.push("work areas");
+  if (missing.length) {
+    throw new Error(`Architecture child ${child.id} is missing required task contract fields: ${missing.join(", ")}.`);
+  }
+}
+
+function assertArchitectureDependencyGraph(state, parent, childTasks) {
+  const childIds = new Set(childTasks.map((child) => child.id));
+  const byId = new Map(childTasks.map((child) => [child.id, child]));
+  for (const child of childTasks) {
+    for (const dependencyId of child.dependsOnTaskIds || []) {
+      if (dependencyId === parent.id) {
+        throw new Error(`Architecture child ${child.id} cannot depend on its architecture parent.`);
       }
-      return child;
-    });
-    if (String(task.type || "").toLowerCase() === "epic" && childTasks.length === 0) {
-      throw new Error("Epic architecture completion requires at least one dependency-linked child task.");
+      const dependency = findTask(state, dependencyId);
+      if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
+      if (dependency.projectId !== parent.projectId) {
+        throw new Error(`Architecture child ${child.id} depends on a task from another project.`);
+      }
     }
+  }
 
-    const now = new Date().toISOString();
-    const author = String(input.author || "StudioOps Systems Architect").trim();
-    task.architectureRequired = true;
-    task.architectureStatus = "completed";
-    task.architectureSummary = summary;
-    task.architectureDecisionTaskIds = decisionTaskIds;
-    task.architectureCompletedAt = now;
-    task.architectureCompletedBy = author;
-    task.assignedAgentRole = "";
-    task.status = String(task.type || "").toLowerCase() === "epic" ? "architecture_ready" : "ready";
-    task.updatedAt = now;
-
-    for (const child of childTasks) {
-      child.architectureRequired = true;
-      child.architectureStatus = "inherited";
-      child.architectureParentTaskId = task.id;
-      if (!child.parentTaskId) child.parentTaskId = task.id;
-      if (child.status === "architecture_pending" || child.status === "idea") child.status = "ready";
-      child.updatedAt = now;
+  const visiting = new Set();
+  const visited = new Set();
+  function visit(taskId) {
+    if (visiting.has(taskId)) {
+      throw new Error("Architecture child dependency graph contains a cycle.");
     }
+    if (visited.has(taskId)) return;
+    visiting.add(taskId);
+    const child = byId.get(taskId);
+    for (const dependencyId of child?.dependsOnTaskIds || []) {
+      if (childIds.has(dependencyId)) visit(dependencyId);
+    }
+    visiting.delete(taskId);
+    visited.add(taskId);
+  }
+  for (const child of childTasks) visit(child.id);
+}
 
-    state.comments = state.comments || [];
-    state.comments.push({
-      id: nextId(state.comments, "comment"),
-      taskId: task.id,
-      author,
-      body: `Architecture decision recorded.\n\n${summary}${decisionTaskIds.length ? `\n\nImplementation tasks: ${decisionTaskIds.join(", ")}` : ""}`,
-      createdAt: now,
-    });
-    state.events = state.events || [];
-    state.events.push({
-      id: nextId(state.events, "event"),
-      type: "architecture_completed",
-      projectId: task.projectId,
-      taskId: task.id,
-      message: `${task.title}: architecture completed with ${decisionTaskIds.length} implementation task(s)`,
-      createdAt: now,
-    });
-    return task;
+export function completeArchitectureInState(state, taskId, input = {}) {
+  const task = findTask(state, taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  const summary = String(input.body || input.summary || "").trim();
+  if (summary.length < 120) {
+    throw new Error("Architecture completion requires a substantive summary of at least 120 characters.");
+  }
+  const decisionTaskIds = normalizeList(
+    input.taskIds || input.decisionTaskIds || input.architectureDecisionTaskIds,
+  );
+  if (!decisionTaskIds.length) {
+    throw new Error("Architecture completion requires at least one dependency-linked implementation child task.");
+  }
+  const childTasks = decisionTaskIds.map((id) => {
+    const child = findTask(state, id);
+    if (!child) throw new Error(`Unknown architecture child task: ${id}`);
+    if (child.projectId !== task.projectId) {
+      throw new Error(`Architecture child ${id} belongs to another project.`);
+    }
+    if (child.id === task.id) throw new Error("An architecture task cannot be its own implementation child.");
+    assertArchitectureChildContract(task, child);
+    return child;
+  });
+  const governedChildIds = state.tasks
+    .filter((child) => child.architectureParentTaskId === task.id)
+    .map((child) => child.id)
+    .sort();
+  const recordedChildIds = [...decisionTaskIds].sort();
+  if (
+    governedChildIds.length !== recordedChildIds.length
+    || governedChildIds.some((id, index) => id !== recordedChildIds[index])
+  ) {
+    throw new Error("Architecture completion must record every staged child task in the governed implementation graph.");
+  }
+  assertArchitectureDependencyGraph(state, task, childTasks);
+
+  const now = new Date().toISOString();
+  const author = String(input.author || "StudioOps Systems Architect").trim();
+  task.architectureRequired = true;
+  task.architectureStatus = "completed";
+  task.architectureSummary = summary;
+  task.architectureDecisionTaskIds = decisionTaskIds;
+  task.architectureCompletedAt = now;
+  task.architectureCompletedBy = author;
+  task.assignedAgentRole = "";
+  task.status = "architecture_ready";
+  task.updatedAt = now;
+
+  for (const child of childTasks) {
+    child.architectureStatus = "inherited";
+    child.status = "ready";
+    child.updatedAt = now;
+  }
+
+  state.comments = state.comments || [];
+  state.comments.push({
+    id: nextId(state.comments, "comment"),
+    taskId: task.id,
+    author,
+    body: `Architecture decision recorded.\n\n${summary}\n\nImplementation tasks: ${decisionTaskIds.join(", ")}`,
+    createdAt: now,
+  });
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "architecture_completed",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title}: architecture completed with ${decisionTaskIds.length} implementation task(s)`,
+    createdAt: now,
+  });
+  return task;
 }
 
 export async function completeArchitecture(taskId, input = {}) {
@@ -1739,14 +1881,14 @@ Architecture mandate:
 - Define loading, empty, error, offline/retry, and degraded states—not only the happy-path mockup.
 - Define the local development and QA path, including seed data, services, health checks, and end-to-end smoke coverage.
 - Capture material decisions and rejected alternatives with concise reasons.
-- Break broad work into dependency-linked StudioOps child tasks. Each child must include the architectural constraints it consumes, observable acceptance criteria, validation commands/expectations, correct attachments, a narrow lane/work area, and \`--architecture-approved\`.
+- Break broad work into dependency-linked StudioOps child tasks. Each child must include the architectural constraints it consumes, observable acceptance criteria, validation commands/expectations, correct attachments, a narrow lane/work area, \`--parent ${task.id}\`, and \`--architecture-approved\`.
 - Preserve a single coherent architecture across those child tasks. Builders must not independently reinvent infrastructure or data contracts.
 
 Required durable handoff:
 1. Create or update the implementation child tasks through the StudioOps CLI.
 2. Record a substantive architecture summary and the implementation task IDs with:
    \`${completionCommand}\`
-3. For an epic, at least one child task is mandatory.
+3. At least one governed child task is mandatory for every architecture completion. The child stays non-buildable until this command atomically validates and approves the complete graph.
 4. Do not edit product code, open a PR, merge, or deploy. Your deliverable is the durable architecture and executable task graph.
 
 ${functionalDeliveryContract(task)}

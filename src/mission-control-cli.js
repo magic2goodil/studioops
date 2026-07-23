@@ -403,7 +403,7 @@ Task fields:
   --attachment                  Image, screenshot, mockup, URL, or reference path
   --delivery-mode               functional, prototype, or visual-only
   --architecture-required       Route this task through systems architecture before builders
-  --architecture-approved       Mark a child task as governed by completed parent architecture
+  --architecture-approved       Stage a --parent child for atomic approval when parent architecture completes
   --lane                        Work lane: backend, frontend, design, devops, product
   --work-area                   Expected file/work areas, comma or newline separated
   --branch                      Associated feature branch

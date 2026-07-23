@@ -17,7 +17,14 @@ import {
 } from "./github-app-auth.js";
 import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
-import { DATA_DIR, findProject, findTask, mutateState, readState } from "./store.js";
+import {
+  architectureIsCompleteInState,
+  DATA_DIR,
+  findProject,
+  findTask,
+  mutateState,
+  readState,
+} from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
@@ -582,9 +589,13 @@ export function successfulHandoffFailure(state, run, task) {
   if (!task) return "task_missing_after_run";
   if (run.group === "architect") {
     if (task.architectureStatus !== "completed") return "architecture_handoff_missing";
-    if (String(task.type || "").toLowerCase() === "epic" && !(task.architectureDecisionTaskIds || []).length) {
-      return "architecture_task_graph_missing";
-    }
+    const childTaskIds = task.architectureDecisionTaskIds || [];
+    if (!childTaskIds.length) return "architecture_task_graph_missing";
+    const childTasks = childTaskIds.map((taskId) => findTask(state, taskId));
+    if (
+      childTasks.some((child) => !child)
+      || childTasks.some((child) => !architectureIsCompleteInState(state, child))
+    ) return "architecture_task_graph_invalid";
     return "";
   }
   if (run.group === "builder") {

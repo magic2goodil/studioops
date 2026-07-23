@@ -230,10 +230,10 @@ When the user says to build:
 1. Create or update the StudioOps task.
 2. Route broad app/platform/mockup work to `architecture_pending`.
 3. Let the `systems-architect` inspect the repository and supplied assets, choose the justified system/data/API/performance boundaries, and create dependency-linked child tasks.
-4. Record architecture completion before any child builder dispatches.
-5. Confirm parent epic and dependency links when this is part of larger work.
-6. If the task depends on foundation/design-system/data-access work, do not start the builder until that dependency is ready.
-7. Set architect-approved implementation tasks to `ready` or `queued`.
+4. Create each implementation child with the architecture task as its parent and `--architecture-approved`; this stages the child without making it buildable.
+5. Record architecture completion only after StudioOps validates the complete child contract and acyclic dependency graph. The same transaction marks the parent complete and its governed children ready, so no child builder can dispatch early.
+6. Confirm parent epic and dependency links when this is part of larger work.
+7. If the task depends on foundation/design-system/data-access work, do not start the builder until that dependency is ready.
 8. Let the scheduled dispatcher create a durable builder run, or run `npm run dispatcher`.
 9. Let the scheduled runner consume the queued builder/reviewer run, or run `npm run runner`.
 10. If automated runner support is unavailable, generate the builder prompt from StudioOps and hand it to a Codex builder task/thread.
