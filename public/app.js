@@ -374,6 +374,7 @@ function selectedProject() {
 
 function notificationStatusText(notification) {
   if (!notification) return "Desktop notification pending";
+  if (notification.status === "not_applicable") return "No desktop notification requested";
   if (notification.status === "sent") {
     return `Desktop notification sent${notification.attemptedAt ? ` ${new Date(notification.attemptedAt).toLocaleString()}` : ""}`;
   }
@@ -381,6 +382,31 @@ function notificationStatusText(notification) {
     return `Desktop notification failed${notification.error ? `: ${notification.error}` : ""}`;
   }
   return "Desktop notification pending";
+}
+
+function inboxChecklist(item) {
+  const checklist = Array.isArray(item.checklist) ? item.checklist : [];
+  const label = item.checklistLabel || "Handoff checklist";
+  if (!checklist.length) {
+    return `
+      <div class="owner-inbox-checklist">
+        <strong>${escapeHtml(label)}</strong>
+        <p>No acceptance criteria were recorded for this handoff.</p>
+      </div>
+    `;
+  }
+  return `
+    <div class="owner-inbox-checklist">
+      <strong>${escapeHtml(label)}</strong>
+      <ul>
+        ${checklist.map((entry) => {
+    const text = typeof entry === "string" ? entry : entry.text;
+    const taskId = typeof entry === "string" ? "" : entry.taskId;
+    return `<li>${taskId ? `<span>${escapeHtml(taskId)}</span>` : ""}${escapeHtml(text)}</li>`;
+  }).join("")}
+      </ul>
+    </div>
+  `;
 }
 
 function renderSystemStatus() {
@@ -423,6 +449,7 @@ function renderOwnerInbox() {
   ownerInbox.hidden = items.length === 0;
   attentionButton.hidden = items.length === 0;
   attentionCount.textContent = String(items.length);
+  attentionButton.setAttribute("aria-label", `Action required: ${items.length} item${items.length === 1 ? "" : "s"}`);
   ownerInboxCount.textContent = `${items.length} item${items.length === 1 ? "" : "s"}`;
   ownerInboxList.innerHTML = items.map((item) => {
     const previewUrl = safeHttpUrl(item.previewUrl);
@@ -443,6 +470,7 @@ function renderOwnerInbox() {
           ${item.blocker.attempts ? `<span>${escapeHtml(item.blocker.attempts)} attempt${item.blocker.attempts === 1 ? "" : "s"} consumed${item.blocker.maxAttempts ? ` of ${escapeHtml(item.blocker.maxAttempts)}` : ""}</span>` : ""}
         </div>
       ` : ""}
+      ${inboxChecklist(item)}
       <div class="owner-inbox-actions">
         ${previewUrl ? `<a class="primary-action" href="${escapeHtml(previewUrl)}">Open local QA</a>` : ""}
         ${prUrl ? `<a href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open pull request</a>` : ""}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { planDispatches } from "../src/dispatcher.js";
+import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
+import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 
 function fixtureState() {
@@ -209,6 +210,100 @@ test("exhausted attempt budgets stop redispatch", () => {
   assert.equal(report.skipped[0].reason, "attempt_budget_exhausted");
 });
 
+test("an actual dispatcher sweep turns exhausted historical attempts into a visible resettable circuit", async () => {
+  const state = fixtureState();
+  state.tasks[1].acceptanceCriteria = ["QA integration succeeds without conflicts."];
+  state.runs.push(
+    {
+      id: "run_1",
+      taskId: "task_2",
+      projectId: "project_1",
+      attemptKey: "task_2:0:qa_integration_blocked:builder",
+      status: "failed",
+    },
+    {
+      id: "run_2",
+      taskId: "task_2",
+      projectId: "project_1",
+      attemptKey: "task_2:0:qa_integration_blocked:builder",
+      status: "failed",
+    },
+  );
+  const action = {
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+    taskStatus: "qa_review",
+    priority: "high",
+    reason: "QA integration is blocked with status conflict.",
+  };
+
+  const report = await dispatchSupervisorActions([action], { state });
+
+  assert.equal(report.runs.length, 0);
+  assert.equal(report.skipped[0].reason, "attempt_budget_exhausted");
+  assert.equal(state.tasks[1].status, "blocked");
+  assert.equal(state.tasks[1].automationCircuit.state, "open");
+  assert.equal(state.tasks[1].automationBlocker.resumeStatus, "qa_review");
+  assert.equal(state.tasks[1].automationCircuit.attemptsConsumed, 2);
+  assert.ok(state.events.some((event) => event.type === "automation_circuit_opened"));
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.items[0].taskId, "task_2");
+  assert.match(inbox.items[0].nextAction, /circuit-reset/);
+});
+
+test("opening an exhausted circuit does not suppress an owner handoff in the same sweep", async () => {
+  const state = fixtureState();
+  state.runs.push(
+    {
+      id: "run_1",
+      taskId: "task_2",
+      projectId: "project_1",
+      attemptKey: "task_2:0:qa_integration_blocked:builder",
+      status: "failed",
+    },
+    {
+      id: "run_2",
+      taskId: "task_2",
+      projectId: "project_1",
+      attemptKey: "task_2:0:qa_integration_blocked:builder",
+      status: "failed",
+    },
+  );
+
+  const report = await dispatchSupervisorActions([
+    {
+      id: "task_2:qa_integration_blocked",
+      type: "qa_integration_blocked",
+      role: "builder",
+      projectId: "project_1",
+      projectKey: "demo",
+      projectName: "Demo",
+      taskId: "task_2",
+      taskTitle: "Blocked integration task",
+    },
+    {
+      id: "task_2:notify_owner",
+      type: "notify_owner",
+      role: "owner",
+      projectId: "project_1",
+      projectKey: "demo",
+      projectName: "Demo",
+      taskId: "task_2",
+      taskTitle: "Blocked integration task",
+    },
+  ], { state });
+
+  assert.equal(state.tasks[1].automationCircuit.state, "open");
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.runs[0].actionType, "notify_owner");
+});
+
 test("open task circuits stop redispatch without blocking owner notifications", () => {
   const state = fixtureState();
   state.tasks[1].automationCircuit = { state: "open" };
@@ -235,6 +330,30 @@ test("open task circuits stop redispatch without blocking owner notifications", 
 
   assert.equal(blocked.selected.length, 0);
   assert.equal(blocked.skipped[0].reason, "task_circuit_open");
+  assert.equal(owner.selected.length, 1);
+});
+
+test("open project circuits stop worker redispatch without hiding owner handoffs", () => {
+  const state = fixtureState();
+  state.projects[0].automationCircuit = { state: "open" };
+  const worker = planDispatches(state, [{
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+  }]);
+  const owner = planDispatches(state, [{
+    id: "task_2:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+  }]);
+
+  assert.equal(worker.skipped[0].reason, "project_circuit_open");
   assert.equal(owner.selected.length, 1);
 });
 

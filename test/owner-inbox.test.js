@@ -23,6 +23,9 @@ function fixtureState() {
       status: "user_review",
       branchName: "codex/dollos-task_7",
       prUrl: "https://github.com/example/dollos/pull/36",
+      acceptanceCriteria: [
+        "The updated ritual duration is visible in the local preview.",
+      ],
       updatedAt: "2026-07-23T15:02:00.000Z",
     }],
     runs: [{
@@ -46,9 +49,11 @@ test("owner handoffs remain in the inbox after a desktop notification was sent",
   assert.equal(inbox.items[0].notification.status, "sent");
   assert.equal(inbox.items[0].previewUrl, "http://127.0.0.1:5080/");
   assert.equal(inbox.items[0].prUrl, "https://github.com/example/dollos/pull/36");
+  assert.equal(inbox.items[0].checklist[0].taskId, "task_7");
+  assert.match(inbox.items[0].checklist[0].text, /ritual duration/);
 });
 
-test("QA tasks with a configured local preview remain visible without synthetic integration metadata", () => {
+test("non-Trust-Leads QA tasks with a configured local preview remain visible", () => {
   const state = fixtureState();
   state.tasks[0].status = "qa_review";
   delete state.tasks[0].integrationStatus;
@@ -57,6 +62,39 @@ test("QA tasks with a configured local preview remain visible without synthetic 
   assert.equal(inbox.count, 1);
   assert.equal(inbox.items[0].kind, "qa_review");
   assert.equal(inbox.items[0].previewUrl, "http://127.0.0.1:5080/");
+});
+
+test("Trust Leads QA handoffs remain hidden until integration and preview validation are ready", () => {
+  const state = fixtureState();
+  state.projects[0].reviewPolicy = {
+    trustLeadApprovals: true,
+    integrationBranch: "qa/dollos",
+  };
+  state.tasks[0].status = "qa_review";
+  delete state.tasks[0].integrationStatus;
+
+  assert.equal(buildOwnerInbox(state).count, 0);
+
+  state.tasks[0].integrationStatus = "ready";
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 1);
+  assert.equal(inbox.items[0].kind, "qa_review");
+});
+
+test("desktop delivery failures remain visible on the persistent handoff", () => {
+  const state = fixtureState();
+  state.runs[0] = {
+    ...state.runs[0],
+    notificationStatus: "failed",
+    notificationError: "osascript unavailable",
+    notificationFailedAt: "2026-07-23T15:03:00.000Z",
+    externalNotifiedAt: "",
+  };
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.items[0].notification.status, "failed");
+  assert.equal(inbox.items[0].notification.error, "osascript unavailable");
+  assert.equal(inbox.items[0].notification.attemptedAt, "2026-07-23T15:03:00.000Z");
 });
 
 test("open circuits and operator pauses remain visibly actionable", () => {
@@ -87,4 +125,42 @@ test("open circuits and operator pauses remain visibly actionable", () => {
   assert.equal(inbox.items[0].kind, "automation_blocked");
   assert.equal(inbox.items[0].blocker.attempts, 2);
   assert.match(inbox.items[0].nextAction, /circuit-reset/);
+});
+
+test("project circuits remain visibly owner-gated and resettable", () => {
+  const state = fixtureState();
+  state.tasks[0].status = "ready";
+  state.projects[0].automationCircuit = {
+    state: "open",
+    normalizedReason: "Repository access is unavailable.",
+    openedAt: "2026-07-23T15:04:00.000Z",
+  };
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 1);
+  assert.equal(inbox.items[0].kind, "project_automation_blocked");
+  assert.equal(inbox.items[0].blocker.reason, "Repository access is unavailable.");
+  assert.match(inbox.items[0].nextAction, /circuit-reset --project dollos/);
+  assert.equal(inbox.items[0].notification.status, "not_applicable");
+});
+
+test("ready QA bundles expose task acceptance criteria as a durable checklist", () => {
+  const state = fixtureState();
+  state.tasks[0].status = "qa_review";
+  state.tasks[0].integrationStatus = "ready";
+  state.tasks[0].qaBundleId = "qa_bundle_1";
+  state.qaBundles = [{
+    id: "qa_bundle_1",
+    projectId: "project_1",
+    status: "ready",
+    previewUrl: "http://127.0.0.1:5080/",
+    tasks: [{ id: "task_7" }],
+    updatedAt: "2026-07-23T15:05:00.000Z",
+  }];
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 1);
+  assert.equal(inbox.items[0].kind, "qa_bundle");
+  assert.equal(inbox.items[0].checklist[0].taskId, "task_7");
+  assert.match(inbox.items[0].checklist[0].text, /ritual duration/);
 });

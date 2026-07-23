@@ -1,4 +1,5 @@
 import { findProject, findTask } from "./store.js";
+import { projectUsesTrustLeadQa } from "./integration-policy.js";
 
 const OWNER_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_bundle_ready"]);
 const QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed", "release_candidate_ready"]);
@@ -39,10 +40,29 @@ function notificationSummary(run) {
   };
 }
 
+function checklistForTask(task) {
+  const criteria = Array.isArray(task?.acceptanceCriteria) ? task.acceptanceCriteria : [];
+  return criteria.map((text) => ({
+    taskId: task.id,
+    taskTitle: task.title,
+    text: String(text),
+  }));
+}
+
+function recoveryChecklist(circuit = {}) {
+  return [
+    circuit.nextCheapProbe
+      || "Inspect the preserved failure evidence and verify the underlying blocker without launching another model.",
+    circuit.remediation
+      || "Repair the blocker, then explicitly reset the circuit with a recorded verification reason.",
+  ].map((text) => ({ taskId: "", taskTitle: "", text }));
+}
+
 function taskInboxItem(state, task, input = {}) {
   const project = findProject(state, task.projectId);
   const run = latestRunForTask(state, task.id);
-  const blocked = task.status === "blocked";
+  const blocked = task.automationCircuit?.state === "open"
+    || (task.status === "blocked" && Boolean(task.automationBlocker));
   const qaReady = task.status === "qa_review";
   const previewUrl = projectPreviewUrl(project);
   return {
@@ -54,7 +74,7 @@ function taskInboxItem(state, task, input = {}) {
     projectName: project?.name || task.projectId,
     taskId: task.id,
     title: task.title,
-    status: task.status,
+    status: blocked ? "automation_blocked" : task.status,
     taskUrl: taskUrl(input.baseUrl, task.id),
     prUrl: task.prUrl || "",
     branchName: task.branchName || "",
@@ -73,8 +93,46 @@ function taskInboxItem(state, task, input = {}) {
       attempts: Number(task.automationCircuit?.attemptsConsumed || task.automationBlocker?.attempts || 0),
       maxAttempts: Number(task.automationCircuit?.maxAttempts || 0),
     } : null,
+    checklistLabel: blocked ? "Recovery checklist" : qaReady ? "QA checklist" : "Review checklist",
+    checklist: blocked ? recoveryChecklist(task.automationCircuit) : checklistForTask(task),
     notification: notificationSummary(run),
     updatedAt: task.updatedAt || task.createdAt || "",
+  };
+}
+
+function projectInboxItem(project) {
+  const circuit = project.automationCircuit || {};
+  const target = project.key || project.id;
+  return {
+    id: `project:${project.id}:automation-circuit`,
+    kind: "project_automation_blocked",
+    severity: "critical",
+    projectId: project.id,
+    projectKey: project.key || project.id,
+    projectName: project.name || project.key || project.id,
+    title: `${project.name || project.key || project.id} automation circuit is open`,
+    status: "automation_blocked",
+    taskUrl: "",
+    prUrl: "",
+    branchName: "",
+    integrationBranch: project.reviewPolicy?.integrationBranch || project.integrationBranch || "",
+    previewUrl: projectPreviewUrl(project),
+    nextAction: circuit.resumeAction
+      || `studioops circuit-reset --project ${target} --reason verified`,
+    blocker: {
+      reason: circuit.normalizedReason || circuit.reasonCode || "Project automation is blocked.",
+      attempts: Number(circuit.attemptsConsumed || 0),
+      maxAttempts: Number(circuit.maxAttempts || 0),
+    },
+    checklistLabel: "Recovery checklist",
+    checklist: recoveryChecklist(circuit),
+    notification: {
+      status: "not_applicable",
+      channel: "",
+      attemptedAt: "",
+      error: "",
+    },
+    updatedAt: circuit.openedAt || project.updatedAt || project.createdAt || "",
   };
 }
 
@@ -111,6 +169,8 @@ function bundleInboxItem(state, bundle, input = {}) {
     nextAction: bundle.status === "release_candidate_ready"
       ? "Review the release-candidate pull request. Production still requires explicit approval."
       : "Open the local QA preview and test the listed tasks as one bundle.",
+    checklistLabel: "QA checklist",
+    checklist: tasks.flatMap(checklistForTask),
     notification: {
       status: bundle.notificationStatus || (bundle.notifiedAt || bundle.promotionNotifiedAt ? "sent" : "pending"),
       channel: bundle.notificationChannel || "",
@@ -133,12 +193,19 @@ export function buildOwnerInbox(state, input = {}) {
     if (QA_BUNDLE_STATUSES.has(bundle.status)) items.push(bundleInboxItem(state, bundle, input));
   }
 
+  for (const project of state.projects || []) {
+    if (project.automationCircuit?.state === "open") items.push(projectInboxItem(project));
+  }
+
   for (const task of state.tasks || []) {
     const project = findProject(state, task.projectId);
-    const blocked = task.status === "blocked" && (task.automationBlocker || task.automationCircuit?.state === "open");
+    const blocked = task.automationCircuit?.state === "open"
+      || (task.status === "blocked" && Boolean(task.automationBlocker));
     const ownerReview = task.status === "user_review";
+    const qaValidationReady = task.integrationStatus === "ready"
+      || (!projectUsesTrustLeadQa(project) && Boolean(projectPreviewUrl(project)));
     const standaloneQa = task.status === "qa_review"
-      && (task.integrationStatus === "ready" || projectPreviewUrl(project))
+      && qaValidationReady
       && !activeBundleTaskIds.has(task.id);
     if (blocked || ownerReview || standaloneQa) items.push(taskInboxItem(state, task, input));
   }

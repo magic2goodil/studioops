@@ -264,6 +264,42 @@ h2 {
   color: #ffbac7;
 }
 
+.owner-inbox-checklist {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.12);
+  padding: 12px;
+}
+
+.owner-inbox-checklist > strong {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.owner-inbox-checklist p,
+.owner-inbox-checklist ul {
+  margin: 0;
+  color: rgba(245, 247, 251, 0.76);
+}
+
+.owner-inbox-checklist ul {
+  display: grid;
+  gap: 7px;
+  padding-left: 22px;
+}
+
+.owner-inbox-checklist li {
+  padding-left: 2px;
+  overflow-wrap: anywhere;
+}
+
+.owner-inbox-checklist li span {
+  margin-right: 7px;
+  color: var(--amber);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
 .owner-inbox-actions,
 .owner-inbox-tasks {
   display: flex;
