@@ -155,7 +155,7 @@ function findLaneConflict(state, selected, action, task) {
 
 function dispatchSafetyReason(state, task, action, options) {
   const group = runGroupFor(action);
-  if (group === "owner" || action.type === "unblock_task") return "";
+  if (group === "owner") return "";
   if (state.meta?.operatorPause?.active && !options.ignoreOperatorPause) {
     return "operator_pause";
   }

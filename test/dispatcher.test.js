@@ -262,6 +262,23 @@ test("operator pause suppresses builders but still permits owner handoffs", () =
   assert.equal(owner.selected.length, 1);
 });
 
+test("operator pause also suppresses dependency-unblock builder dispatches", () => {
+  const state = fixtureState();
+  state.meta = { operatorPause: { active: true, reason: "Recovery" } };
+
+  const report = planDispatches(state, [{
+    id: "task_2:unblock_task",
+    type: "unblock_task",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+  }]);
+
+  assert.equal(report.selected.length, 0);
+  assert.equal(report.skipped[0].reason, "operator_pause");
+});
+
 test("preview service failures route to infrastructure repair instead of rebuilding feature code", () => {
   const state = fixtureState();
   state.projects[0].reviewPolicy = { trustLeadApprovals: true, integrationBranch: "qa/demo" };
