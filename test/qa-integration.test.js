@@ -15,6 +15,7 @@ import {
 } from "../src/integration-policy.js";
 import {
   planQaIntegrations,
+  probeQaIntegrationProject,
   projectPlanHasWork,
   qaResultFingerprint,
 } from "../src/qa-integration.js";
@@ -134,6 +135,53 @@ test("QA integration honors retry windows for unchanged blocked work", () => {
   assert.equal(projectPlanHasWork(deferredPlan.projects[0]), false);
   assert.equal(planQaIntegrations(state, { project: "demo", nowMs: nowMs + 16 * 60_000 }).taskCount, 1);
   assert.equal(planQaIntegrations(state, { project: "demo", nowMs, force: true }).taskCount, 1);
+});
+
+test("QA project repair probes use the qa-integration-worker identity and remote operation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-probe-"));
+  const repoPath = path.join(root, "repo");
+  try {
+    await git(root, ["init", repoPath]);
+    await git(repoPath, ["remote", "add", "origin", "https://github.com/example/demo.git"]);
+    let preparedRole = "";
+    let checkedRole = "";
+    let checkedOperation = "";
+    let cleaned = false;
+    const result = await probeQaIntegrationProject({
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath,
+      repoUrl: "https://github.com/example/demo",
+      reviewPolicy: { integrationBranch: "qa/integration" },
+    }, {
+      prepareGitHubAppAuth: async (runContext) => {
+        preparedRole = runContext.role;
+        return {
+          token: "test-token-value",
+          jwt: "",
+          role: runContext.role,
+          app: { slug: "qa-test" },
+          repo: { owner: "example", name: "demo" },
+          askpassPath: path.join(root, "askpass"),
+        };
+      },
+      cleanupGitHubAppAuth: async () => { cleaned = true; },
+      checkQaIntegrationRemote: async (context) => {
+        checkedRole = context.role;
+        checkedOperation = context.operation;
+        return { ok: true };
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(preparedRole, "qa-integration-worker");
+    assert.equal(checkedRole, "qa-integration-worker");
+    assert.equal(checkedOperation, "git ls-remote origin");
+    assert.equal(cleaned, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("QA result fingerprints ignore isolated workspace names but detect material changes", () => {
@@ -900,6 +948,110 @@ test("QA integration refuses workspace roots inside the registered repo", async 
   }
 });
 
+test("preview failures preserve the integrated commit and the next sweep only probes health", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-preview-probe-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  const previewPath = path.join(root, "preview");
+  const markerPath = path.join(root, "validation-runs.txt");
+  const qaWorkspaceRoot = path.join(root, "qa-workspaces");
+
+  try {
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    await git(repoPath, ["push", "origin", "main"]);
+    await git(repoPath, ["push", "origin", "main:qa/integration"]);
+    await git(root, ["--git-dir", remotePath, "symbolic-ref", "HEAD", "refs/heads/main"]);
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "app.txt"), "feature\n", "utf8");
+    await git(repoPath, ["commit", "-am", "feature"]);
+    await git(repoPath, ["push", "origin", "feature/task"]);
+
+    const markerScript = `require("node:fs").appendFileSync(${JSON.stringify(markerPath)}, "validated\\n")`;
+    const validationCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(markerScript)}`;
+    await mkdir(path.join(root, "data"), { recursive: true });
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+      meta: {},
+      projects: [{
+        id: "project_1",
+        key: "demo",
+        name: "Demo",
+        repoPath,
+        repoUrl: "",
+        defaultBranch: "main",
+        validationCommands: [validationCommand],
+        reviewPolicy: {
+          trustLeadApprovals: true,
+          integrationBranch: "qa/integration",
+        },
+        localQaPreview: {
+          enabled: true,
+          checkoutPath: previewPath,
+          branch: "qa/integration",
+          createIfMissing: true,
+          healthCheckUrl: "http://127.0.0.1:49999/health",
+        },
+      }],
+      tasks: [{
+        id: "task_1",
+        projectId: "project_1",
+        title: "Feature task",
+        status: "qa_review",
+        branchName: "feature/task",
+        prUrl: "",
+      }],
+      comments: [],
+      events: [],
+      reviews: [],
+      runs: [],
+      qaBundles: [],
+    }, null, 2)}\n`, "utf8");
+
+    const script = `
+      import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      const options = {
+        workspaceRoot: ${JSON.stringify(qaWorkspaceRoot)},
+        githubAppAuth: false,
+        healthAttempts: 1,
+        healthRetryDelayMs: 0,
+        fetch: async () => ({ ok: false, status: 503, statusText: "Unavailable" }),
+      };
+      const first = await runQaIntegration(options);
+      const second = await runQaIntegration({
+        ...options,
+        nowMs: Date.now() + 16 * 60_000,
+      });
+      console.log(JSON.stringify({ first, second }));
+    `;
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: root,
+    });
+    const reports = JSON.parse(runResult.stdout.trim());
+    const state = readPersistedState(root);
+    const validationRuns = (await readFile(markerPath, "utf8")).trim().split("\n");
+
+    assert.equal(reports.first.projects[0].status, "preview_blocked");
+    assert.equal(reports.second.projects[0].status, "preview_blocked");
+    assert.equal(reports.second.projects[0].previewProbeOnly, true);
+    assert.equal(validationRuns.length, 1);
+    assert.ok(state.tasks[0].integrationCommit);
+    assert.equal(state.tasks[0].integrationStatus, "preview_blocked");
+    assert.equal(state.runs.length, 0);
+    assert.equal(
+      state.tasks[0].integrationCommit,
+      await git(remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("GitHub QA integration fails explicitly when app credentials are missing", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
   const remotePath = path.join(root, "remote.git");
@@ -942,11 +1094,30 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
           branchName: "feature/task",
           prUrl: "https://github.com/example/demo/pull/1",
         },
+        {
+          id: "task_2",
+          projectId: "project_1",
+          title: "Queued sibling",
+          status: "in_progress",
+          branchName: "feature/sibling",
+        },
       ],
       comments: [],
       events: [],
       reviews: [],
-      runs: [],
+      runs: [{
+        id: "run_1",
+        taskId: "task_2",
+        projectId: "project_1",
+        actionType: "start_builder",
+        group: "builder",
+        role: "builder",
+        status: "queued",
+        taskStatusBeforeDispatch: "queued",
+        modelBudgetConsumed: false,
+        budgetReservation: true,
+        createdAt: new Date().toISOString(),
+      }],
     }, null, 2)}\n`, "utf8");
 
     const script = `
@@ -964,13 +1135,20 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
 
     assert.equal(report.projects[0].status, "blocked");
     assert.equal(report.projects[0].tasks[0].status, "blocked");
-    assert.match(report.projects[0].output, /GitHub App auth failed/);
-    assert.match(report.projects[0].output, /credentials/);
+    assert.match(report.projects[0].output, /QA-integration GitHub App credentials/i);
     assert.doesNotMatch(report.projects[0].output, /could not read Username/);
 
     const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "blocked");
-    assert.match(state.comments[0].body, /GitHub App auth failed/);
+    assert.equal(state.tasks[0].status, "blocked");
+    assert.equal(state.tasks[0].assignedAgentRole, "owner");
+    assert.equal(state.tasks[0].automationBlocker.type, "project_circuit");
+    assert.equal(state.projects[0].automationCircuit.state, "open");
+    assert.equal(state.projects[0].automationCircuit.probeKind, "qa_integration_preflight");
+    assert.equal(state.projects[0].automationCircuit.probeRole, "qa-integration-worker");
+    assert.equal(state.runs[0].status, "cancelled");
+    assert.equal(state.tasks[1].status, "queued");
+    assert.ok(state.comments.some((comment) => /Project automation circuit opened/.test(comment.body)));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

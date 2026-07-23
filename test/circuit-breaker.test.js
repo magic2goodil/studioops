@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { planDispatches } from "../src/dispatcher.js";
 import {
+  classifyQaIntegrationProjectFailure,
   classifyPreviewHealthFailure,
+  openQaIntegrationProjectCircuitInState,
   planQaIntegrations,
   probePreviewHealth,
 } from "../src/qa-integration.js";
 import {
   claimRuns,
   completeRun,
+  normalizeAutomationFailure,
   probeAutomationCircuit,
   reconcileStaleRuns,
 } from "../src/runner.js";
@@ -17,6 +20,7 @@ import {
   cancelQueuedRuns,
   resetAutomationCircuit,
   setAutomationPause,
+  taskAttemptSummary,
 } from "../src/store.js";
 
 const NOW_MS = Date.parse("2026-07-22T12:00:00.000Z");
@@ -97,6 +101,7 @@ test("task retry limit survives action and review-cycle key changes", async () =
 
   assert.equal(state.tasks[0].status, "queued");
   assert.equal(state.runs[0].failureCode, "sdk_error");
+  assert.equal(state.runs[0].normalizedFailureReason, "The Codex SDK model run failed.");
   assert.equal(state.runs[0].elapsedMs, 1_250);
   assert.equal(state.runs[0].tokenUsage.totalTokens, 125);
 
@@ -149,6 +154,38 @@ test("task retry limit survives action and review-cycle key changes", async () =
   assert.equal(task.automationAttemptEpoch, 1);
 });
 
+test("circuit metadata stores allowlisted summaries instead of provider secrets or PII", async () => {
+  const secretNotes = "SDK failed for alice@example.com password=hunter2 api_key=sk-proj-private customer=Jane Doe";
+  const normalized = normalizeAutomationFailure("sdk_error", secretNotes);
+  assert.equal(normalized.normalizedReason, "The Codex SDK model run failed.");
+  assert.doesNotMatch(JSON.stringify(normalized), /alice@example|hunter2|sk-proj-private|Jane Doe/);
+
+  const state = baseState();
+  state.runs.push(runningRun("run_1"));
+  await completeRun("run_1", {
+    state,
+    status: "failed",
+    exitCode: "sdk_error",
+    notes: secretNotes,
+  });
+  state.tasks[0].status = "in_progress";
+  state.runs.push(runningRun("run_2", {
+    attempt: 2,
+    modelLaunchedAt: new Date(NOW_MS + 1_000).toISOString(),
+    startedAt: new Date(NOW_MS + 1_000).toISOString(),
+  }));
+  await completeRun("run_2", {
+    state,
+    status: "failed",
+    exitCode: "sdk_error",
+    notes: "SDK failed for bob@example.com bearer ghp_private_token password=other",
+  });
+
+  const persistedCircuit = JSON.stringify(state.tasks[0].automationCircuit);
+  assert.doesNotMatch(persistedCircuit, /alice@example|bob@example|hunter2|ghp_private_token|Jane Doe/);
+  assert.equal(state.tasks[0].automationCircuit.normalizedReason, "The Codex SDK model run failed.");
+});
+
 test("project credential preflight opens one circuit and cancels sibling queues without task failures", async () => {
   const state = baseState();
   state.tasks.push({
@@ -194,6 +231,11 @@ test("project credential preflight opens one circuit and cancels sibling queues 
   assert.equal(state.tasks[1].status, "queued");
   assert.equal(state.tasks[1].lastAutomationFailure, undefined);
 
+  state.runs.push(
+    { ...runningRun("run_failed_1"), status: "failed" },
+    { ...runningRun("run_failed_2"), status: "failed" },
+  );
+  assert.equal(taskAttemptSummary(state, state.tasks[0]).attemptsConsumed, 2);
   const probe = await probeAutomationCircuit({
     state,
     project: "demo",
@@ -206,6 +248,71 @@ test("project credential preflight opens one circuit and cancels sibling queues 
   assert.equal(probe.ok, true);
   assert.equal(state.projects[0].automationCircuit.state, "closed");
   assert.equal(state.tasks[0].status, "queued");
+  assert.equal(state.tasks[0].automationAttemptEpoch, 1);
+  assert.equal(taskAttemptSummary(state, state.tasks[0]).attemptsConsumed, 0);
+  const resumedPlan = planDispatches(state, [{
+    id: "task_1:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskTitle: state.tasks[0].title,
+  }], { nowMs: NOW_MS + 1_000 });
+  assert.equal(resumedPlan.selected.length, 1);
+});
+
+test("QA remote failures open one project circuit and cancel model queues", async () => {
+  const state = baseState();
+  state.tasks[0].status = "qa_review";
+  state.tasks[0].integrationStatus = "blocked";
+  state.runs.push({
+    ...runningRun("run_queued"),
+    status: "queued",
+    modelLaunchedAt: "",
+    modelBudgetConsumed: false,
+    budgetReservation: true,
+  });
+  const failure = classifyQaIntegrationProjectFailure(
+    "fatal: unable to access origin: Could not resolve host github.com",
+    "remote",
+  );
+  await openQaIntegrationProjectCircuitInState(state, {
+    projectId: "project_1",
+    projectKey: "demo",
+    tasks: [{ taskId: "task_1", status: "blocked" }],
+    projectCircuitFailure: failure,
+  }, { nowMs: NOW_MS });
+
+  assert.equal(state.projects[0].automationCircuit.state, "open");
+  assert.equal(state.projects[0].automationCircuit.reasonCode, "qa_integration_remote_inaccessible");
+  assert.equal(state.projects[0].automationCircuit.probeKind, "qa_integration_preflight");
+  assert.equal(state.projects[0].automationCircuit.probeRole, "qa-integration-worker");
+  assert.equal(state.runs[0].status, "cancelled");
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationBlocker.resumeStatus, "qa_review");
+
+  state.runs.push(
+    { ...runningRun("run_failed_1"), status: "failed" },
+    { ...runningRun("run_failed_2"), status: "failed" },
+  );
+  const probe = await probeAutomationCircuit({
+    state,
+    project: "demo",
+    probeQaIntegrationProject: async () => ({
+      ok: true,
+      workflowMode: "github",
+      role: "qa-integration-worker",
+      operation: "git ls-remote origin",
+    }),
+  });
+  assert.equal(probe.ok, true);
+  assert.equal(state.projects[0].automationCircuit.state, "closed");
+  assert.equal(state.tasks[0].status, "qa_review");
+  assert.equal(state.tasks[0].integrationStatus, "");
+  assert.equal(state.tasks[0].automationAttemptEpoch, 1);
+  assert.equal(taskAttemptSummary(state, state.tasks[0]).attemptsConsumed, 0);
+  assert.equal(planQaIntegrations(state, { nowMs: NOW_MS + 1_000 }).projects[0].tasks.length, 1);
 });
 
 test("runner PID loss preserves evidence and opens a no-relaunch circuit", async () => {

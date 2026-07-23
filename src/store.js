@@ -400,10 +400,16 @@ export async function resetAutomationCircuit(input = {}) {
       const resumeStatus = VALID_STATUSES.has(task.automationBlocker.resumeStatus)
         ? task.automationBlocker.resumeStatus
         : "queued";
+      const resumeIntegrationStatus = task.automationBlocker.resumeIntegrationStatus;
+      task.automationAttemptEpoch = taskAttemptEpoch(task) + 1;
       delete task.automationBlocker;
       task.status = resumeStatus;
       task.assignedAgentRole = "";
       task.retryNotBefore = "";
+      if (resumeIntegrationStatus !== undefined) {
+        task.integrationStatus = String(resumeIntegrationStatus || "");
+        task.integrationRetryNotBefore = "";
+      }
       task.updatedAt = now;
       restoredTaskIds.push(task.id);
     }

@@ -18,7 +18,13 @@ import {
   prepareGitHubAppAuth,
   redactSecrets,
 } from "./github-app-auth.js";
-import { mutateState, readState } from "./store.js";
+import {
+  automationCircuitIsOpen,
+  cancelQueuedRuns,
+  findProject,
+  mutateState,
+  readState,
+} from "./store.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -182,7 +188,8 @@ function qaIntegrationAuthEnabled(projectPlan, input = {}) {
 async function prepareQaIntegrationAuth(projectPlan, input = {}) {
   if (!qaIntegrationAuthEnabled(projectPlan, input)) return null;
   const role = input.githubAppRole || input.githubAppAuthRole || "qa-integration-worker";
-  return prepareGitHubAppAuth(
+  const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
+  return prepareAuth(
     {
       id: `qa_${projectPlan.projectId || projectPlan.projectKey || "project"}`,
       role,
@@ -199,6 +206,137 @@ async function prepareQaIntegrationAuth(projectPlan, input = {}) {
       githubAppDefaultRole: input.githubAppDefaultRole || "builder",
     },
   );
+}
+
+const QA_PROJECT_FAILURE_DETAILS = Object.freeze({
+  qa_integration_invalid_github_credentials: {
+    normalizedReason: "QA-integration GitHub App credentials are invalid.",
+    remediation: "Repair the qa-integration-worker GitHub App app ID, private key, and repository installation.",
+  },
+  qa_integration_missing_github_credentials: {
+    normalizedReason: "QA-integration GitHub App credentials are missing.",
+    remediation: "Install credentials for the qa-integration-worker GitHub App role.",
+  },
+  qa_integration_github_auth_failure: {
+    normalizedReason: "QA-integration GitHub App authentication failed.",
+    remediation: "Repair the qa-integration-worker GitHub App credentials and repository installation.",
+  },
+  qa_integration_missing_origin: {
+    normalizedReason: "The QA-integration repository has no origin remote.",
+    remediation: "Configure the project repository origin used by QA integration.",
+  },
+  qa_integration_remote_inaccessible: {
+    normalizedReason: "The QA-integration GitHub remote is inaccessible.",
+    remediation: "Repair the origin URL, network access, TLS trust, or qa-integration-worker repository permissions.",
+  },
+});
+
+function qaProjectFailure(reasonCode) {
+  const details = QA_PROJECT_FAILURE_DETAILS[reasonCode];
+  if (!details) return null;
+  return {
+    scope: "project",
+    reasonCode,
+    ...details,
+    failureFingerprint: createHash("sha256")
+      .update(`project:${reasonCode}`)
+      .digest("hex")
+      .slice(0, 20),
+    nextCheapProbe: "Prepare the qa-integration-worker GitHub App identity and run authenticated `git ls-remote origin` without launching a model.",
+    probeKind: "qa_integration_preflight",
+    probeRole: "qa-integration-worker",
+    probeOperation: "git ls-remote origin",
+  };
+}
+
+export function classifyQaIntegrationProjectFailure(value, stage = "remote") {
+  const text = String(value?.message || value?.output || value || "");
+  if (stage === "auth") {
+    if (/were not found|not found|missing/i.test(text)) {
+      return qaProjectFailure("qa_integration_missing_github_credentials");
+    }
+    if (/invalid|could not read app\.json|private-key\.pem|private key/i.test(text)) {
+      return qaProjectFailure("qa_integration_invalid_github_credentials");
+    }
+    return qaProjectFailure("qa_integration_github_auth_failure");
+  }
+  if (/must have an origin remote|missing.*origin|no .*origin remote/i.test(text)) {
+    return qaProjectFailure("qa_integration_missing_origin");
+  }
+  if (
+    /authentication failed|bad credentials|could not read username|permission denied|repository not found|could not read from remote|unable to access|could not resolve host|connection (?:refused|reset|timed out)|network is unreachable|tls|ssl|certificate|http\s+(?:401|403)/i.test(text)
+  ) {
+    return qaProjectFailure("qa_integration_remote_inaccessible");
+  }
+  return null;
+}
+
+export async function probeQaIntegrationProject(project, input = {}) {
+  const projectPlan = {
+    projectId: project.id,
+    projectKey: project.key,
+    projectName: project.name,
+    repoPath: project.repoPath,
+    repoUrl: project.repoUrl,
+    defaultBranch: project.defaultBranch,
+    qaIntegration: project.qaIntegration || {},
+    integrationBranch: integrationBranchName(project),
+  };
+  const cleanupAuth = input.cleanupGitHubAppAuth || cleanupGitHubAppAuth;
+  let authContext = null;
+  let stage = "auth";
+  try {
+    authContext = await prepareQaIntegrationAuth(projectPlan, input);
+    stage = "remote";
+    const secrets = normalizeSecrets(input.secrets, githubAppAuthSecrets(authContext));
+    const env = githubAppAuthEnv(authContext, input.env || {});
+    const origin = await git(projectPlan.repoPath, ["remote", "get-url", "origin"], {
+      allowFailure: true,
+      env,
+      secrets,
+    });
+    if (!origin.ok || !origin.output.trim()) {
+      return { ok: false, ...qaProjectFailure("qa_integration_missing_origin") };
+    }
+    const checkRemote = input.checkQaIntegrationRemote;
+    const remote = checkRemote
+      ? await checkRemote({
+          project,
+          projectPlan,
+          authContext,
+          role: "qa-integration-worker",
+          operation: "git ls-remote origin",
+          env,
+          secrets,
+        })
+      : await git(projectPlan.repoPath, ["ls-remote", "origin"], {
+          allowFailure: true,
+          env,
+          secrets,
+          timeoutMs: 60_000,
+        });
+    if (remote?.ok === false) {
+      const failure = classifyQaIntegrationProjectFailure(remote, "remote")
+        || qaProjectFailure("qa_integration_remote_inaccessible");
+      return { ok: false, ...failure };
+    }
+    return {
+      ok: true,
+      scope: "project",
+      projectId: project.id,
+      workflowMode: "github",
+      role: "qa-integration-worker",
+      operation: "git ls-remote origin",
+    };
+  } catch (error) {
+    const failure = classifyQaIntegrationProjectFailure(error, stage)
+      || qaProjectFailure(stage === "auth"
+        ? "qa_integration_github_auth_failure"
+        : "qa_integration_remote_inaccessible");
+    return { ok: false, ...failure };
+  } finally {
+    await cleanupAuth(authContext);
+  }
 }
 
 async function runCommand(command, args, options = {}) {
@@ -911,7 +1049,8 @@ export function planQaIntegrations(state, input = {}) {
       const integrationBranch = integrationBranchName(project);
       const safetyError = integrationBranchSafetyError(project);
       const trustEnabled = trustLeadApprovalsEnabled(project);
-      const pendingTasks = (state.tasks || [])
+      const circuitOpen = automationCircuitIsOpen(project);
+      const pendingTasks = (circuitOpen ? [] : state.tasks || [])
         .filter((task) => task.projectId === project.id)
         .filter((task) => task.status === "qa_review")
         .filter((task) => input.force || task.integrationStatus !== "ready")
@@ -938,8 +1077,11 @@ export function planQaIntegrations(state, input = {}) {
         localQaPreview: project.localQaPreview || null,
         syncDefaultBranchIntoIntegration: syncDefaultBranchEnabled(project),
         trustLeadApprovals: trustEnabled,
-        eligible: projectUsesTrustLeadQa(project),
-        skipReason: trustEnabled ? safetyError : "trustLeadApprovals is disabled.",
+        eligible: !circuitOpen && projectUsesTrustLeadQa(project),
+        skipReason: circuitOpen
+          ? `Project automation circuit is open: ${project.automationCircuit.reasonCode || "configuration failure"}.`
+          : trustEnabled ? safetyError : "trustLeadApprovals is disabled.",
+        automationCircuitOpen: circuitOpen,
         integrationBranch,
         integrationBranchUrl: branchWebUrl(project, integrationBranch),
         validationCommands: normalizeList(project.validationCommands),
@@ -976,6 +1118,7 @@ export function planQaIntegrations(state, input = {}) {
 }
 
 export function projectPlanHasWork(projectPlan) {
+  if (projectPlan.automationCircuitOpen) return false;
   if (projectPlan.tasks.length) return true;
   if (projectPlan.previewTasks?.length) return true;
   if (projectPlan.deferredTaskCount > 0) return false;
@@ -1175,6 +1318,7 @@ async function integrateProject(projectPlan, options = {}) {
     if (!push.ok) {
       result.status = "push_failed";
       result.output = `Non-force push to ${projectPlan.integrationBranch} failed. The remote branch may have changed; rerun QA integration after fetching/reconciling it.\n${truncateOutput(push.output)}`;
+      result.projectCircuitFailure = classifyQaIntegrationProjectFailure(push, "remote");
       for (const task of mergedTasks) task.status = "push_failed";
       return result;
     }
@@ -1195,6 +1339,7 @@ async function integrateProject(projectPlan, options = {}) {
   } catch (error) {
     result.status = "blocked";
     result.output = truncateOutput(error.message);
+    result.projectCircuitFailure = classifyQaIntegrationProjectFailure(error, "remote");
     result.tasks = result.tasks.length ? result.tasks : allTaskResults(projectPlan.tasks, "blocked", error.message);
     return result;
   } finally {
@@ -1218,7 +1363,8 @@ async function integrateProject(projectPlan, options = {}) {
 }
 
 function authFailureProjectResult(projectPlan, error) {
-  const output = `GitHub App auth failed for QA integration: ${error.message}`;
+  const projectCircuitFailure = classifyQaIntegrationProjectFailure(error, "auth");
+  const output = `${projectCircuitFailure.normalizedReason} ${projectCircuitFailure.remediation}`;
   return {
     ...projectPlan,
     tasks: allTaskResults(projectPlan.tasks, "blocked", output),
@@ -1229,6 +1375,7 @@ function authFailureProjectResult(projectPlan, error) {
     sourceRepoPath: projectPlan.repoPath || "",
     workspacePath: "",
     workspaceStrategy: "",
+    projectCircuitFailure,
   };
 }
 
@@ -1345,13 +1492,16 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
   const integrationRetryNotBefore = taskResult.status === "ready"
     ? ""
     : new Date(Date.parse(now) + DEFAULT_QA_RETRY_DELAY_MS).toISOString();
+  const integratedCommit = (
+    taskResult.status === "ready"
+    || (taskResult.status === "preview_blocked" && projectResult.commit)
+    || projectResult.previewProbeOnly
+  ) ? projectResult.commit || "" : "";
   return {
     integrationStatus: taskResult.status,
     integrationBranch: projectResult.integrationBranch,
     integrationBranchUrl: projectResult.integrationBranchUrl,
-    integrationCommit: projectResult.previewProbeOnly
-      ? projectResult.commit
-      : taskResult.status === "ready" ? projectResult.commit : "",
+    integrationCommit: integratedCommit,
     integrationSource: taskResult.source || "",
     integrationWorkspacePath: projectResult.workspacePath || "",
     integrationWorkspaceStrategy: projectResult.workspaceStrategy || "",
@@ -1367,6 +1517,88 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
     assignedAgentRole: taskResult.status === "ready" ? "owner" : "builder",
     reviewerThreadId: "",
   };
+}
+
+export async function openQaIntegrationProjectCircuitInState(state, projectResult, input = {}) {
+  const failure = projectResult.projectCircuitFailure;
+  if (!failure) return null;
+  const project = findProject(state, projectResult.projectId || projectResult.projectKey);
+  if (!project) return null;
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  const alreadyOpen = automationCircuitIsOpen(project);
+  await cancelQueuedRuns({
+    state,
+    project: project.id,
+    reason: `Project circuit opened for ${failure.reasonCode}; cancelled before model launch.`,
+    nowMs: Date.parse(now),
+  });
+
+  const affectedTaskIds = [...new Set(
+    (projectResult.tasks || []).map((task) => task.taskId || task.id).filter(Boolean),
+  )];
+  project.automationCircuit = {
+    state: "open",
+    scope: "project",
+    reasonCode: failure.reasonCode,
+    normalizedReason: failure.normalizedReason,
+    failureFingerprint: failure.failureFingerprint,
+    attemptsConsumed: 0,
+    failureOccurrences: alreadyOpen
+      ? Number(project.automationCircuit.failureOccurrences || 1) + 1
+      : 1,
+    openedAt: alreadyOpen ? project.automationCircuit.openedAt : now,
+    remediation: failure.remediation,
+    nextCheapProbe: failure.nextCheapProbe,
+    probeKind: failure.probeKind,
+    probeRole: failure.probeRole,
+    probeOperation: failure.probeOperation,
+    affectedTaskIds,
+    resumeAction: `Run \`studioops circuit-probe --project ${project.key}\`; this uses the qa-integration-worker identity and does not launch a model.`,
+  };
+  project.updatedAt = now;
+
+  for (const taskId of affectedTaskIds) {
+    const task = (state.tasks || []).find((candidate) => candidate.id === taskId);
+    if (!task) continue;
+    const resumeIntegrationStatus = ["blocked", "push_failed"].includes(task.integrationStatus)
+      ? ""
+      : task.integrationStatus || "";
+    task.status = "blocked";
+    task.assignedAgentRole = "owner";
+    task.retryNotBefore = "";
+    task.automationBlocker = {
+      type: "project_circuit",
+      reason: failure.reasonCode,
+      projectId: project.id,
+      resumeStatus: "qa_review",
+      resumeIntegrationStatus,
+      blockedAt: now,
+    };
+    task.updatedAt = now;
+  }
+
+  state.comments = state.comments || [];
+  state.events = state.events || [];
+  if (!alreadyOpen && affectedTaskIds[0]) {
+    state.comments.push({
+      id: nextId(state.comments, "comment"),
+      taskId: affectedTaskIds[0],
+      author: "StudioOps Circuit Breaker",
+      systemGenerated: true,
+      kind: "automation_circuit",
+      body: `Project automation circuit opened for ${failure.reasonCode}.\n\nNormalized root cause: ${failure.normalizedReason}\nRemediation: ${failure.remediation}\nNext cheap probe: ${failure.nextCheapProbe}\n\nNo builder or reviewer model work will launch for this project until the role-specific probe succeeds or the owner explicitly resets the circuit.`,
+      createdAt: now,
+    });
+  }
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "qa_integration_project_circuit_opened",
+    projectId: project.id,
+    taskId: affectedTaskIds[0] || "",
+    message: `${project.key} QA-integration project circuit opened for ${failure.reasonCode}.`,
+    createdAt: now,
+  });
+  return project.automationCircuit;
 }
 
 async function recordProjectResult(projectResult) {
@@ -1402,6 +1634,10 @@ async function recordProjectResult(projectResult) {
           createdAt: now,
         });
       }
+    }
+
+    if (projectResult.projectCircuitFailure) {
+      await openQaIntegrationProjectCircuitInState(state, projectResult, { now });
     }
 
     const readyTasks = (projectResult.tasks || []).filter((task) => task.status === "ready");
@@ -1508,6 +1744,7 @@ export async function runQaIntegration(input = {}) {
     }
     let authContext = null;
     let result = null;
+    const cleanupAuth = input.cleanupGitHubAppAuth || cleanupGitHubAppAuth;
     try {
       const previewProbeOnly = !projectPlan.tasks.length && projectPlan.previewTasks?.length;
       authContext = previewProbeOnly ? null : await prepareQaIntegrationAuth(projectPlan, input);
@@ -1517,10 +1754,16 @@ export async function runQaIntegration(input = {}) {
         env: githubAppAuthEnv(authContext, input.env || {}),
         secrets,
       });
+      if (
+        !result.projectCircuitFailure
+        && ["blocked", "push_failed"].includes(result.status)
+      ) {
+        result.projectCircuitFailure = classifyQaIntegrationProjectFailure(result.output, "remote");
+      }
     } catch (error) {
       result = authFailureProjectResult(projectPlan, error);
     } finally {
-      await cleanupGitHubAppAuth(authContext);
+      await cleanupAuth(authContext);
     }
     await recordProjectResult(result);
     results.push(result);

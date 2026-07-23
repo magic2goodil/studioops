@@ -83,17 +83,42 @@ function normalizeProvider(value) {
   return SUPPORTED_PROVIDERS.has(provider) ? provider : "codex-cli";
 }
 
-function normalizeFailureText(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, "<id>")
-    .replace(/\b(?:run|task|project|thread|pid)[_:= -]*\d+\b/gi, "<dynamic-id>")
-    .replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/gi, "<timestamp>")
-    .replace(/\/(?:users|private|tmp|var)\/[^\s:]+/gi, "<path>")
-    .replace(/\b\d{4,}\b/g, "<number>")
-    .replace(/\s+/g, " ")
+const FAILURE_SUMMARIES = Object.freeze({
+  invalid_github_app_credentials: "GitHub App credentials are invalid.",
+  missing_github_app_credentials: "GitHub App credentials are missing.",
+  github_credential_failure: "GitHub credential validation failed.",
+  inaccessible_github_remote: "The configured GitHub remote is inaccessible.",
+  missing_github_origin: "The repository has no valid GitHub origin.",
+  repo_path_not_found: "The configured repository path does not exist.",
+  repo_path_inaccessible: "The configured repository path is inaccessible.",
+  repo_path_not_directory: "The configured repository path is not a directory.",
+  not_git_repository: "The configured repository path is not a Git repository.",
+  missing_repo_path: "The project has no configured repository path.",
+  missing_local_base_ref: "The local repository has no usable base commit.",
+  runner_pid_lost: "The StudioOps runner PID was lost before durable completion.",
+  sdk_error: "The Codex SDK model run failed.",
+  timeout: "The model run timed out.",
+  task_attempt_limit: "The task-wide model attempt limit was reached.",
+  builder_handoff_missing: "The builder finished without a complete durable handoff.",
+  review_outcome_missing: "The reviewer finished without recording a review outcome.",
+  task_missing_after_run: "The task record was missing when the run completed.",
+  runner_preflight_failed: "The non-model runner preflight failed.",
+  spawn_error: "The local model worker process could not start.",
+  workspace_error: "The isolated model workspace could not be prepared.",
+  orphaned_run: "A running model job became stale without durable completion evidence.",
+  runner_failed: "The automation worker failed.",
+});
+
+function safeReasonCode(value) {
+  const candidate = String(value || "runner_failed")
+    .split(":")[0]
     .trim()
-    .slice(0, 320);
+    .toLowerCase();
+  return /^[a-z][a-z0-9_]{0,63}$/.test(candidate) ? candidate : "runner_failed";
+}
+
+function failureSummary(reasonCode) {
+  return FAILURE_SUMMARIES[reasonCode] || FAILURE_SUMMARIES.runner_failed;
 }
 
 function failureFingerprint(scope, reasonCode, normalizedReason) {
@@ -121,7 +146,7 @@ function failureFingerprint(scope, reasonCode, normalizedReason) {
 
 export function normalizeAutomationFailure(reason, notes = "") {
   const raw = `${String(reason || "runner_failed")}\n${String(notes || "")}`;
-  let reasonCode = String(reason || "runner_failed").split(":")[0] || "runner_failed";
+  let reasonCode = safeReasonCode(reason);
   if (/runner_pid_(?:not_alive|lost)/i.test(raw)) reasonCode = "runner_pid_lost";
   else if (/invalid_github_app_credentials|credentials .* invalid|could not read app\.json/i.test(raw)) reasonCode = "invalid_github_app_credentials";
   else if (/missing_github_app_credentials|credentials .* were not found/i.test(raw)) reasonCode = "missing_github_app_credentials";
@@ -144,7 +169,7 @@ export function normalizeAutomationFailure(reason, notes = "") {
     "missing_local_base_ref",
   ]);
   const scope = projectReasons.has(reasonCode) ? "project" : "task";
-  const normalizedReason = normalizeFailureText(notes || reason || reasonCode) || reasonCode;
+  const normalizedReason = failureSummary(reasonCode);
   const catalog = {
     invalid_github_app_credentials: {
       remediation: "Repair the GitHub App app ID/private key and repository installation, then run the project circuit probe.",
@@ -173,7 +198,7 @@ export function normalizeAutomationFailure(reason, notes = "") {
       unsafeAutomaticRetry: true,
     },
     sdk_error: {
-      remediation: "Inspect the normalized SDK failure and repair the local Codex/provider environment before retrying.",
+      remediation: "Inspect the preserved run output and repair the local Codex/provider environment before retrying.",
       nextCheapProbe: "Verify the Codex executable and local repository preflight; provider/account failures require an owner reset.",
       probeKind: "runner_environment",
     },
@@ -594,27 +619,38 @@ export async function probeAutomationCircuit(input = {}) {
     if (!automationCircuitIsOpen(project)) {
       return { ok: true, scope: "project", projectId: project.id, alreadyClosed: true };
     }
-    const run = latestRunForCircuit(
-      state,
-      project.automationCircuit,
-      (candidate) => candidate.projectId === project.id,
-    ) || {
-      id: `probe_${project.id}`,
-      projectId: project.id,
-      taskId: "",
-      role: "builder",
-      actionType: "start_builder",
-      branchName: "",
-    };
-    const runPreflight = input.preflightRun || preflightRun;
-    const probe = await runPreflight({ ...run, project }, input);
+    let probe;
+    if (project.automationCircuit.probeKind === "qa_integration_preflight") {
+      const probeQaIntegrationProject = input.probeQaIntegrationProject
+        || (await import("./qa-integration.js")).probeQaIntegrationProject;
+      probe = await probeQaIntegrationProject(project, input);
+    } else {
+      const run = latestRunForCircuit(
+        state,
+        project.automationCircuit,
+        (candidate) => candidate.projectId === project.id,
+      ) || {
+        id: `probe_${project.id}`,
+        projectId: project.id,
+        taskId: "",
+        role: "builder",
+        actionType: "start_builder",
+        branchName: "",
+      };
+      const runPreflight = input.preflightRun || preflightRun;
+      probe = await runPreflight({ ...run, project }, input);
+    }
     if (!probe.ok) {
+      const normalized = normalizeAutomationFailure(
+        probe.reasonCode || probe.code || "runner_preflight_failed",
+        probe.message,
+      );
       return {
         ok: false,
         scope: "project",
         projectId: project.id,
         reasonCode: probe.reasonCode || probe.code,
-        normalizedReason: probe.normalizedReason || probe.message,
+        normalizedReason: probe.normalizedReason || normalized.normalizedReason,
         remediation: probe.remediation,
       };
     }
@@ -1313,9 +1349,12 @@ function nonRetryableWorkspaceFailureReason(notes) {
 async function blockQueuedRunForPreflight(state, run, failure, now) {
   const task = findTask(state, run.taskId);
   const project = findProject(state, run.projectId || task?.projectId);
+  const normalized = normalizeAutomationFailure(failure.code, failure.message);
   const classification = {
-    ...normalizeAutomationFailure(failure.code, failure.message),
-    ...failure,
+    ...normalized,
+    remediation: failure.remediation || normalized.remediation,
+    nextCheapProbe: failure.nextCheapProbe || normalized.nextCheapProbe,
+    probeKind: failure.probeKind || normalized.probeKind,
   };
   run.status = "cancelled";
   run.exitCode = failure.code;
