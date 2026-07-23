@@ -41,8 +41,9 @@ export function planWatchdogActions(state, heartbeats, input = {}) {
     actions.push({ type: "restart_worker", worker: "runner", reason: "queued_run_waiting" });
     scheduled.add("runner");
   }
-  const dispatchWaiting = (state.tasks || []).some((task) => (
+  const dispatchWaiting = !state.meta?.operatorPause?.active && (state.tasks || []).some((task) => (
     ["queued", "ready", "needs_changes", "builder_review", "backend_review", "frontend_review", "accessibility_review", "lead_review"].includes(task.status)
+    && task.automationCircuit?.state !== "open"
     && ageMs(task.updatedAt || task.createdAt, nowMs) > workWaitMs
     && !(state.runs || []).some((run) => run.taskId === task.id && ["queued", "running"].includes(run.status))
   ));

@@ -70,6 +70,42 @@ test("transient blockers recover automatically after their retry window", async 
   assert.equal(state.tasks[0].automationBlocker, undefined);
 });
 
+test("transient recovery opens a circuit instead of looping after the recovery budget", async () => {
+  const state = stateWith({
+    status: "blocked",
+    lastAutomationRecoveryCount: 1,
+    automationBlocker: {
+      type: "transient",
+      reason: "sdk_error",
+      runId: "run_8",
+      attempts: 2,
+      resumeStatus: "queued",
+      blockedAt: "2026-07-21T10:00:00.000Z",
+      retryAt: "2026-07-21T10:15:00.000Z",
+      recoveryCount: 1,
+    },
+  });
+  const result = await automationTick({ state, nowMs: NOW });
+  assert.match(result.actions.join("\n"), /opened automation circuit/);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationCircuit.state, "open");
+  assert.equal(state.tasks[0].automationBlocker.type, "circuit");
+});
+
+test("operator pause prevents automation state advancement", async () => {
+  const state = stateWith({ status: "ready" });
+  state.meta = {
+    operatorPause: {
+      active: true,
+      reason: "Database recovery verification",
+    },
+  };
+  const result = await automationTick({ state, nowMs: NOW });
+  assert.equal(result.paused, true);
+  assert.equal(result.actions.length, 0);
+  assert.equal(state.tasks[0].status, "ready");
+});
+
 test("configuration blockers still require explicit owner repair", async () => {
   const state = stateWith({
     status: "blocked",

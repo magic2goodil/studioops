@@ -172,6 +172,96 @@ test("queued runs still block duplicate dispatches", () => {
   assert.equal(report.skipped[0].reason, "already_dispatched");
 });
 
+test("exhausted attempt budgets stop redispatch", () => {
+  const state = fixtureState();
+  state.runs.push(
+    {
+      id: "run_1",
+      taskId: "task_2",
+      projectId: "project_1",
+      attemptKey: "task_2:0:qa_integration_blocked:builder",
+      status: "failed",
+    },
+    {
+      id: "run_2",
+      taskId: "task_2",
+      projectId: "project_1",
+      attemptKey: "task_2:0:qa_integration_blocked:builder",
+      status: "failed",
+    },
+  );
+
+  const report = planDispatches(state, [{
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+    taskStatus: "qa_review",
+    priority: "high",
+    reason: "QA integration is blocked with status conflict.",
+  }]);
+
+  assert.equal(report.selected.length, 0);
+  assert.equal(report.skipped[0].reason, "attempt_budget_exhausted");
+});
+
+test("open task circuits stop redispatch without blocking owner notifications", () => {
+  const state = fixtureState();
+  state.tasks[1].automationCircuit = { state: "open" };
+  const blocked = planDispatches(state, [{
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+  }]);
+  const owner = planDispatches(state, [{
+    id: "task_2:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+  }]);
+
+  assert.equal(blocked.selected.length, 0);
+  assert.equal(blocked.skipped[0].reason, "task_circuit_open");
+  assert.equal(owner.selected.length, 1);
+});
+
+test("operator pause suppresses builders but still permits owner handoffs", () => {
+  const state = fixtureState();
+  state.meta = { operatorPause: { active: true, reason: "Recovery" } };
+  const builder = planDispatches(state, [{
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+  }]);
+  const owner = planDispatches(state, [{
+    id: "task_2:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+  }]);
+
+  assert.equal(builder.skipped[0].reason, "operator_pause");
+  assert.equal(owner.selected.length, 1);
+});
+
 test("preview service failures route to infrastructure repair instead of rebuilding feature code", () => {
   const state = fixtureState();
   state.projects[0].reviewPolicy = { trustLeadApprovals: true, integrationBranch: "qa/demo" };

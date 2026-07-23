@@ -44,6 +44,21 @@ Long-running workers write atomic heartbeats under `data/heartbeats/` every 30 s
 
 Configuration blockers such as missing or invalid GitHub App credentials remain owner-gated. Tracking epics are exempt from the active-run invariant because their status represents child-task progress rather than direct builder execution.
 
+Builder and reviewer attempts are bounded. When the configured attempt budget and one bounded transient recovery are exhausted, StudioOps opens a task circuit and stops dispatching model runs for it. Inspect the preserved output, repair or verify the underlying blocker, then reset that one circuit:
+
+```bash
+studioops circuit-reset --task task_123 --reason "Verified credentials and repository access"
+```
+
+Incident-wide pauses are explicit and auditable:
+
+```bash
+studioops automation-pause --reason "Database recovery"
+studioops automation-resume --reason "Backup, integrity, and worker health verified"
+```
+
+An operator pause suppresses new builder and reviewer claims while still allowing owner-review notifications to reach the persistent inbox.
+
 By default, the web UI is only available on the local machine:
 
 ```text

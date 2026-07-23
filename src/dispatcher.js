@@ -1,4 +1,4 @@
-import { findTask, generatePrompt, mutateState } from "./store.js";
+import { findProject, findTask, generatePrompt, mutateState } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 
@@ -151,6 +151,22 @@ function findLaneConflict(state, selected, action, task) {
   };
   const conflict = activeLaneProfiles(state, selected).find((item) => laneProfilesConflict(current, item));
   return conflict ? { conflict, profile } : { conflict: null, profile };
+}
+
+function dispatchSafetyReason(state, task, action, options) {
+  const group = runGroupFor(action);
+  if (group === "owner" || action.type === "unblock_task") return "";
+  if (state.meta?.operatorPause?.active && !options.ignoreOperatorPause) {
+    return "operator_pause";
+  }
+  const project = findProject(state, task.projectId);
+  if (project?.automationCircuit?.state === "open") return "project_circuit_open";
+  if (task.automationCircuit?.state === "open") return "task_circuit_open";
+  const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const attemptKey = executionAttemptKey(task, action);
+  const attemptCount = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length;
+  if (attemptCount >= executionPolicy.maxAttempts) return "attempt_budget_exhausted";
+  return "";
 }
 
 function ownerPrompt(action) {
@@ -313,6 +329,11 @@ export function planDispatches(state, actions, input = {}) {
     const task = findTask(state, action.taskId);
     if (!task) {
       skipped.push({ action, reason: "missing_task" });
+      continue;
+    }
+    const safetyReason = dispatchSafetyReason(state, task, action, options);
+    if (safetyReason) {
+      skipped.push({ action, reason: safetyReason });
       continue;
     }
     if (hasExistingDispatch(state, action, task)) {

@@ -2,8 +2,25 @@ import http from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { addComment, addProject, addTask, automationTick, generatePrompt, readState, recordQaBundleDecision, recordQaDecision, recordReview, taskWithProject, updateProject, updateTask } from "./store.js";
+import {
+  addComment,
+  addProject,
+  addTask,
+  automationTick,
+  generatePrompt,
+  readState,
+  recordQaBundleDecision,
+  recordQaDecision,
+  recordReview,
+  resetAutomationCircuit,
+  resumeOperatorAutomation,
+  setOperatorPause,
+  taskWithProject,
+  updateProject,
+  updateTask,
+} from "./store.js";
 import { loadConfig } from "./config.js";
+import { buildOwnerInbox } from "./owner-inbox.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
@@ -146,9 +163,15 @@ async function handleApi(req, res, url) {
       projects: state.projects || [],
       tasks: state.tasks || [],
       qaBundles: state.qaBundles || [],
+      ownerInbox: buildOwnerInbox(state),
       configLoaded: !!config,
       productAccess: localProductAccess(),
     });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/inbox") {
+    sendJson(res, 200, buildOwnerInbox(await readState()));
     return;
   }
 
@@ -212,6 +235,21 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/automation/tick") {
     sendJson(res, 200, await automationTick(await readJsonBody(req)));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/automation/pause") {
+    sendJson(res, 200, { operatorPause: await setOperatorPause(await readJsonBody(req)) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/automation/resume") {
+    sendJson(res, 200, { operatorPause: await resumeOperatorAutomation(await readJsonBody(req)) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/automation/circuit-reset") {
+    sendJson(res, 200, { target: await resetAutomationCircuit(await readJsonBody(req)) });
     return;
   }
 
