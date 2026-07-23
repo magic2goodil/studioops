@@ -526,6 +526,129 @@ async function ensureLocalQaPreviewCheckout(projectPlan, preview, options = {}) 
   return { ok: true, created: true };
 }
 
+export function classifyPreviewHealthFailure(error, response = null) {
+  if (response) {
+    return {
+      diagnosticCode: "preview_http_status",
+      message: `Preview returned HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}.`,
+      remediation: "Inspect the preview application logs and health route; restore a successful 2xx response before rerunning the cheap probe.",
+      httpStatus: response.status,
+    };
+  }
+  const code = String(error?.cause?.code || error?.code || "").toUpperCase();
+  const message = String(error?.message || error || "Unknown preview connection failure.");
+  if (
+    code.includes("CERT")
+    || code.includes("TLS")
+    || code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+    || code === "DEPTH_ZERO_SELF_SIGNED_CERT"
+    || /certificate|tls|ssl/i.test(message)
+  ) {
+    return {
+      diagnosticCode: "preview_tls_error",
+      message: `TLS validation failed: ${message}`,
+      remediation: "Repair the local certificate trust chain, hostname, or HTTPS configuration; do not disable TLS verification globally.",
+    };
+  }
+  if (code === "ECONNREFUSED" || /connection refused|fetch failed/i.test(message) && code === "ECONNREFUSED") {
+    return {
+      diagnosticCode: "preview_connection_refused",
+      message: `The preview process refused the connection: ${message}`,
+      remediation: "Start or restart the configured preview process and verify it is listening on the health-check host and port.",
+    };
+  }
+  if (code === "ETIMEDOUT" || error?.name === "TimeoutError" || error?.name === "AbortError" || /timed? out/i.test(message)) {
+    return {
+      diagnosticCode: "preview_connection_timeout",
+      message: `The preview health request timed out: ${message}`,
+      remediation: "Check whether the preview process is hung, overloaded, or bound to a different address/port.",
+    };
+  }
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+    return {
+      diagnosticCode: "preview_dns_error",
+      message: `The preview hostname could not be resolved: ${message}`,
+      remediation: "Correct the health-check hostname or local DNS/hosts configuration.",
+    };
+  }
+  return {
+    diagnosticCode: "preview_connection_error",
+    message,
+    remediation: "Inspect the preview process, host/port binding, and local network path before rerunning the cheap probe.",
+  };
+}
+
+export async function probePreviewHealth(url, options = {}) {
+  const healthCheckUrl = String(url || "").trim();
+  if (!healthCheckUrl) {
+    return {
+      ok: false,
+      status: "health_check_missing",
+      diagnosticCode: "preview_health_url_missing",
+      message: "No local QA preview health-check URL is configured.",
+      remediation: "Configure localQaPreview.healthCheckUrl with a local non-production health endpoint.",
+      attempts: 0,
+    };
+  }
+  const attempts = Math.max(1, Number(options.healthAttempts || options.attempts || 1));
+  const timeoutMs = Math.max(250, Number(options.healthTimeoutMs || options.timeoutMs || 5_000));
+  const delayMs = Math.max(0, Number(options.healthRetryDelayMs ?? options.retryDelayMs ?? 1_000));
+  const fetchImpl = options.fetch || globalThis.fetch;
+  let lastDiagnostic = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetchImpl(healthCheckUrl, { signal: AbortSignal.timeout(timeoutMs) });
+      if (response.ok) {
+        return {
+          ok: true,
+          status: "healthy",
+          diagnosticCode: "preview_healthy",
+          message: `Preview health probe returned HTTP ${response.status}.`,
+          remediation: "",
+          httpStatus: response.status,
+          attempts: attempt,
+          url: healthCheckUrl,
+          probedAt: new Date().toISOString(),
+        };
+      }
+      lastDiagnostic = classifyPreviewHealthFailure(null, response);
+    } catch (error) {
+      lastDiagnostic = classifyPreviewHealthFailure(error);
+    }
+    if (attempt < attempts && delayMs) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return {
+    ok: false,
+    status: "health_check_failed",
+    ...lastDiagnostic,
+    attempts,
+    url: healthCheckUrl,
+    probedAt: new Date().toISOString(),
+  };
+}
+
+export async function probeProjectQaPreview(project, options = {}) {
+  const preview = localQaPreviewConfig({
+    ...project,
+    projectId: project.id || project.projectId,
+    projectKey: project.key || project.projectKey,
+    integrationBranch: project.integrationBranch || integrationBranchName(project),
+  });
+  if (!preview.enabled) {
+    return {
+      ok: false,
+      status: "preview_disabled",
+      diagnosticCode: "preview_disabled",
+      message: "Local QA preview is not enabled for this project.",
+      remediation: "Enable localQaPreview or use an explicit owner circuit reset after manual verification.",
+      attempts: 0,
+    };
+  }
+  return probePreviewHealth(preview.healthCheckUrl, options);
+}
+
 async function syncLocalQaPreview(projectPlan, options = {}) {
   const preview = localQaPreviewConfig(projectPlan);
   const result = {
@@ -542,6 +665,7 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     restartResults: [],
     previewUrl: preview.previewUrl || "",
     healthCheckUrl: preview.healthCheckUrl || "",
+    healthProbe: null,
   };
   if (!preview.enabled) return result;
   if (!preview.branch) {
@@ -689,24 +813,13 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
   }
 
   if (preview.healthCheckUrl) {
-    let healthError = "";
-    let healthy = false;
-    for (let attempt = 1; attempt <= 8; attempt += 1) {
-      try {
-        const response = await fetch(preview.healthCheckUrl, { signal: AbortSignal.timeout(5_000) });
-        if (response.ok) {
-          healthy = true;
-          break;
-        }
-        healthError = `HTTP ${response.status}`;
-      } catch (error) {
-        healthError = error.message;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
-    }
-    if (!healthy) {
+    result.healthProbe = await probePreviewHealth(preview.healthCheckUrl, {
+      ...options,
+      healthAttempts: options.healthAttempts || 8,
+    });
+    if (!result.healthProbe.ok) {
       result.status = "health_check_failed";
-      result.output = `Local QA preview health check failed at ${preview.healthCheckUrl}: ${healthError}`;
+      result.output = `Local QA preview health check failed at ${preview.healthCheckUrl}: ${result.healthProbe.diagnosticCode}. ${result.healthProbe.message} Remediation: ${result.healthProbe.remediation}`;
       return result;
     }
   }
@@ -803,7 +916,17 @@ export function planQaIntegrations(state, input = {}) {
         .filter((task) => task.status === "qa_review")
         .filter((task) => input.force || task.integrationStatus !== "ready")
         .filter((task) => taskMatches(task, input));
-      const tasks = pendingTasks.filter((task) => input.force || retryWindowElapsed(task, nowMs));
+      const previewOnlyTasks = input.force
+        ? []
+        : pendingTasks.filter((task) => (
+            task.integrationStatus === "preview_blocked"
+            && task.integrationCommit
+          ));
+      const previewOnlyIds = new Set(previewOnlyTasks.map((task) => task.id));
+      const tasks = pendingTasks
+        .filter((task) => !previewOnlyIds.has(task.id))
+        .filter((task) => input.force || retryWindowElapsed(task, nowMs));
+      const previewTasks = previewOnlyTasks.filter((task) => retryWindowElapsed(task, nowMs));
       return {
         projectId: project.id,
         projectKey: project.key,
@@ -820,7 +943,7 @@ export function planQaIntegrations(state, input = {}) {
         integrationBranch,
         integrationBranchUrl: branchWebUrl(project, integrationBranch),
         validationCommands: normalizeList(project.validationCommands),
-        deferredTaskCount: pendingTasks.length - tasks.length,
+        deferredTaskCount: pendingTasks.length - tasks.length - previewTasks.length,
         tasks: tasks.map((task) => ({
           id: task.id,
           title: task.title,
@@ -830,6 +953,17 @@ export function planQaIntegrations(state, input = {}) {
           integrationStatus: task.integrationStatus || "",
           integrationRetryNotBefore: task.integrationRetryNotBefore || "",
         })),
+        previewTasks: previewTasks.map((task) => ({
+          id: task.id,
+          title: task.title,
+          status: task.status,
+          branchName: task.branchName || "",
+          prUrl: task.prUrl || "",
+          integrationStatus: task.integrationStatus || "",
+          integrationCommit: task.integrationCommit || "",
+          integrationSource: task.integrationSource || sourceLabel(task),
+          integrationRetryNotBefore: task.integrationRetryNotBefore || "",
+        })),
       };
     });
 
@@ -837,12 +971,13 @@ export function planQaIntegrations(state, input = {}) {
     generatedAt: new Date().toISOString(),
     dryRun: Boolean(input.dryRun || input.plan),
     projects: projectPlans,
-    taskCount: projectPlans.reduce((count, project) => count + project.tasks.length, 0),
+    taskCount: projectPlans.reduce((count, project) => count + project.tasks.length + project.previewTasks.length, 0),
   };
 }
 
 export function projectPlanHasWork(projectPlan) {
   if (projectPlan.tasks.length) return true;
+  if (projectPlan.previewTasks?.length) return true;
   if (projectPlan.deferredTaskCount > 0) return false;
   return Boolean(
     projectPlan.syncDefaultBranchIntoIntegration
@@ -894,6 +1029,40 @@ async function integrateProject(projectPlan, options = {}) {
   };
   const shouldSyncDefaultBranch = syncDefaultBranchEnabled(projectPlan);
   const shouldSyncLocalPreview = localQaPreviewConfig(projectPlan).enabled;
+
+  if (!projectPlan.tasks.length && projectPlan.previewTasks?.length) {
+    const healthProbe = await probeProjectQaPreview(projectPlan, {
+      ...options,
+      healthAttempts: options.healthAttempts || 1,
+    });
+    const previewConfig = localQaPreviewConfig(projectPlan);
+    result.previewProbeOnly = true;
+    result.commit = projectPlan.previewTasks[0]?.integrationCommit || "";
+    result.localQaPreview = {
+      enabled: previewConfig.enabled,
+      status: healthProbe.ok ? "current" : "health_check_failed",
+      checkoutPath: previewConfig.checkoutPath || "",
+      branch: previewConfig.branch || projectPlan.integrationBranch,
+      previewUrl: previewConfig.previewUrl || "",
+      healthCheckUrl: previewConfig.healthCheckUrl || "",
+      healthProbe,
+      output: healthProbe.ok
+        ? healthProbe.message
+        : `${healthProbe.diagnosticCode}: ${healthProbe.message} Remediation: ${healthProbe.remediation}`,
+    };
+    result.status = healthProbe.ok ? "ready" : "preview_blocked";
+    result.output = healthProbe.ok
+      ? `Already integrated branch ${projectPlan.integrationBranch} passed a cheap non-model preview health probe; feature branches were not rebuilt or remerged.`
+      : `Already integrated branch ${projectPlan.integrationBranch} remains preview-blocked after a cheap non-model probe: ${result.localQaPreview.output}`;
+    result.tasks = projectPlan.previewTasks.map((task) => ({
+      taskId: task.id,
+      title: task.title,
+      status: healthProbe.ok ? "ready" : "preview_blocked",
+      source: task.integrationSource || sourceLabel(task),
+      output: result.output,
+    }));
+    return result;
+  }
 
   if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && !shouldSyncLocalPreview) {
     result.status = "no_tasks";
@@ -1091,6 +1260,10 @@ function localPreviewSummary(result) {
   for (const item of preview.restartResults || []) {
     lines.push(`- Restart ${item.label}: ${item.status}`);
   }
+  if (preview.healthProbe) {
+    lines.push(`- Health diagnostic: ${preview.healthProbe.diagnosticCode || preview.healthProbe.status}`);
+    if (preview.healthProbe.remediation) lines.push(`- Health remediation: ${preview.healthProbe.remediation}`);
+  }
   if (preview.output) lines.push(`- Note: ${preview.output}`);
   return lines.join("\n");
 }
@@ -1103,6 +1276,9 @@ function commentForTask(projectResult, taskResult) {
   const previewLine = localPreviewSummary(projectResult);
 
   if (taskResult.status === "ready") {
+    if (projectResult.previewProbeOnly) {
+      return `QA preview repair probe passed for the already-integrated ${projectResult.integrationBranch} commit ${projectResult.commit}. No feature branch was rebuilt or remerged, and no model run was launched.${branchLine}${previewLine}`;
+    }
     return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}${previewLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
   }
 
@@ -1173,7 +1349,9 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
     integrationStatus: taskResult.status,
     integrationBranch: projectResult.integrationBranch,
     integrationBranchUrl: projectResult.integrationBranchUrl,
-    integrationCommit: taskResult.status === "ready" ? projectResult.commit : "",
+    integrationCommit: projectResult.previewProbeOnly
+      ? projectResult.commit
+      : taskResult.status === "ready" ? projectResult.commit : "",
     integrationSource: taskResult.source || "",
     integrationWorkspacePath: projectResult.workspacePath || "",
     integrationWorkspaceStrategy: projectResult.workspaceStrategy || "",
@@ -1331,7 +1509,8 @@ export async function runQaIntegration(input = {}) {
     let authContext = null;
     let result = null;
     try {
-      authContext = await prepareQaIntegrationAuth(projectPlan, input);
+      const previewProbeOnly = !projectPlan.tasks.length && projectPlan.previewTasks?.length;
+      authContext = previewProbeOnly ? null : await prepareQaIntegrationAuth(projectPlan, input);
       const secrets = normalizeSecrets(input.secrets, githubAppAuthSecrets(authContext));
       result = await integrateProject(projectPlan, {
         ...input,
@@ -1386,6 +1565,12 @@ export function formatQaIntegrationReport(report) {
     }
     if (project.localQaPreview?.enabled) {
       lines.push(`  Local QA preview: ${project.localQaPreview.status || "configured"} ${project.localQaPreview.checkoutPath || ""}`.trimEnd());
+      if (project.localQaPreview.healthProbe) {
+        lines.push(`    Diagnostic: ${project.localQaPreview.healthProbe.diagnosticCode || project.localQaPreview.healthProbe.status}`);
+        if (project.localQaPreview.healthProbe.remediation) {
+          lines.push(`    Remediation: ${project.localQaPreview.healthProbe.remediation}`);
+        }
+      }
       for (const item of project.localQaPreview.restartResults || []) {
         lines.push(`    Restart ${item.label}: ${item.status}`);
       }

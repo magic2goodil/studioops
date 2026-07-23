@@ -357,7 +357,9 @@ test("claim preflight blocks configuration failures once without starting or ret
   assert.equal(state.runs[0].attempt, 1);
   assert.equal(state.runs[0].attemptKey, "");
   assert.equal(state.tasks[0].status, "blocked");
-  assert.equal(state.tasks[0].automationBlocker.type, "configuration");
+  assert.equal(state.tasks[0].automationBlocker.type, "project_circuit");
+  assert.equal(state.projects[0].automationCircuit.state, "open");
+  assert.equal(state.projects[0].automationCircuit.attemptsConsumed, 0);
   assert.equal(state.comments.length, 1);
 
   assert.deepEqual(await claimRuns({ state, limit: 1 }), []);
@@ -370,7 +372,7 @@ test("dead or overlong running jobs are identified for automatic recovery", () =
     status: "running",
     startedAt: "2026-07-20T11:00:00.000Z",
     runnerPid: 999_999_999,
-  }, { nowMs, pidGraceMs: 1_000 }), /runner_pid_not_alive/);
+  }, { nowMs, pidGraceMs: 1_000 }), /runner_pid_lost/);
 
   assert.match(activeRunStaleReason({
     status: "running",

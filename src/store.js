@@ -73,8 +73,7 @@ const DEPENDENCY_COMPLETE_STATUSES = new Set([
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
 const DEFAULT_ORPHANED_TASK_GRACE_MS = 15 * 60 * 1000;
-const DEFAULT_TRANSIENT_RECOVERY_MS = 15 * 60 * 1000;
-const MAX_TRANSIENT_RECOVERY_MS = 2 * 60 * 60 * 1000;
+const OPEN_CIRCUIT_STATES = new Set(["open", "probe_required"]);
 
 const DEFAULT_REVIEW_PIPELINE = [
   {
@@ -159,6 +158,269 @@ function nextId(items, prefix) {
     .filter(Number.isFinite)
     .reduce((highest, value) => Math.max(highest, value), 0);
   return `${prefix}_${max + 1}`;
+}
+
+function mutateInputState(input, mutator) {
+  if (input?.state) return mutator(input.state);
+  return mutateState(mutator);
+}
+
+export function automationCircuitIsOpen(entity) {
+  return OPEN_CIRCUIT_STATES.has(String(entity?.automationCircuit?.state || "").toLowerCase());
+}
+
+function runAttemptEpoch(run) {
+  return Math.max(0, Number(run.attemptEpoch || 0));
+}
+
+function taskAttemptEpoch(task) {
+  return Math.max(0, Number(task?.automationAttemptEpoch || 0));
+}
+
+function runReservedModelWork(run) {
+  if (!["builder", "reviewer"].includes(run.group)) return false;
+  if (run.preflightOnly) return false;
+  if (run.status === "cancelled" && !run.modelLaunchedAt && !run.startedAt) return false;
+  return Boolean(
+    run.modelLaunchedAt
+    || run.modelBudgetConsumed
+    || run.budgetReservation
+    || (run.startedAt && ["running", "completed", "failed"].includes(run.status)),
+  );
+}
+
+export function taskAttemptSummary(state, task, input = {}) {
+  const epoch = taskAttemptEpoch(task);
+  const runs = (state.runs || []).filter((run) => (
+    run.taskId === task.id
+    && runAttemptEpoch(run) === epoch
+    && runReservedModelWork(run)
+  ));
+  const launched = runs.filter((run) => (
+    run.modelLaunchedAt
+    || run.modelBudgetConsumed
+    || (run.startedAt && ["running", "completed", "failed"].includes(run.status))
+  ));
+  const failed = launched.filter((run) => run.status === "failed");
+  const inFlight = launched.filter((run) => run.status === "running");
+  const reservations = runs.filter((run) => run.status === "queued");
+  const attemptRuns = input.includeReservations === false
+    ? failed
+    : [...failed, ...inFlight, ...reservations];
+  return {
+    epoch,
+    attemptsConsumed: failed.length,
+    attemptsReserved: attemptRuns.length,
+    attemptsInFlight: inFlight.length,
+    attemptsQueued: reservations.length,
+    modelRunsLaunched: launched.length,
+    successfulRuns: launched.filter((run) => run.status === "completed").length,
+    runIds: failed.map((run) => run.id),
+  };
+}
+
+function taskResumeStatusForCancelledRun(run, task) {
+  if (run.taskStatusBeforeDispatch && VALID_STATUSES.has(run.taskStatusBeforeDispatch)) {
+    return run.taskStatusBeforeDispatch;
+  }
+  if (["start_builder_fix", "return_to_builder"].includes(run.actionType)) return "needs_changes";
+  if (["start_builder", "unblock_task"].includes(run.actionType)) return "queued";
+  if (run.actionType === "qa_integration_blocked") return "qa_review";
+  if (["start_review", "continue_review"].includes(run.actionType)) {
+    return String(run.taskStatusBeforeDispatch || task.status || "builder_review");
+  }
+  return task.status || "queued";
+}
+
+export async function setAutomationPause(paused, input = {}) {
+  return mutateInputState(input, async (state) => {
+    state.meta = state.meta || {};
+    state.events = state.events || [];
+    const now = new Date(Number(input.nowMs || Date.now())).toISOString();
+    if (paused) {
+      state.meta.operatorPause = {
+        active: true,
+        reason: String(input.reason || "Paused by the StudioOps owner.").trim(),
+        pausedAt: now,
+        pausedBy: String(input.author || "StudioOps Owner").trim(),
+        actionRequired: "Run `studioops automation-resume` after the operator is ready to allow new durable runs.",
+      };
+    } else {
+      state.meta.operatorPause = {
+        active: false,
+        reason: "",
+        resumedAt: now,
+        resumedBy: String(input.author || "StudioOps Owner").trim(),
+      };
+    }
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: paused ? "automation_operator_paused" : "automation_operator_resumed",
+      projectId: "",
+      message: paused
+        ? `Global automation pause enabled: ${state.meta.operatorPause.reason}`
+        : "Global automation pause cleared.",
+      createdAt: now,
+    });
+    return state.meta.operatorPause;
+  });
+}
+
+export async function cancelQueuedRuns(input = {}) {
+  return mutateInputState(input, async (state) => {
+    state.runs = state.runs || [];
+    state.tasks = state.tasks || [];
+    state.events = state.events || [];
+    state.comments = state.comments || [];
+    const now = new Date(Number(input.nowMs || Date.now())).toISOString();
+    const project = input.project || input.projectId
+      ? findProject(state, input.project || input.projectId)
+      : null;
+    if ((input.project || input.projectId) && !project) {
+      throw new Error(`Unknown project: ${input.project || input.projectId}`);
+    }
+    const taskId = String(input.task || input.taskId || "").trim();
+    const cancelled = [];
+    for (const run of state.runs) {
+      if (run.status !== "queued") continue;
+      if (!["builder", "reviewer"].includes(run.group)) continue;
+      if (project && run.projectId !== project.id) continue;
+      if (taskId && run.taskId !== taskId) continue;
+      run.status = "cancelled";
+      run.exitCode = "operator_cancelled";
+      run.cancellationReason = String(input.reason || "Cancelled by the StudioOps owner before model launch.").trim();
+      run.budgetReservation = false;
+      run.modelBudgetConsumed = false;
+      run.completedAt = now;
+      run.updatedAt = now;
+      cancelled.push(run);
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "run_cancelled",
+        projectId: run.projectId || "",
+        taskId: run.taskId || "",
+        message: `${run.id} cancelled before model launch: ${run.cancellationReason}`,
+        createdAt: now,
+      });
+    }
+
+    const affectedTaskIds = new Set(cancelled.map((run) => run.taskId));
+    for (const affectedTaskId of affectedTaskIds) {
+      const task = findTask(state, affectedTaskId);
+      if (!task) continue;
+      const hasActiveRun = state.runs.some((run) => (
+        run.taskId === affectedTaskId && ACTIVE_RUN_STATUSES.has(run.status)
+      ));
+      if (hasActiveRun || automationCircuitIsOpen(task)) continue;
+      const latest = cancelled
+        .filter((run) => run.taskId === affectedTaskId)
+        .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0];
+      task.status = taskResumeStatusForCancelledRun(latest, task);
+      task.assignedAgentRole = latest.assignedAgentRoleBeforeDispatch || "";
+      task.retryNotBefore = "";
+      task.updatedAt = now;
+      state.comments.push({
+        id: nextId(state.comments, "comment"),
+        taskId: task.id,
+        author: "StudioOps Operator",
+        body: `${latest.id} was cancelled before model launch. The task was restored to ${task.status}; this cancellation is not recorded as a task failure and consumed no model attempt.`,
+        createdAt: now,
+      });
+    }
+    return cancelled;
+  });
+}
+
+export async function resetAutomationCircuit(input = {}) {
+  return mutateInputState(input, async (state) => {
+    state.events = state.events || [];
+    state.comments = state.comments || [];
+    const now = new Date(Number(input.nowMs || Date.now())).toISOString();
+    const reason = String(input.reason || "Explicit owner reset.").trim();
+    const author = String(input.author || "StudioOps Owner").trim();
+    const projectKey = input.project || input.projectId;
+    const taskId = input.task || input.taskId;
+
+    if (taskId) {
+      const task = findTask(state, taskId);
+      if (!task) throw new Error(`Unknown task: ${taskId}`);
+      const circuit = task.automationCircuit;
+      if (!automationCircuitIsOpen(task)) throw new Error(`Task circuit is not open: ${task.id}`);
+      const resumeStatus = VALID_STATUSES.has(input.resumeStatus)
+        ? input.resumeStatus
+        : VALID_STATUSES.has(circuit?.resumeStatus) ? circuit.resumeStatus : "queued";
+      task.automationAttemptEpoch = taskAttemptEpoch(task) + 1;
+      task.automationCircuit = {
+        ...(circuit || {}),
+        state: "closed",
+        resetAt: now,
+        resetBy: author,
+        resetReason: reason,
+      };
+      delete task.automationBlocker;
+      task.status = resumeStatus;
+      task.assignedAgentRole = "";
+      task.retryNotBefore = "";
+      task.updatedAt = now;
+      state.comments.push({
+        id: nextId(state.comments, "comment"),
+        taskId: task.id,
+        author,
+        body: `Automation circuit reset for ${task.id}. Resume status: ${resumeStatus}. Reason: ${reason}`,
+        createdAt: now,
+      });
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "task_automation_circuit_reset",
+        projectId: task.projectId,
+        taskId: task.id,
+        message: `${task.id} automation circuit reset by ${author}.`,
+        createdAt: now,
+      });
+      return { scope: "task", task, circuit: task.automationCircuit };
+    }
+
+    const project = findProject(state, projectKey);
+    if (!project) throw new Error(`Unknown project: ${projectKey}`);
+    if (!automationCircuitIsOpen(project)) throw new Error(`Project circuit is not open: ${project.key}`);
+    project.automationCircuit = {
+      ...(project.automationCircuit || {}),
+      state: "closed",
+      resetAt: now,
+      resetBy: author,
+      resetReason: reason,
+    };
+    project.updatedAt = now;
+    const restoredTaskIds = [];
+    for (const task of state.tasks || []) {
+      if (
+        task.projectId !== project.id
+        || task.automationBlocker?.type !== "project_circuit"
+      ) continue;
+      const resumeStatus = VALID_STATUSES.has(task.automationBlocker.resumeStatus)
+        ? task.automationBlocker.resumeStatus
+        : "queued";
+      delete task.automationBlocker;
+      task.status = resumeStatus;
+      task.assignedAgentRole = "";
+      task.retryNotBefore = "";
+      task.updatedAt = now;
+      restoredTaskIds.push(task.id);
+    }
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "project_automation_circuit_reset",
+      projectId: project.id,
+      message: `${project.key} automation circuit reset by ${author}; restored ${restoredTaskIds.length} task(s).`,
+      createdAt: now,
+    });
+    return {
+      scope: "project",
+      project,
+      circuit: project.automationCircuit,
+      restoredTaskIds,
+    };
+  });
 }
 
 function normalizeList(value) {
@@ -312,6 +574,9 @@ export async function addProject(input) {
       reviewPolicy,
       trustLeadApprovals: reviewPolicy.trustLeadApprovals,
       integrationBranch: reviewPolicy.integrationBranch,
+      automationCircuit: {
+        state: "closed",
+      },
       createdAt: now,
       updatedAt: now,
     };
@@ -439,6 +704,10 @@ export async function addTask(input) {
       assignedThreadId: String(input.assignedThreadId || "").trim(),
       reviewerThreadId: String(input.reviewerThreadId || "").trim(),
       reviewCycle: 0,
+      automationAttemptEpoch: 0,
+      automationCircuit: {
+        state: "closed",
+      },
       createdAt: now,
       updatedAt: now,
     };
@@ -461,6 +730,16 @@ export async function updateTask(taskId, patch) {
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     if (patch.status && !VALID_STATUSES.has(patch.status)) {
       throw new Error(`Invalid status: ${patch.status}`);
+    }
+    if (
+      patch.status
+      && patch.status !== "blocked"
+      && automationCircuitIsOpen(task)
+    ) {
+      throw new Error(
+        `Task automation circuit is open (${task.automationCircuit.reasonCode || task.automationCircuit.failureFingerprint || "failure"}). `
+        + "Run the circuit probe or explicit circuit reset command before resuming model work.",
+      );
     }
     const previousStatus = task.status;
     const allowed = [
@@ -507,6 +786,7 @@ export async function updateTask(taskId, patch) {
       Object.prototype.hasOwnProperty.call(patch, "status")
       && patch.status !== "blocked"
       && task.automationBlocker
+      && !["circuit", "project_circuit"].includes(task.automationBlocker.type)
     ) {
       delete task.automationBlocker;
     }
@@ -786,16 +1066,6 @@ function taskHasActiveRun(state, taskId) {
   return (state.runs || []).some((run) => run.taskId === taskId && ACTIVE_RUN_STATUSES.has(run.status));
 }
 
-function transientRecoveryAt(blocker, input = {}) {
-  const explicit = Date.parse(blocker.retryAt || "");
-  if (Number.isFinite(explicit)) return explicit;
-  const blockedAt = Date.parse(blocker.blockedAt || "");
-  if (!Number.isFinite(blockedAt)) return 0;
-  const baseMs = Math.max(60_000, Number(input.transientRecoveryMs || DEFAULT_TRANSIENT_RECOVERY_MS));
-  const cycle = Math.max(0, Number(blocker.recoveryCount || 0));
-  return blockedAt + Math.min(MAX_TRANSIENT_RECOVERY_MS, baseMs * (2 ** cycle));
-}
-
 function recordRecovery(state, task, body, eventType, now) {
   state.comments = state.comments || [];
   state.events = state.events || [];
@@ -824,48 +1094,87 @@ export function reconcileAutomationStateInState(state, input = {}) {
       task.status === "blocked"
       && blocker
       && ["execution", "transient"].includes(blocker.type)
-      && transientRecoveryAt(blocker, input) <= nowMs
+      && !automationCircuitIsOpen(task)
     ) {
       const resumeStatus = VALID_STATUSES.has(blocker.resumeStatus) ? blocker.resumeStatus : "queued";
-      const recoveryCount = Math.max(0, Number(blocker.recoveryCount || 0)) + 1;
-      task.status = resumeStatus;
-      task.assignedAgentRole = "";
-      task.assignedThreadId = "";
-      task.reviewerThreadId = "";
+      task.automationCircuit = {
+        state: "open",
+        scope: "task",
+        reasonCode: String(blocker.reason || "legacy_transient_failure").split(":")[0],
+        normalizedReason: String(blocker.reason || "legacy transient worker failure"),
+        failureFingerprint: String(blocker.failureFingerprint || blocker.reason || "legacy_transient_failure"),
+        attemptsConsumed: Math.max(1, Number(blocker.attempts || 1)),
+        lastRunId: blocker.runId || "",
+        openedAt: blocker.blockedAt || now,
+        resumeStatus,
+        nextCheapProbe: "Inspect the preserved run evidence and verify the repaired runner prerequisite without launching a model.",
+        resumeAction: `Run \`studioops circuit-probe --task ${task.id}\`; if no automatic probe applies, use an explicit owner circuit reset.`,
+      };
+      task.automationBlocker = {
+        ...blocker,
+        type: "circuit",
+      };
       task.retryNotBefore = "";
-      task.lastAutomationRecoveryCount = recoveryCount;
       task.updatedAt = now;
-      delete task.automationBlocker;
       recordRecovery(
         state,
         task,
-        `Recovered transient automation failure and returned the task to ${resumeStatus}. Recovery cycle ${recoveryCount}.`,
-        "transient_failure_recovered",
+        "Converted a legacy self-reopening transient blocker into a durable task circuit. Model work now requires a successful cheap probe or explicit owner reset.",
+        "legacy_transient_circuit_opened",
         now,
       );
-      actions.push(`${task.id}: recovered transient automation failure`);
+      actions.push(`${task.id}: opened durable circuit for legacy transient failure`);
     }
 
     const isTrackingContainer = task.type === "epic"
       || (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
-    if (task.status !== "in_progress" || isTrackingContainer || taskHasActiveRun(state, task.id)) continue;
+    const projectForTask = findProject(state, task.projectId);
+    if (
+      task.status !== "in_progress"
+      || isTrackingContainer
+      || taskHasActiveRun(state, task.id)
+      || automationCircuitIsOpen(task)
+      || automationCircuitIsOpen(projectForTask)
+    ) continue;
     const updatedAt = Date.parse(task.updatedAt || task.createdAt || "");
     if (Number.isFinite(updatedAt) && nowMs - updatedAt < orphanGraceMs) continue;
 
-    task.status = "queued";
-    task.assignedAgentRole = "";
-    task.assignedThreadId = "";
-    task.reviewerThreadId = "";
+    task.status = "blocked";
+    task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
+    task.automationCircuit = {
+      state: "open",
+      scope: "task",
+      reasonCode: "orphaned_task_no_durable_run",
+      normalizedReason: "In-progress task has no queued or running durable run.",
+      failureFingerprint: "orphaned_task_no_durable_run",
+      attemptsConsumed: taskAttemptSummary(state, task, { includeReservations: false }).attemptsConsumed,
+      openedAt: now,
+      resumeStatus: "queued",
+      nextCheapProbe: "Inspect the preserved task thread, branch, PR, and workspace evidence without launching a model.",
+      resumeAction: `Run \`studioops circuit-probe --task ${task.id}\`; use an explicit owner circuit reset only after confirming another launch is safe.`,
+      preservedEvidence: {
+        assignedThreadId: task.assignedThreadId || "",
+        reviewerThreadId: task.reviewerThreadId || "",
+        branchName: task.branchName || "",
+        prUrl: task.prUrl || "",
+      },
+    };
+    task.automationBlocker = {
+      type: "circuit",
+      reason: "orphaned_task_no_durable_run",
+      resumeStatus: "queued",
+      blockedAt: now,
+    };
     task.updatedAt = now;
     recordRecovery(
       state,
       task,
-      "Recovered an orphaned in-progress task because no queued or running durable run exists.",
-      "orphaned_task_recovered",
+      "Opened a durable circuit for an orphaned in-progress task because no queued or running durable run exists. Existing thread and branch evidence was preserved; StudioOps did not redispatch model work.",
+      "orphaned_task_circuit_opened",
       now,
     );
-    actions.push(`${task.id}: recovered orphaned in-progress task`);
+    actions.push(`${task.id}: opened orphaned-task circuit`);
   }
 
   return actions;
@@ -890,6 +1199,11 @@ export async function updateRun(runId, patch = {}) {
       "completedAt",
       "exitCode",
       "runnerPid",
+      "childPid",
+      "modelLaunchedAt",
+      "failureCode",
+      "failureFingerprint",
+      "normalizedFailureReason",
       "externalNotifiedAt",
       "failureNotifiedAt",
       "notificationStatus",
@@ -901,6 +1215,14 @@ export async function updateRun(runId, patch = {}) {
       if (Object.prototype.hasOwnProperty.call(patch, key)) {
         run[key] = String(patch[key] || "").trim();
       }
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "elapsedMs")) {
+      run.elapsedMs = Math.max(0, Number(patch.elapsedMs || 0));
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "tokenUsage")) {
+      run.tokenUsage = patch.tokenUsage && typeof patch.tokenUsage === "object"
+        ? { ...patch.tokenUsage }
+        : { available: false, reason: "invalid_usage_summary" };
     }
     run.updatedAt = new Date().toISOString();
     state.events = state.events || [];
@@ -1355,15 +1677,47 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
 }
 
 export function taskWithProject(state, task) {
+  const project = state.projects.find((candidate) => candidate.id === task.projectId) || null;
+  const attempts = taskAttemptSummary(state, task);
+  const taskCircuit = task.automationCircuit || { state: "closed" };
+  const projectCircuit = project?.automationCircuit || { state: "closed" };
   return {
     ...task,
-    project: state.projects.find((project) => project.id === task.projectId) || null,
+    project,
     parent: state.tasks.find((item) => item.id === task.parentTaskId) || null,
     children: state.tasks.filter((item) => item.parentTaskId === task.id),
     dependencies: state.tasks.filter((item) => (task.dependsOnTaskIds || []).includes(item.id)),
     comments: state.comments.filter((comment) => comment.taskId === task.id),
     runs: (state.runs || []).filter((run) => run.taskId === task.id),
     reviews: state.reviews.filter((review) => review.taskId === task.id),
+    automationSummary: {
+      circuitState: automationCircuitIsOpen(task)
+        ? taskCircuit.state
+        : automationCircuitIsOpen(project) ? projectCircuit.state : "closed",
+      scope: automationCircuitIsOpen(task)
+        ? "task"
+        : automationCircuitIsOpen(project) ? "project" : "",
+      normalizedFailureReason: automationCircuitIsOpen(task)
+        ? taskCircuit.normalizedReason || taskCircuit.reasonCode || ""
+        : projectCircuit.normalizedReason || projectCircuit.reasonCode || "",
+      failureFingerprint: automationCircuitIsOpen(task)
+        ? taskCircuit.failureFingerprint || ""
+        : projectCircuit.failureFingerprint || "",
+      attemptsConsumed: attempts.attemptsConsumed,
+      modelRunsLaunched: attempts.modelRunsLaunched,
+      successfulRuns: attempts.successfulRuns,
+      maxAttempts: taskCircuit.maxAttempts || "",
+      nextCheapProbe: automationCircuitIsOpen(task)
+        ? taskCircuit.nextCheapProbe || ""
+        : projectCircuit.nextCheapProbe || "",
+      resumeAction: automationCircuitIsOpen(task)
+        ? taskCircuit.resumeAction || ""
+        : projectCircuit.resumeAction || "",
+      taskCircuit,
+      projectCircuit,
+      operatorPause: state.meta?.operatorPause || { active: false },
+      dispatchBudget: state.meta?.dispatchBudget || null,
+    },
   };
 }
 

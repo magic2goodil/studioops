@@ -56,6 +56,34 @@ test("watchdog wakes the runner for old queued work and dispatcher for stranded 
   assert.ok(actions.some((item) => item.worker === "dispatcher" && item.reason === "dispatchable_task_waiting"));
 });
 
+test("watchdog does not churn workers while a run budget pause is active", () => {
+  const nowMs = Date.parse("2026-07-21T12:00:00.000Z");
+  const fresh = ["dispatcher", "runner", "supervisor", "notifier"].map((worker) => ({
+    worker,
+    updatedAt: new Date(nowMs).toISOString(),
+  }));
+  const state = {
+    meta: {
+      budgetPause: {
+        active: true,
+        resumesAt: new Date(nowMs + 60 * 60 * 1_000).toISOString(),
+      },
+    },
+    runs: [{ id: "run_1", taskId: "task_1", status: "queued", createdAt: "2026-07-21T10:00:00.000Z" }],
+    tasks: [{ id: "task_2", status: "queued", updatedAt: "2026-07-21T10:00:00.000Z" }],
+    projects: [],
+  };
+
+  assert.deepEqual(planWatchdogActions(state, fresh, { nowMs, workWaitMs: 60_000 }), []);
+  const afterWindow = planWatchdogActions(state, fresh, {
+    nowMs: nowMs + 2 * 60 * 60 * 1_000,
+    workWaitMs: 60_000,
+    staleAfterMs: 3 * 60 * 60 * 1_000,
+  });
+  assert.ok(afterWindow.some((item) => item.worker === "runner" && item.reason === "queued_run_waiting"));
+  assert.ok(afterWindow.some((item) => item.worker === "dispatcher" && item.reason === "dispatchable_task_waiting"));
+});
+
 test("disk pressure pauses restart planning instead of creating a restart loop", () => {
   const actions = planWatchdogActions(
     { runs: [], tasks: [] },

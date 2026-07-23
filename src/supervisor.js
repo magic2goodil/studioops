@@ -1,4 +1,9 @@
-import { reviewPolicyForProject, reviewStagesForProject } from "./store.js";
+import {
+  automationCircuitIsOpen,
+  reviewPolicyForProject,
+  reviewStagesForProject,
+  taskAttemptSummary,
+} from "./store.js";
 import {
   branchWebUrl,
   integrationBranchName,
@@ -113,18 +118,31 @@ function statusCounts(tasks) {
 
 function projectSummary(state, project) {
   const tasks = state.tasks.filter((task) => task.projectId === project.id);
+  const circuit = project.automationCircuit || { state: "closed" };
   return {
     id: project.id,
     key: project.key,
     name: project.name,
     taskCount: tasks.length,
     statuses: statusCounts(tasks),
+    circuit: {
+      state: automationCircuitIsOpen(project) ? circuit.state : "closed",
+      reasonCode: circuit.reasonCode || "",
+      normalizedReason: circuit.normalizedReason || "",
+      failureFingerprint: circuit.failureFingerprint || "",
+      attemptsConsumed: circuit.attemptsConsumed || 0,
+      nextCheapProbe: circuit.nextCheapProbe || "",
+      resumeAction: circuit.resumeAction || "",
+    },
   };
 }
 
 function actionBase(state, task, type, role, reason, options = {}) {
   const project = projectForTask(state, task);
   const integrationBranch = task.integrationBranch || options.integrationBranch || integrationBranchName(project);
+  const attempts = taskAttemptSummary(state, task);
+  const taskCircuit = task.automationCircuit || { state: "closed" };
+  const projectCircuit = project?.automationCircuit || { state: "closed" };
   return {
     id: `${task.id}:${type}`,
     type,
@@ -147,6 +165,20 @@ function actionBase(state, task, type, role, reason, options = {}) {
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     integrationCommand: options.integrationCommand || "",
     nextStatus: options.nextStatus || "",
+    circuit: automationCircuitIsOpen(task)
+      ? taskCircuit
+      : automationCircuitIsOpen(project) ? projectCircuit : { state: "closed" },
+    circuitScope: automationCircuitIsOpen(task)
+      ? "task"
+      : automationCircuitIsOpen(project) ? "project" : "",
+    attemptsConsumed: attempts.attemptsConsumed,
+    attemptsReserved: attempts.attemptsReserved,
+    nextCheapProbe: options.nextCheapProbe || (automationCircuitIsOpen(task)
+      ? taskCircuit.nextCheapProbe || ""
+      : projectCircuit.nextCheapProbe || ""),
+    resumeAction: options.resumeAction || (automationCircuitIsOpen(task)
+      ? taskCircuit.resumeAction || ""
+      : projectCircuit.resumeAction || ""),
     dependencies: dependenciesForTask(state, task).map((dependency) => ({
       id: dependency.id,
       status: dependency.status,
@@ -189,6 +221,41 @@ function taskActions(state, task, options = {}) {
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
   if (task.type === "epic" || hasChildren) return [];
 
+  if (state.meta?.operatorPause?.active) {
+    return [actionBase(
+      state,
+      task,
+      "waiting_for_operator_resume",
+      "",
+      `Global operator pause is active: ${state.meta.operatorPause.reason || "No new durable runs are allowed."} Selected in-flight runs may finish; resume action: ${state.meta.operatorPause.actionRequired || "studioops automation-resume"}`,
+      options,
+    )];
+  }
+
+  if (automationCircuitIsOpen(project)) {
+    const circuit = project.automationCircuit;
+    return [actionBase(
+      state,
+      task,
+      "repair_project_circuit",
+      "owner",
+      `Project automation circuit is open for ${circuit.reasonCode || circuit.failureFingerprint || "a configuration failure"}. ${circuit.remediation || ""} Next cheap probe: ${circuit.nextCheapProbe || "(not recorded)"}. Exact resume action: ${circuit.resumeAction || `studioops circuit-probe --project ${project.key}`}`,
+      options,
+    )];
+  }
+
+  if (automationCircuitIsOpen(task)) {
+    const circuit = task.automationCircuit;
+    return [actionBase(
+      state,
+      task,
+      "repair_task_circuit",
+      "owner",
+      `Task automation circuit is open for ${circuit.reasonCode || circuit.failureFingerprint || "a repeated failure"} after ${circuit.attemptsConsumed || 0}/${circuit.maxAttempts || "?"} attempts. ${circuit.remediation || ""} Next cheap probe: ${circuit.nextCheapProbe || "(not recorded)"}. Exact resume action: ${circuit.resumeAction || `studioops circuit-probe --task ${task.id}`}`,
+      options,
+    )];
+  }
+
   const missingDependencies = incompleteDependencies(state, task);
   const retryNotBefore = Date.parse(task.retryNotBefore || "");
   if (Number.isFinite(retryNotBefore) && retryNotBefore > Date.now()) {
@@ -222,19 +289,6 @@ function taskActions(state, task, options = {}) {
   if (task.status === "blocked") {
     if (task.automationBlocker) {
       const blocker = task.automationBlocker;
-      if (["execution", "transient"].includes(blocker.type)) {
-        return [actionBase(
-          state,
-          task,
-          "waiting_for_transient_recovery",
-          "",
-          `StudioOps will automatically retry this transient failure${blocker.retryAt ? ` after ${blocker.retryAt}` : " after its recovery delay"}: ${blocker.reason || "worker error"}.`,
-          {
-            ...options,
-            nextStatus: blocker.resumeStatus || "queued",
-          },
-        )];
-      }
       return [actionBase(
         state,
         task,
@@ -339,7 +393,19 @@ function taskActions(state, task, options = {}) {
       return [actionBase(state, task, "qa_bundle_ready", "owner", "QA integration branch is validated and ready for local owner testing.", options)];
     }
     if (task.integrationStatus === "preview_blocked") {
-      return [actionBase(state, task, "repair_qa_preview", "owner", "The QA branch is validated, but the configured local preview did not restart or pass its health check. Repair the preview service without rebuilding the feature PR.", options)];
+      const healthProbe = task.localQaPreview?.healthProbe || {};
+      return [actionBase(
+        state,
+        task,
+        "repair_qa_preview",
+        "owner",
+        `The QA branch is already integrated and validated, but the local preview probe failed${healthProbe.diagnosticCode ? ` with ${healthProbe.diagnosticCode}` : ""}. ${healthProbe.message || "Repair the preview service without rebuilding the feature PR."} ${healthProbe.remediation || ""}`.trim(),
+        {
+          ...options,
+          nextCheapProbe: `Run \`npm run qa-integrate -- --project ${project.key} --task ${task.id}\`; StudioOps will probe the existing integrated commit without a model or feature rebuild.`,
+          resumeAction: "A successful preview probe automatically restores integrationStatus=ready; no model circuit reset is required.",
+        },
+      )];
     }
     if (["conflict", "validation_failed", "push_failed", "blocked"].includes(task.integrationStatus)) {
       return [actionBase(state, task, "qa_integration_blocked", "builder", `QA integration is blocked with status ${task.integrationStatus}. Review task comments and update the PR branch before rerunning integration.`, options)];
@@ -370,7 +436,7 @@ function sortActions(actions) {
 
 export function createSupervisorReport(state, options = {}) {
   const allActions = sortActions((state.tasks || []).flatMap((task) => taskActions(state, task, options)));
-  const passiveActionTypes = new Set(["waiting_on_dependency", "waiting_for_retry", "blocked", "release_candidate_ready"]);
+  const passiveActionTypes = new Set(["waiting_on_dependency", "waiting_for_retry", "waiting_for_operator_resume", "blocked", "release_candidate_ready"]);
   const actions = options.includeWaiting || options.all
     ? allActions
     : allActions.filter((action) => !passiveActionTypes.has(action.type));
@@ -378,6 +444,8 @@ export function createSupervisorReport(state, options = {}) {
     generatedAt: new Date().toISOString(),
     intervalSeconds: Number(options.intervalSeconds || 300),
     mode: options.mode || "once",
+    operatorPause: state.meta?.operatorPause || { active: false },
+    dispatchBudget: state.meta?.dispatchBudget || null,
     projects: (state.projects || []).map((project) => projectSummary(state, project)),
     totals: {
       projects: (state.projects || []).length,
@@ -400,6 +468,21 @@ export function formatSupervisorReport(report) {
     "",
   ];
 
+  if (report.operatorPause?.active) {
+    lines.push(
+      `GLOBAL OPERATOR PAUSE: ${report.operatorPause.reason || "New durable runs are disabled."}`,
+      `Resume: ${report.operatorPause.actionRequired || "studioops automation-resume"}`,
+      "",
+    );
+  }
+  if (report.dispatchBudget?.pause) {
+    lines.push(
+      `MODEL RUN BUDGET PAUSE: ${report.dispatchBudget.pause.reason}`,
+      `Resumes: ${report.dispatchBudget.pause.resumesAt || "(not recorded)"}`,
+      "",
+    );
+  }
+
   if (!report.actions.length) {
     lines.push("No actionable work found.");
     return lines.join("\n");
@@ -415,6 +498,12 @@ export function formatSupervisorReport(report) {
     if (action.branchName) lines.push(`  Branch: ${action.branchName}`);
     if (action.integrationBranch) lines.push(`  QA branch: ${action.integrationBranch}${action.integrationBranchUrl ? ` (${action.integrationBranchUrl})` : ""}`);
     if (action.integrationStatus) lines.push(`  QA status: ${action.integrationStatus}`);
+    if (action.circuitScope) {
+      lines.push(`  Circuit: ${action.circuitScope}/${action.circuit.state || "open"} ${action.circuit.reasonCode || action.circuit.failureFingerprint || ""}`.trimEnd());
+      lines.push(`  Attempts consumed: ${action.attemptsConsumed}`);
+    }
+    if (action.nextCheapProbe) lines.push(`  Next cheap probe: ${action.nextCheapProbe}`);
+    if (action.resumeAction) lines.push(`  Resume: ${action.resumeAction}`);
     if (action.promptCommand) lines.push(`  Prompt: ${action.promptCommand}`);
     if (action.reviewCommand) lines.push(`  Review command: ${action.reviewCommand}`);
     if (action.integrationCommand) lines.push(`  Integration command: ${action.integrationCommand}`);

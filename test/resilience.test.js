@@ -25,14 +25,15 @@ function stateWith(task, runs = []) {
   };
 }
 
-test("automation reconciles orphaned executable tasks back to the queue", async () => {
+test("automation opens a durable circuit for orphaned executable tasks", async () => {
   const state = stateWith({ assignedAgentRole: "builder", assignedThreadId: "thread_1" });
   const result = await automationTick({ state, nowMs: NOW, orphanGraceMs: 60_000 });
 
-  assert.match(result.actions.join("\n"), /recovered orphaned in-progress task/);
-  assert.equal(state.tasks[0].status, "queued");
-  assert.equal(state.tasks[0].assignedThreadId, "");
-  assert.ok(state.events.some((event) => event.type === "orphaned_task_recovered"));
+  assert.match(result.actions.join("\n"), /opened orphaned-task circuit/);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].assignedThreadId, "thread_1");
+  assert.equal(state.tasks[0].automationCircuit.state, "open");
+  assert.ok(state.events.some((event) => event.type === "orphaned_task_circuit_opened"));
 });
 
 test("automation leaves an in-progress task alone when a durable run exists", async () => {
@@ -72,7 +73,7 @@ test("automation does not recover tracking parents with child tasks into builder
   assert.equal(result.actions.some((action) => action.includes("task_1")), false);
 });
 
-test("transient blockers recover automatically after their retry window", async () => {
+test("legacy transient blockers become durable circuits instead of reopening", async () => {
   const state = stateWith({
     status: "blocked",
     automationBlocker: {
@@ -84,9 +85,10 @@ test("transient blockers recover automatically after their retry window", async 
     },
   });
   const result = await automationTick({ state, nowMs: NOW });
-  assert.match(result.actions.join("\n"), /recovered transient automation failure/);
-  assert.equal(state.tasks[0].status, "queued");
-  assert.equal(state.tasks[0].automationBlocker, undefined);
+  assert.match(result.actions.join("\n"), /opened durable circuit/);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationBlocker.type, "circuit");
+  assert.equal(state.tasks[0].automationCircuit.state, "open");
 });
 
 test("configuration blockers still require explicit owner repair", async () => {

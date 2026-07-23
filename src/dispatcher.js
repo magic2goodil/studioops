@@ -1,6 +1,17 @@
-import { findTask, generatePrompt, mutateState } from "./store.js";
+import {
+  automationCircuitIsOpen,
+  findProject,
+  findTask,
+  generatePrompt,
+  mutateState,
+  taskAttemptSummary,
+} from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
-import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
+import {
+  DEFAULT_EXECUTION_POLICY,
+  executionAttemptKey,
+  resolveExecutionPolicy,
+} from "./execution-policy.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_builder",
@@ -23,7 +34,12 @@ const DEFAULTS = {
   builderConcurrency: 3,
   reviewerConcurrency: 3,
   ownerConcurrency: 10,
+  rollingHourRunBudget: positiveBudget(process.env.STUDIOOPS_ROLLING_HOUR_RUN_BUDGET, 6),
+  dailyRunBudget: positiveBudget(process.env.STUDIOOPS_DAILY_RUN_BUDGET, 24),
 };
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -42,6 +58,72 @@ function normalizeList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function booleanOption(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function positiveBudget(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isModelRunGroup(group) {
+  return group === "builder" || group === "reviewer";
+}
+
+function budgetTimestamp(run) {
+  return Date.parse(run.modelLaunchedAt || run.createdAt || run.startedAt || "");
+}
+
+function reservesModelBudget(run, includeReservations = true) {
+  if (!isModelRunGroup(run.group)) return false;
+  if (run.preflightOnly) return false;
+  if (run.status === "cancelled" && !run.modelLaunchedAt && !run.startedAt) return false;
+  return Boolean(
+    (includeReservations && run.budgetReservation)
+    || run.modelLaunchedAt
+    || (run.startedAt && ["running", "completed", "failed"].includes(run.status)),
+  );
+}
+
+export function dispatchBudgetSnapshot(state, options = {}, nowMs = Date.now()) {
+  const rollingHourLimit = positiveBudget(
+    options.rollingHourRunBudget || options.hourlyRunBudget,
+    DEFAULTS.rollingHourRunBudget,
+  );
+  const dailyLimit = positiveBudget(options.dailyRunBudget, DEFAULTS.dailyRunBudget);
+  const timestamps = (state.runs || [])
+    .filter((run) => reservesModelBudget(run, options.includeReservations !== false))
+    .map(budgetTimestamp)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const rollingHourTimestamps = timestamps.filter((value) => value > nowMs - HOUR_MS);
+  const dailyTimestamps = timestamps.filter((value) => value > nowMs - DAY_MS);
+  return {
+    rollingHourLimit,
+    dailyLimit,
+    rollingHourUsed: rollingHourTimestamps.length,
+    dailyUsed: dailyTimestamps.length,
+    rollingHourResumesAt: rollingHourTimestamps.length
+      ? new Date(rollingHourTimestamps[0] + HOUR_MS).toISOString()
+      : "",
+    dailyResumesAt: dailyTimestamps.length
+      ? new Date(dailyTimestamps[0] + DAY_MS).toISOString()
+      : "",
+    override: booleanOption(
+      options.budgetOverride
+      ?? options.overrideBudget
+      ?? process.env.STUDIOOPS_DISPATCH_BUDGET_OVERRIDE,
+      false,
+    ),
+  };
 }
 
 function runGroupFor(action) {
@@ -251,7 +333,9 @@ function makeRun(state, task, action, options, now) {
   const profile = laneProfile(task, action);
   const executionPolicy = resolveExecutionPolicy(task, action, options);
   const attemptKey = executionAttemptKey(task, action);
-  const attempt = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length + 1;
+  const actionAttempt = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length + 1;
+  const attemptSummary = taskAttemptSummary(state, task);
+  const attempt = isModelRunGroup(group) ? attemptSummary.attemptsReserved + 1 : 0;
   return {
     id: nextId(state.runs, "run"),
     taskId: task.id,
@@ -270,6 +354,8 @@ function makeRun(state, task, action, options, now) {
     modelSelectionReason: executionPolicy.selectionReason,
     attemptKey,
     attempt,
+    actionAttempt,
+    attemptEpoch: attemptSummary.epoch,
     maxAttempts: executionPolicy.maxAttempts,
     retryBackoffMs: executionPolicy.retryBackoffMs,
     staleRunMs: executionPolicy.staleRunMs,
@@ -284,6 +370,10 @@ function makeRun(state, task, action, options, now) {
     integrationBranchUrl: action.integrationBranchUrl || "",
     integrationStatus: action.integrationStatus || "",
     threadId,
+    taskStatusBeforeDispatch: task.status || "",
+    assignedAgentRoleBeforeDispatch: task.assignedAgentRole || "",
+    budgetReservation: isModelRunGroup(group),
+    modelBudgetConsumed: false,
     notes: "",
     createdAt: now,
     updatedAt: now,
@@ -292,10 +382,15 @@ function makeRun(state, task, action, options, now) {
 
 export function planDispatches(state, actions, input = {}) {
   const options = { ...DEFAULTS, ...input };
+  const nowMs = Number(options.nowMs || Date.now());
   const counts = activeCounts(state);
   const maxDispatches = Math.max(1, Number(options.maxDispatchesPerSweep || DEFAULTS.maxDispatchesPerSweep));
+  const budget = dispatchBudgetSnapshot(state, options, nowMs);
   const selected = [];
   const skipped = [];
+  let selectedModelRuns = 0;
+  const selectedModelRunsByTask = new Map();
+  let budgetPause = null;
 
   for (const action of actions || []) {
     if (selected.length >= maxDispatches) {
@@ -310,16 +405,63 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: "project_filter" });
       continue;
     }
+    if (state.meta?.operatorPause?.active) {
+      skipped.push({ action, reason: "operator_pause" });
+      continue;
+    }
     const task = findTask(state, action.taskId);
     if (!task) {
       skipped.push({ action, reason: "missing_task" });
       continue;
     }
+    const group = runGroupFor(action);
+    const project = findProject(state, task.projectId);
+    if (isModelRunGroup(group) && automationCircuitIsOpen(project)) {
+      skipped.push({
+        action,
+        reason: `project_circuit_open:${project.automationCircuit.reasonCode || project.automationCircuit.failureFingerprint || "failure"}`,
+      });
+      continue;
+    }
+    if (isModelRunGroup(group) && automationCircuitIsOpen(task)) {
+      skipped.push({
+        action,
+        reason: `task_circuit_open:${task.automationCircuit.reasonCode || task.automationCircuit.failureFingerprint || "failure"}`,
+      });
+      continue;
+    }
+    if (isModelRunGroup(group)) {
+      const executionPolicy = resolveExecutionPolicy(task, action, options);
+      const attempts = taskAttemptSummary(state, task);
+      const attemptsWithSelection = attempts.attemptsReserved
+        + (selectedModelRunsByTask.get(task.id) || 0);
+      if (attemptsWithSelection >= executionPolicy.maxAttempts) {
+        skipped.push({ action, reason: `task_attempt_limit:${attemptsWithSelection}/${executionPolicy.maxAttempts}` });
+        continue;
+      }
+      if (!budget.override) {
+        if (budget.rollingHourUsed + selectedModelRuns >= budget.rollingHourLimit) {
+          budgetPause = {
+            reason: "rolling_hour_run_budget_exceeded",
+            resumesAt: budget.rollingHourResumesAt,
+          };
+          skipped.push({ action, reason: budgetPause.reason });
+          continue;
+        }
+        if (budget.dailyUsed + selectedModelRuns >= budget.dailyLimit) {
+          budgetPause = {
+            reason: "daily_run_budget_exceeded",
+            resumesAt: budget.dailyResumesAt,
+          };
+          skipped.push({ action, reason: budgetPause.reason });
+          continue;
+        }
+      }
+    }
     if (hasExistingDispatch(state, action, task)) {
       skipped.push({ action, reason: "already_dispatched" });
       continue;
     }
-    const group = runGroupFor(action);
     const limit = concurrencyLimitFor(group, options);
     if ((counts[group] || 0) >= limit) {
       skipped.push({ action, reason: `${group}_concurrency_limit` });
@@ -332,6 +474,10 @@ export function planDispatches(state, actions, input = {}) {
     }
     selected.push({ action, task, group, profile });
     counts[group] = (counts[group] || 0) + 1;
+    if (isModelRunGroup(group)) {
+      selectedModelRuns += 1;
+      selectedModelRunsByTask.set(task.id, (selectedModelRunsByTask.get(task.id) || 0) + 1);
+    }
   }
 
   return {
@@ -350,6 +496,12 @@ export function planDispatches(state, actions, input = {}) {
       taskId: action?.taskId || "",
       reason,
     })),
+    budget: {
+      ...budget,
+      rollingHourReserved: budget.rollingHourUsed + selectedModelRuns,
+      dailyReserved: budget.dailyUsed + selectedModelRuns,
+      pause: budgetPause,
+    },
   };
 }
 
@@ -358,6 +510,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
     state.runs = state.runs || [];
     state.comments = state.comments || [];
     state.events = state.events || [];
+    state.meta = state.meta || {};
 
     const now = new Date().toISOString();
     const options = { ...DEFAULTS, ...input };
@@ -371,7 +524,71 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         runs,
         selected: plan.selected,
         skipped: plan.skipped,
+        budget: plan.budget,
       };
+    }
+
+    state.meta.dispatchBudget = {
+      ...plan.budget,
+      checkedAt: now,
+      actionRequired: plan.budget.pause
+        ? "Wait for the budget window to reopen or rerun the dispatcher with the explicit budget override."
+        : "",
+    };
+    state.meta.budgetPause = plan.budget.pause
+      ? {
+          active: true,
+          reason: plan.budget.pause.reason,
+          resumesAt: plan.budget.pause.resumesAt,
+          openedAt: now,
+        }
+      : { active: false, clearedAt: now };
+
+    for (const skipped of plan.skipped) {
+      if (!skipped.reason.startsWith("task_attempt_limit:")) continue;
+      const task = findTask(state, skipped.taskId);
+      if (!task || automationCircuitIsOpen(task)) continue;
+      const attempts = taskAttemptSummary(state, task, { includeReservations: false });
+      const latestFailure = (state.runs || [])
+        .filter((run) => run.taskId === task.id && run.status === "failed")
+        .sort((a, b) => String(b.completedAt || b.updatedAt || "").localeCompare(String(a.completedAt || a.updatedAt || "")))[0];
+      const maxAttempts = Number(
+        skipped.reason.split(":")[1]?.split("/")[1]
+        || DEFAULT_EXECUTION_POLICY.maxAttempts,
+      );
+      const resumeStatus = task.status || "queued";
+      task.status = "blocked";
+      task.assignedAgentRole = "owner";
+      task.retryNotBefore = "";
+      task.automationCircuit = {
+        state: "open",
+        scope: "task",
+        reasonCode: "task_attempt_limit",
+        normalizedReason: latestFailure?.normalizedFailureReason || latestFailure?.failureCode || "Task-wide model attempt limit reached.",
+        failureFingerprint: latestFailure?.failureFingerprint || "task_attempt_limit",
+        attemptsConsumed: attempts.attemptsConsumed,
+        maxAttempts,
+        lastRunId: latestFailure?.id || attempts.runIds.at(-1) || "",
+        openedAt: now,
+        resumeStatus,
+        nextCheapProbe: latestFailure?.nextCheapProbe || "Inspect the last run evidence without launching a model.",
+        resumeAction: `Run \`studioops circuit-probe --task ${task.id}\`; if no safe probe applies, use \`studioops circuit-reset --task ${task.id} --reason \"<owner repair>\"\`.`,
+      };
+      task.automationBlocker = {
+        type: "circuit",
+        reason: "task_attempt_limit",
+        resumeStatus,
+        runId: latestFailure?.id || "",
+        blockedAt: now,
+      };
+      task.updatedAt = now;
+      state.comments.push({
+        id: nextId(state.comments, "comment"),
+        taskId: task.id,
+        author: "StudioOps Circuit Breaker",
+        body: `Task-wide model attempt circuit opened after ${attempts.attemptsConsumed}/${maxAttempts} consumed attempts. No additional action or review cycle will launch model work until a cheap repair probe succeeds or the owner explicitly resets the circuit.`,
+        createdAt: now,
+      });
     }
 
     for (const item of plan.selected) {
@@ -411,6 +628,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       runs,
       selected: plan.selected,
       skipped: plan.skipped,
+      budget: plan.budget,
     };
   });
 }
@@ -419,8 +637,19 @@ export function formatDispatchReport(report) {
   const lines = [
     `StudioOps dispatcher sweep (${report.generatedAt})`,
     `Created runs: ${report.runs.length}  Selected: ${report.selected.length}  Skipped: ${report.skipped.length}${report.dryRun ? "  DRY RUN" : ""}`,
+    report.budget
+      ? `Run budget: hour ${report.budget.rollingHourReserved ?? report.budget.rollingHourUsed}/${report.budget.rollingHourLimit}, day ${report.budget.dailyReserved ?? report.budget.dailyUsed}/${report.budget.dailyLimit}${report.budget.override ? " (override)" : ""}`
+      : "",
     "",
-  ];
+  ].filter((line, index) => line || index === 3);
+
+  if (report.budget?.pause) {
+    lines.push(
+      `Model dispatch paused: ${report.budget.pause.reason}.`,
+      `Next budget window: ${report.budget.pause.resumesAt || "(not available)"}.`,
+      "",
+    );
+  }
 
   if (!report.runs.length && !report.selected.length) {
     lines.push("No dispatchable work selected.");

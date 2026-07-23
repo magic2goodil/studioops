@@ -176,10 +176,20 @@ test("preview service failures route to infrastructure repair instead of rebuild
   const state = fixtureState();
   state.projects[0].reviewPolicy = { trustLeadApprovals: true, integrationBranch: "qa/demo" };
   state.tasks[0].integrationStatus = "preview_blocked";
+  state.tasks[0].localQaPreview = {
+    healthProbe: {
+      diagnosticCode: "preview_tls_error",
+      message: "TLS validation failed.",
+      remediation: "Repair the local certificate trust chain.",
+    },
+  };
   const report = createSupervisorReport(state);
   const action = report.actions.find((item) => item.taskId === "task_1");
 
   assert.equal(action.type, "repair_qa_preview");
   assert.equal(action.role, "owner");
   assert.match(action.reason, /preview/i);
+  assert.match(action.reason, /preview_tls_error/);
+  assert.match(action.nextCheapProbe, /without a model or feature rebuild/);
+  assert.match(action.resumeAction, /automatically restores/);
 });

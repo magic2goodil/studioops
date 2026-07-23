@@ -8,17 +8,27 @@ import {
   addProject,
   addTask,
   automationTick,
+  cancelQueuedRuns,
   generatePrompt,
   recordQaDecision,
   recordReview,
   readState,
+  resetAutomationCircuit,
+  setAutomationPause,
+  taskAttemptSummary,
   updateProject,
   updateTask,
   updateRun,
 } from "./store.js";
 import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
 import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
-import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
+import {
+  formatRunnerPlan,
+  formatRunnerReport,
+  planRunnableRuns,
+  probeAutomationCircuit,
+  runQueuedRuns,
+} from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
 import { formatPromotionReport, planPromotions, runPromotion } from "./promotion.js";
@@ -384,6 +394,12 @@ Commands:
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
+  circuits                      Show open task/project circuits and the global pause
+  circuit-probe --task|--project Run a cheap non-model repair probe
+  circuit-reset --task|--project Explicitly reset a repaired circuit
+  automation-pause              Prevent new durable runs; in-flight work may finish
+  automation-resume             Clear the global operator pause
+  cancel-runs                   Cancel queued runs without failing their tasks
   prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, accessibility-reviewer, or lead-reviewer prompt
   qa-list                       List tasks waiting for local QA review
 
@@ -416,6 +432,9 @@ Automation:
   studioops notifier --plan
   studioops self-update --plan
   studioops runs --status queued
+  studioops automation-pause --reason "Maintenance" --cancel-queued
+  studioops circuit-probe --project dollos
+  studioops circuit-reset --task task_1 --reason "Owner verified repaired credentials"
   studioops review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
   studioops qa-pass task_1 --body "Looks good locally."
 `);
@@ -438,6 +457,121 @@ Automation:
     return;
   }
 
+  if (command === "automation-pause") {
+    const pause = await setAutomationPause(true, {
+      reason: args.reason || args.body || "Paused by the StudioOps owner.",
+      author: args.author || "StudioOps Owner",
+    });
+    let cancelled = [];
+    if (args["cancel-queued"] || args.cancelQueued) {
+      cancelled = await cancelQueuedRuns({
+        project: args.project,
+        task: args.task || args["task-id"],
+        reason: args.reason || "Cancelled during global operator pause.",
+      });
+    }
+    console.log(`Global automation pause enabled: ${pause.reason}`);
+    if (cancelled.length) console.log(`Cancelled ${cancelled.length} queued run(s) without recording task failures.`);
+    return;
+  }
+
+  if (command === "automation-resume") {
+    const pause = await setAutomationPause(false, {
+      author: args.author || "StudioOps Owner",
+    });
+    console.log(`Global automation pause cleared at ${pause.resumedAt}.`);
+    return;
+  }
+
+  if (command === "cancel-runs") {
+    const cancelled = await cancelQueuedRuns({
+      project: args.project,
+      task: args.task || args["task-id"],
+      reason: args.reason || "Cancelled by the StudioOps owner before model launch.",
+    });
+    console.log(`Cancelled ${cancelled.length} queued run(s); tasks were restored without false failure state.`);
+    return;
+  }
+
+  if (command === "circuit-reset") {
+    const reason = String(args.reason || args.body || "").trim();
+    if (!reason) throw new Error("An explicit circuit reset requires --reason.");
+    const result = await resetAutomationCircuit({
+      task: args.task || args["task-id"],
+      project: args.project,
+      resumeStatus: args.status || args["resume-status"],
+      reason,
+      author: args.author || "StudioOps Owner",
+    });
+    console.log(`Reset ${result.scope} circuit. State: ${result.circuit.state}.`);
+    return;
+  }
+
+  if (command === "circuit-probe") {
+    if (!args.project && !args.task && !args["task-id"]) {
+      throw new Error("circuit-probe requires --project or --task.");
+    }
+    const result = await probeAutomationCircuit({
+      project: args.project,
+      task: args.task || args["task-id"],
+      author: args.author || "StudioOps Repair Probe",
+      githubAppCredentialsDir: args["github-apps-dir"],
+      githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
+    });
+    if (args.json) console.log(JSON.stringify(result, null, 2));
+    else if (result.ok) console.log(`Circuit probe passed for ${result.scope}; the circuit is closed.`);
+    else console.log(`Circuit probe did not close ${result.scope}: ${result.reasonCode || result.code}. ${result.remediation || ""}`.trim());
+    if (!result.ok) process.exitCode = 2;
+    return;
+  }
+
+  if (command === "circuits") {
+    const state = await readState();
+    const rows = [];
+    if (state.meta?.operatorPause?.active) {
+      rows.push({
+        scope: "global",
+        id: "operator",
+        state: "open",
+        reason: state.meta.operatorPause.reason || "operator_pause",
+        attempts: "",
+        probe: "",
+        resume: state.meta.operatorPause.actionRequired || "studioops automation-resume",
+      });
+    }
+    for (const project of state.projects || []) {
+      if (!["open", "probe_required"].includes(project.automationCircuit?.state)) continue;
+      rows.push({
+        scope: "project",
+        id: project.key,
+        state: project.automationCircuit.state,
+        reason: project.automationCircuit.reasonCode || project.automationCircuit.normalizedReason || "",
+        attempts: project.automationCircuit.attemptsConsumed || 0,
+        probe: project.automationCircuit.nextCheapProbe || "",
+        resume: project.automationCircuit.resumeAction || "",
+      });
+    }
+    for (const task of state.tasks || []) {
+      if (!["open", "probe_required"].includes(task.automationCircuit?.state)) continue;
+      rows.push({
+        scope: "task",
+        id: task.id,
+        state: task.automationCircuit.state,
+        reason: task.automationCircuit.reasonCode || task.automationCircuit.normalizedReason || "",
+        attempts: task.automationCircuit.attemptsConsumed || taskAttemptSummary(state, task).attemptsConsumed,
+        probe: task.automationCircuit.nextCheapProbe || "",
+        resume: task.automationCircuit.resumeAction || "",
+      });
+    }
+    if (args.json) console.log(JSON.stringify({
+      operatorPause: state.meta?.operatorPause || { active: false },
+      dispatchBudget: state.meta?.dispatchBudget || null,
+      circuits: rows,
+    }, null, 2));
+    else printTable(rows, ["scope", "id", "state", "reason", "attempts", "probe", "resume"]);
+    return;
+  }
+
   if (command === "projects") {
     const state = await readState();
     printTable(state.projects.map((project) => ({
@@ -448,7 +582,10 @@ Automation:
       repo: project.repoPath || project.repoUrl,
       trustLeads: project.reviewPolicy?.trustLeadApprovals ? "yes" : "no",
       integrationBranch: project.reviewPolicy?.integrationBranch || "",
-    })), ["id", "key", "name", "workflowMode", "repo", "trustLeads", "integrationBranch"]);
+      circuit: project.automationCircuit?.state || "closed",
+      failure: project.automationCircuit?.reasonCode || "",
+      probe: project.automationCircuit?.nextCheapProbe || "",
+    })), ["id", "key", "name", "workflowMode", "repo", "trustLeads", "integrationBranch", "circuit", "failure", "probe"]);
     return;
   }
 
@@ -500,6 +637,7 @@ Automation:
       .filter((task) => !args.status || task.status === args.status);
     printTable(tasks.map((task) => {
       const project = state.projects.find((item) => item.id === task.projectId);
+      const attempts = taskAttemptSummary(state, task);
       return {
         id: task.id,
         project: project?.key || task.projectId,
@@ -509,9 +647,14 @@ Automation:
         type: task.type,
         priority: task.priority,
         parent: task.parentTaskId || "",
+        attempts: attempts.attemptsConsumed,
+        modelRuns: attempts.modelRunsLaunched,
+        circuit: task.automationCircuit?.state || project?.automationCircuit?.state || "closed",
+        failure: task.automationCircuit?.reasonCode || project?.automationCircuit?.reasonCode || "",
+        probe: task.automationCircuit?.nextCheapProbe || project?.automationCircuit?.nextCheapProbe || "",
         title: task.title,
       };
-    }), ["id", "project", "status", "owner", "cycle", "type", "priority", "parent", "title"]);
+    }), ["id", "project", "status", "owner", "cycle", "type", "priority", "parent", "attempts", "modelRuns", "circuit", "failure", "probe", "title"]);
     return;
   }
 
@@ -527,6 +670,14 @@ Automation:
     printTable(runs.map((run) => {
       const task = state.tasks.find((item) => item.id === run.taskId);
       const project = state.projects.find((item) => item.id === run.projectId);
+      const tokenTotal = Number(
+        run.tokenUsage?.totalTokens
+        ?? run.tokenUsage?.total_tokens
+        ?? (
+          Number(run.tokenUsage?.inputTokens ?? run.tokenUsage?.input_tokens ?? 0)
+          + Number(run.tokenUsage?.outputTokens ?? run.tokenUsage?.output_tokens ?? 0)
+        ),
+      );
       return {
         id: run.id,
         project: project?.key || run.projectId,
@@ -537,10 +688,15 @@ Automation:
         model: run.model || "",
         effort: run.modelReasoningEffort || "",
         attempt: run.attempt ? `${run.attempt}/${run.maxAttempts || "?"}` : "",
+        elapsed: run.elapsedMs === undefined ? "" : `${run.elapsedMs}ms`,
+        tokens: run.tokenUsage?.available === false || !run.tokenUsage
+          ? "unavailable"
+          : tokenTotal,
+        failure: run.failureCode || "",
         thread: run.threadId || "",
         title: task?.title || "",
       };
-    }), ["id", "project", "task", "status", "role", "action", "model", "effort", "attempt", "thread", "title"]);
+    }), ["id", "project", "task", "status", "role", "action", "model", "effort", "attempt", "elapsed", "tokens", "failure", "thread", "title"]);
     return;
   }
 
@@ -722,6 +878,10 @@ Automation:
   if (command === "dispatcher" || command === "dispatch") {
     const state = await readState();
     const config = await loadConfig();
+    const dispatcherDefaults = {
+      ...(config?.defaults?.dispatcher || {}),
+      ...(config?.dispatcher || {}),
+    };
     const supervisor = createSupervisorReport(state, {
       baseUrl: args["base-url"] || "http://127.0.0.1:4317",
       intervalSeconds: args.interval || args["interval-seconds"] || 300,
@@ -734,6 +894,15 @@ Automation:
       builderConcurrency: args["builder-concurrency"],
       reviewerConcurrency: args["reviewer-concurrency"],
       ownerConcurrency: args["owner-concurrency"],
+      rollingHourRunBudget: args["rolling-hour-run-budget"]
+        || args["hourly-run-budget"]
+        || dispatcherDefaults.rollingHourRunBudget
+        || dispatcherDefaults.hourlyRunBudget,
+      dailyRunBudget: args["daily-run-budget"] || dispatcherDefaults.dailyRunBudget,
+      budgetOverride: booleanOption(
+        args["budget-override"] || args["override-budget"] || dispatcherDefaults.budgetOverride,
+        false,
+      ),
       executionPolicy: {
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
@@ -747,6 +916,7 @@ Automation:
         runs: [],
         selected: plan.selected,
         skipped: plan.skipped,
+        budget: plan.budget,
       };
       if (args.json) console.log(JSON.stringify(report, null, 2));
       else console.log(formatDispatchReport(report));
@@ -764,6 +934,10 @@ Automation:
       ...(config?.defaults?.runner || {}),
       ...(config?.runner || {}),
     };
+    const dispatcherDefaults = {
+      ...(config?.defaults?.dispatcher || {}),
+      ...(config?.dispatcher || {}),
+    };
     const options = {
       project: args.project || args.projects,
       limit: args.limit || args["max-runs"],
@@ -780,6 +954,15 @@ Automation:
       timeoutMs: args["timeout-ms"],
       githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
       githubAppCredentialsDir: args["github-apps-dir"],
+      rollingHourRunBudget: args["rolling-hour-run-budget"]
+        || args["hourly-run-budget"]
+        || dispatcherDefaults.rollingHourRunBudget
+        || dispatcherDefaults.hourlyRunBudget,
+      dailyRunBudget: args["daily-run-budget"] || dispatcherDefaults.dailyRunBudget,
+      budgetOverride: booleanOption(
+        args["budget-override"] || args["override-budget"] || dispatcherDefaults.budgetOverride,
+        false,
+      ),
     };
     if (args.plan || args["dry-run"] || args.dryRun) {
       const state = await readState();

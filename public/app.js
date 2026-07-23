@@ -2,6 +2,8 @@ const state = {
   projects: [],
   tasks: [],
   qaBundles: [],
+  operatorPause: { active: false },
+  dispatchBudget: null,
   selectedProjectId: "",
   selectedTaskId: "",
   routeTaskId: "",
@@ -137,6 +139,26 @@ function integrationStatusLabel(task) {
   return status.replaceAll("_", " ");
 }
 
+function automationSafety(task, project = projectFor(task)) {
+  const derived = task.automationSummary || {};
+  const taskCircuit = derived.taskCircuit || task.automationCircuit || { state: "closed" };
+  const projectCircuit = derived.projectCircuit || project?.automationCircuit || { state: "closed" };
+  const taskOpen = ["open", "probe_required"].includes(taskCircuit.state);
+  const projectOpen = ["open", "probe_required"].includes(projectCircuit.state);
+  const circuit = taskOpen ? taskCircuit : projectOpen ? projectCircuit : { state: "closed" };
+  return {
+    state: taskOpen || projectOpen ? circuit.state : "closed",
+    scope: taskOpen ? "task" : projectOpen ? "project" : "",
+    circuit,
+    attemptsConsumed: derived.attemptsConsumed ?? circuit.attemptsConsumed ?? 0,
+    modelRunsLaunched: derived.modelRunsLaunched ?? "",
+    nextCheapProbe: derived.nextCheapProbe || circuit.nextCheapProbe || "",
+    resumeAction: derived.resumeAction || circuit.resumeAction || "",
+    operatorPause: derived.operatorPause || state.operatorPause || { active: false },
+    dispatchBudget: derived.dispatchBudget || state.dispatchBudget || null,
+  };
+}
+
 function trustLeadApprovalsEnabled(project) {
   const policy = project?.reviewPolicy || {};
   if (Object.prototype.hasOwnProperty.call(policy, "trustLeadApprovals")) return truthyFlag(policy.trustLeadApprovals);
@@ -186,6 +208,10 @@ function workflowOwner(task) {
 }
 
 function workflowGate(task) {
+  const safety = automationSafety(task);
+  if (safety.state !== "closed") {
+    return `${safety.scope} circuit open: ${safety.circuit.reasonCode || safety.circuit.normalizedReason || "automation failure"}`;
+  }
   const owner = workflowOwner(task);
   if (task.status === "qa_review") {
     if (task.integrationStatus === "ready") return "QA bundle ready";
@@ -296,6 +322,8 @@ async function loadState() {
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
   state.qaBundles = data.qaBundles || [];
+  state.operatorPause = data.meta?.operatorPause || { active: false };
+  state.dispatchBudget = data.meta?.dispatchBudget || null;
   state.productAccess = data.productAccess || null;
   if (productPlan && state.productAccess) {
     productPlan.textContent = `${state.productAccess.planName} · ${state.productAccess.connectedToCloud ? "cloud" : "local"}`;
@@ -339,7 +367,7 @@ function renderProjects() {
   projectList.innerHTML = state.projects.map((project) => `
     <button type="button" class="project-item ${project.id === state.selectedProjectId ? "active" : ""}" data-project-id="${escapeHtml(project.id)}">
       <strong>${escapeHtml(project.name)}</strong>
-      <span>${escapeHtml(project.repoPath || project.repoUrl || project.key)}</span>
+      <span>${escapeHtml(project.repoPath || project.repoUrl || project.key)}${["open", "probe_required"].includes(project.automationCircuit?.state) ? ` · circuit open: ${escapeHtml(project.automationCircuit.reasonCode || "failure")}` : ""}</span>
     </button>
   `).join("") || `<div class="project-item"><strong>No projects yet</strong><span>Add one below or run setup.</span></div>`;
 
@@ -491,6 +519,68 @@ function renderTasks() {
       </article>
     `;
   }).join("") || `<p>No tasks match this view.</p>`;
+}
+
+function runTokenSummary(run) {
+  if (!run.tokenUsage || run.tokenUsage.available === false) return "unavailable";
+  return String(
+    run.tokenUsage.totalTokens
+    ?? run.tokenUsage.total_tokens
+    ?? (
+      Number(run.tokenUsage.inputTokens ?? run.tokenUsage.input_tokens ?? 0)
+      + Number(run.tokenUsage.outputTokens ?? run.tokenUsage.output_tokens ?? 0)
+    ),
+  );
+}
+
+function renderAutomationSafetyPanel(task, project) {
+  const safety = automationSafety(task, project);
+  const circuit = safety.circuit;
+  const recentRuns = [...(task.runs || [])]
+    .filter((run) => ["builder", "reviewer"].includes(run.group))
+    .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))
+    .slice(0, 6);
+  return `
+    <section class="detail-section automation-safety-section">
+      <div class="section-heading">
+        <h3>Automation Safety</h3>
+        <span>${escapeHtml(safety.state === "closed" ? "circuit closed" : `${safety.scope} circuit ${safety.state}`)}</span>
+      </div>
+      <div class="workflow-grid">
+        <div>
+          <strong>Normalized failure</strong>
+          <span>${escapeHtml(circuit.normalizedReason || circuit.reasonCode || "none")}</span>
+        </div>
+        <div>
+          <strong>Failure fingerprint</strong>
+          <span>${escapeHtml(circuit.failureFingerprint || "none")}</span>
+        </div>
+        <div>
+          <strong>Attempts consumed</strong>
+          <span>${escapeHtml(safety.attemptsConsumed)}${circuit.maxAttempts ? ` / ${escapeHtml(circuit.maxAttempts)}` : ""}</span>
+        </div>
+        <div>
+          <strong>Model runs launched</strong>
+          <span>${escapeHtml(safety.modelRunsLaunched === "" ? "not summarized" : safety.modelRunsLaunched)}</span>
+        </div>
+        <div>
+          <strong>Global operator pause</strong>
+          <span>${safety.operatorPause?.active ? escapeHtml(safety.operatorPause.reason || "active") : "not active"}</span>
+        </div>
+        <div>
+          <strong>Dispatch budget</strong>
+          <span>${safety.dispatchBudget ? `hour ${escapeHtml(safety.dispatchBudget.rollingHourUsed ?? 0)} / ${escapeHtml(safety.dispatchBudget.rollingHourLimit ?? "?")} · day ${escapeHtml(safety.dispatchBudget.dailyUsed ?? 0)} / ${escapeHtml(safety.dispatchBudget.dailyLimit ?? "?")}` : "not evaluated"}</span>
+        </div>
+      </div>
+      ${safety.nextCheapProbe ? `<p><strong>Next cheap probe:</strong> ${escapeHtml(safety.nextCheapProbe)}</p>` : ""}
+      ${safety.resumeAction ? `<p><strong>Exact action to resume:</strong> <code>${escapeHtml(safety.resumeAction)}</code></p>` : ""}
+      ${circuit.remediation ? `<p><strong>Remediation:</strong> ${escapeHtml(circuit.remediation)}</p>` : ""}
+      <div class="validation-list">
+        <strong>Recent model run summaries</strong>
+        ${recentRuns.map((run) => `<code>${escapeHtml(run.id)} · ${escapeHtml(run.status)} · ${escapeHtml(run.model || "model unknown")} (${escapeHtml(run.modelReasoningEffort || "effort unknown")}) · ${escapeHtml(run.elapsedMs === undefined ? "elapsed unavailable" : `${run.elapsedMs}ms`)} · tokens ${escapeHtml(runTokenSummary(run))}${run.failureCode ? ` · ${escapeHtml(run.failureCode)}` : ""}</code>`).join("") || `<p class="muted-note">No durable runs recorded.</p>`}
+      </div>
+    </section>
+  `;
 }
 
 function renderHierarchyPanel(task) {
@@ -753,6 +843,7 @@ async function renderDetail() {
     </div>
     ${renderReviewPanel(fullTask, project)}
     <div class="detail-grid ${isFullPage ? "detail-grid-full" : ""}">
+      ${renderAutomationSafetyPanel(fullTask, project)}
       <section class="detail-section">
         <h3>Description</h3>
         <p>${escapeHtml(fullTask.description || "No description yet.")}</p>

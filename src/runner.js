@@ -1,7 +1,8 @@
 import { createWriteStream, existsSync } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -18,9 +19,19 @@ import {
 } from "./github-app-auth.js";
 import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
-import { DATA_DIR, findProject, findTask, mutateState, readState } from "./store.js";
+import {
+  automationCircuitIsOpen,
+  DATA_DIR,
+  findProject,
+  findTask,
+  mutateState,
+  readState,
+  resetAutomationCircuit,
+  taskAttemptSummary,
+} from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
+import { dispatchBudgetSnapshot } from "./dispatcher.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
 import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode } from "./config.js";
@@ -40,6 +51,7 @@ const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "preview_blocked", "blocked"]);
 const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const MAX_FAILURE_FINGERPRINT_RUNS = 2;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
   "/usr/local/bin",
@@ -71,6 +83,121 @@ function normalizeProvider(value) {
   return SUPPORTED_PROVIDERS.has(provider) ? provider : "codex-cli";
 }
 
+function normalizeFailureText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, "<id>")
+    .replace(/\b(?:run|task|project|thread|pid)[_:= -]*\d+\b/gi, "<dynamic-id>")
+    .replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/gi, "<timestamp>")
+    .replace(/\/(?:users|private|tmp|var)\/[^\s:]+/gi, "<path>")
+    .replace(/\b\d{4,}\b/g, "<number>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 320);
+}
+
+function failureFingerprint(scope, reasonCode, normalizedReason) {
+  const stableReason = [
+    "invalid_github_app_credentials",
+    "missing_github_app_credentials",
+    "github_credential_failure",
+    "inaccessible_github_remote",
+    "missing_github_origin",
+    "repo_path_not_found",
+    "repo_path_inaccessible",
+    "repo_path_not_directory",
+    "not_git_repository",
+    "missing_repo_path",
+    "missing_local_base_ref",
+    "runner_pid_lost",
+  ].includes(reasonCode)
+    ? reasonCode
+    : `${reasonCode}:${normalizedReason}`;
+  return createHash("sha256")
+    .update(`${scope}:${stableReason}`)
+    .digest("hex")
+    .slice(0, 20);
+}
+
+export function normalizeAutomationFailure(reason, notes = "") {
+  const raw = `${String(reason || "runner_failed")}\n${String(notes || "")}`;
+  let reasonCode = String(reason || "runner_failed").split(":")[0] || "runner_failed";
+  if (/runner_pid_(?:not_alive|lost)/i.test(raw)) reasonCode = "runner_pid_lost";
+  else if (/invalid_github_app_credentials|credentials .* invalid|could not read app\.json/i.test(raw)) reasonCode = "invalid_github_app_credentials";
+  else if (/missing_github_app_credentials|credentials .* were not found/i.test(raw)) reasonCode = "missing_github_app_credentials";
+  else if (/inaccessible_github_remote|could not read from remote|repository not found/i.test(raw)) reasonCode = "inaccessible_github_remote";
+  else if (/missing_github_origin/i.test(raw)) reasonCode = "missing_github_origin";
+  else if (/sdk_error|codex sdk/i.test(raw)) reasonCode = "sdk_error";
+  else if (/timeout|aborterror/i.test(raw)) reasonCode = "timeout";
+
+  const projectReasons = new Set([
+    "invalid_github_app_credentials",
+    "missing_github_app_credentials",
+    "github_credential_failure",
+    "inaccessible_github_remote",
+    "missing_github_origin",
+    "repo_path_not_found",
+    "repo_path_inaccessible",
+    "repo_path_not_directory",
+    "not_git_repository",
+    "missing_repo_path",
+    "missing_local_base_ref",
+  ]);
+  const scope = projectReasons.has(reasonCode) ? "project" : "task";
+  const normalizedReason = normalizeFailureText(notes || reason || reasonCode) || reasonCode;
+  const catalog = {
+    invalid_github_app_credentials: {
+      remediation: "Repair the GitHub App app ID/private key and repository installation, then run the project circuit probe.",
+      nextCheapProbe: "Validate GitHub App credentials and `git ls-remote origin` without launching a model.",
+      probeKind: "github_preflight",
+    },
+    missing_github_app_credentials: {
+      remediation: "Install the configured GitHub App credentials for this worker role, then run the project circuit probe.",
+      nextCheapProbe: "Validate GitHub App credential files and repository installation without launching a model.",
+      probeKind: "github_preflight",
+    },
+    inaccessible_github_remote: {
+      remediation: "Repair the origin URL, network access, or GitHub App installation permissions.",
+      nextCheapProbe: "Run authenticated `git ls-remote origin` without launching a model.",
+      probeKind: "github_preflight",
+    },
+    missing_github_origin: {
+      remediation: "Add a GitHub origin or explicitly switch the project to local workflow mode.",
+      nextCheapProbe: "Inspect the repository workflow mode and origin URL without launching a model.",
+      probeKind: "github_preflight",
+    },
+    runner_pid_lost: {
+      remediation: "Inspect the preserved workspace, Codex thread, child PID, and last-message evidence before deciding whether another model launch is safe.",
+      nextCheapProbe: "Check the recorded runner/child PIDs, task handoff, thread ID, workspace, and last-message file.",
+      probeKind: "orphaned_process",
+      unsafeAutomaticRetry: true,
+    },
+    sdk_error: {
+      remediation: "Inspect the normalized SDK failure and repair the local Codex/provider environment before retrying.",
+      nextCheapProbe: "Verify the Codex executable and local repository preflight; provider/account failures require an owner reset.",
+      probeKind: "runner_environment",
+    },
+    timeout: {
+      remediation: "Inspect the preserved thread/workspace and confirm the previous child is no longer running before retrying.",
+      nextCheapProbe: "Check process liveness and saved handoff evidence without launching a model.",
+      probeKind: "orphaned_process",
+      unsafeAutomaticRetry: true,
+    },
+  };
+  const details = catalog[reasonCode] || {
+    remediation: "Inspect the preserved run evidence, repair the root cause, then run a cheap probe or explicitly reset the task circuit.",
+    nextCheapProbe: "Verify repository and runner prerequisites without launching a model.",
+    probeKind: "runner_environment",
+  };
+  return {
+    scope,
+    reasonCode,
+    normalizedReason,
+    failureFingerprint: failureFingerprint(scope, reasonCode, normalizedReason),
+    ...details,
+  };
+}
+
 export function resolveCodexBin(input = {}) {
   const explicit = String(input.codexBin || process.env.MISSION_CONTROL_CODEX_BIN || "").trim();
   if (explicit) return explicit;
@@ -95,7 +222,8 @@ export function activeRunStaleReason(run, input = {}) {
   const ageMs = Number.isFinite(startedMs) ? nowMs - startedMs : 0;
   const pidGraceMs = Math.max(1_000, Number(input.pidGraceMs || 30_000));
   if (ageMs >= pidGraceMs && run.runnerPid && !pidIsAlive(run.runnerPid)) {
-    return `runner_pid_not_alive:${run.runnerPid}`;
+    if (run.childPid && pidIsAlive(run.childPid)) return "";
+    return `runner_pid_lost:${run.runnerPid}`;
   }
   const staleRunMs = Math.max(60_000, Number(run.staleRunMs || input.staleRunMs || DEFAULT_EXECUTION_POLICY.staleRunMs));
   if (ageMs > staleRunMs) return `run_exceeded_${staleRunMs}ms`;
@@ -206,7 +334,14 @@ export function resolveProjectWorkflowMode(project = {}, originUrl = "") {
 }
 
 function preflightFailure(code, message, remediation) {
-  return { ok: false, code, message, remediation };
+  const normalized = normalizeAutomationFailure(code, message);
+  return {
+    ok: false,
+    code,
+    message,
+    remediation: remediation || normalized.remediation,
+    ...normalized,
+  };
 }
 
 function workflowAuthEnv(workflowMode, authContext, baseEnv = process.env) {
@@ -440,6 +575,127 @@ export async function preflightRun(run, input = {}) {
   return { ok: true, workflowMode, originUrl };
 }
 
+function latestRunForCircuit(state, circuit, predicate) {
+  const explicit = (state.runs || []).find((run) => run.id === circuit?.lastRunId);
+  if (explicit && predicate(explicit)) return explicit;
+  return (state.runs || [])
+    .filter(predicate)
+    .sort((a, b) => String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || "")))[0] || null;
+}
+
+export async function probeAutomationCircuit(input = {}) {
+  const state = input.state || await readState();
+  const taskId = String(input.task || input.taskId || "").trim();
+  const projectKey = input.project || input.projectId;
+
+  if (projectKey) {
+    const project = findProject(state, projectKey);
+    if (!project) throw new Error(`Unknown project: ${projectKey}`);
+    if (!automationCircuitIsOpen(project)) {
+      return { ok: true, scope: "project", projectId: project.id, alreadyClosed: true };
+    }
+    const run = latestRunForCircuit(
+      state,
+      project.automationCircuit,
+      (candidate) => candidate.projectId === project.id,
+    ) || {
+      id: `probe_${project.id}`,
+      projectId: project.id,
+      taskId: "",
+      role: "builder",
+      actionType: "start_builder",
+      branchName: "",
+    };
+    const runPreflight = input.preflightRun || preflightRun;
+    const probe = await runPreflight({ ...run, project }, input);
+    if (!probe.ok) {
+      return {
+        ok: false,
+        scope: "project",
+        projectId: project.id,
+        reasonCode: probe.reasonCode || probe.code,
+        normalizedReason: probe.normalizedReason || probe.message,
+        remediation: probe.remediation,
+      };
+    }
+    const reset = await resetAutomationCircuit({
+      ...(input.state ? { state } : {}),
+      project: project.id,
+      author: input.author || "StudioOps Repair Probe",
+      reason: `Successful non-model ${project.automationCircuit.probeKind || "repository"} probe.`,
+      nowMs: input.nowMs,
+    });
+    return {
+      ok: true,
+      scope: "project",
+      projectId: project.id,
+      workflowMode: probe.workflowMode,
+      restoredTaskIds: reset.restoredTaskIds,
+    };
+  }
+
+  const task = findTask(state, taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  if (!automationCircuitIsOpen(task)) {
+    return { ok: true, scope: "task", taskId: task.id, alreadyClosed: true };
+  }
+  const circuit = task.automationCircuit;
+  const run = latestRunForCircuit(state, circuit, (candidate) => candidate.taskId === task.id);
+  if (!run) {
+    return {
+      ok: false,
+      scope: "task",
+      taskId: task.id,
+      reasonCode: "missing_run_evidence",
+      remediation: "Inspect the task history and use an explicit owner reset only after the root cause is repaired.",
+    };
+  }
+  if (circuit.probeKind === "github_preflight") {
+    const project = findProject(state, task.projectId);
+    const runPreflight = input.preflightRun || preflightRun;
+    const probe = await runPreflight({ ...run, project }, input);
+    if (!probe.ok) return { ok: false, scope: "task", taskId: task.id, ...probe };
+    await resetAutomationCircuit({
+      ...(input.state ? { state } : {}),
+      task: task.id,
+      author: input.author || "StudioOps Repair Probe",
+      reason: "Successful non-model repository/GitHub preflight.",
+      nowMs: input.nowMs,
+    });
+    return { ok: true, scope: "task", taskId: task.id, workflowMode: probe.workflowMode };
+  }
+  if (circuit.probeKind === "orphaned_process") {
+    if ((run.runnerPid && pidIsAlive(run.runnerPid)) || (run.childPid && pidIsAlive(run.childPid))) {
+      return {
+        ok: false,
+        scope: "task",
+        taskId: task.id,
+        reasonCode: "recorded_process_still_running",
+        remediation: "Leave the circuit open and inspect the recorded process/thread; do not launch replacement model work.",
+      };
+    }
+    const lastMessageExists = run.lastMessagePath
+      ? await access(run.lastMessagePath).then(() => true).catch(() => false)
+      : false;
+    return {
+      ok: false,
+      scope: "task",
+      taskId: task.id,
+      reasonCode: lastMessageExists ? "owner_handoff_confirmation_required" : "orphaned_process_evidence_incomplete",
+      preservedEvidence: circuit.preservedEvidence,
+      remediation: "The recorded processes are gone, but process liveness alone cannot prove whether the model turn completed. Inspect the preserved thread/workspace and use an explicit owner reset only if another launch is safe.",
+    };
+  }
+  return {
+    ok: false,
+    scope: "task",
+    taskId: task.id,
+    reasonCode: "owner_reset_required",
+    remediation: circuit.remediation || "Repair the root cause and explicitly reset the task circuit.",
+    nextCheapProbe: circuit.nextCheapProbe || "",
+  };
+}
+
 async function localBranchExists(repoPath, branch) {
   return gitOk(["rev-parse", "--verify", `refs/heads/${branch}`], { cwd: repoPath });
 }
@@ -621,6 +877,25 @@ export function planRunnableRuns(state, input = {}) {
   )).length;
   const available = Math.max(0, limit - activeCount);
   const selfUpdateLease = activeSelfUpdateLease(state, input);
+  const operatorPause = state.meta?.operatorPause?.active ? state.meta.operatorPause : null;
+  const budget = dispatchBudgetSnapshot(
+    state,
+    { ...input, includeReservations: false },
+    Number(input.nowMs || Date.now()),
+  );
+  const budgetPause = !budget.override && (
+    budget.rollingHourUsed >= budget.rollingHourLimit
+      ? {
+          reason: "rolling_hour_run_budget_exceeded",
+          resumesAt: budget.rollingHourResumesAt,
+        }
+      : budget.dailyUsed >= budget.dailyLimit
+        ? {
+            reason: "daily_run_budget_exceeded",
+            resumesAt: budget.dailyResumesAt,
+          }
+        : null
+  );
   const runnable = [];
   const skipped = [];
   const plannedRuns = [];
@@ -632,12 +907,41 @@ export function planRunnableRuns(state, input = {}) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "not_runner_group" });
       continue;
     }
+    if (operatorPause || budgetPause) {
+      skipped.push({
+        runId: run.id,
+        taskId: run.taskId,
+        reason: operatorPause ? "operator_pause" : budgetPause.reason,
+      });
+      continue;
+    }
     if (selfUpdateLease) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `self_update_in_progress:${selfUpdateLease.id}` });
       continue;
     }
     if (!projectAllowed(run, project, input)) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "project_filter" });
+      continue;
+    }
+    const task = findTask(state, run.taskId);
+    if (automationCircuitIsOpen(project)) {
+      skipped.push({
+        runId: run.id,
+        taskId: run.taskId,
+        reason: `project_circuit_open:${project.automationCircuit.reasonCode || project.automationCircuit.failureFingerprint || "failure"}`,
+      });
+      continue;
+    }
+    if (automationCircuitIsOpen(task)) {
+      skipped.push({
+        runId: run.id,
+        taskId: run.taskId,
+        reason: `task_circuit_open:${task.automationCircuit.reasonCode || task.automationCircuit.failureFingerprint || "failure"}`,
+      });
+      continue;
+    }
+    if (run.attemptEpoch !== undefined && Number(run.attemptEpoch) !== Number(task?.automationAttemptEpoch || 0)) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: "stale_attempt_epoch" });
       continue;
     }
     const staleReason = staleRunReason(state, run);
@@ -668,6 +972,12 @@ export function planRunnableRuns(state, input = {}) {
     available,
     runnable,
     skipped,
+    paused: Boolean(operatorPause || budgetPause),
+    pauseReason: operatorPause?.reason || budgetPause?.reason || "",
+    budget: {
+      ...budget,
+      pause: budgetPause,
+    },
   };
 }
 
@@ -776,42 +1086,179 @@ function applySuccessfulHandoff(state, run, task, now) {
   }
 }
 
-function applyFailedRunToTask(task, run, reason, now) {
-  if (!task || task.automationBlocker?.type === "configuration") return { blocked: true, retryAt: "" };
-  const attempt = Math.max(1, Number(run.attempt || 1));
-  const maxAttempts = Math.max(1, Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts));
-  task.lastAutomationFailure = reason;
-  task.lastAutomationFailureRunId = run.id;
+function restoreQueuedTaskWithoutFailure(state, run, now) {
+  const task = findTask(state, run.taskId);
+  if (!task || automationCircuitIsOpen(task)) return;
+  const hasOtherActiveRun = (state.runs || []).some((candidate) => (
+    candidate.id !== run.id
+    && candidate.taskId === task.id
+    && ["queued", "running"].includes(candidate.status)
+  ));
+  if (hasOtherActiveRun) return;
+  task.status = run.taskStatusBeforeDispatch || restoreTaskStatusForRun(run, task);
+  task.assignedAgentRole = run.assignedAgentRoleBeforeDispatch || "";
+  task.retryNotBefore = "";
   task.updatedAt = now;
-  if (attempt >= maxAttempts) {
+}
+
+function cancelQueuedProjectRuns(state, projectId, reason, now, excludedRunId = "") {
+  for (const candidate of state.runs || []) {
+    if (
+      candidate.id === excludedRunId
+      || candidate.projectId !== projectId
+      || candidate.status !== "queued"
+      || !RUNNABLE_GROUPS.has(candidate.group)
+    ) continue;
+    candidate.status = "cancelled";
+    candidate.exitCode = "project_circuit_open";
+    candidate.cancellationReason = reason;
+    candidate.budgetReservation = false;
+    candidate.modelBudgetConsumed = false;
+    candidate.completedAt = now;
+    candidate.updatedAt = now;
+    restoreQueuedTaskWithoutFailure(state, candidate, now);
+  }
+}
+
+function openProjectCircuit(state, project, task, run, classification, now) {
+  const alreadyOpen = automationCircuitIsOpen(project);
+  const projectFailureRuns = (state.runs || []).filter((candidate) => (
+    candidate.projectId === project.id
+    && candidate.failureFingerprint === classification.failureFingerprint
+  ));
+  const projectModelAttempts = projectFailureRuns.filter((candidate) => (
+    candidate.modelBudgetConsumed
+    || candidate.modelLaunchedAt
+    || (candidate.startedAt && candidate.status !== "cancelled")
+  )).length;
+  project.automationCircuit = {
+    state: "open",
+    scope: "project",
+    reasonCode: classification.reasonCode,
+    normalizedReason: classification.normalizedReason,
+    failureFingerprint: classification.failureFingerprint,
+    attemptsConsumed: projectModelAttempts,
+    failureOccurrences: projectFailureRuns.length,
+    lastRunId: run.id,
+    openedAt: alreadyOpen ? project.automationCircuit.openedAt : now,
+    remediation: classification.remediation,
+    nextCheapProbe: classification.nextCheapProbe,
+    probeKind: classification.probeKind,
+    resumeAction: `Run \`studioops circuit-probe --project ${project.key}\`; use \`studioops circuit-reset --project ${project.key} --reason \"<owner repair>\"\` only when an automatic probe cannot prove recovery.`,
+  };
+  project.updatedAt = now;
+  cancelQueuedProjectRuns(
+    state,
+    project.id,
+    `Project circuit opened for ${classification.reasonCode}; cancelled before model launch.`,
+    now,
+    run.id,
+  );
+  if (task) {
     const resumeStatus = restoreTaskStatusForRun(run, task);
     task.status = "blocked";
     task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
-    const recoveryCount = Math.max(0, Number(task.lastAutomationRecoveryCount || 0));
-    const recoveryDelayMs = Math.min(2 * 60 * 60 * 1000, 15 * 60 * 1000 * (2 ** recoveryCount));
     task.automationBlocker = {
-      type: "transient",
-      reason,
+      type: "project_circuit",
+      reason: classification.reasonCode,
       runId: run.id,
-      attempts: attempt,
+      projectId: project.id,
       resumeStatus,
       blockedAt: now,
-      retryAt: new Date(Date.parse(now) + recoveryDelayMs).toISOString(),
-      recoveryCount,
     };
-    return { blocked: true, retryAt: "" };
+    task.updatedAt = now;
   }
+  return !alreadyOpen;
+}
+
+function openTaskCircuit(state, task, run, classification, now, attemptsConsumed, maxAttempts) {
+  const resumeStatus = restoreTaskStatusForRun(run, task);
+  const alreadyOpen = automationCircuitIsOpen(task);
+  task.status = "blocked";
+  task.assignedAgentRole = "owner";
+  task.retryNotBefore = "";
+  task.automationCircuit = {
+    state: "open",
+    scope: "task",
+    reasonCode: classification.reasonCode,
+    normalizedReason: classification.normalizedReason,
+    failureFingerprint: classification.failureFingerprint,
+    attemptsConsumed,
+    maxAttempts,
+    lastRunId: run.id,
+    openedAt: alreadyOpen ? task.automationCircuit.openedAt : now,
+    resumeStatus,
+    remediation: classification.remediation,
+    nextCheapProbe: classification.nextCheapProbe,
+    probeKind: classification.probeKind,
+    preservedEvidence: {
+      threadId: run.threadId || task.assignedThreadId || task.reviewerThreadId || "",
+      runnerPid: run.runnerPid || "",
+      childPid: run.childPid || "",
+      workspacePath: run.workspacePath || run.executionRepoPath || "",
+      outputPath: run.outputPath || "",
+      lastMessagePath: run.lastMessagePath || "",
+    },
+    resumeAction: `Run \`studioops circuit-probe --task ${task.id}\`; use \`studioops circuit-reset --task ${task.id} --reason \"<owner repair>\"\` only when an automatic probe cannot prove recovery.`,
+  };
+  task.automationBlocker = {
+    type: "circuit",
+    reason: classification.reasonCode,
+    runId: run.id,
+    attempts: attemptsConsumed,
+    resumeStatus,
+    blockedAt: now,
+  };
+  task.updatedAt = now;
+}
+
+function applyFailedRunToTask(state, task, run, reason, now) {
+  if (!task) return { blocked: true, retryAt: "", classification: normalizeAutomationFailure(reason) };
+  const classification = normalizeAutomationFailure(reason, run.notes);
+  run.failureCode = classification.reasonCode;
+  run.normalizedFailureReason = classification.normalizedReason;
+  run.failureFingerprint = classification.failureFingerprint;
+  run.nextCheapProbe = classification.nextCheapProbe;
+  const attemptSummary = taskAttemptSummary(state, task, { includeReservations: false });
+  const attempt = Math.max(1, attemptSummary.attemptsConsumed || Number(run.attempt || 1));
+  const maxAttempts = Math.max(1, Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts));
+  const fingerprintAttempts = (state.runs || []).filter((candidate) => (
+    candidate.taskId === task.id
+    && Number(candidate.attemptEpoch || 0) === Number(task.automationAttemptEpoch || 0)
+    && candidate.failureFingerprint === classification.failureFingerprint
+  )).length;
+  task.lastAutomationFailure = classification.reasonCode;
+  task.lastAutomationFailureFingerprint = classification.failureFingerprint;
+  task.lastAutomationFailureRunId = run.id;
+  task.updatedAt = now;
+
+  if (classification.scope === "project") {
+    const project = findProject(state, task.projectId);
+    if (project) openProjectCircuit(state, project, task, run, classification, now);
+    return { blocked: true, retryAt: "", classification, scope: "project" };
+  }
+
+  if (
+    classification.unsafeAutomaticRetry
+    || attempt >= maxAttempts
+    || fingerprintAttempts >= MAX_FAILURE_FINGERPRINT_RUNS
+  ) {
+    openTaskCircuit(state, task, run, classification, now, attempt, maxAttempts);
+    return { blocked: true, retryAt: "", classification, scope: "task" };
+  }
+
   const backoffMs = Math.max(1_000, Number(run.retryBackoffMs || DEFAULT_EXECUTION_POLICY.retryBackoffMs)) * attempt;
   task.status = restoreTaskStatusForRun(run, task);
   task.assignedAgentRole = run.group === "reviewer" ? run.role : "builder";
   task.retryNotBefore = new Date(Date.parse(now) + backoffMs).toISOString();
-  return { blocked: false, retryAt: task.retryNotBefore };
+  return { blocked: false, retryAt: task.retryNotBefore, classification };
 }
 
 function runFailureComment(run, reason, disposition) {
   if (disposition.blocked) {
-    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Rapid retries are paused; StudioOps will automatically probe this transient failure again after its recovery delay.`;
+    const classification = disposition.classification || normalizeAutomationFailure(reason, run.notes);
+    return `${run.id} opened a ${disposition.scope || classification.scope} automation circuit after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} task-wide attempts.\n\nNormalized root cause: ${classification.reasonCode}\nFingerprint: ${classification.failureFingerprint}\nRemediation: ${classification.remediation}\nNext cheap probe: ${classification.nextCheapProbe}\n\nNo additional model work will launch until a cheap repair probe succeeds or the owner explicitly resets the circuit.`;
   }
   return `${run.id} failed: ${reason}. StudioOps will retry no earlier than ${disposition.retryAt}.`;
 }
@@ -863,70 +1310,44 @@ function nonRetryableWorkspaceFailureReason(notes) {
   return "";
 }
 
-async function pauseTaskForAutomationConfig(run, reason, notes) {
-  const now = new Date().toISOString();
-  await mutateState(async (state) => {
-    state.events = state.events || [];
-    const task = findTask(state, run.taskId);
-    if (task) {
-      const resumeStatus = task.status;
-      task.status = "blocked";
-      task.assignedAgentRole = "owner";
-      task.automationBlocker = {
-        type: "configuration",
-        reason,
-        runId: run.id,
-        resumeStatus,
-        blockedAt: now,
-      };
-      task.updatedAt = now;
-    }
-    await appendTaskComment(
-      state,
-      run,
-      `${run.id} paused automation for this task: ${reason}.\n\n${notes}\n\nFix the StudioOps runner configuration, then move the task back to the appropriate ready/review state to retry.`,
-      now,
-    );
-    state.events.push({
-      id: nextId(state.events, "event"),
-      type: "automation_config_blocked",
-      projectId: run.projectId,
-      taskId: run.taskId,
-      message: `${run.id} paused after non-retryable workspace preparation failure: ${reason}`,
-      createdAt: now,
-    });
-  });
-}
-
 async function blockQueuedRunForPreflight(state, run, failure, now) {
   const task = findTask(state, run.taskId);
+  const project = findProject(state, run.projectId || task?.projectId);
+  const classification = {
+    ...normalizeAutomationFailure(failure.code, failure.message),
+    ...failure,
+  };
   run.status = "cancelled";
   run.exitCode = failure.code;
   // Configuration preflight is outside the worker retry budget. Clearing the
   // attempt key keeps a repaired task's first actual worker launch at attempt 1.
   run.attemptKey = "";
+  run.budgetReservation = false;
+  run.modelBudgetConsumed = false;
+  run.failureCode = classification.reasonCode;
+  run.normalizedFailureReason = classification.normalizedReason;
+  run.failureFingerprint = classification.failureFingerprint;
+  run.nextCheapProbe = classification.nextCheapProbe;
   run.notes = `${failure.message}\n\nRemediation: ${failure.remediation}`;
   run.completedAt = now;
   run.updatedAt = now;
-  if (task) {
-    const resumeStatus = restoreTaskStatusForRun(run, task);
-    task.status = "blocked";
-    task.assignedAgentRole = "owner";
-    task.retryNotBefore = "";
-    task.lastAutomationFailure = failure.code;
+  if (task && classification.scope === "project" && project) {
+    task.lastAutomationFailure = classification.reasonCode;
+    task.lastAutomationFailureFingerprint = classification.failureFingerprint;
     task.lastAutomationFailureRunId = run.id;
-    task.automationBlocker = {
-      type: "configuration",
-      reason: failure.code,
-      message: failure.message,
-      remediation: failure.remediation,
-      runId: run.id,
-      resumeStatus,
-      blockedAt: now,
-    };
-    task.updatedAt = now;
+    openProjectCircuit(state, project, task, run, classification, now);
+  } else if (task) {
+    openTaskCircuit(
+      state,
+      task,
+      run,
+      classification,
+      now,
+      taskAttemptSummary(state, task, { includeReservations: false }).attemptsConsumed,
+      Math.max(1, Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts)),
+    );
   }
-  const body = `${run.id} was blocked by runner preflight before a worker was claimed: ${failure.code}.\n\n${failure.message}\n\nRemediation: ${failure.remediation}`;
+  const body = `${run.id} opened a ${classification.scope} circuit during a non-model preflight: ${classification.reasonCode}.\n\n${failure.message}\n\nRemediation: ${failure.remediation}\nNext cheap probe: ${classification.nextCheapProbe}\n\nThis preflight cancellation consumed no model attempt.`;
   await appendTaskComment(state, run, body, now);
   state.events.push({
     id: nextId(state.events, "event"),
@@ -970,15 +1391,80 @@ export async function claimRuns(input = {}) {
     const available = Math.max(0, limit - activeCount);
     if (available <= 0) return [];
     if (activeSelfUpdateLease(state, input)) return [];
+    if (state.meta?.operatorPause?.active) return [];
+    const budget = dispatchBudgetSnapshot(
+      state,
+      { ...input, includeReservations: false },
+      Number(input.nowMs || Date.now()),
+    );
+    const rollingAvailable = budget.override
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, budget.rollingHourLimit - budget.rollingHourUsed);
+    const dailyAvailable = budget.override
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, budget.dailyLimit - budget.dailyUsed);
+    const budgetAvailable = Math.min(rollingAvailable, dailyAvailable);
+    state.meta = state.meta || {};
+    if (budgetAvailable <= 0) {
+      const rollingExceeded = rollingAvailable <= 0;
+      const pause = {
+        active: true,
+        reason: rollingExceeded
+          ? "rolling_hour_run_budget_exceeded"
+          : "daily_run_budget_exceeded",
+        resumesAt: rollingExceeded
+          ? budget.rollingHourResumesAt
+          : budget.dailyResumesAt,
+        openedAt: now,
+      };
+      state.meta.budgetPause = pause;
+      state.meta.dispatchBudget = {
+        ...budget,
+        pause,
+        checkedAt: now,
+        actionRequired: "Wait for the budget window to reopen or rerun the runner with the explicit budget override.",
+      };
+      return [];
+    }
+    state.meta.budgetPause = { active: false, clearedAt: now };
+    state.meta.dispatchBudget = {
+      ...budget,
+      pause: null,
+      checkedAt: now,
+      actionRequired: "",
+    };
 
     const claimed = [];
     const plannedRuns = [];
     for (const run of state.runs) {
-      if (claimed.length >= available) break;
+      if (claimed.length >= Math.min(available, budgetAvailable)) break;
       const project = findProject(state, run.projectId);
+      const task = findTask(state, run.taskId);
       if (!RUNNABLE_STATUSES.has(run.status)) continue;
       if (!RUNNABLE_GROUPS.has(run.group)) continue;
       if (!projectAllowed(run, project, input)) continue;
+      if (automationCircuitIsOpen(project) || automationCircuitIsOpen(task)) {
+        run.status = "cancelled";
+        run.exitCode = automationCircuitIsOpen(project) ? "project_circuit_open" : "task_circuit_open";
+        run.cancellationReason = "Circuit opened before model launch.";
+        run.budgetReservation = false;
+        run.modelBudgetConsumed = false;
+        run.completedAt = now;
+        run.updatedAt = now;
+        restoreQueuedTaskWithoutFailure(state, run, now);
+        continue;
+      }
+      if (Number(run.attemptEpoch || 0) !== Number(task?.automationAttemptEpoch || 0)) {
+        run.status = "cancelled";
+        run.exitCode = "stale_attempt_epoch";
+        run.cancellationReason = "An explicit circuit reset started a new task attempt epoch.";
+        run.budgetReservation = false;
+        run.modelBudgetConsumed = false;
+        run.completedAt = now;
+        run.updatedAt = now;
+        restoreQueuedTaskWithoutFailure(state, run, now);
+        continue;
+      }
       const staleReason = staleRunReason(state, run);
       if (staleReason) {
         run.status = "cancelled";
@@ -1024,7 +1510,30 @@ export async function claimRuns(input = {}) {
       run.model = run.model || executionPolicy.model || input.model;
       run.modelReasoningEffort = run.modelReasoningEffort || executionPolicy.reasoningEffort || input.modelReasoningEffort;
       run.modelSelectionReason = run.modelSelectionReason || executionPolicy.selectionReason;
-      run.attempt = Math.max(1, Number(run.attempt || 1));
+      const attemptSummary = taskAttemptSummary(state, task, { includeReservations: false });
+      const nextAttempt = attemptSummary.attemptsConsumed + attemptSummary.attemptsInFlight + 1;
+      if (nextAttempt > executionPolicy.maxAttempts) {
+        run.status = "cancelled";
+        run.exitCode = "task_attempt_limit";
+        run.cancellationReason = "Task-wide model attempt limit reached before launch.";
+        run.budgetReservation = false;
+        run.modelBudgetConsumed = false;
+        run.completedAt = now;
+        run.updatedAt = now;
+        const classification = normalizeAutomationFailure("task_attempt_limit", run.cancellationReason);
+        openTaskCircuit(
+          state,
+          task,
+          run,
+          classification,
+          now,
+          attemptSummary.attemptsConsumed,
+          executionPolicy.maxAttempts,
+        );
+        continue;
+      }
+      run.attempt = nextAttempt;
+      run.attemptEpoch = attemptSummary.epoch;
       run.maxAttempts = Math.max(1, Number(run.maxAttempts || executionPolicy.maxAttempts));
       run.retryBackoffMs = Math.max(1_000, Number(run.retryBackoffMs || executionPolicy.retryBackoffMs));
       run.staleRunMs = Math.max(60_000, Number(run.staleRunMs || executionPolicy.staleRunMs));
@@ -1038,6 +1547,9 @@ export async function claimRuns(input = {}) {
       run.notificationError = "";
       run.updatedAt = now;
       run.runnerPid = String(process.pid);
+      run.modelLaunchedAt = now;
+      run.modelBudgetConsumed = true;
+      run.budgetReservation = false;
       run.outputPath = path.join(RUN_OUTPUT_DIR, `${run.id}.log`);
       run.lastMessagePath = path.join(RUN_OUTPUT_DIR, `${run.id}.last-message.md`);
 
@@ -1061,7 +1573,10 @@ export async function claimRuns(input = {}) {
 }
 
 export async function completeRun(runId, input = {}) {
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
@@ -1075,6 +1590,15 @@ export async function completeRun(runId, input = {}) {
     run.outputPath = input.outputPath || run.outputPath || "";
     run.lastMessagePath = input.lastMessagePath || run.lastMessagePath || "";
     run.notes = String(input.notes || run.notes || "").trim();
+    run.elapsedMs = Math.max(
+      0,
+      Number(input.elapsedMs)
+      || (Date.parse(now) - Date.parse(run.startedAt || now)),
+    );
+    run.tokenUsage = input.tokenUsage || run.tokenUsage || {
+      available: false,
+      reason: "provider_did_not_report_usage",
+    };
 
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
@@ -1091,12 +1615,20 @@ export async function completeRun(runId, input = {}) {
 
     let failureDisposition = null;
     if (run.status === "failed") {
-      failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
+      failureDisposition = applyFailedRunToTask(state, task, run, run.exitCode || run.notes || "runner_failed", now);
     }
 
+    const tokenTotal = Number(
+      run.tokenUsage?.totalTokens
+      ?? run.tokenUsage?.total_tokens
+      ?? (
+        Number(run.tokenUsage?.inputTokens ?? run.tokenUsage?.input_tokens ?? 0)
+        + Number(run.tokenUsage?.outputTokens ?? run.tokenUsage?.output_tokens ?? 0)
+      ),
+    );
     const summary = run.status === "completed"
-      ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
-      : `${run.id} failed with exit code ${run.exitCode || "unknown"}. Output: ${run.outputPath || "(not recorded)"}`;
+      ? `${run.id} completed. Model: ${run.model || "(not recorded)"} (${run.modelReasoningEffort || "(not recorded)"}). Elapsed: ${run.elapsedMs}ms. Tokens: ${run.tokenUsage?.available === false ? "unavailable" : tokenTotal}. Output: ${run.outputPath || "(not recorded)"}`
+      : `${run.id} failed with exit code ${run.exitCode || "unknown"}. Model: ${run.model || "(not recorded)"} (${run.modelReasoningEffort || "(not recorded)"}). Elapsed: ${run.elapsedMs}ms. Tokens: ${run.tokenUsage?.available === false ? "unavailable" : tokenTotal}. Output: ${run.outputPath || "(not recorded)"}`;
     await appendTaskComment(state, run, summary, now);
     if (failureDisposition) {
       await appendTaskComment(
@@ -1121,7 +1653,10 @@ export async function completeRun(runId, input = {}) {
 }
 
 export async function reconcileStaleRuns(input = {}) {
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => {
     state.events = state.events || [];
     state.comments = state.comments || [];
     const now = new Date(Number(input.nowMs || Date.now())).toISOString();
@@ -1130,13 +1665,50 @@ export async function reconcileStaleRuns(input = {}) {
       if (run.status !== "running") continue;
       const reason = activeRunStaleReason(run, input);
       if (!reason) continue;
+      const task = findTask(state, run.taskId);
+      const runnerPidLost = reason.startsWith("runner_pid_lost:");
+      const builderHandoffComplete = run.group === "builder"
+        && task
+        && !["in_progress", "qa_review", "blocked"].includes(task.status)
+        && Boolean(task.branchName || run.workflowMode === "local");
+      const reviewerHandoffComplete = run.group === "reviewer" && reviewerRecordedOutcome(state, run);
+      if (runnerPidLost && (builderHandoffComplete || reviewerHandoffComplete)) {
+        run.status = "completed";
+        run.exitCode = "runner_pid_lost_after_handoff";
+        run.completedAt = now;
+        run.updatedAt = now;
+        run.elapsedMs = Math.max(0, Date.parse(now) - Date.parse(run.startedAt || now));
+        run.tokenUsage = run.tokenUsage || {
+          available: false,
+          reason: "runner_pid_lost_before_usage_summary",
+        };
+        applySuccessfulHandoff(state, run, task, now);
+        const message = `${run.id} lost its runner PID after durable handoff evidence was recorded. The run was reconciled as completed without launching replacement model work; workspace ${run.workspacePath || run.executionRepoPath || "(not recorded)"} and thread ${run.threadId || "(not recorded)"} were preserved.`;
+        await appendTaskComment(state, run, message, now);
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: "runner_pid_lost_after_handoff",
+          projectId: run.projectId,
+          taskId: run.taskId,
+          message,
+          createdAt: now,
+        });
+        recovered.push({ runId: run.id, taskId: run.taskId, reason, blocked: false, completed: true });
+        continue;
+      }
       run.status = "failed";
-      run.exitCode = `orphaned_run:${reason}`;
+      run.exitCode = runnerPidLost ? "runner_pid_lost" : `orphaned_run:${reason}`;
       run.completedAt = now;
       run.updatedAt = now;
-      const task = findTask(state, run.taskId);
-      const disposition = applyFailedRunToTask(task, run, run.exitCode, now);
-      const message = `${run.id} recovered from stale running state: ${reason}.`;
+      run.elapsedMs = Math.max(0, Date.parse(now) - Date.parse(run.startedAt || now));
+      run.tokenUsage = run.tokenUsage || {
+        available: false,
+        reason: runnerPidLost ? "runner_pid_lost_before_usage_summary" : "stale_run_recovered_before_usage_summary",
+      };
+      const disposition = applyFailedRunToTask(state, task, run, run.exitCode, now);
+      const message = runnerPidLost
+        ? `${run.id} lost runner PID ${run.runnerPid}. StudioOps preserved workspace ${run.workspacePath || run.executionRepoPath || "(not recorded)"}, thread ${run.threadId || "(not recorded)"}, child PID ${run.childPid || "(not recorded)"}, and output evidence instead of relaunching blindly.`
+        : `${run.id} recovered from stale running state: ${reason}.`;
       await appendTaskComment(state, run, `${message}\n\n${runFailureComment(run, run.exitCode, disposition)}`, now);
       state.events.push({
         id: nextId(state.events, "event"),
@@ -1180,6 +1752,34 @@ async function persistRunThread(run, threadId) {
       createdAt: now,
     });
   });
+}
+
+async function persistRunChildPid(run, childPid) {
+  if (!childPid) return;
+  run.childPid = String(childPid);
+  await mutateState(async (state) => {
+    const liveRun = (state.runs || []).find((item) => item.id === run.id);
+    if (!liveRun || liveRun.status !== "running") return;
+    liveRun.childPid = String(childPid);
+    liveRun.updatedAt = new Date().toISOString();
+  });
+}
+
+function normalizedTokenUsage(value) {
+  if (!value || typeof value !== "object") {
+    return { available: false, reason: "provider_did_not_report_usage" };
+  }
+  const inputTokens = Number(value.inputTokens ?? value.input_tokens ?? 0);
+  const cachedInputTokens = Number(value.cachedInputTokens ?? value.cached_input_tokens ?? 0);
+  const outputTokens = Number(value.outputTokens ?? value.output_tokens ?? 0);
+  const totalTokens = Number(value.totalTokens ?? value.total_tokens ?? inputTokens + outputTokens);
+  return {
+    available: true,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    totalTokens,
+  };
 }
 
 export function sdkThreadOptions(run, input = {}) {
@@ -1232,6 +1832,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
   let pauseReason = "";
   let executionRun = run;
   let authContext = null;
+  let tokenUsage = { available: false, reason: "provider_did_not_report_usage" };
+  const executionStartedMs = Date.now();
 
   const timeout = setTimeout(() => {
     log.write(`\nRunner timeout after ${Math.round(timeoutMs / 1000)}s. Aborting Codex SDK turn.\n`);
@@ -1267,6 +1869,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
         await persistRunThread(run, event.thread_id);
       } else if (event.type === "item.completed" && event.item?.type === "agent_message") {
         finalResponse = event.item.text || "";
+      } else if (event.type === "turn.completed") {
+        tokenUsage = normalizedTokenUsage(event.usage || event.turn?.usage);
       } else if (event.type === "turn.failed") {
         throw new Error(event.error?.message || "Codex SDK turn failed");
       } else if (event.type === "error") {
@@ -1301,8 +1905,9 @@ async function runClaimedRunWithSdk(run, input = {}) {
     outputPath,
     lastMessagePath,
     notes,
+    elapsedMs: Date.now() - executionStartedMs,
+    tokenUsage,
   });
-  if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
   return completed;
 }
 
@@ -1317,6 +1922,7 @@ async function runClaimedRunWithCli(run, input = {}) {
   let executionRun = run;
   let prompt = "";
   let authContext = null;
+  const executionStartedMs = Date.now();
   try {
     authContext = await prepareRunAuth(run, input);
     log.write(formatGitHubAppAuthForLog(authContext));
@@ -1341,7 +1947,6 @@ async function runClaimedRunWithCli(run, input = {}) {
       notes,
     });
     const pauseReason = nonRetryableWorkspaceFailureReason(notes);
-    if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
     return completed;
   }
   const args = [
@@ -1390,6 +1995,9 @@ async function runClaimedRunWithCli(run, input = {}) {
         MISSION_CONTROL_RUN_REASONING_EFFORT: run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort,
       }),
     });
+    persistRunChildPid(run, child.pid).catch((error) => {
+      log.write(`\nCould not persist child PID: ${error.message}\n`);
+    });
 
     const timeout = setTimeout(() => {
       if (settled) return;
@@ -1421,6 +2029,8 @@ async function runClaimedRunWithCli(run, input = {}) {
         outputPath,
         lastMessagePath,
         notes,
+        elapsedMs: Date.now() - executionStartedMs,
+        tokenUsage: { available: false, reason: "codex_cli_did_not_report_usage" },
       });
       resolve(completed);
     });
@@ -1445,6 +2055,8 @@ async function runClaimedRunWithCli(run, input = {}) {
         outputPath,
         lastMessagePath,
         notes,
+        elapsedMs: Date.now() - executionStartedMs,
+        tokenUsage: { available: false, reason: "codex_cli_did_not_report_usage" },
       });
       resolve(completed);
     });
@@ -1510,6 +2122,17 @@ export function formatRunnerReport(report) {
   for (const run of report.results) {
     lines.push(`[${run.id}] ${run.status}${run.exitCode ? ` (${run.exitCode})` : ""}`);
     lines.push(`  Task: ${run.taskId}`);
+    lines.push(`  Model: ${run.model || "(not recorded)"} (${run.modelReasoningEffort || "(not recorded)"})`);
+    lines.push(`  Elapsed: ${run.elapsedMs ?? "(not recorded)"}ms`);
+    const tokenTotal = Number(
+      run.tokenUsage?.totalTokens
+      ?? (
+        Number(run.tokenUsage?.inputTokens || 0)
+        + Number(run.tokenUsage?.outputTokens || 0)
+      ),
+    );
+    lines.push(`  Tokens: ${run.tokenUsage?.available === false || !run.tokenUsage ? "unavailable" : tokenTotal}`);
+    if (run.failureFingerprint) lines.push(`  Failure fingerprint: ${run.failureFingerprint} (${run.failureCode})`);
     if (run.outputPath) lines.push(`  Output: ${run.outputPath}`);
     if (run.lastMessagePath) lines.push(`  Last message: ${run.lastMessagePath}`);
     lines.push("");
@@ -1524,7 +2147,9 @@ export function formatRunnerPlan(plan) {
     "",
   ];
   if (!plan.runnable.length) {
-    lines.push("No queued builder/reviewer runs are ready for this runner.");
+    lines.push(plan.paused
+      ? `Runner claims paused: ${plan.pauseReason || "No new model work is allowed."}`
+      : "No queued builder/reviewer runs are ready for this runner.");
   }
   for (const run of plan.runnable) {
     lines.push(`[${run.id}] ${run.role} ${run.actionType}`);
