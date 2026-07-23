@@ -37,6 +37,16 @@ For non-trivial work, identify the shared architecture before implementation:
 
 If several builders will work in parallel, the foundation task should define these boundaries first.
 
+Broad apps, platforms, epics, and mockup-driven product work must use the StudioOps `systems-architect` gate before builders. Architecture must select the smallest system justified by the workload, record rejected alternatives, inventory canonical supplied assets, and flow into dependency-linked implementation tasks. Infrastructure such as caches, queues, fanout, or extra services requires a stated performance, consistency, durability, isolation, or operating reason.
+
+## Functional Product Gate
+
+- A mockup is not a complete implementation specification and is never an implicit request for a static replica.
+- Unless a task explicitly says `visual-only`, every primary control must work or be explicitly disabled and labeled.
+- Data-bearing surfaces must define their source of truth, persistence lifecycle, authorization boundary, bounded loading strategy, and loading/empty/error/retry states.
+- Durable outcomes must survive refresh and process restart.
+- Core behavior requires executable validation, not only render or snapshot checks.
+
 ## Production Change Gate
 
 Prefer admin-editable content and layout configuration over code changes for routine copy, images, panel ordering, visibility, and SEO metadata.

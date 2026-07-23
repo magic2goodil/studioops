@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { projectFromConfig } from "../src/config.js";
 import {
   activeRunStaleReason,
+  applyFailedRunToTask,
   branchReuseSafetyReason,
   claimRuns,
   cloneFallbackSource,
@@ -127,6 +128,65 @@ test("active builder runs created by dispatch remain runnable after task status 
   assert.equal(report.runnable.length, 1);
   assert.equal(report.runnable[0].id, "run_1");
   assert.equal(report.skipped.length, 0);
+});
+
+test("runner claim is the transition from queued to in progress", async () => {
+  const state = fixtureState(
+    {
+      status: "queued",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+    },
+    {
+      actionType: "start_builder",
+      integrationStatus: "",
+    },
+  );
+
+  const claimed = await claimRuns({
+    state,
+    limit: 1,
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "local",
+      originUrl: "",
+      baseRef: "HEAD",
+      baseCommit: "test-commit",
+    }),
+  });
+
+  assert.equal(claimed.length, 1);
+  assert.equal(state.runs[0].status, "running");
+  assert.equal(state.tasks[0].status, "in_progress");
+});
+
+test("an SDK infrastructure error fails over to codex-cli without waiting for owner repair", () => {
+  const task = {
+    id: "task_1",
+    status: "in_progress",
+    assignedAgentRole: "builder",
+    automationAttemptEpoch: 0,
+  };
+  const run = {
+    id: "run_1",
+    actionType: "start_builder",
+    group: "builder",
+    role: "builder",
+    provider: "codex-sdk",
+    attempt: 1,
+    maxAttempts: 2,
+  };
+  const now = "2026-07-21T12:00:00.000Z";
+
+  const result = applyFailedRunToTask(task, run, "sdk_error", now);
+
+  assert.equal(result.failedOver, true);
+  assert.equal(task.preferredRunnerProvider, "codex-cli");
+  assert.equal(task.status, "queued");
+  assert.equal(task.automationAttemptEpoch, 1);
+  assert.equal(task.automationFailover.from, "codex-sdk");
+  assert.equal(task.automationFailover.to, "codex-cli");
+  assert.ok(Date.parse(task.retryNotBefore) > Date.parse(now));
 });
 
 test("runner does not plan or claim runs while self-update lease is active", async () => {
@@ -308,6 +368,40 @@ test("local preflight never prepares GitHub auth and creates an isolated no-orig
     assert.equal(await git(workspace.workspacePath, ["symbolic-ref", "--short", "HEAD"]), "codex/demo-local");
     assert.equal(await git(workspace.workspacePath, ["remote"]), "");
     assert.equal(await readFile(path.join(workspace.workspacePath, "README.md"), "utf8"), "test\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("systems architect preflight validates the source checkout without GitHub credentials", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-architect-preflight-"));
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["remote", "add", "origin", "https://github.com/example/demo.git"]);
+    let authCalls = 0;
+    const result = await preflightRun({
+      id: "run_architect",
+      group: "architect",
+      role: "systems-architect",
+      actionType: "start_architecture",
+      project: {
+        key: "demo",
+        repoPath,
+        repoUrl: "https://github.com/example/demo.git",
+        workflowMode: "github",
+        defaultBranch: "main",
+      },
+    }, {
+      prepareGitHubAppAuth: async () => {
+        authCalls += 1;
+        throw new Error("Architect preflight must not prepare GitHub credentials.");
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.workflowMode, "local");
+    assert.equal(result.originUrl, "https://github.com/example/demo.git");
+    assert.equal(authCalls, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

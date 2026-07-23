@@ -34,7 +34,7 @@ npm run notifier
 ## Run Continuously
 
 ```bash
-npm run notifier -- --watch --interval 60
+npm run notifier -- --watch --interval 10
 ```
 
 The LaunchAgent example lives at:

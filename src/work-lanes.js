@@ -54,6 +54,7 @@ function textIncludesAny(text, words) {
 function roleLane(role) {
   const normalized = normalize(role);
   if (!normalized) return "";
+  if (normalized.includes("architect")) return "project-wide";
   if (normalized.includes("lead")) return "project-wide";
   if (normalized.includes("backend")) return "backend";
   if (normalized.includes("frontend")) return "frontend";

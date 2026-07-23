@@ -121,6 +121,40 @@ test("default GitHub App credentials remain an intentional fallback when no role
   }
 });
 
+test("missing repository installation reports the exact repository and remediation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    await writeApp(root, "backend-reviewer", { role: "backend-reviewer" });
+    globalThis.fetch = async (url) => {
+      assert.ok(String(url).endsWith("/repos/example/repo/installation"));
+      return {
+        ok: false,
+        status: 404,
+        text: async () => JSON.stringify({ message: "Not Found" }),
+      };
+    };
+
+    await assert.rejects(
+      () => prepareGitHubAppAuth(runFixture(), {
+        githubAppCredentialsDir: root,
+        githubAppRuntimeDir: path.join(root, "runtime"),
+      }),
+      (error) => {
+        assert.equal(error.code, "github_app_not_installed_on_repository");
+        assert.match(error.message, /example\/repo/);
+        assert.match(error.message, /Install that role app/);
+        assert.doesNotMatch(error.message, /^Not Found$/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("accessibility reviewer GitHub App credentials resolve as a reviewer role", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
   const originalFetch = globalThis.fetch;

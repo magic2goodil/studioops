@@ -3,7 +3,7 @@ import { loadConfig } from "./config.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
-const DEFAULT_INTERVAL_SECONDS = 60;
+const DEFAULT_INTERVAL_SECONDS = 10;
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -84,7 +84,7 @@ async function main() {
 Usage:
   studioops-notifier --plan
   studioops-notifier
-  studioops-notifier --watch --interval 60
+  studioops-notifier --watch --interval 10
   studioops notifier --project event-horizons-web
 
 The notifier sends local macOS notifications when a task reaches owner review,

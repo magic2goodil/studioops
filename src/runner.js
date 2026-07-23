@@ -18,7 +18,14 @@ import {
 } from "./github-app-auth.js";
 import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
-import { DATA_DIR, findProject, findTask, mutateState, readState } from "./store.js";
+import {
+  architectureIsCompleteInState,
+  DATA_DIR,
+  findProject,
+  findTask,
+  mutateState,
+  readState,
+} from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
@@ -33,7 +40,7 @@ const DEFAULT_CODEX_BINS = [
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUN_OUTPUT_DIR = path.join(DATA_DIR, "run-outputs");
 const DEFAULT_WORKSPACE_ROOT = defaultStudioOpsWorkspaceRoot("run");
-const RUNNABLE_GROUPS = new Set(["builder", "reviewer"]);
+const RUNNABLE_GROUPS = new Set(["architect", "builder", "reviewer"]);
 const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
@@ -138,7 +145,10 @@ function findRunnableLaneConflict(state, run, extraRuns = []) {
 function staleRunReason(state, run) {
   const task = findTask(state, run.taskId);
   if (!task) return "task_missing";
-  if (task.type === "epic" || (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id)) {
+  if (
+    run.actionType !== "start_architecture"
+    && (task.type === "epic" || (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id))
+  ) {
     return "tracking_container";
   }
 
@@ -153,8 +163,18 @@ function staleRunReason(state, run) {
     return "";
   }
 
+  if (run.actionType === "start_architecture") {
+    if (!["architecture_pending", "architecture_in_progress"].includes(task.status)) {
+      return `task_status_changed:${task.status || "unknown"}`;
+    }
+    if (task.assignedAgentRole && task.assignedAgentRole !== run.role) {
+      return `assignee_changed:${task.assignedAgentRole}`;
+    }
+    return "";
+  }
+
   if (["start_builder", "start_builder_fix", "return_to_builder"].includes(run.actionType)) {
-    if (task.status !== "in_progress") return `task_status_changed:${task.status || "unknown"}`;
+    if (!["queued", "in_progress"].includes(task.status)) return `task_status_changed:${task.status || "unknown"}`;
     if (task.assignedAgentRole && task.assignedAgentRole !== run.role) {
       return `assignee_changed:${task.assignedAgentRole}`;
     }
@@ -381,6 +401,13 @@ export async function preflightRun(run, input = {}) {
   }
 
   const originUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
+  if (run.group === "architect") {
+    return {
+      ok: true,
+      workflowMode: "local",
+      originUrl,
+    };
+  }
   const workflowMode = resolveProjectWorkflowMode(project, originUrl);
   if (workflowMode === "local") {
     const base = await resolveLocalBaseRef(
@@ -515,6 +542,14 @@ export function cloneFallbackSource(repoPath, originUrl) {
 }
 
 export async function prepareRunWorkspace(run, input = {}, log, authContext = null) {
+  if (run.group === "architect") {
+    log.write("Workspace strategy: read-only source checkout for systems architecture\n");
+    return {
+      executionRepoPath: run.project.repoPath,
+      workspacePath: "",
+      strategy: "source-checkout",
+    };
+  }
   const workflowMode = run.workflowMode || resolveProjectWorkflowMode(run.project, run.preflightOriginUrl);
   const gitEnv = workflowAuthEnv(workflowMode, authContext, process.env);
   const enabled = booleanOption(
@@ -724,6 +759,7 @@ StudioOps CLI:
 \`node ${missionControlCli}\`
 
 Automation rules:
+- This run is ${run.group === "architect" ? "a systems-architecture pass: inspect the repository and supplied assets, create/update StudioOps tasks, and record the architecture decision; do not edit product code or create a feature branch/PR" : "an implementation or review pass governed by the task prompt"}.
 - You may create local branches, edit code, run validation, commit, push, and open/update a PR when the task requires it.
 - Do not merge PRs.
 - Do not deploy production.
@@ -746,6 +782,7 @@ ${run.prompt || ""}
 }
 
 function restoreTaskStatusForRun(run, task) {
+  if (run.actionType === "start_architecture") return "architecture_pending";
   if (["start_builder_fix", "return_to_builder"].includes(run.actionType)) return "needs_changes";
   if (["start_builder", "unblock_task"].includes(run.actionType)) return "queued";
   if (run.actionType === "qa_integration_blocked") return "qa_review";
@@ -762,8 +799,19 @@ function reviewerRecordedOutcome(state, run) {
   });
 }
 
-function successfulHandoffFailure(state, run, task) {
+export function successfulHandoffFailure(state, run, task) {
   if (!task) return "task_missing_after_run";
+  if (run.group === "architect") {
+    if (task.architectureStatus !== "completed") return "architecture_handoff_missing";
+    const childTaskIds = task.architectureDecisionTaskIds || [];
+    if (!childTaskIds.length) return "architecture_task_graph_missing";
+    const childTasks = childTaskIds.map((taskId) => findTask(state, taskId));
+    if (
+      childTasks.some((child) => !child)
+      || childTasks.some((child) => !architectureIsCompleteInState(state, child))
+    ) return "architecture_task_graph_invalid";
+    return "";
+  }
   if (run.group === "builder") {
     if (task.status !== "in_progress" && task.status !== "qa_review") return "";
     if (task.branchName && task.prUrl && run.actionType !== "qa_integration_blocked") return "";
@@ -793,39 +841,48 @@ function applySuccessfulHandoff(state, run, task, now) {
   }
 }
 
-function applyFailedRunToTask(task, run, reason, now) {
+export function applyFailedRunToTask(task, run, reason, now) {
   if (!task || task.automationBlocker?.type === "configuration") return { blocked: true, retryAt: "" };
   const attempt = Math.max(1, Number(run.attempt || 1));
   const maxAttempts = Math.max(1, Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts));
   task.lastAutomationFailure = reason;
   task.lastAutomationFailureRunId = run.id;
   task.updatedAt = now;
+  if (
+    reason === "sdk_error"
+    && run.provider === "codex-sdk"
+    && task.preferredRunnerProvider !== "codex-cli"
+  ) {
+    task.preferredRunnerProvider = "codex-cli";
+    task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
+    task.automationFailover = {
+      from: "codex-sdk",
+      to: "codex-cli",
+      reason,
+      runId: run.id,
+      failedOverAt: now,
+    };
+    task.status = restoreTaskStatusForRun(run, task);
+    task.assignedAgentRole = run.group === "reviewer" ? run.role : run.group === "architect" ? "systems-architect" : "builder";
+    task.retryNotBefore = new Date(Date.parse(now) + 15_000).toISOString();
+    return { blocked: false, retryAt: task.retryNotBefore, failedOver: true };
+  }
   if (attempt >= maxAttempts) {
     const resumeStatus = restoreTaskStatusForRun(run, task);
     task.status = "blocked";
     task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
+    const recoveryCount = Math.max(0, Number(task.lastAutomationRecoveryCount || 0));
+    const recoveryDelayMs = Math.min(15 * 60 * 1000, 2 * 60 * 1000 * (2 ** recoveryCount));
     task.automationBlocker = {
-      type: "circuit",
+      type: "transient",
       reason,
       runId: run.id,
       attempts: attempt,
       resumeStatus,
       blockedAt: now,
-      retryAt: "",
-    };
-    task.automationCircuit = {
-      state: "open",
-      scope: "task",
-      reasonCode: reason,
-      normalizedReason: `StudioOps stopped after ${attempt}/${maxAttempts} failed execution attempts.`,
-      failureFingerprint: `${task.id}:${run.attemptKey || run.actionType || "run"}:${reason}`,
-      attemptsConsumed: attempt,
-      maxAttempts,
-      openedAt: now,
-      nextCheapProbe: "Inspect the preserved run output and verify the underlying blocker without launching a model.",
-      resumeAction: `studioops circuit-reset --task ${task.id} --reason verified`,
-      remediation: "Repair or verify the underlying blocker, then explicitly reset this task circuit.",
+      retryAt: new Date(Date.parse(now) + recoveryDelayMs).toISOString(),
+      recoveryCount,
     };
     return { blocked: true, retryAt: "" };
   }
@@ -837,8 +894,11 @@ function applyFailedRunToTask(task, run, reason, now) {
 }
 
 function runFailureComment(run, reason, disposition) {
+  if (disposition.failedOver) {
+    return `${run.id} failed in the Codex SDK path: ${reason}. StudioOps switched this task to the approved codex-cli provider and will retry after ${disposition.retryAt}.`;
+  }
   if (disposition.blocked) {
-    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. The task circuit is open; StudioOps will not spend another model run until the blocker is verified and the circuit is explicitly reset.`;
+    return `${run.id} stopped after ${run.attempt || 1}/${run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts} attempts: ${reason}. Rapid retries are paused; StudioOps will run one bounded automatic recovery cycle before opening the task circuit.`;
   }
   return `${run.id} failed: ${reason}. StudioOps will retry no earlier than ${disposition.retryAt}.`;
 }
@@ -883,6 +943,7 @@ async function recordUnsafeBranchReuse(run, reason) {
 
 function nonRetryableWorkspaceFailureReason(notes) {
   const text = String(notes || "");
+  if (/github_app_not_installed_on_repository/i.test(text)) return "github_app_not_installed_on_repository";
   if (/GitHub App credentials .* were not found/i.test(text)) return "missing_github_app_credentials";
   if (/GitHub App credentials .* invalid/i.test(text)) return "invalid_github_app_credentials";
   if (/could not read app\.json/i.test(text)) return "invalid_github_app_credentials";
@@ -1093,6 +1154,15 @@ export async function claimRuns(input = {}) {
       run.runnerPid = String(process.pid);
       run.outputPath = path.join(RUN_OUTPUT_DIR, `${run.id}.log`);
       run.lastMessagePath = path.join(RUN_OUTPUT_DIR, `${run.id}.last-message.md`);
+      if (task && run.group === "architect") {
+        task.status = "architecture_in_progress";
+        task.assignedAgentRole = run.role;
+        task.updatedAt = now;
+      } else if (task && run.group === "builder" && run.actionType !== "qa_integration_blocked") {
+        task.status = "in_progress";
+        task.assignedAgentRole = run.role;
+        task.updatedAt = now;
+      }
 
       state.events.push({
         id: nextId(state.events, "event"),
@@ -1297,7 +1367,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Provider: codex-sdk\n`);
     log.write(`Model: ${run.model || input.model || DEFAULT_EXECUTION_POLICY.model}\n`);
     log.write(`Reasoning: ${run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort}\n`);
-    authContext = await prepareRunAuth(run, input);
+    authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
     log.write(formatGitHubAppAuthForLog(authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);
@@ -1371,7 +1441,7 @@ async function runClaimedRunWithCli(run, input = {}) {
   let prompt = "";
   let authContext = null;
   try {
-    authContext = await prepareRunAuth(run, input);
+    authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
     log.write(formatGitHubAppAuthForLog(authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);

@@ -13,11 +13,20 @@ import {
 const execFileAsync = promisify(execFile);
 const WORKERS = ["dispatcher", "runner", "supervisor", "notifier"];
 const LABEL_PREFIX = "com.codex.mission-control.";
-const DEFAULT_WORK_WAIT_MS = 12 * 60 * 1000;
+const DEFAULT_WORK_WAIT_MS = 45 * 1000;
 
 function ageMs(value, nowMs) {
   const parsed = Date.parse(value || "");
   return Number.isFinite(parsed) ? nowMs - parsed : Number.POSITIVE_INFINITY;
+}
+
+function workerSweepIsOverdue(heartbeats, worker, nowMs, workWaitMs) {
+  const heartbeat = (heartbeats || []).find((item) => item.worker === worker);
+  if (!heartbeat || heartbeat.invalid || heartbeat.status === "busy") return false;
+  const lastSweep = heartbeat.lastSweepStartedAt || heartbeat.lastSweepCompletedAt;
+  if (!lastSweep) return false;
+  const intervalMs = Math.max(1_000, Number(heartbeat.intervalSeconds || 15) * 1000);
+  return ageMs(lastSweep, nowMs) > Math.max(workWaitMs, intervalMs * 2);
 }
 
 export function planWatchdogActions(state, heartbeats, input = {}) {
@@ -35,9 +44,13 @@ export function planWatchdogActions(state, heartbeats, input = {}) {
   const actions = staleWorkerNames(heartbeats, WORKERS, input)
     .map((worker) => ({ type: "restart_worker", worker, reason: "heartbeat_stale_or_missing" }));
   const scheduled = new Set(actions.map((item) => item.worker));
-  const workWaitMs = Math.max(60_000, Number(input.workWaitMs || DEFAULT_WORK_WAIT_MS));
+  const workWaitMs = Math.max(15_000, Number(input.workWaitMs || DEFAULT_WORK_WAIT_MS));
   const queuedRunWaiting = (state.runs || []).some((run) => run.status === "queued" && ageMs(run.createdAt, nowMs) > workWaitMs);
-  if (queuedRunWaiting && !scheduled.has("runner")) {
+  if (
+    queuedRunWaiting
+    && !scheduled.has("runner")
+    && workerSweepIsOverdue(heartbeats, "runner", nowMs, workWaitMs)
+  ) {
     actions.push({ type: "restart_worker", worker: "runner", reason: "queued_run_waiting" });
     scheduled.add("runner");
   }
@@ -47,7 +60,11 @@ export function planWatchdogActions(state, heartbeats, input = {}) {
     && ageMs(task.updatedAt || task.createdAt, nowMs) > workWaitMs
     && !(state.runs || []).some((run) => run.taskId === task.id && ["queued", "running"].includes(run.status))
   ));
-  if (dispatchWaiting && !scheduled.has("dispatcher")) {
+  if (
+    dispatchWaiting
+    && !scheduled.has("dispatcher")
+    && workerSweepIsOverdue(heartbeats, "dispatcher", nowMs, workWaitMs)
+  ) {
     actions.push({ type: "restart_worker", worker: "dispatcher", reason: "dispatchable_task_waiting" });
   }
   return actions;

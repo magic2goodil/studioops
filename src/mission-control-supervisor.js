@@ -4,7 +4,7 @@ import { readState } from "./store.js";
 import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
 import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
-const DEFAULT_INTERVAL_SECONDS = 300;
+const DEFAULT_INTERVAL_SECONDS = 15;
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -93,9 +93,9 @@ async function main() {
 Usage:
   studioops-supervisor
   studioops-supervisor --json
-  studioops-supervisor --watch --interval 300
+  studioops-supervisor --watch --interval 15
   studioops-supervisor --all
-  studioops supervisor --watch --interval 300
+  studioops supervisor --watch --interval 15
 
 The supervisor is read-oriented. It inspects every project and task, then prints the
 next builder, reviewer, dependency, or owner handoff action. It does not merge,

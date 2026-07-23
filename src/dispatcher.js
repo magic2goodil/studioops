@@ -3,6 +3,7 @@ import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
+  "start_architecture",
   "start_builder",
   "start_builder_fix",
   "return_to_builder",
@@ -21,6 +22,7 @@ const DEFAULTS = {
   provider: "prompt-outbox",
   maxDispatchesPerSweep: 6,
   builderConcurrency: 3,
+  architectConcurrency: 1,
   reviewerConcurrency: 3,
   ownerConcurrency: 10,
 };
@@ -46,6 +48,7 @@ function normalizeList(value) {
 
 function runGroupFor(action) {
   const role = String(action.role || "").toLowerCase();
+  if (action.type === "start_architecture" || role.includes("architect")) return "architect";
   if (
     action.type === "notify_owner"
     || action.type === "notify_qa_review"
@@ -57,6 +60,7 @@ function runGroupFor(action) {
 }
 
 function concurrencyLimitFor(group, options) {
+  if (group === "architect") return Number(options.architectConcurrency || DEFAULTS.architectConcurrency);
   if (group === "reviewer") return Number(options.reviewerConcurrency || DEFAULTS.reviewerConcurrency);
   if (group === "owner") return Number(options.ownerConcurrency || DEFAULTS.ownerConcurrency);
   return Number(options.builderConcurrency || DEFAULTS.builderConcurrency);
@@ -71,8 +75,9 @@ function dispatchStatusFor(action) {
 function taskStatusFor(action) {
   if (["notify_owner", "notify_qa_review", "qa_bundle_ready", "qa_integration_blocked"].includes(action.type)) return "";
   if (action.type === "unblock_task") return "queued";
+  if (action.type === "start_architecture") return "architecture_pending";
   if (action.type === "start_builder" || action.type === "start_builder_fix" || action.type === "return_to_builder") {
-    return "in_progress";
+    return "queued";
   }
   return action.nextStatus || "";
 }
@@ -93,6 +98,17 @@ function activeRunMatches(run, action, task) {
   if (!ACTIVE_RUN_STATUSES.has(run.status)) return false;
   if (run.role !== action.role) return false;
   return run.group === runGroupFor(action);
+}
+
+export function executionAttemptWasConsumed(run = {}) {
+  if (run.status === "cancelled") return Boolean(run.startedAt);
+  return ["running", "completed", "failed"].includes(run.status);
+}
+
+function executionAttemptCount(state, attemptKey) {
+  return (state.runs || []).filter((run) => (
+    run.attemptKey === attemptKey && executionAttemptWasConsumed(run)
+  )).length;
 }
 
 function hasExistingDispatch(state, action, task) {
@@ -164,7 +180,7 @@ function dispatchSafetyReason(state, task, action, options) {
   if (task.automationCircuit?.state === "open") return "task_circuit_open";
   const executionPolicy = resolveExecutionPolicy(task, action, options);
   const attemptKey = executionAttemptKey(task, action);
-  const attemptCount = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length;
+  const attemptCount = executionAttemptCount(state, attemptKey);
   if (attemptCount >= executionPolicy.maxAttempts) return "attempt_budget_exhausted";
   return "";
 }
@@ -188,7 +204,7 @@ function openExhaustedAttemptCircuits(state, actions, skipped, options, now) {
     if (!task || !action || task.automationCircuit?.state === "open") continue;
     const policy = resolveExecutionPolicy(task, action, options);
     const attemptKey = executionAttemptKey(task, action);
-    const attempts = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length;
+    const attempts = executionAttemptCount(state, attemptKey);
     const resumeStatus = task.status;
     task.status = "blocked";
     task.assignedAgentRole = "owner";
@@ -337,7 +353,7 @@ function makeRun(state, task, action, options, now) {
   const profile = laneProfile(task, action);
   const executionPolicy = resolveExecutionPolicy(task, action, options);
   const attemptKey = executionAttemptKey(task, action);
-  const attempt = (state.runs || []).filter((run) => run.attemptKey === attemptKey).length + 1;
+  const attempt = executionAttemptCount(state, attemptKey) + 1;
   return {
     id: nextId(state.runs, "run"),
     taskId: task.id,
@@ -350,7 +366,7 @@ function makeRun(state, task, action, options, now) {
     lane: profile.lane,
     conflictGroup: profile.conflictGroup,
     fileScope: profile.fileScope,
-    provider: options.provider || DEFAULTS.provider,
+    provider: task.preferredRunnerProvider || options.provider || DEFAULTS.provider,
     model: executionPolicy.model,
     modelReasoningEffort: executionPolicy.reasoningEffort,
     modelSelectionReason: executionPolicy.selectionReason,

@@ -4,7 +4,38 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { planWatchdogActions, restartWorker } from "../src/watchdog.js";
-import { readWorkerHeartbeats, staleWorkerNames, writeWorkerHeartbeat } from "../src/worker-heartbeat.js";
+import {
+  createOverlappingSweepStarter,
+  readWorkerHeartbeats,
+  staleWorkerNames,
+  writeWorkerHeartbeat,
+} from "../src/worker-heartbeat.js";
+
+test("overlapping sweep starter keeps polling while a prior sweep owns long-running jobs", async () => {
+  let releaseFirst;
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const started = [];
+  const sweeps = createOverlappingSweepStarter(async () => {
+    const index = started.length + 1;
+    started.push(index);
+    if (index === 1) await firstBlocked;
+  });
+
+  const first = sweeps.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sweeps.activeCount, 1);
+
+  const second = sweeps.start();
+  await second;
+  assert.deepEqual(started, [1, 2]);
+  assert.equal(sweeps.activeCount, 1);
+
+  releaseFirst();
+  await first;
+  assert.equal(sweeps.activeCount, 0);
+});
 
 test("heartbeats are written atomically and stale workers are identified", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mission-control-heartbeat-"));
@@ -46,6 +77,9 @@ test("watchdog wakes the runner for old queued work and dispatcher for stranded 
   const fresh = ["dispatcher", "runner", "supervisor", "notifier"].map((worker) => ({
     worker,
     updatedAt: new Date(nowMs).toISOString(),
+    status: "idle",
+    intervalSeconds: 15,
+    lastSweepStartedAt: "2026-07-21T10:00:00.000Z",
   }));
   const state = {
     runs: [{ id: "run_1", taskId: "task_1", status: "queued", createdAt: "2026-07-21T10:00:00.000Z" }],
@@ -54,6 +88,24 @@ test("watchdog wakes the runner for old queued work and dispatcher for stranded 
   const actions = planWatchdogActions(state, fresh, { nowMs, workWaitMs: 60_000 });
   assert.ok(actions.some((item) => item.worker === "runner" && item.reason === "queued_run_waiting"));
   assert.ok(actions.some((item) => item.worker === "dispatcher" && item.reason === "dispatchable_task_waiting"));
+});
+
+test("watchdog does not restart healthy workers for queued or capacity-blocked work", () => {
+  const nowMs = Date.parse("2026-07-21T12:00:00.000Z");
+  const heartbeats = ["dispatcher", "runner", "supervisor", "notifier"].map((worker) => ({
+    worker,
+    updatedAt: new Date(nowMs).toISOString(),
+    status: "idle",
+    intervalSeconds: 10,
+    lastSweepStartedAt: new Date(nowMs - 5_000).toISOString(),
+    lastSweepCompletedAt: new Date(nowMs - 4_000).toISOString(),
+  }));
+  const state = {
+    runs: [{ id: "run_1", taskId: "task_1", status: "queued", createdAt: "2026-07-21T10:00:00.000Z" }],
+    tasks: [{ id: "task_2", status: "queued", updatedAt: "2026-07-21T10:00:00.000Z" }],
+  };
+
+  assert.deepEqual(planWatchdogActions(state, heartbeats, { nowMs, workWaitMs: 15_000 }), []);
 });
 
 test("disk pressure pauses restart planning instead of creating a restart loop", () => {

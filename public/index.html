@@ -68,6 +68,9 @@
           <select id="statusFilter" aria-label="Status filter">
             <option value="">All statuses</option>
             <option value="idea">Idea</option>
+            <option value="architecture_pending">Architecture pending</option>
+            <option value="architecture_in_progress">Architecture in progress</option>
+            <option value="architecture_ready">Architecture ready</option>
             <option value="ready">Ready</option>
             <option value="queued">Queued</option>
             <option value="in_progress">In progress</option>
@@ -123,9 +126,18 @@
           <label>User Story <textarea name="userStory" rows="2" placeholder="As a customer, I want..."></textarea></label>
           <label>Expected Outcome <textarea name="expectedOutcome" rows="3" placeholder="What should be true when this is complete?"></textarea></label>
           <label>Visual Attachments <textarea name="attachments" rows="3" placeholder="One image path, screenshot, mockup URL, or reference per line"></textarea></label>
+          <label>Delivery Mode
+            <select name="deliveryMode">
+              <option value="functional">Functional product</option>
+              <option value="prototype">Functional prototype</option>
+              <option value="visual-only">Visual-only (explicit)</option>
+            </select>
+          </label>
+          <label class="checkbox-row"><input name="architectureRequired" type="checkbox"> Require systems architecture before builders</label>
           <label>Status
             <select name="status">
               <option value="idea">Idea</option>
+              <option value="architecture_pending">Architecture pending</option>
               <option value="ready">Ready</option>
               <option value="queued">Queued</option>
             </select>

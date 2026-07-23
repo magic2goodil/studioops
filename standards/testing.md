@@ -28,6 +28,10 @@ When working from a mockup:
 - state how mobile, tablet, and desktop layouts map to the mockup
 - note any intentional deviations
 - verify the rest of the visible page was not left in a mismatched design state
+- exercise every visible primary control or verify it is explicitly disabled and labeled
+- verify data survives refresh/restart where the task promises persistence
+- verify loading, empty, error, and retry behavior for each data-bearing surface
+- run at least one end-to-end or integration smoke path for the core user outcome unless the task is explicitly `visual-only`
 
 ## Performance-Sensitive Work
 
@@ -42,4 +46,3 @@ Run Lighthouse, WebPageTest, browser performance tools, or a project-approved eq
 ## Backend Work
 
 Backend tasks should include relevant unit, integration, migration, or smoke checks. If full testing is not practical, record the smallest meaningful validation performed and the remaining risk.
-

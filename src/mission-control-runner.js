@@ -7,9 +7,12 @@ import {
   planRunnableRuns,
   runQueuedRuns,
 } from "./runner.js";
-import { runResilientWorkerLoop } from "./worker-heartbeat.js";
+import {
+  createOverlappingSweepStarter,
+  runResilientWorkerLoop,
+} from "./worker-heartbeat.js";
 
-const DEFAULT_INTERVAL_SECONDS = 300;
+const DEFAULT_INTERVAL_SECONDS = 10;
 const DEFAULT_LIMIT = 1;
 
 function parseArgs(argv) {
@@ -104,12 +107,20 @@ async function runOnce(args) {
 
 async function runWatch(args) {
   const options = await optionsFrom(args);
+  const sweeps = createOverlappingSweepStarter(
+    () => runOnce(args),
+    {
+      onError: (error) => console.error(
+        `[runner] background sweep failed; the watcher will continue polling: ${error?.message || error}`,
+      ),
+    },
+  );
   await runResilientWorkerLoop({
     worker: "runner",
     intervalSeconds: options.intervalSeconds,
     runOnce: async () => {
-      await runOnce(args);
-      console.log("");
+      sweeps.start();
+      console.log(`[runner] sweep scheduled (${sweeps.activeCount} active sweep${sweeps.activeCount === 1 ? "" : "s"}).`);
     },
   });
 }
@@ -122,7 +133,7 @@ async function main() {
 Usage:
   studioops-runner --plan
   studioops-runner
-  studioops-runner --watch --interval 300 --limit 1
+  studioops-runner --watch --interval 10 --limit 1
   studioops-runner --watch --timeout-ms 7200000
   studioops-runner --provider codex-sdk
   studioops-runner --model gpt-5.6-sol --model-reasoning-effort high

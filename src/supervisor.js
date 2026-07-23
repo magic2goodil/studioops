@@ -1,4 +1,8 @@
-import { reviewPolicyForProject, reviewStagesForProject } from "./store.js";
+import {
+  architectureIsCompleteInState,
+  reviewPolicyForProject,
+  reviewStagesForProject,
+} from "./store.js";
 import {
   branchWebUrl,
   integrationBranchName,
@@ -187,7 +191,6 @@ function taskActions(state, task, options = {}) {
   }
 
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
-  if (task.type === "epic" || hasChildren) return [];
 
   const missingDependencies = incompleteDependencies(state, task);
   const retryNotBefore = Date.parse(task.retryNotBefore || "");
@@ -201,6 +204,46 @@ function taskActions(state, task, options = {}) {
       options,
     )];
   }
+
+  const architectureComplete = architectureIsCompleteInState(state, task);
+  if (
+    task.architectureRequired
+    && !architectureComplete
+    && task.architectureParentTaskId
+  ) {
+    const architectureParent = state.tasks.find((candidate) => (
+      candidate.id === task.architectureParentTaskId
+      && candidate.projectId === task.projectId
+    ));
+    return [actionBase(
+      state,
+      task,
+      "waiting_on_architecture",
+      "",
+      architectureParent
+        ? `Waiting for parent ${architectureParent.id} to record the durable architecture decision and governed task graph.`
+        : `Waiting for missing architecture parent ${task.architectureParentTaskId} to be repaired.`,
+      options,
+    )];
+  }
+  if (
+    ["architecture_pending", "architecture_in_progress"].includes(task.status)
+    || (BUILDABLE_STATUSES.has(task.status) && task.architectureRequired && !architectureComplete)
+  ) {
+    return [actionBase(
+      state,
+      task,
+      "start_architecture",
+      "systems-architect",
+      "This product/app task requires a durable systems architecture and implementation task graph before builders can start.",
+      {
+        ...options,
+        nextStatus: "architecture_in_progress",
+      },
+    )];
+  }
+
+  if (task.type === "epic" || hasChildren) return [];
 
   if (BUILDABLE_STATUSES.has(task.status)) {
     if (missingDependencies.length) {
@@ -370,13 +413,19 @@ function sortActions(actions) {
 
 export function createSupervisorReport(state, options = {}) {
   const allActions = sortActions((state.tasks || []).flatMap((task) => taskActions(state, task, options)));
-  const passiveActionTypes = new Set(["waiting_on_dependency", "waiting_for_retry", "blocked", "release_candidate_ready"]);
+  const passiveActionTypes = new Set([
+    "waiting_on_architecture",
+    "waiting_on_dependency",
+    "waiting_for_retry",
+    "blocked",
+    "release_candidate_ready",
+  ]);
   const actions = options.includeWaiting || options.all
     ? allActions
     : allActions.filter((action) => !passiveActionTypes.has(action.type));
   return {
     generatedAt: new Date().toISOString(),
-    intervalSeconds: Number(options.intervalSeconds || 300),
+    intervalSeconds: Number(options.intervalSeconds || 15),
     mode: options.mode || "once",
     projects: (state.projects || []).map((project) => projectSummary(state, project)),
     totals: {
