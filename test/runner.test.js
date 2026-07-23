@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { projectFromConfig } from "../src/config.js";
 import {
   activeRunStaleReason,
+  applyFailedRunToTask,
   branchReuseSafetyReason,
   claimRuns,
   cloneFallbackSource,
@@ -127,6 +128,55 @@ test("active builder runs created by dispatch remain runnable after task status 
   assert.equal(report.runnable.length, 1);
   assert.equal(report.runnable[0].id, "run_1");
   assert.equal(report.skipped.length, 0);
+});
+
+test("runner claim is the transition from queued to in progress", async () => {
+  const state = fixtureState(
+    {
+      status: "queued",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+    },
+    {
+      actionType: "start_builder",
+      integrationStatus: "",
+    },
+  );
+
+  const claimed = await claimRuns({ state, limit: 1 });
+
+  assert.equal(claimed.length, 1);
+  assert.equal(state.runs[0].status, "running");
+  assert.equal(state.tasks[0].status, "in_progress");
+});
+
+test("an SDK infrastructure error fails over to codex-cli without waiting for owner repair", () => {
+  const task = {
+    id: "task_1",
+    status: "in_progress",
+    assignedAgentRole: "builder",
+    automationAttemptEpoch: 0,
+  };
+  const run = {
+    id: "run_1",
+    actionType: "start_builder",
+    group: "builder",
+    role: "builder",
+    provider: "codex-sdk",
+    attempt: 1,
+    maxAttempts: 2,
+  };
+  const now = "2026-07-21T12:00:00.000Z";
+
+  const result = applyFailedRunToTask(task, run, "sdk_error", now);
+
+  assert.equal(result.failedOver, true);
+  assert.equal(task.preferredRunnerProvider, "codex-cli");
+  assert.equal(task.status, "queued");
+  assert.equal(task.automationAttemptEpoch, 1);
+  assert.equal(task.automationFailover.from, "codex-sdk");
+  assert.equal(task.automationFailover.to, "codex-cli");
+  assert.ok(Date.parse(task.retryNotBefore) > Date.parse(now));
 });
 
 test("runner does not plan or claim runs while self-update lease is active", async () => {

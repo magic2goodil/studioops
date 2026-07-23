@@ -34,13 +34,13 @@ npm run supervisor -- --all
 ## Run Continuously
 
 ```bash
-npm run supervisor -- --watch --interval 300
+npm run supervisor -- --watch --interval 15
 ```
 
-The default interval is 300 seconds. For active local work, 60 seconds is reasonable:
+The default interval is 15 seconds for low-latency local delivery:
 
 ```bash
-npm run supervisor -- --watch --interval 60
+npm run supervisor -- --watch --interval 15
 ```
 
 ## Keep It Running On macOS
@@ -78,6 +78,7 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.codex.mission-control.
 
 The supervisor emits active actions like:
 
+- `start_architecture`: broad product/mockup work needs the `systems-architect` before builders.
 - `start_builder`: a `ready` or `queued` task can be picked up by a builder.
 - `unblock_task`: a blocked task can return to the queue.
 - `start_builder_fix`: reviewer changes need builder work.
@@ -129,7 +130,7 @@ Local config can set the supervisor defaults:
 {
   "defaults": {
     "supervisor": {
-      "intervalSeconds": 300,
+      "intervalSeconds": 15,
       "baseUrl": "http://127.0.0.1:4317",
       "ownerNotificationStatus": "user_review",
       "builderConcurrency": 1,

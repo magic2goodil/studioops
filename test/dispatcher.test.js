@@ -136,6 +136,62 @@ test("finished failed or cancelled runs do not permanently block redispatch", ()
   assert.equal(report.skipped.length, 0);
 });
 
+test("a cancelled run that never started does not consume an execution attempt", async () => {
+  const state = fixtureState();
+  state.runs.push({
+    id: "run_1",
+    taskId: "task_2",
+    projectId: "project_1",
+    attemptKey: "task_2:0:qa_integration_blocked:builder",
+    status: "cancelled",
+    startedAt: "",
+  });
+  const action = {
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+    taskStatus: "qa_review",
+    priority: "high",
+    reason: "QA integration is blocked with status conflict.",
+  };
+
+  const report = await dispatchSupervisorActions([action], { state });
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.runs[0].attempt, 1);
+});
+
+test("builder dispatch stays truthfully queued until the runner claims it", async () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+  };
+  const report = await dispatchSupervisorActions([{
+    id: "task_1:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_1",
+    taskTitle: "QA-ready task",
+    taskStatus: "ready",
+    priority: "high",
+    reason: "Ready to build.",
+    nextStatus: "in_progress",
+  }], { state });
+
+  assert.equal(report.runs[0].status, "queued");
+  assert.equal(state.tasks[0].status, "queued");
+});
+
 test("queued runs still block duplicate dispatches", () => {
   const state = fixtureState();
   state.runs.push({

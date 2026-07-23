@@ -192,6 +192,8 @@ function taskRelationshipList(tasks, emptyText) {
 
 function workflowOwner(task) {
   if (task.assignedAgentRole) return task.assignedAgentRole;
+  if (["architecture_pending", "architecture_in_progress"].includes(task.status)) return "systems-architect";
+  if (task.status === "architecture_ready") return "product";
   if (task.status === "qa_review") return "local QA";
   if (task.status === "approved_for_main") return "promotion-worker";
   if (task.status === "promotion_blocked") return "builder";
@@ -886,6 +888,8 @@ async function renderDetail() {
         <p>${escapeHtml(fullTask.description || "No description yet.")}</p>
         ${fullTask.userStory ? `<h3>User Story</h3><p>${escapeHtml(fullTask.userStory)}</p>` : ""}
         ${fullTask.expectedOutcome ? `<h3>Expected Outcome</h3><p>${escapeHtml(fullTask.expectedOutcome)}</p>` : ""}
+        <h3>Delivery Mode</h3><p>${escapeHtml(fullTask.deliveryMode || "functional")}</p>
+        ${fullTask.architectureRequired ? `<h3>Systems Architecture</h3><p>${escapeHtml(fullTask.architectureStatus || "pending")}</p>${fullTask.architectureSummary ? `<p>${escapeHtml(fullTask.architectureSummary)}</p>` : ""}` : ""}
       </section>
       ${renderHierarchyPanel(fullTask)}
       ${renderBranchPanel(fullTask, project)}
@@ -913,6 +917,8 @@ async function renderDetail() {
       <button type="button" data-status="done">Done</button>
     </div>
     ${renderComments(fullTask.comments || [])}
+    <h3>Systems Architect Prompt</h3>
+    <div class="prompt-box">${escapeHtml(prompts["systems-architect"] || "Prompt unavailable.")}</div>
     <h3>Builder Prompt</h3>
     <div class="prompt-box">${escapeHtml(prompts.builder || "Prompt unavailable.")}</div>
     <h3>Backend Reviewer Prompt</h3>

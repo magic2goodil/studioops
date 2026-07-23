@@ -46,6 +46,12 @@ Runner docs:
 docs/RUNNER.md
 ```
 
+Systems architect docs:
+
+```text
+docs/ARCHITECT.md
+```
+
 Notifier docs:
 
 ```text
@@ -95,6 +101,10 @@ Review the branch for task task_123 and tell me if it is ready for me.
 ## Intake Standard
 
 Every non-trivial task should be shaped into a real build ticket before implementation.
+
+Broad apps, platforms, epics, and mockup-driven product work must pass through the `systems-architect` gate before builders. The architect is pinned to `gpt-5.6-sol` at `xhigh`, records the cross-cutting technical decisions, and creates the dependency-linked implementation task graph. See [ARCHITECT.md](ARCHITECT.md).
+
+Functional delivery is the default. `visual-only` must be stated explicitly. A mockup is evidence of presentation and interaction intent, not authorization to deliver a static replica.
 
 Required fields:
 
@@ -218,35 +228,38 @@ Twig is acceptable and preferred for PHP/Drupal-style projects when already avai
 When the user says to build:
 
 1. Create or update the StudioOps task.
-2. Confirm parent epic and dependency links when this is part of larger work.
-3. If the task depends on foundation/design-system/data-access work, do not start the builder until that dependency is ready.
-4. Set task status to `ready` or `queued`.
-5. Let the scheduled dispatcher create a durable builder run, or run `npm run dispatcher`.
-6. Let the scheduled runner consume the queued builder/reviewer run, or run `npm run runner`.
-7. If automated runner support is unavailable, generate the builder prompt from StudioOps and hand it to a Codex builder task/thread.
-8. Builder creates a feature branch using:
+2. Route broad app/platform/mockup work to `architecture_pending`.
+3. Let the `systems-architect` inspect the repository and supplied assets, choose the justified system/data/API/performance boundaries, and create dependency-linked child tasks.
+4. Create each implementation child with the architecture task as its parent and `--architecture-approved`; this stages the child without making it buildable.
+5. Record architecture completion only after StudioOps validates the complete child contract and acyclic dependency graph. The same transaction marks the parent complete and its governed children ready, so no child builder can dispatch early.
+6. Confirm parent epic and dependency links when this is part of larger work.
+7. If the task depends on foundation/design-system/data-access work, do not start the builder until that dependency is ready.
+8. Let the scheduled dispatcher create a durable builder run, or run `npm run dispatcher`.
+9. Let the scheduled runner consume the queued builder/reviewer run, or run `npm run runner`.
+10. If automated runner support is unavailable, generate the builder prompt from StudioOps and hand it to a Codex builder task/thread.
+11. Builder creates a feature branch using:
 
 ```text
 codex/<project-key>-<task-id>-<short-title>
 ```
 
-9. Builder implements the change, validates it, commits, pushes, and opens a PR when the project workflow calls for it.
-10. Builder links the feature branch and PR on the task.
-11. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
-12. Task moves to `builder_review`.
-13. Run `npm run automation-tick -- --project <project-key> --limit 10` or let the scheduled steward route the task across projects.
-14. Run `npm run dispatcher -- --plan` to preview worker dispatches, or let the scheduled dispatcher create durable run records across projects.
-15. Run `npm run runner -- --plan` to preview queued builder/reviewer work, or let the scheduled runner execute queued Codex work.
-16. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.
-17. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
-18. Accessibility reviewer runs before lead review for UI/frontend work and checks contrast, typography, focus-visible states, keyboard tab order, semantic headings, link/button names, alt text, title text, form labels, ARIA use, screen-reader basics, and mobile/tablet/desktop behavior. Otherwise, record a `skipped` accessibility review.
-19. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
-20. Reviewers record outcomes with `studioops review <task-id> --stage backend|frontend|accessibility|lead --outcome approved|skipped|changes_requested --body "..."`.
-21. A first routine `changes_requested` outcome returns the task to `needs_changes` and assigns the builder. At the configured review-cycle limit, non-lead `changes_requested` routes to lead review instead of another builder loop.
-22. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review`, or to `qa_review` when Trust Leads is enabled.
-23. The supervisor reports `notify_owner` for final human review or `notify_qa_review` for local QA bundle review.
-24. The notifier sends a local owner/QA-review notification.
-25. The human owner makes the final production release decision.
+12. Builder implements the change, validates it, commits, pushes, and opens a PR when the project workflow calls for it.
+13. Builder links the feature branch and PR on the task.
+14. Builder leaves a task comment with changed files, validation results, known gaps, and the PR link.
+15. Task moves to `builder_review`.
+16. Run `npm run automation-tick -- --project <project-key> --limit 10` or let the scheduled steward route the task across projects.
+17. Run `npm run dispatcher -- --plan` to preview worker dispatches, or let the scheduled dispatcher create durable run records across projects.
+18. Run `npm run runner -- --plan` to preview queued builder/reviewer work, or let the scheduled runner execute queued Codex work.
+19. Backend reviewer runs when the PR touches backend, data, auth, analytics, queues, integrations, deployment, security, privacy, or persistence. Otherwise, record a `skipped` backend review.
+20. Frontend reviewer runs when the PR touches UI, templates, CSS/Sass, frontend JavaScript, content rendering, assets, SEO, accessibility, or public pages. Otherwise, record a `skipped` frontend review.
+21. Accessibility reviewer runs before lead review for UI/frontend work and checks contrast, typography, focus-visible states, keyboard tab order, semantic headings, link/button names, alt text, title text, form labels, ARIA use, screen-reader basics, and mobile/tablet/desktop behavior. Otherwise, record a `skipped` accessibility review.
+22. Primary team lead reviewer checks product fit, architecture, scope, previous reviewer findings, deployment risk, and whether the PR should be split.
+23. Reviewers record outcomes with `studioops review <task-id> --stage backend|frontend|accessibility|lead --outcome approved|skipped|changes_requested --body "..."`.
+24. A first routine `changes_requested` outcome returns the task to `needs_changes` and assigns the builder. At the configured review-cycle limit, non-lead `changes_requested` routes to lead review instead of another builder loop.
+25. After all current-cycle review stages are approved or skipped, automation moves the task to `user_review`, or to `qa_review` when Trust Leads is enabled.
+26. The supervisor reports `notify_owner` for final human review or `notify_qa_review` for local QA bundle review.
+27. The notifier sends a local owner/QA-review notification.
+28. The human owner makes the final production release decision.
 
 Default PR rule:
 
@@ -261,18 +274,19 @@ Default PR rule:
 When asked to break a mockup into tasks:
 
 1. Inspect the full mockup first.
-2. Identify each screen, panel, state, and interaction.
-3. Create a foundation/design-system epic before page builders begin.
-4. Define the shared component inventory, Sass tokens/mixins/classes, fonts, spacing, cards, buttons, maps, charts, icons, image treatments, and motion language.
-5. Identify editable content, dynamic content, and hard-coded design-only elements.
-6. Audit navigation and subnavigation against the product requirements; create tasks for valid pages and call out placeholders or AI-invented items.
-7. Group the work into coherent slices that one builder can finish on a feature branch.
-8. Create one StudioOps task per slice.
-9. Attach the relevant image crop or full mockup reference.
-10. Include mobile, tablet, and desktop expectations for each visual slice.
-11. Include the applicable product requirement, not just the visual appearance.
-12. Add acceptance criteria that cover functionality, responsive behavior, visual match, reuse of shared components, editable/dynamic content, privacy/consent where relevant, and validation.
-13. Link each task back to the same project and original source image.
+2. Run the systems architect before builders.
+3. Inventory canonical assets, especially supplied logos, and identify each screen, panel, state, interaction, and data-bearing region.
+4. Create a foundation/design-system epic before page builders begin.
+5. Define the shared component inventory, Sass tokens/mixins/classes, fonts, spacing, cards, buttons, maps, charts, icons, image treatments, and motion language.
+6. Identify editable content, dynamic content, and hard-coded design-only elements.
+7. Audit navigation and subnavigation against the product requirements; create tasks for valid pages and call out placeholders or AI-invented items.
+8. Group the work into coherent slices that one builder can finish on a feature branch.
+9. Create one StudioOps task per slice.
+10. Attach the relevant image crop or full mockup reference.
+11. Include mobile, tablet, and desktop expectations for each visual slice.
+12. Include the applicable product requirement, not just the visual appearance.
+13. Add acceptance criteria that cover functionality, responsive behavior, visual match, reuse of shared components, editable/dynamic content, privacy/consent where relevant, and validation.
+14. Link each task back to the same project and original source image.
 
 The first implementation task after a mockup breakdown should usually be a foundation task. It prevents six parallel builders from creating six button systems, six card systems, or six incompatible Sass APIs.
 
@@ -331,6 +345,8 @@ Default rules:
 - Performance-sensitive database work must consider indexes, query shape, pagination, and explain/query-plan review where practical.
 - Large rewrites should be split into reviewable chunks with feature branches and PRs.
 - Reviewers should send work back when it looks complete visually but is brittle, duplicated, slow, inaccessible, insecure, or hard for a human to maintain.
+- Reviewers must reject an inert display page when the task asks for an app, workflow, platform, or functional product.
+- Every visible primary control must work or be explicitly disabled and labeled. Data-bearing UI must have a defined source of truth, persistence lifecycle, authorization boundary, bounded loading behavior, and loading/empty/error states.
 
 ## If StudioOps Is Not Running
 

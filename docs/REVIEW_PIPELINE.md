@@ -27,12 +27,13 @@ npm run supervisor
 or keep it running:
 
 ```bash
-npm run supervisor -- --watch --interval 300
+npm run supervisor -- --watch --interval 15
 ```
 
 The automation tick:
 
-- assigns `ready` or `queued` tasks to the builder by moving them to `in_progress`
+- routes architecture-required product work to `systems-architect` before any builder
+- leaves dispatched builder work truthfully `queued` until the runner claims it, then moves it to `in_progress`
 - marks tasks `blocked` when dependencies are unfinished
 - rechecks blocked tasks and returns them to the queue when dependencies are complete
 - requires branch and PR links before reviewer routing
@@ -57,33 +58,37 @@ Each time a builder moves work into `builder_review`, StudioOps increments the t
 
 ## Default Flow
 
-1. `in_progress`
+1. `architecture_pending` / `architecture_in_progress` / `architecture_ready`
+   - Broad app, platform, epic, and mockup-driven work is decomposed by the `gpt-5.6-sol` `xhigh` systems architect.
+   - The architect records canonical assets, system/data/API/performance/security decisions, and dependency-linked child tasks.
+
+2. `in_progress`
    - Builder is implementing the task on a feature branch.
 
-2. `builder_review`
+3. `builder_review`
    - Builder has pushed a branch/PR, run validation, linked the PR on the task, and left a comment with changed files, validation results, known gaps, and next review step.
 
-3. `backend_review`
+4. `backend_review`
    - Backend reviewer checks API contracts, persistence, migrations, query shape, indexes, pagination, auth/session handling, PII, security, privacy, queues, deployment impact, and operational risk.
    - Required when the PR touches backend, data, auth, analytics, integrations, queues, or deploy behavior.
    - May be explicitly skipped in a task comment when there is no backend/data/deployment surface.
 
-4. `frontend_review`
+5. `frontend_review`
    - Frontend reviewer checks UI/UX, responsiveness, visual fidelity, accessibility, design-system reuse, Sass/CSS structure, content editability, loading/empty/error states, browser console health, and direct route behavior.
    - Required when the PR touches UI, CSS, frontend JS, templates, content rendering, assets, SEO, or public pages.
    - May be explicitly skipped in a task comment when there is no frontend/user-visible surface.
 
-5. `accessibility_review`
+6. `accessibility_review`
    - Accessibility expert reviewer checks color contrast, readable typography, focus-visible states, keyboard tab order, semantic headings, link/button names, alt text, title text, form labels, ARIA use, and screen-reader basics.
    - Required before lead review when the PR touches UI, CSS, frontend JS, templates, content rendering, assets, SEO, or public pages.
    - Review must cover mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.
    - May be explicitly skipped with a review outcome when there is no frontend/user-visible accessibility surface.
 
-6. `lead_review`
+7. `lead_review`
    - Primary team lead checks product fit, acceptance criteria, architecture, cross-cutting risk, prior reviewer findings, task/PR scope, deployment safety, and readiness for the human owner.
    - Always required before `qa_review` or `user_review`.
 
-7. `qa_review`
+8. `qa_review`
    - Optional Trust Leads gate for projects with `trustLeadApprovals: true` and a safe `integrationBranch`.
    - The QA integration worker prepares an isolated workspace for the project, merges lead-approved PR heads into the configured non-production integration branch, runs validation commands, and records conflicts or validation failures back on the task.
    - The registered project `repoPath` remains on the owner's active branch with its existing dirty or clean state; QA reports and task comments show the isolated workspace path used for the run.
@@ -91,16 +96,16 @@ Each time a builder moves work into `builder_review`, StudioOps increments the t
    - The human owner should test the full QA bundle locally before approving production.
    - This is not production approval.
 
-8. `user_review`
+9. `user_review`
    - Work is ready for the human owner to inspect, test, request changes, approve, merge, or deploy.
 
-9. `needs_changes`
+10. `needs_changes`
    - Any reviewer or the human owner can send the work back.
    - The task should include a comment with concrete requested changes.
    - Builder fixes the same branch/PR unless the reviewer asks for a split PR.
    - At the configured review-cycle limit, unresolved non-lead findings route to lead review instead of another routine builder pass.
 
-10. `done`
+11. `done`
    - Work is merged/deployed or intentionally closed.
 
 ## Reviewer Outcome Rules

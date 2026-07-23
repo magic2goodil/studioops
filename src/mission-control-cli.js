@@ -8,6 +8,7 @@ import {
   addProject,
   addTask,
   automationTick,
+  completeArchitecture,
   generatePrompt,
   recordQaDecision,
   recordReview,
@@ -153,11 +154,11 @@ async function setup() {
           leadReasoningEffort: "xhigh",
           complexReasoningEffort: "xhigh",
           maxAttempts: 2,
-          retryBackoffMs: 300000,
+          retryBackoffMs: 30000,
           staleRunMs: 7200000,
         },
         supervisor: {
-          intervalSeconds: 300,
+          intervalSeconds: 15,
           baseUrl: "http://127.0.0.1:4317",
           ownerNotificationStatus: "user_review",
           builderConcurrency: 1,
@@ -166,13 +167,14 @@ async function setup() {
           requireGitHubActionsDeploy: true,
         },
         steward: {
-          intervalSeconds: 300,
+          intervalSeconds: 10,
           limit: 50,
         },
         dispatcher: {
-          intervalSeconds: 300,
+          intervalSeconds: 10,
           provider: "prompt-outbox",
           maxDispatchesPerSweep: 6,
+          architectConcurrency: 1,
           builderConcurrency: 3,
           reviewerConcurrency: 3,
           ownerConcurrency: 10,
@@ -180,7 +182,7 @@ async function setup() {
           requireGitHubActionsDeploy: true,
         },
         runner: {
-          intervalSeconds: 300,
+          intervalSeconds: 10,
           limit: 3,
           provider: "codex-cli",
           model: "gpt-5.6-sol",
@@ -205,7 +207,7 @@ async function setup() {
           githubAppRole: "promotion-worker",
         },
         notifier: {
-          intervalSeconds: 60,
+          intervalSeconds: 10,
           channel: "macos",
           limit: 10,
         },
@@ -372,6 +374,7 @@ Commands:
   update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Update task status
   comment TASK_ID --body        Add a builder/reviewer comment
+  architecture-complete TASK   Record the architecture decision and implementation task graph
   review TASK_ID --stage        Record approved, skipped, or changes_requested
   automation-tick               Advance ready, blocked, and review tasks
   automation-pause              Pause new builder and reviewer work
@@ -398,6 +401,9 @@ Task fields:
   --expected                    Expected outcome or feature behavior
   --criteria                    Acceptance criteria, comma or newline separated
   --attachment                  Image, screenshot, mockup, URL, or reference path
+  --delivery-mode               functional, prototype, or visual-only
+  --architecture-required       Route this task through systems architecture before builders
+  --architecture-approved       Stage a --parent child for atomic approval when parent architecture completes
   --lane                        Work lane: backend, frontend, design, devops, product
   --work-area                   Expected file/work areas, comma or newline separated
   --branch                      Associated feature branch
@@ -652,6 +658,16 @@ Automation:
       expectedOutcome: args.expected || args["expected-outcome"],
       attachments: args.attachment || args.attachments,
       acceptanceCriteria: args.criteria,
+      deliveryMode: args["delivery-mode"],
+      ...(Object.prototype.hasOwnProperty.call(args, "architecture-required")
+        ? { architectureRequired: booleanOption(args["architecture-required"], true) }
+        : Object.prototype.hasOwnProperty.call(args, "no-architecture-required")
+          ? { architectureRequired: false }
+          : {}),
+      ...(Object.prototype.hasOwnProperty.call(args, "architecture-approved")
+        ? { architectureApproved: booleanOption(args["architecture-approved"], true) }
+        : {}),
+      architectureParentTaskId: args["architecture-parent"] || "",
       privacyNotes: args.privacy,
       securityNotes: args.security,
       branchName: args.branch || args["branch-name"],
@@ -683,6 +699,17 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "expected")) patch.expectedOutcome = args.expected;
     if (Object.prototype.hasOwnProperty.call(args, "criteria")) patch.acceptanceCriteria = args.criteria;
     if (Object.prototype.hasOwnProperty.call(args, "attachment")) patch.attachments = args.attachment;
+    if (Object.prototype.hasOwnProperty.call(args, "delivery-mode")) patch.deliveryMode = args["delivery-mode"];
+    if (Object.prototype.hasOwnProperty.call(args, "architecture-required")) {
+      patch.architectureRequired = booleanOption(args["architecture-required"], true);
+    }
+    if (Object.prototype.hasOwnProperty.call(args, "no-architecture-required")) patch.architectureRequired = false;
+    if (Object.prototype.hasOwnProperty.call(args, "architecture-approved")) {
+      patch.architectureApproved = booleanOption(args["architecture-approved"], true);
+    }
+    if (Object.prototype.hasOwnProperty.call(args, "architecture-parent")) {
+      patch.architectureParentTaskId = args["architecture-parent"];
+    }
     const task = await updateTask(taskId, patch);
     console.log(`Updated ${task.id}: ${task.title}`);
     return;
@@ -699,6 +726,17 @@ Automation:
     const taskId = args._[1];
     const comment = await addComment(taskId, args.body, args.author || "Codex Builder");
     console.log(`Added comment ${comment.id} to ${taskId}`);
+    return;
+  }
+
+  if (command === "architecture-complete") {
+    const taskId = args._[1];
+    const task = await completeArchitecture(taskId, {
+      body: args.body || args.summary,
+      taskIds: args["task-ids"] || args.tasks,
+      author: args.author,
+    });
+    console.log(`Architecture completed for ${task.id}: ${task.status}`);
     return;
   }
 
@@ -762,7 +800,7 @@ Automation:
     const config = await loadConfig();
     const supervisor = createSupervisorReport(state, {
       baseUrl: args["base-url"] || "http://127.0.0.1:4317",
-      intervalSeconds: args.interval || args["interval-seconds"] || 300,
+      intervalSeconds: args.interval || args["interval-seconds"] || 10,
     });
     const options = {
       project: args.project || args.projects,
@@ -770,6 +808,7 @@ Automation:
       provider: args.provider || "prompt-outbox",
       maxDispatchesPerSweep: args.limit || args["max-dispatches"],
       builderConcurrency: args["builder-concurrency"],
+      architectConcurrency: args["architect-concurrency"],
       reviewerConcurrency: args["reviewer-concurrency"],
       ownerConcurrency: args["owner-concurrency"],
       executionPolicy: {
@@ -940,7 +979,7 @@ Automation:
     const report = createSupervisorReport(state, {
       baseUrl: args["base-url"] || "http://127.0.0.1:4317",
       includeWaiting: args.all || args["include-waiting"],
-      intervalSeconds: args.interval || args["interval-seconds"] || 300,
+      intervalSeconds: args.interval || args["interval-seconds"] || 15,
     });
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(formatSupervisorReport(report));

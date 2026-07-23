@@ -191,7 +191,11 @@ async function githubJson(pathname, { method = "GET", token, body } = {}) {
   const text = await response.text();
   const payload = parseJson(text, { message: text });
   if (!response.ok) {
-    throw new Error(payload.message || `GitHub API ${method} ${pathname} failed with HTTP ${response.status}`);
+    const detail = payload.message || "Unknown GitHub API error";
+    const error = new Error(`GitHub API ${method} ${pathname} failed with HTTP ${response.status}: ${detail}`);
+    error.status = response.status;
+    error.pathname = pathname;
+    throw error;
   }
   return payload;
 }
@@ -485,10 +489,23 @@ export async function prepareGitHubAppAuth(run, input = {}) {
   const repo = await resolveRunRepository(run);
   const app = await loadConfiguredApp(credentialsDir, role, { roleMap, defaultRole });
   const jwt = createGitHubAppJwt(app.appId, app.privateKey);
-  const installation = await githubJson(
-    `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/installation`,
-    { token: jwt },
-  );
+  let installation;
+  try {
+    installation = await githubJson(
+      `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/installation`,
+      { token: jwt },
+    );
+  } catch (error) {
+    if (Number(error?.status) === 404) {
+      const installationError = new Error(
+        `github_app_not_installed_on_repository: the ${app.key || role} GitHub App is not installed on ${repo.owner}/${repo.name}. Install that role app on this repository, then reset the StudioOps task circuit and retry.`,
+      );
+      installationError.code = "github_app_not_installed_on_repository";
+      installationError.cause = error;
+      throw installationError;
+    }
+    throw error;
+  }
   const permissions = permissionsForRole(role);
   const accessToken = await githubJson(
     `/app/installations/${encodeURIComponent(installation.id)}/access_tokens`,

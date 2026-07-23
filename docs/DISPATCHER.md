@@ -6,6 +6,7 @@ The supervisor decides what should happen next. The dispatcher turns those decis
 
 It can:
 
+- create systems-architect runs for `start_architecture`
 - create builder runs for `start_builder`, `start_builder_fix`, and `return_to_builder`
 - create reviewer runs for `start_review` and `continue_review`
 - create owner handoff notifications for `notify_owner`, `notify_qa_review`, and validated `qa_bundle_ready` Trust Leads QA bundles
@@ -61,7 +62,7 @@ npm run dispatcher -- --project event-horizons-web --limit 3
 ## Run Continuously
 
 ```bash
-npm run dispatcher -- --watch --interval 300
+npm run dispatcher -- --watch --interval 10
 ```
 
 The dispatcher should be the durable runner for a machine. The supervisor can keep running as a read-only dashboard, but the dispatcher is what creates run records.
@@ -123,6 +124,7 @@ Default dispatcher limits:
 ```json
 {
   "maxDispatchesPerSweep": 6,
+  "architectConcurrency": 1,
   "builderConcurrency": 3,
   "reviewerConcurrency": 3,
   "ownerConcurrency": 10

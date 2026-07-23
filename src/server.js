@@ -287,7 +287,7 @@ async function handleApi(req, res, url) {
       sendJson(res, 404, { error: "Task not found." });
       return;
     }
-    const roles = ["builder", "backend-reviewer", "frontend-reviewer", "accessibility-reviewer", "lead-reviewer"];
+    const roles = ["systems-architect", "builder", "backend-reviewer", "frontend-reviewer", "accessibility-reviewer", "lead-reviewer"];
     sendJson(res, 200, {
       task: taskWithProject(state, task),
       prompts: Object.fromEntries(roles.map((role) => [role, generatePrompt(state, task.id, role)])),

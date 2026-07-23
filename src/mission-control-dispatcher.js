@@ -5,7 +5,7 @@ import { createSupervisorReport } from "./supervisor.js";
 import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
 import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 
-const DEFAULT_INTERVAL_SECONDS = 300;
+const DEFAULT_INTERVAL_SECONDS = 10;
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -55,6 +55,7 @@ function optionsFrom(args, config) {
   return {
     baseUrl: args["base-url"] || defaults.baseUrl || "http://127.0.0.1:4317",
     builderConcurrency: numberFrom(args["builder-concurrency"] || defaults.builderConcurrency, 3),
+    architectConcurrency: numberFrom(args["architect-concurrency"] || defaults.architectConcurrency, 1),
     reviewerConcurrency: numberFrom(args["reviewer-concurrency"] || defaults.reviewerConcurrency, 3),
     ownerConcurrency: numberFrom(args["owner-concurrency"] || defaults.ownerConcurrency, 10),
     maxDispatchesPerSweep: numberFrom(args.limit || args["max-dispatches"] || defaults.maxDispatchesPerSweep, 6),
@@ -125,7 +126,7 @@ Usage:
   studioops-dispatcher --plan
   studioops-dispatcher --dry-run
   studioops-dispatcher
-  studioops-dispatcher --watch --interval 300
+  studioops-dispatcher --watch --interval 10
   studioops dispatcher --project event-horizons-web --limit 3
 
 The dispatcher consumes supervisor actions and creates durable run records. It
