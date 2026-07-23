@@ -196,7 +196,7 @@ async function githubJson(pathname, { method = "GET", token, body } = {}) {
   return payload;
 }
 
-function parseGitHubRepoUrl(value) {
+export function parseGitHubRepoUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) return null;
 
@@ -457,6 +457,9 @@ export async function cleanupGitHubAppAuth(auth) {
 }
 
 export async function prepareGitHubAppAuth(run, input = {}) {
+  if (String(run.workflowMode || run.project?.workflowMode || "").trim().toLowerCase() === "local") {
+    return null;
+  }
   const config = await safeLoadConfig();
   const githubApps = config?.githubApps || {};
   const runnerDefaults = {

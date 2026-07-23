@@ -53,6 +53,25 @@ test("automation does not dispatch tracking epics as builder work", async () => 
   assert.equal(state.tasks[0].status, "in_progress");
 });
 
+test("automation does not recover tracking parents with child tasks into builder work", async () => {
+  const state = stateWith({ type: "feature" });
+  state.tasks.push({
+    id: "task_child",
+    projectId: "project_1",
+    parentTaskId: "task_1",
+    title: "Buildable child",
+    type: "feature",
+    status: "idea",
+    dependsOnTaskIds: [],
+    createdAt: "2026-07-21T10:00:00.000Z",
+    updatedAt: "2026-07-21T10:00:00.000Z",
+  });
+
+  const result = await automationTick({ state, nowMs: NOW, orphanGraceMs: 60_000 });
+  assert.equal(state.tasks[0].status, "in_progress");
+  assert.equal(result.actions.some((action) => action.includes("task_1")), false);
+});
+
 test("transient blockers recover automatically after their retry window", async () => {
   const state = stateWith({
     status: "blocked",
