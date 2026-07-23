@@ -1,0 +1,29 @@
+{
+  "submissionType": "skills-only",
+  "name": "studioops",
+  "version": "0.1.0+codex.20260722185818",
+  "displayName": "StudioOps",
+  "shortDescription": "AI software delivery workflow",
+  "longDescription": "Install and run a local-first AI software delivery workflow. StudioOps turns ideas into structured projects and tasks, routes work through isolated builders and specialist reviews, assembles approved changes in non-production QA, and keeps releases under human control.",
+  "developerName": "Team Robison",
+  "category": "Developer Tools",
+  "capabilities": [
+    "One-step local setup",
+    "Structured intake",
+    "Local project orchestration",
+    "Engineering workflow"
+  ],
+  "websiteUrl": "https://github.com/magic2goodil/studioops",
+  "supportUrl": "https://github.com/magic2goodil/studioops/blob/main/SUPPORT.md",
+  "privacyPolicyUrl": "https://github.com/magic2goodil/studioops/blob/main/PRIVACY.md",
+  "termsOfServiceUrl": "https://github.com/magic2goodil/studioops/blob/main/TERMS.md",
+  "starterPrompts": [
+    "Set up StudioOps for this project.",
+    "Run this feature through StudioOps.",
+    "Turn this mockup into StudioOps tasks."
+  ],
+  "availability": {
+    "decisionRequiredFromPublisher": true,
+    "notes": "Select only regions where Codex plugins, the publisher identity, support, privacy notice, and terms are ready."
+  }
+}

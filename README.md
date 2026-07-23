@@ -79,7 +79,16 @@ For a complete first-run walkthrough, GitHub bot setup, manual operation, and al
 
 ## Install The Codex Plugin
 
-The repository is also a Codex plugin marketplace. After cloning StudioOps and starting the local app:
+The repository is also a Codex plugin marketplace. The normal onboarding path is one request in Codex:
+
+```text
+Install StudioOps from https://github.com/magic2goodil/studioops and set it up
+for this project using safe local defaults. Detect the repository, Git remote,
+AGENTS.md, standards, and validation commands. Ask only for information you
+cannot detect.
+```
+
+Codex adds the marketplace, installs the plugin, and uses the bundled setup skill. The equivalent manual plugin commands are:
 
 ```bash
 codex plugin marketplace add /absolute/path/to/studioops
@@ -89,10 +98,10 @@ codex plugin add studioops@studioops-marketplace
 Start a new Codex task after installation, then ask:
 
 ```text
-Create this project in StudioOps.
+Set up StudioOps for this project.
 ```
 
-The bundled `run-studioops` skill inspects the current repository, creates or reuses the matching StudioOps project, and writes a structured task with user story, expected outcome, acceptance criteria, work lane, validation, and security/privacy notes. See [Plugin Development](docs/PLUGIN.md).
+The bundled `setup-studioops` skill installs and verifies the local control plane before registering the current repository. The `run-studioops` skill then creates or reuses the matching project and writes structured work with user story, expected outcome, acceptance criteria, work lane, validation, and security/privacy notes. See [Plugin Development](docs/PLUGIN.md).
 
 ## Community And Paid Plans
 
@@ -199,6 +208,12 @@ By default, StudioOps:
 - requires a separate explicit release or tag for production deployment
 
 Do not place secrets, access tokens, private keys, customer data, or unnecessary PII in tasks, comments, attachments, prompts, or logs. Read [SECURITY.md](SECURITY.md) before enabling network access or automation against production repositories.
+
+Public policy and support information:
+
+- [Privacy](PRIVACY.md)
+- [Terms](TERMS.md)
+- [Support](SUPPORT.md)
 
 ## Current Limitations
 
