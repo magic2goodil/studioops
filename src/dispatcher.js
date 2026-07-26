@@ -417,6 +417,10 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: "missing_task" });
       continue;
     }
+    if (action.taskStatus && task.status !== action.taskStatus) {
+      skipped.push({ action, reason: `task_status_changed:${action.taskStatus}->${task.status}` });
+      continue;
+    }
     const safetyReason = dispatchSafetyReason(state, task, action, options);
     if (safetyReason) {
       skipped.push({ action, reason: safetyReason });

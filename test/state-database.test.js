@@ -490,6 +490,31 @@ test("SQLite archives excess machine QA history without compacting human comment
         ? machineComments[index].createdAt
         : new Date(Date.UTC(2026, 6, 1, 1, index)).toISOString(),
     }));
+    state.runs = Array.from({ length: 10 }, (_, index) => ({
+      id: `run_${index + 1}`,
+      taskId: "task_1",
+      projectId: "project_1",
+      dispatchKey: "task_1:1:continue_review:qa-reviewer:qa_review",
+      actionType: "continue_review",
+      role: "qa-reviewer",
+      status: "cancelled",
+      prompt: `Large generated prompt ${index + 1}`,
+      exitCode: "task_status_changed:qa_review",
+      createdAt: new Date(Date.UTC(2026, 6, 1, 2, index)).toISOString(),
+      updatedAt: new Date(Date.UTC(2026, 6, 1, 2, index)).toISOString(),
+    }));
+    state.runs.push({
+      id: "run_failed",
+      taskId: "task_1",
+      projectId: "project_1",
+      dispatchKey: "task_1:1:continue_review:qa-reviewer:qa_review",
+      actionType: "continue_review",
+      role: "qa-reviewer",
+      status: "failed",
+      prompt: "Preserved failure evidence",
+      createdAt: "2026-07-01T03:00:00.000Z",
+      updatedAt: "2026-07-01T03:00:00.000Z",
+    });
     await writeLegacyState(root, state);
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
 
@@ -497,6 +522,8 @@ test("SQLite archives excess machine QA history without compacting human comment
     assert.equal(persisted.comments.filter((item) => item.id !== "comment_human").length, 20);
     assert.equal(persisted.comments.filter((item) => item.id === "comment_human").length, 1);
     assert.equal(persisted.events.filter((item) => item.type === "qa_integration_blocked").length, 40);
+    assert.equal(persisted.runs.filter((item) => item.status === "cancelled").length, 3);
+    assert.equal(persisted.runs.some((item) => item.id === "run_failed"), true);
 
     const backupPath = persisted.meta.operationalArchive.backupPath;
     assert.equal((await stat(backupPath)).mode & 0o777, 0o600);
@@ -546,7 +573,13 @@ test("SQLite archives excess machine QA history without compacting human comment
       assert.deepEqual(archived, [
         { entity_type: "comments", count: 15 },
         { entity_type: "events", count: 15 },
+        { entity_type: "runs", count: 7 },
       ]);
+      const archivedRun = JSON.parse(db.prepare(
+        "SELECT payload FROM operational_archive WHERE entity_type = 'runs' LIMIT 1",
+      ).get().payload);
+      assert.equal(archivedRun.prompt, undefined);
+      assert.equal(archivedRun.promptOmitted, true);
     } finally {
       db.close();
     }
