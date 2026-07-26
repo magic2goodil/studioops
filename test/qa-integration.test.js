@@ -126,12 +126,42 @@ async function addReviewedQaTask(root, task, subjectSha) {
   await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
 }
 
+async function advanceReviewedQaTask(root, taskId, subjectSha) {
+  const script = `
+    import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+    await mutateState((state) => {
+      const task = state.tasks.find((item) => item.id === ${JSON.stringify(taskId)});
+      if (!task) throw new Error("missing task");
+      task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+      task.reviewSubjectSha = ${JSON.stringify(subjectSha)};
+      task.reviewSubjectCycle = task.reviewCycle;
+      for (const stageKey of ["backend", "frontend", "accessibility", "lead"]) {
+        state.reviews.push({
+          id: "review_" + (state.reviews.length + 1),
+          taskId: task.id,
+          projectId: task.projectId,
+          cycle: task.reviewCycle,
+          candidateCycle: task.reviewCycle,
+          stageKey,
+          status: stageKey + "_review",
+          role: stageKey + "-reviewer",
+          outcome: "approved",
+          subjectSha: ${JSON.stringify(subjectSha)},
+          createdAt: "2026-07-25T13:00:00.000Z"
+        });
+      }
+    });
+  `;
+  await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+}
+
 async function createProtectedBranchFixture(root) {
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const fakeBin = path.join(root, "fake-bin");
   const prMarker = path.join(root, "pr-created");
   const prCreateLog = path.join(root, "pr-create.log");
+  const prCloseLog = path.join(root, "pr-close.log");
 
   await git(root, ["init", "--bare", remotePath]);
   await git(root, ["clone", remotePath, repoPath]);
@@ -168,36 +198,77 @@ exit 0
   await mkdir(fakeBin, { recursive: true });
   const fakeGh = path.join(fakeBin, "gh");
   await writeFile(fakeGh, `#!/usr/bin/env node
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 const args = process.argv.slice(2);
 const marker = process.env.FAKE_GH_PR_MARKER;
 const createLog = process.env.FAKE_GH_CREATE_LOG;
+const closeLog = process.env.FAKE_GH_CLOSE_LOG;
+const readPrs = () => existsSync(marker)
+  ? JSON.parse(readFileSync(marker, "utf8") || "[]")
+  : [];
+const writePrs = (prs) => writeFileSync(marker, JSON.stringify(prs));
 if (args[0] === "pr" && args[1] === "create") {
-  writeFileSync(marker, "created\\n");
-  appendFileSync(createLog, "create\\n");
-  console.log("https://github.com/example/demo/pull/42");
+  const prs = readPrs();
+  const head = args[args.indexOf("--head") + 1];
+  const base = args[args.indexOf("--base") + 1];
+  const existing = prs.find((pr) => pr.head === head && pr.base === base);
+  if (existing) {
+    console.log(existing.url);
+    process.exit(0);
+  }
+  const number = 42 + prs.length;
+  const record = {
+    number,
+    url: "https://github.com/example/demo/pull/" + number,
+    head,
+    base,
+    state: "OPEN"
+  };
+  prs.push(record);
+  writePrs(prs);
+  appendFileSync(createLog, "create " + number + " " + head + "\\n");
+  console.log(record.url);
+  process.exit(0);
+}
+if (args[0] === "pr" && args[1] === "close") {
+  const number = Number(args[2]);
+  const prs = readPrs();
+  const record = prs.find((pr) => pr.number === number);
+  if (!record) {
+    console.error("missing PR " + number);
+    process.exit(1);
+  }
+  record.state = "CLOSED";
+  writePrs(prs);
+  appendFileSync(closeLog, "close " + number + "\\n");
+  console.log("Closed pull request " + record.url);
   process.exit(0);
 }
 if (args[0] === "pr" && args[1] === "list") {
-  if (!existsSync(marker)) {
+  const head = args[args.indexOf("--head") + 1];
+  const base = args[args.indexOf("--base") + 1];
+  const record = readPrs()
+    .filter((pr) => pr.head === head && pr.base === base)
+    .sort((a, b) => b.number - a.number)[0];
+  if (!record) {
     console.log("[]");
     process.exit(0);
   }
-  const head = args[args.indexOf("--head") + 1];
-  const base = args[args.indexOf("--base") + 1];
   const line = execFileSync("git", ["ls-remote", "origin", "refs/heads/" + head], { encoding: "utf8" }).trim();
   const oid = line.split(/\\s+/)[0] || "";
-  const checkMode = process.env.FAKE_GH_CHECK_STATE || "pending";
+  const checkMode = String(record.number) === process.env.FAKE_GH_FAILED_PR_NUMBER
+    ? "failed"
+    : process.env.FAKE_GH_CHECK_STATE || "pending";
   const checks = checkMode === "failed"
     ? [{ name: "integration-test", status: "COMPLETED", conclusion: "FAILURE", detailsUrl: "https://example.test/check" }]
     : checkMode === "passed"
       ? [{ name: "integration-test", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://example.test/check" }]
       : [{ name: "integration-test", status: "IN_PROGRESS", conclusion: "", detailsUrl: "https://example.test/check" }];
   console.log(JSON.stringify([{
-    number: 42,
-    url: "https://github.com/example/demo/pull/42",
-    state: process.env.FAKE_GH_PR_STATE || "OPEN",
+    number: record.number,
+    url: record.url,
+    state: process.env.FAKE_GH_PR_STATE || record.state,
     headRefName: head,
     headRefOid: oid,
     baseRefName: base,
@@ -252,11 +323,13 @@ process.exit(1);
     hookPath,
     prMarker,
     prCreateLog,
+    prCloseLog,
     baseSha,
     env: {
       PATH: `${fakeBin}:${process.env.PATH}`,
       FAKE_GH_PR_MARKER: prMarker,
       FAKE_GH_CREATE_LOG: prCreateLog,
+      FAKE_GH_CLOSE_LOG: prCloseLog,
     },
   };
 }
@@ -1786,6 +1859,135 @@ test("new QA tasks wait behind an existing protected integration handoff", async
     const laterTask = persisted.tasks.find((task) => task.id === "task_2");
     assert.equal(laterTask.integrationCandidateBranch || "", "");
     assert.equal(laterTask.integrationPrUrl || "", "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed protected handoffs are audited and safely replaced after new source review", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-replacement-"));
+
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    const previous = pending.projects[0];
+
+    const failed = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_CHECK_STATE: "failed",
+        FAKE_GH_REVIEW_DECISION: "",
+      },
+    });
+    assert.equal(failed.projects[0].status, "checks_failed");
+    let persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].integrationStatus, "blocked");
+    assert.equal(persisted.tasks[0].integrationValidation.status, "checks_failed");
+    assert.equal(persisted.tasks[0].integrationSourceHeadSha, persisted.tasks[0].reviewSubjectSha);
+    assert.equal(persisted.tasks[0].integrationSourceCandidateCycle, 1);
+
+    await git(fixture.repoPath, ["checkout", "feature/task"]);
+    await writeFile(path.join(fixture.repoPath, "feature.txt"), "corrected protected QA feature\n", "utf8");
+    await git(fixture.repoPath, ["commit", "-am", "correct protected feature"]);
+    const correctedHead = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "feature/task"]);
+    await advanceReviewedQaTask(root, "task_1", correctedHead);
+
+    await git(fixture.repoPath, ["checkout", "-b", "feature/task-2", "main"]);
+    await writeFile(path.join(fixture.repoPath, "feature-2.txt"), "later reviewed feature\n", "utf8");
+    await git(fixture.repoPath, ["add", "feature-2.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "later reviewed feature"]);
+    const secondHead = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "feature/task-2"]);
+    await addReviewedQaTask(root, {
+      id: "task_2",
+      projectId: "project_1",
+      title: "Later feature task",
+      status: "qa_review",
+      branchName: "feature/task-2",
+      prUrl: "",
+    }, secondHead);
+
+    const replacement = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_FAILED_PR_NUMBER: "42",
+        FAKE_GH_REVIEW_DECISION: "REVIEW_REQUIRED",
+      },
+    });
+    const replacementProject = replacement.projects[0];
+
+    assert.equal(replacementProject.status, "pr_waiting", JSON.stringify(replacementProject, null, 2));
+    assert.equal(replacementProject.integrationPr.url, "https://github.com/example/demo/pull/43");
+    assert.notEqual(replacementProject.integrationCandidateCommit, previous.integrationCandidateCommit);
+    assert.deepEqual(replacementProject.tasks.map((task) => task.taskId), ["task_1", "task_2"]);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 2);
+    assert.equal((await readFile(fixture.prCloseLog, "utf8")).trim(), "close 42");
+    assert.equal(
+      await git(fixture.remotePath, ["for-each-ref", "--format=%(refname)", `refs/heads/${previous.integrationCandidateBranch}`]),
+      "",
+    );
+
+    persisted = readPersistedState(root);
+    const correctedTask = persisted.tasks.find((task) => task.id === "task_1");
+    const laterTask = persisted.tasks.find((task) => task.id === "task_2");
+    assert.equal(correctedTask.integrationPrUrl, "https://github.com/example/demo/pull/43");
+    assert.equal(correctedTask.integrationSourceHeadSha, correctedHead);
+    assert.equal(correctedTask.integrationSourceCandidateCycle, 2);
+    assert.equal(correctedTask.integrationHandoffHistory.length, 1);
+    assert.equal(correctedTask.integrationHandoffHistory[0].candidateCommit, previous.integrationCandidateCommit);
+    assert.equal(correctedTask.integrationHandoffHistory[0].prUrl, "https://github.com/example/demo/pull/42");
+    assert.equal(correctedTask.integrationHandoffHistory[0].checkState.state, "failed");
+    assert.match(correctedTask.integrationHandoffHistory[0].cleanup, /Removed superseded/);
+    assert.equal(laterTask.integrationPrUrl, "https://github.com/example/demo/pull/43");
+    assert.equal(laterTask.integrationHandoffHistory, undefined);
+
+    const repeated = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_FAILED_PR_NUMBER: "42",
+        FAKE_GH_REVIEW_DECISION: "REVIEW_REQUIRED",
+      },
+    });
+    assert.equal(repeated.projects[0].status, "pr_waiting");
+    assert.equal(repeated.projects[0].integrationPr.url, "https://github.com/example/demo/pull/43");
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 2);
+    assert.equal((await readFile(fixture.prCloseLog, "utf8")).trim(), "close 42");
+
+    await rm(fixture.hookPath);
+    await git(fixture.repoPath, [
+      "fetch",
+      "origin",
+      `refs/heads/${replacementProject.integrationCandidateBranch}`,
+    ]);
+    await git(fixture.repoPath, [
+      "checkout",
+      "-B",
+      "replacement-merge",
+      "refs/remotes/origin/qa/integration",
+    ]);
+    await git(fixture.repoPath, ["merge", "--no-ff", "--no-edit", "FETCH_HEAD"]);
+    const mergeCommit = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "HEAD:refs/heads/qa/integration"]);
+
+    const merged = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_PR_STATE: "MERGED",
+        FAKE_GH_CHECK_STATE: "passed",
+        FAKE_GH_REVIEW_DECISION: "APPROVED",
+        FAKE_GH_MERGE_STATE: "CLEAN",
+        FAKE_GH_MERGE_COMMIT: mergeCommit,
+      },
+    });
+    assert.equal(merged.projects[0].status, "preview_missing");
+    assert.equal(merged.projects[0].commit, mergeCommit);
+    assert.equal(merged.projects[0].integrationMergeCommit, mergeCommit);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -120,4 +120,11 @@ test("supervisor tracks protected QA PRs and routes failed checks back to a buil
   const failed = createSupervisorReport(state);
   assert.equal(failed.actions[0].type, "qa_integration_blocked");
   assert.equal(failed.actions[0].role, "builder");
+
+  state.tasks[0].integrationStatus = "changes_requested";
+  state.tasks[0].integrationPrReviewDecision = "CHANGES_REQUESTED";
+  state.tasks[0].integrationBlocker = "The integration PR has requested changes.";
+  const requestedChanges = createSupervisorReport(state);
+  assert.equal(requestedChanges.actions[0].type, "qa_integration_blocked");
+  assert.equal(requestedChanges.actions[0].role, "builder");
 });

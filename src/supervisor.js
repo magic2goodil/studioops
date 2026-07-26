@@ -432,7 +432,17 @@ function taskActions(state, task, options = {}) {
     if (task.integrationStatus === "pr_closed") {
       return [actionBase(state, task, "qa_integration_pr_closed", "owner", task.integrationBlocker || "The protected QA branch integration PR was closed without merging.", options)];
     }
-    if (["conflict", "validation_failed", "push_failed", "checks_failed", "candidate_drift", "candidate_publish_failed", "blocked"].includes(task.integrationStatus)) {
+    if ([
+      "conflict",
+      "validation_failed",
+      "push_failed",
+      "checks_failed",
+      "changes_requested",
+      "candidate_drift",
+      "candidate_publish_failed",
+      "candidate_supersession_failed",
+      "blocked",
+    ].includes(task.integrationStatus)) {
       return [actionBase(state, task, "qa_integration_blocked", "builder", `QA integration is blocked with status ${task.integrationStatus}. Review task comments and update the PR branch before rerunning integration.`, options)];
     }
     return [actionBase(state, task, "run_qa_integration", "qa-integration-worker", "Task is lead-approved and waiting for the QA integration branch worker.", {
