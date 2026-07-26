@@ -72,9 +72,14 @@ export function executionAttemptKey(task, action) {
   const key = [
     task.id,
     Number(task.reviewCycle || 0),
-    action.type,
-    action.role || "builder",
   ];
+  if (["start_review", "continue_review"].includes(action.type)) {
+    const candidateCycle = Number(action.candidateCycle || task.reviewSubjectCycle || 0);
+    const subjectSha = String(action.reviewSubjectSha || task.reviewSubjectSha || "").trim();
+    if (candidateCycle > 0) key.push(`candidate-${candidateCycle}`);
+    if (subjectSha) key.push(`sha-${subjectSha}`);
+  }
+  key.push(action.type, action.role || "builder");
   const epoch = Number(task.automationAttemptEpoch || 0);
   if (epoch > 0) key.push(`epoch-${epoch}`);
   return key.join(":");

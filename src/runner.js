@@ -20,6 +20,7 @@ import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   architectureIsCompleteInState,
+  currentReviewCandidateCycle,
   DATA_DIR,
   findProject,
   findTask,
@@ -799,6 +800,19 @@ function reviewerRecordedOutcome(state, run) {
   });
 }
 
+export function reviewerRunSupersessionReason(run, task) {
+  if (run.group !== "reviewer" || !task) return "";
+  const runCandidateCycle = Number(run.candidateCycle || 0);
+  const taskCandidateCycle = currentReviewCandidateCycle(task);
+  if (
+    runCandidateCycle <= 0
+    || taskCandidateCycle <= runCandidateCycle
+  ) {
+    return "";
+  }
+  return "review_candidate_superseded";
+}
+
 export function successfulHandoffFailure(state, run, task) {
   if (!task) return "task_missing_after_run";
   if (run.group === "architect") {
@@ -812,6 +826,7 @@ export function successfulHandoffFailure(state, run, task) {
     ) return "architecture_task_graph_invalid";
     return "";
   }
+  if (reviewerRunSupersessionReason(run, task)) return "";
   if (run.group === "builder") {
     if (task.status !== "in_progress" && task.status !== "qa_review") return "";
     if (task.branchName && task.prUrl && run.actionType !== "qa_integration_blocked") return "";
@@ -1184,7 +1199,10 @@ export async function claimRuns(input = {}) {
 }
 
 export async function completeRun(runId, input = {}) {
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
@@ -1202,13 +1220,22 @@ export async function completeRun(runId, input = {}) {
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
     if (run.status === "completed") {
-      handoffFailure = successfulHandoffFailure(state, run, task);
-      if (handoffFailure) {
-        run.status = "failed";
-        run.exitCode = handoffFailure;
-        run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
+      const supersessionReason = reviewerRunSupersessionReason(run, task);
+      if (supersessionReason) {
+        run.completionDisposition = "superseded";
+        run.neutralCompletionReason = supersessionReason;
+        run.attemptConsumed = false;
+        const note = "Reviewer run ended after its candidate was superseded; no review outcome was required.";
+        run.notes = run.notes ? `${run.notes}\n\n${note}` : note;
       } else {
-        applySuccessfulHandoff(state, run, task, now);
+        handoffFailure = successfulHandoffFailure(state, run, task);
+        if (handoffFailure) {
+          run.status = "failed";
+          run.exitCode = handoffFailure;
+          run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
+        } else {
+          applySuccessfulHandoff(state, run, task, now);
+        }
       }
     }
 
@@ -1217,8 +1244,11 @@ export async function completeRun(runId, input = {}) {
       failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
     }
 
-    const summary = run.status === "completed"
-      ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
+    const neutralCompletion = run.status === "completed" && run.completionDisposition === "superseded";
+    const summary = neutralCompletion
+      ? `${run.id} completed neutrally because its review candidate was superseded. Output: ${run.outputPath || "(not recorded)"}`
+      : run.status === "completed"
+        ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
       : `${run.id} failed with exit code ${run.exitCode || "unknown"}. Output: ${run.outputPath || "(not recorded)"}`;
     await appendTaskComment(state, run, summary, now);
     if (failureDisposition) {
@@ -1232,7 +1262,7 @@ export async function completeRun(runId, input = {}) {
 
     state.events.push({
       id: nextId(state.events, "event"),
-      type: run.status === "completed" ? "run_completed" : "run_failed",
+      type: neutralCompletion ? "run_superseded" : run.status === "completed" ? "run_completed" : "run_failed",
       projectId: run.projectId,
       taskId: run.taskId,
       message: summary,

@@ -596,6 +596,7 @@ export async function updateTask(taskId, patch) {
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
+    const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
     if (patch.status && !VALID_STATUSES.has(patch.status)) {
       throw new Error(`Invalid status: ${patch.status}`);
     }
@@ -695,14 +696,35 @@ export async function updateTask(taskId, patch) {
     ) {
       task.status = "architecture_pending";
     }
-    if (patch.status === "builder_review" && previousStatus !== "builder_review") {
+    const startedBuilderReviewCycle = patch.status === "builder_review" && previousStatus !== "builder_review";
+    if (startedBuilderReviewCycle) {
       task.reviewCycle = Number(task.reviewCycle || 0) + 1;
       task.reviewSubjectSha = "";
-      task.reviewSubjectCycle = task.reviewCycle;
+      task.reviewSubjectCycle = Math.max(
+        Number(task.reviewSubjectCycle || 0) + 1,
+        task.reviewCycle,
+      );
     }
     if (Object.prototype.hasOwnProperty.call(patch, "subjectSha")) {
-      task.reviewSubjectSha = normalizeGitSha(patch.subjectSha, "review subject SHA");
-      task.reviewSubjectCycle = Number(task.reviewCycle || 0);
+      const subjectSha = normalizeGitSha(patch.subjectSha, "review subject SHA");
+      task.reviewSubjectSha = subjectSha;
+      if (!task.reviewSubjectCycle) {
+        task.reviewSubjectCycle = Number(task.reviewCycle || 0);
+      }
+      if (
+        !startedBuilderReviewCycle
+        && previousReviewSubjectSha
+        && previousReviewSubjectSha !== subjectSha
+      ) {
+        restartReviewsForSubjectChange(
+          state,
+          task,
+          project,
+          previousReviewSubjectSha,
+          subjectSha,
+          new Date().toISOString(),
+        );
+      }
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
@@ -1116,11 +1138,12 @@ export async function recordReview(taskId, input = {}) {
     }
     const candidateCycle = Number(input.candidateCycle || input.cycle);
     const currentCycle = currentReviewCycle(task);
+    const currentCandidateCycle = currentReviewCandidateCycle(task);
     if (!Number.isSafeInteger(candidateCycle) || candidateCycle < 1) {
       throw new Error("Review candidate cycle is required.");
     }
-    if (candidateCycle !== currentCycle) {
-      throw new Error(`Review candidate cycle ${candidateCycle} does not match current cycle ${currentCycle}.`);
+    if (candidateCycle !== currentCandidateCycle) {
+      throw new Error(`Review candidate cycle ${candidateCycle} does not match current cycle candidate ${currentCandidateCycle}.`);
     }
     const subjectSha = normalizeGitSha(input.subjectSha || input.sha, "review subject SHA");
     if (task.reviewSubjectSha && task.reviewSubjectSha !== subjectSha) {
@@ -1128,6 +1151,14 @@ export async function recordReview(taskId, input = {}) {
     }
     task.reviewSubjectSha = subjectSha;
     task.reviewSubjectCycle = candidateCycle;
+    const stageIndex = stages.indexOf(stage);
+    const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+    const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
+    if (earliestRequiredStage && stageIndex > earliestRequiredIndex) {
+      throw new Error(
+        `${earliestRequiredStage.label || earliestRequiredStage.key} must approve candidate cycle ${candidateCycle} at ${subjectSha} before ${stage.label || stage.key} can continue.`,
+      );
+    }
     const now = new Date().toISOString();
     const review = {
       id: nextId(state.reviews, "review"),
@@ -1602,27 +1633,55 @@ function currentReviewCycle(task) {
   return Number(task.reviewCycle || 0);
 }
 
-function latestReviewForStage(state, task, stage) {
+export function currentReviewCandidateCycle(task) {
+  return Number(task.reviewSubjectCycle || task.reviewCycle || 0);
+}
+
+export function reviewMatchesCurrentCandidate(task, review) {
+  const reviewCycle = currentReviewCycle(task);
+  if (Number(review?.cycle || 0) !== reviewCycle) return false;
+  if (!task.reviewSubjectSha) {
+    return !review?.candidateCycle || Number(review.candidateCycle) === currentReviewCandidateCycle(task);
+  }
+  return (
+    currentReviewCandidateCycle(task) > 0
+    && review?.subjectSha === task.reviewSubjectSha
+    && Number(review?.candidateCycle || 0) === currentReviewCandidateCycle(task)
+  );
+}
+
+export function latestCurrentReviewForStage(state, task, stage) {
   return (state.reviews || [])
     .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
-    .filter((review) => !task.reviewSubjectSha || review.subjectSha === task.reviewSubjectSha)
-    .filter((review) => !review.candidateCycle || Number(review.candidateCycle) === currentReviewCycle(task))
-    .filter((review) => review.stageKey === stage.key || review.status === stage.status || review.role === stage.role)
+    .filter((review) => reviewMatchesCurrentCandidate(task, review))
+    .filter((review) => (
+      review.stageKey
+        ? review.stageKey === stage.key
+        : Boolean(review.status) && review.status === stage.status
+    ))
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
+}
+
+export function earliestIncompleteRequiredReviewStage(state, project, task) {
+  return reviewStagesForProject(project)
+    .filter((stage) => stage.required !== false)
+    .find((stage) => {
+      const review = latestCurrentReviewForStage(state, task, stage);
+      return !review || !REVIEW_COMPLETE_OUTCOMES.has(review.outcome);
+    }) || null;
 }
 
 export function candidateReviewEvidenceForTask(state, task) {
   const project = findProject(state, task.projectId);
   if (!project) return { ok: false, error: `Task has missing project: ${task.projectId}` };
-  const candidateCycle = currentReviewCycle(task);
-  if (!candidateCycle || task.reviewSubjectCycle !== candidateCycle || !task.reviewSubjectSha) {
+  const candidateCycle = currentReviewCandidateCycle(task);
+  if (!currentReviewCycle(task) || !candidateCycle || !task.reviewSubjectSha) {
     return { ok: false, error: "Task has no exact review subject for its current candidate cycle." };
   }
   const requiredStages = reviewStagesForProject(project).filter((stage) => stage.required !== false);
   const reviews = [];
   for (const stage of requiredStages) {
-    const review = latestReviewForStage(state, task, stage);
+    const review = latestCurrentReviewForStage(state, task, stage);
     if (!review || !REVIEW_COMPLETE_OUTCOMES.has(review.outcome)) {
       return { ok: false, error: `Required ${stage.label || stage.key} is not complete for the current subject SHA.` };
     }
@@ -1671,14 +1730,14 @@ function reviewCycleAtLimit(project, task) {
 function changeRequestedReviewsForCycle(state, task) {
   return (state.reviews || [])
     .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
+    .filter((review) => reviewMatchesCurrentCandidate(task, review))
     .filter((review) => review.outcome === "changes_requested");
 }
 
 function leadReviewCompleteForCycle(state, task, project) {
   const leadStage = leadReviewStageForProject(project);
   if (!leadStage) return false;
-  const latestReview = latestReviewForStage(state, task, leadStage);
+  const latestReview = latestCurrentReviewForStage(state, task, leadStage);
   return latestReview?.outcome === "approved";
 }
 
@@ -1725,7 +1784,10 @@ function setTaskWorkflowState(state, task, patch, now) {
   if (patch.status === "builder_review" && previousStatus !== "builder_review") {
     task.reviewCycle = Number(task.reviewCycle || 0) + 1;
     task.reviewSubjectSha = "";
-    task.reviewSubjectCycle = task.reviewCycle;
+    task.reviewSubjectCycle = Math.max(
+      Number(task.reviewSubjectCycle || 0) + 1,
+      task.reviewCycle,
+    );
   }
   task.updatedAt = now;
   state.events.push({
@@ -1734,6 +1796,71 @@ function setTaskWorkflowState(state, task, patch, now) {
     projectId: task.projectId,
     taskId: task.id,
     message: `Task moved to ${task.status}: ${task.title}`,
+    createdAt: now,
+  });
+}
+
+function restartReviewsForSubjectChange(state, task, project, previousSha, subjectSha, now) {
+  task.reviewSubjectCycle = Math.max(
+    currentReviewCandidateCycle(task),
+    currentReviewCycle(task),
+  ) + 1;
+  for (const candidate of state.candidates || []) {
+    if (
+      candidate.invalidation
+      || !(candidate.manifest?.sources || []).some((source) => source.taskId === task.id)
+    ) {
+      continue;
+    }
+    invalidateCandidate(candidate, {
+      reason: `Task ${task.id} review subject changed after candidate assembly.`,
+      expected: previousSha,
+      observed: subjectSha,
+      invalidatedAt: now,
+    });
+    const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+    if (bundle) {
+      bundle.status = "invalidated";
+      bundle.updatedAt = now;
+    }
+  }
+  task.candidateId = "";
+  task.qaBundleId = "";
+  task.integrationStatus = "";
+  task.qaDecision = null;
+  task.promotionStatus = "";
+  const firstRequiredStage = reviewStagesForProject(project)
+    .find((stage) => stage.required !== false);
+  if (firstRequiredStage) {
+    setTaskWorkflowState(state, task, {
+      status: firstRequiredStage.status,
+      assignedAgentRole: firstRequiredStage.role,
+      reviewerThreadId: "",
+    }, now);
+  }
+  for (const run of state.runs || []) {
+    if (
+      run.taskId === task.id
+      && run.group === "reviewer"
+      && run.status === "queued"
+    ) {
+      run.status = "cancelled";
+      run.notes = `Cancelled before start because the review subject changed from ${previousSha} to ${subjectSha}.`;
+      run.updatedAt = now;
+    }
+  }
+  addAutomationComment(
+    state,
+    task,
+    `Review subject changed from ${previousSha} to ${subjectSha}. Prior candidate-cycle approvals are stale, so StudioOps restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.`,
+    now,
+  );
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "review_subject_changed",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title}: review subject changed and required reviews restarted`,
     createdAt: now,
   });
 }
@@ -1929,7 +2056,7 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
 
   const currentStage = findReviewStage(stages, task.status);
   if (currentStage) {
-    const latestReview = latestReviewForStage(state, task, currentStage);
+    const latestReview = latestCurrentReviewForStage(state, task, currentStage);
     if (!latestReview) {
       if (task.assignedAgentRole !== currentStage.role) {
         setTaskWorkflowState(state, task, {
@@ -1969,7 +2096,7 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
   }
 
   for (const stage of stages) {
-    const latestReview = latestReviewForStage(state, task, stage);
+    const latestReview = latestCurrentReviewForStage(state, task, stage);
     if (latestReview?.outcome === "changes_requested" && project && shouldEscalateChangesToLead(project, task, stage)) {
       return routeChangesRequestedInState(state, task, project, stage, now, author, actions);
     }
@@ -2156,6 +2283,7 @@ Work lane: ${task.lane || task.area || "(inferred by StudioOps)"}
 Work areas:
 ${(task.workAreas || []).map((item) => `- ${item}`).join("\n") || "- Not explicitly scoped."}
 Review cycle: ${currentReviewCycle(task)}
+Candidate cycle: ${currentReviewCandidateCycle(task)}
 Parent epic/task: ${parent ? `${parent.id}: ${parent.title}` : "(none)"}
 
 Task:
@@ -2210,11 +2338,12 @@ ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
 - Confirm the task has branch/PR context and builder notes when implementation work was done.
 - Confirm whether this PR has one primary task or intentionally covers multiple tasks. If it covers multiple tasks, verify each linked task has clear complete/partial scope notes.
 - If you find small deterministic issues and the project policy allows reviewer fixes, fix them directly on the PR branch, run relevant validation, comment with exactly what changed, then continue the review.
+- If a reviewer fix changes the source SHA, update the task's review subject to the new full SHA. StudioOps will preserve the builder review cycle, advance the candidate cycle, invalidate prior-candidate approvals, and restart at the earliest required review lane. Do not record a later-lane approval until automation routes the new candidate back to that lane.
 - Use \`changes_requested\` only for material, risky, ambiguous, security/privacy-sensitive, or product-shaping problems that should not be quietly fixed inside review.
 - Do not create an endless builder-review loop. If this is review cycle ${reviewPolicy.maxBuilderReviewCycles} or later, routine bounce-backs are exhausted.
 - At or beyond the review-cycle limit, non-lead reviewers should record \`changes_requested\` only for material unresolved issues; StudioOps will route the task to lead review for the final decision.
 - At or beyond the review-cycle limit, the lead reviewer should make the final call: fix and approve, approve with residual risk documented, or hand the task to the human owner if it is unsafe or genuinely blocked. Do not send it back for another routine builder pass.
-- Record the result with \`studioops review ${task.id} --stage ${reviewerProfile.stageHint} --subject-sha ${task.reviewSubjectSha || "<full-head-sha>"} --candidate-cycle ${currentReviewCycle(task) || "<candidate-cycle>"} --outcome approved|skipped|changes_requested --body "..."\`
+- Record the result with \`studioops review ${task.id} --stage ${reviewerProfile.stageHint} --subject-sha ${task.reviewSubjectSha || "<full-head-sha>"} --candidate-cycle ${currentReviewCandidateCycle(task) || "<candidate-cycle>"} --outcome approved|skipped|changes_requested --body "..."\`
 - Use \`changes_requested\` for material issues and include concrete findings.
 - Use \`skipped\` only when this review lane truly has no relevant surface.
 - Use \`approved\` when this lane is complete, with validation reviewed and residual risk summarized.
