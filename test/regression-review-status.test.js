@@ -5,6 +5,9 @@ import { planRunnableRuns } from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { generatePrompt, normalizeReviewPipeline } from "../src/store.js";
 
+const SUBJECT_SHA = "a".repeat(40);
+const REVIEWER_FIX_SHA = "b".repeat(40);
+
 function fixtureState(taskPatch = {}, reviews = []) {
   return {
     projects: [{
@@ -160,4 +163,171 @@ test("repeated automation sweeps create one regression run and no local-QA revie
   assert.equal(localQaState.tasks[0].status, "qa_review");
   assert.equal(localQaState.tasks[0].assignedAgentRole, "owner");
   assert.equal(localQaState.runs.length, 0);
+});
+
+test("supervisor restarts the earliest exact-SHA lane despite stale duplicate approvals", () => {
+  const state = fixtureState({
+    status: "accessibility_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 2,
+  }, [
+    {
+      id: "review_1",
+      taskId: "task_1",
+      stageKey: "backend",
+      role: "backend-reviewer",
+      cycle: 1,
+      candidateCycle: 1,
+      subjectSha: SUBJECT_SHA,
+      outcome: "approved",
+      createdAt: "2026-07-26T10:00:00.000Z",
+    },
+    {
+      id: "review_2",
+      taskId: "task_1",
+      stageKey: "backend",
+      role: "backend-reviewer",
+      cycle: 1,
+      candidateCycle: 1,
+      subjectSha: SUBJECT_SHA,
+      outcome: "approved",
+      createdAt: "2026-07-26T10:01:00.000Z",
+    },
+    {
+      id: "review_3",
+      taskId: "task_1",
+      stageKey: "frontend",
+      role: "frontend-reviewer",
+      cycle: 1,
+      candidateCycle: 2,
+      subjectSha: REVIEWER_FIX_SHA,
+      outcome: "approved",
+      createdAt: "2026-07-26T10:02:00.000Z",
+    },
+  ]);
+  state.projects[0].reviewPipeline = [
+    {
+      key: "backend",
+      label: "Backend Review",
+      role: "backend-reviewer",
+      status: "backend_review",
+      required: true,
+    },
+    {
+      key: "frontend",
+      label: "Frontend Review",
+      role: "frontend-reviewer",
+      status: "frontend_review",
+      required: true,
+    },
+    {
+      key: "accessibility",
+      label: "Accessibility Review",
+      role: "accessibility-reviewer",
+      status: "accessibility_review",
+      required: true,
+    },
+    {
+      key: "lead",
+      label: "Primary Lead Review",
+      role: "lead-reviewer",
+      status: "lead_review",
+      required: true,
+    },
+  ];
+
+  const report = createSupervisorReport(state);
+
+  assert.equal(report.actions.length, 1);
+  assert.equal(report.actions[0].type, "start_review");
+  assert.equal(report.actions[0].role, "backend-reviewer");
+  assert.equal(report.actions[0].nextStatus, "backend_review");
+  assert.equal(report.actions[0].reviewSubjectSha, REVIEWER_FIX_SHA);
+  assert.equal(report.actions[0].candidateCycle, 2);
+  assert.match(report.actions[0].reason, /later review and owner\/QA handoff are blocked/);
+});
+
+test("dispatcher rejects stale identity and later-lane actions for an incomplete candidate", () => {
+  const state = fixtureState({
+    status: "backend_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 2,
+  }, [
+    {
+      id: "review_1",
+      taskId: "task_1",
+      stageKey: "backend",
+      role: "backend-reviewer",
+      cycle: 1,
+      candidateCycle: 1,
+      subjectSha: SUBJECT_SHA,
+      outcome: "approved",
+      createdAt: "2026-07-26T10:00:00.000Z",
+    },
+  ]);
+  state.projects[0].reviewPipeline = [
+    {
+      key: "backend",
+      label: "Backend Review",
+      role: "backend-reviewer",
+      status: "backend_review",
+      required: true,
+    },
+    {
+      key: "accessibility",
+      label: "Accessibility Review",
+      role: "accessibility-reviewer",
+      status: "accessibility_review",
+      required: true,
+    },
+    {
+      key: "lead",
+      label: "Primary Lead Review",
+      role: "lead-reviewer",
+      status: "lead_review",
+      required: true,
+    },
+  ];
+  const actionBase = {
+    id: "task_1:start_review",
+    type: "start_review",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_1",
+    taskTitle: "Review candidate",
+    taskStatus: "backend_review",
+    priority: "high",
+  };
+
+  const staleIdentity = planDispatches(state, [{
+    ...actionBase,
+    role: "backend-reviewer",
+    nextStatus: "backend_review",
+    reviewSubjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+  }]);
+  const laterLane = planDispatches(state, [{
+    ...actionBase,
+    role: "accessibility-reviewer",
+    nextStatus: "accessibility_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+  }]);
+  const ownerHandoff = planDispatches(state, [{
+    ...actionBase,
+    id: "task_1:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    nextStatus: "user_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+  }]);
+
+  assert.equal(staleIdentity.selected.length, 0);
+  assert.equal(staleIdentity.skipped[0].reason, "review_subject_changed");
+  assert.equal(laterLane.selected.length, 0);
+  assert.equal(laterLane.skipped[0].reason, "earlier_review_incomplete:backend");
+  assert.equal(ownerHandoff.selected.length, 0);
+  assert.equal(ownerHandoff.skipped[0].reason, "earlier_review_incomplete:backend");
 });

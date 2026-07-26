@@ -1,6 +1,10 @@
 import {
   architectureIsCompleteInState,
+  currentReviewCandidateCycle,
+  earliestIncompleteRequiredReviewStage,
+  latestCurrentReviewForStage,
   reviewPolicyForProject,
+  reviewMatchesCurrentCandidate,
   reviewStagesForProject,
 } from "./store.js";
 import {
@@ -37,7 +41,7 @@ function promptCommand(task, role) {
 
 function reviewCommand(task, stage) {
   const subject = task.reviewSubjectSha || "<full-head-sha>";
-  const cycle = Number(task.reviewCycle || 0) || "<candidate-cycle>";
+  const cycle = currentReviewCandidateCycle(task) || "<candidate-cycle>";
   return `node src/mission-control-cli.js review ${task.id} --stage ${stage.key} --subject-sha ${subject} --candidate-cycle ${cycle} --outcome approved --body "Reviewed ${stage.label || stage.key}."`;
 }
 
@@ -53,14 +57,6 @@ function incompleteDependencies(state, task) {
 
 function currentReviewCycle(task) {
   return Number(task.reviewCycle || 0);
-}
-
-function latestReviewForStage(state, task, stage) {
-  return (state.reviews || [])
-    .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
-    .filter((review) => review.stageKey === stage.key || review.status === stage.status || review.role === stage.role)
-    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
 }
 
 function isLeadReviewStage(stage) {
@@ -81,14 +77,14 @@ function reviewCycleAtLimit(project, task) {
 function changeRequestedReviewsForCycle(state, task) {
   return (state.reviews || [])
     .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
+    .filter((review) => reviewMatchesCurrentCandidate(task, review))
     .filter((review) => review.outcome === "changes_requested");
 }
 
 function leadReviewCompleteForCycle(state, task, project) {
   const leadStage = leadReviewStageForProject(project);
   if (!leadStage) return false;
-  const latest = latestReviewForStage(state, task, leadStage);
+  const latest = latestCurrentReviewForStage(state, task, leadStage);
   return latest && REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
 }
 
@@ -105,7 +101,7 @@ function nextOpenReviewStage(state, project, task) {
     return leadReviewStageForProject(project);
   }
   return reviewStagesForProject(project).find((stage) => {
-    const latest = latestReviewForStage(state, task, stage);
+    const latest = latestCurrentReviewForStage(state, task, stage);
     return !latest || !REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
   }) || null;
 }
@@ -149,6 +145,8 @@ function actionBase(state, task, type, role, reason, options = {}) {
     integrationBranch,
     integrationBranchUrl: task.integrationBranchUrl || branchWebUrl(project, integrationBranch),
     integrationStatus: task.integrationStatus || "",
+    reviewSubjectSha: task.reviewSubjectSha || "",
+    candidateCycle: currentReviewCandidateCycle(task),
     promptCommand: role && role !== "owner" && !String(role).includes("integration-worker") ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     integrationCommand: options.integrationCommand || "",
@@ -247,6 +245,40 @@ function taskActions(state, task, options = {}) {
 
   if (task.type === "epic" || hasChildren) return [];
 
+  const stages = reviewStagesForProject(project);
+  const currentStage = stageForStatus(project, task.status);
+  const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+  const currentStageIndex = stages.indexOf(currentStage);
+  const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
+  const laterReviewStatuses = new Set([
+    "qa_review",
+    "user_review",
+    "approved_for_main",
+    "promotion_blocked",
+    "approved",
+  ]);
+  if (
+    task.reviewSubjectSha
+    && earliestRequiredStage
+    && (
+      (currentStage && currentStageIndex > earliestRequiredIndex)
+      || (!currentStage && laterReviewStatuses.has(task.status))
+    )
+  ) {
+    return [actionBase(
+      state,
+      task,
+      "start_review",
+      earliestRequiredStage.role,
+      `${earliestRequiredStage.label || earliestRequiredStage.key} lacks approval for candidate cycle ${currentReviewCandidateCycle(task)} at ${task.reviewSubjectSha}; later review and owner/QA handoff are blocked.`,
+      {
+        ...options,
+        stage: earliestRequiredStage,
+        nextStatus: earliestRequiredStage.status,
+      },
+    )];
+  }
+
   if (BUILDABLE_STATUSES.has(task.status)) {
     if (missingDependencies.length) {
       return [actionBase(
@@ -333,9 +365,8 @@ function taskActions(state, task, options = {}) {
     })];
   }
 
-  const currentStage = stageForStatus(project, task.status);
   if (currentStage) {
-    const latest = latestReviewForStage(state, task, currentStage);
+    const latest = latestCurrentReviewForStage(state, task, currentStage);
     if (!latest) {
       return [actionBase(state, task, "continue_review", currentStage.role, `${currentStage.label || currentStage.key} has not recorded an outcome yet.`, {
         ...options,

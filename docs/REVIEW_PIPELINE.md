@@ -54,7 +54,9 @@ node src/mission-control-cli.js review task_123 --stage lead --outcome changes_r
 
 Valid outcomes are `approved`, `skipped`, and `changes_requested`.
 
-Each time a builder moves work into `builder_review`, StudioOps increments the task's review cycle. Review outcomes are scoped to that cycle, so an old approval cannot carry forward after a reviewer requests changes and the builder resubmits.
+Each time a builder moves work into `builder_review`, StudioOps increments the task's builder review cycle. Every submitted source SHA also has a candidate cycle. Review evidence is valid only when its builder cycle, candidate cycle, and full source SHA all match the task's current review subject.
+
+A reviewer-side commit does not consume another builder review cycle. When the reviewer records the new full source SHA, StudioOps advances the candidate cycle, makes every prior-candidate approval stale, cancels queued reviewer runs for the superseded candidate, and routes the task to the earliest required review lane. Later reviewers, lead approval, QA handoff, and owner handoff remain blocked until every required lane approves or skips the new candidate in order. Reusing an older SHA does not resurrect its former approvals because the candidate cycle has changed.
 
 ## Default Flow
 
@@ -140,7 +142,7 @@ Expected reviewer outcomes:
 - Wrong scope: request a PR split or task split.
 - Incomplete acceptance criteria: record `changes_requested`.
 - Missing review lane: let automation route to the required review status, or record a `skipped` outcome when the lane truly does not apply.
-- Small reviewer fix made: commit the fix, comment with exactly what changed, then continue the review stage.
+- Small reviewer fix made: commit the fix, comment with exactly what changed, update `reviewSubjectSha` to the new full SHA, and stop that lane's approval attempt when StudioOps restarts an earlier required lane. The original lane continues only after the new candidate returns through the pipeline.
 
 ## Review Loop Limits
 
