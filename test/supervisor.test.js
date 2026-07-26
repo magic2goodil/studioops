@@ -100,6 +100,19 @@ test("supervisor tracks protected QA PRs and routes failed checks back to a buil
   assert.equal(waiting.actions[0].integrationPrUrl, "https://github.com/example/demo/pull/42");
   assert.equal(waiting.actions[0].integrationCheckState.state, "passed");
 
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_1",
+    title: "Later QA task",
+    type: "feature",
+    status: "qa_review",
+    dependsOnTaskIds: [],
+  });
+  const serialized = createSupervisorReport(state, { includeWaiting: true });
+  const deferred = serialized.actions.find((action) => action.taskId === "task_2");
+  assert.equal(deferred.type, "waiting_on_qa_integration_handoff");
+  assert.match(deferred.reason, /task_1 integration PR/);
+
   state.tasks[0].integrationStatus = "checks_failed";
   state.tasks[0].integrationPrReviewDecision = "";
   state.tasks[0].integrationCheckState = { state: "failed", passed: 1, pending: 0, failed: 1 };

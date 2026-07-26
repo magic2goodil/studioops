@@ -385,6 +385,30 @@ function taskActions(state, task, options = {}) {
     if (!projectUsesTrustLeadQa(project)) {
       return [actionBase(state, task, "qa_integration_config_error", "owner", `QA review is waiting, but the project integration branch is not eligible: ${integrationBranchSafetyError(project) || "Trust Leads QA integration is disabled."}`, options)];
     }
+    const activeProjectHandoff = (state.tasks || []).find((candidate) => (
+      candidate.id !== task.id
+      && candidate.projectId === task.projectId
+      && candidate.status === "qa_review"
+      && candidate.integrationStatus !== "ready"
+      && candidate.integrationCandidateBranch
+      && candidate.integrationCandidateCommit
+      && candidate.integrationPrUrl
+    ));
+    if (
+      activeProjectHandoff
+      && !task.integrationCandidateBranch
+      && !task.integrationCandidateCommit
+      && !task.integrationPrUrl
+    ) {
+      return [actionBase(
+        state,
+        task,
+        "waiting_on_qa_integration_handoff",
+        "",
+        `Waiting for ${activeProjectHandoff.id} integration PR ${activeProjectHandoff.integrationPrUrl} to resolve before assembling another project QA candidate.`,
+        options,
+      )];
+    }
     if (task.integrationStatus === "ready") {
       return [actionBase(state, task, "qa_bundle_ready", "owner", "QA integration branch is validated and ready for local owner testing.", options)];
     }
@@ -441,6 +465,7 @@ export function createSupervisorReport(state, options = {}) {
     "waiting_on_architecture",
     "waiting_on_dependency",
     "waiting_for_retry",
+    "waiting_on_qa_integration_handoff",
     "blocked",
     "release_candidate_ready",
   ]);
