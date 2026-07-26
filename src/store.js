@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   branchWebUrl,
   integrationBranchName,
@@ -79,6 +80,19 @@ const DEFAULT_ORPHANED_TASK_GRACE_MS = 15 * 60 * 1000;
 const DEFAULT_TRANSIENT_RECOVERY_MS = 2 * 60 * 1000;
 const MAX_TRANSIENT_RECOVERY_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_TRANSIENT_RECOVERIES = 1;
+const GITHUB_REMOTE_RECOVERY_DELAYS_MS = [
+  60_000,
+  2 * 60_000,
+  4 * 60_000,
+  8 * 60_000,
+  15 * 60_000,
+];
+const VALID_GITHUB_REMOTE_RECOVERY_RESUME_STATUSES = new Set([
+  "backend_review",
+  "frontend_review",
+  "accessibility_review",
+  "lead_review",
+]);
 const VALID_DELIVERY_MODES = new Set(["functional", "prototype", "visual-only"]);
 const ARCHITECTURE_TASK_PATTERN = /\b(app|application|platform|product|system|dashboard|portal|website|web app|mobile|native|mockup|redesign)\b/i;
 
@@ -155,6 +169,353 @@ export async function writeState(state) {
 
 export async function mutateState(mutator) {
   return mutateDatabaseState(mutator);
+}
+
+function boundedRecoveryDiagnostic(value) {
+  return String(value || "")
+    .replace(/(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi, "$1[REDACTED]@")
+    .replace(/\b(?:github_pat_|gh[pousr]_)[a-z0-9_]{8,}\b/gi, "[REDACTED]")
+    .replace(/\b((?:authorization|bearer|token|secret|password|private[-_ ]?key)\s*[:=]\s*)\S+/gi, "$1[REDACTED]")
+    .trim()
+    .slice(0, 2_000);
+}
+
+function normalizedGitHubRepository(value) {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https?:\/\/github\.com\/)([^/]+)\/([^/#?]+?)(?:\.git)?$/i);
+  if (!match) return null;
+  return {
+    owner: match[1].toLowerCase(),
+    repository: match[2].replace(/\.git$/i, "").toLowerCase(),
+  };
+}
+
+function recoveryProbeMatchesClaim(probe, claim) {
+  const claimed = claim?.probe;
+  if (!claimed) return false;
+  return [
+    "sourceRunId",
+    "projectId",
+    "owner",
+    "repository",
+    "role",
+    "actionType",
+    "branchName",
+    "prUrl",
+    "resumeStatus",
+    "probeCount",
+    "nextProbeAt",
+  ].every((key) => probe[key] === claimed[key]);
+}
+
+function recoveryResumeStatusIsValid(probe) {
+  if (["start_builder", "unblock_task"].includes(probe.actionType)) {
+    return probe.resumeStatus === "queued";
+  }
+  if (["start_builder_fix", "return_to_builder"].includes(probe.actionType)) {
+    return probe.resumeStatus === "needs_changes";
+  }
+  if (probe.actionType === "qa_integration_blocked") {
+    return probe.resumeStatus === "qa_review";
+  }
+  if (["start_review", "continue_review"].includes(probe.actionType)) {
+    return VALID_GITHUB_REMOTE_RECOVERY_RESUME_STATUSES.has(probe.resumeStatus);
+  }
+  return false;
+}
+
+function recoveryContextFailure(state, task, probe) {
+  if (task.status !== "blocked") return "github_remote_recovery_task_status_changed";
+  if (task.automationBlocker?.type !== "configuration") return "github_remote_recovery_blocker_changed";
+  if (task.automationBlocker.reason !== "inaccessible_github_remote") {
+    return "github_remote_recovery_reason_changed";
+  }
+  if (!probe || task.automationBlocker.recoveryProbe !== probe) {
+    return "github_remote_recovery_probe_changed";
+  }
+  if (!recoveryResumeStatusIsValid(probe)) {
+    return "github_remote_recovery_invalid_resume_status";
+  }
+  if (!probe.sourceRunId) return "github_remote_recovery_source_run_missing";
+  if (!probe.projectId || !probe.owner || !probe.repository || !probe.role || !probe.actionType) {
+    return "github_remote_recovery_context_missing";
+  }
+  if (!probe.branchName) return "github_remote_recovery_branch_missing";
+
+  const sourceRun = (state.runs || []).find((run) => run.id === probe.sourceRunId);
+  if (!sourceRun) return "github_remote_recovery_source_run_missing";
+  if (
+    sourceRun.status !== "cancelled"
+    || sourceRun.exitCode !== "inaccessible_github_remote"
+    || String(sourceRun.attemptKey || "") !== ""
+    || sourceRun.taskId !== task.id
+    || sourceRun.projectId !== probe.projectId
+    || sourceRun.role !== probe.role
+    || sourceRun.actionType !== probe.actionType
+    || String(sourceRun.branchName || "") !== probe.branchName
+    || String(sourceRun.prUrl || "") !== probe.prUrl
+    || String(sourceRun.recoveryGitHubOwner || "") !== probe.owner
+    || String(sourceRun.recoveryGitHubRepository || "") !== probe.repository
+  ) {
+    return "github_remote_recovery_source_context_changed";
+  }
+  const project = findProject(state, probe.projectId);
+  if (!project || task.projectId !== probe.projectId) {
+    return "github_remote_recovery_project_changed";
+  }
+  const configuredRepository = normalizedGitHubRepository(project.repoUrl);
+  if (
+    configuredRepository
+    && (
+      configuredRepository.owner !== probe.owner
+      || configuredRepository.repository !== probe.repository
+    )
+  ) {
+    return "github_remote_recovery_repository_changed";
+  }
+  if (
+    String(task.branchName || "") !== probe.branchName
+    || String(task.prUrl || "") !== probe.prUrl
+  ) {
+    return "github_remote_recovery_target_changed";
+  }
+  return "";
+}
+
+function makeRecoveryNonProbeable(state, task, probe, code, diagnostic, now) {
+  const safeCode = String(code || "github_remote_recovery_context_changed");
+  const safeDiagnostic = boundedRecoveryDiagnostic(diagnostic || safeCode);
+  task.assignedAgentRole = "owner";
+  task.retryNotBefore = "";
+  task.automationBlocker = {
+    ...task.automationBlocker,
+    reason: safeCode,
+    message: safeDiagnostic,
+    remediation: "Repair the recorded GitHub repository, role, branch, or pull request target, then restore the task to its prior workflow state.",
+    recoveryProbe: {
+      ...probe,
+      nextProbeAt: "",
+      lastCode: safeCode,
+      lastDiagnostic: safeDiagnostic,
+      lease: null,
+    },
+  };
+  task.updatedAt = now;
+}
+
+export function scheduleGitHubRemoteRecoveryProbeInState(state, run, input = {}) {
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const task = findTask(state, run.taskId);
+  if (!task) return null;
+  const branchName = String(input.branchName || run.branchName || "").trim();
+  const prUrl = String(input.prUrl ?? run.prUrl ?? "").trim();
+  const resumeStatus = String(input.resumeStatus || "").trim();
+  const owner = String(input.owner || "").trim().toLowerCase();
+  const repository = String(input.repository || "").trim().replace(/\.git$/i, "").toLowerCase();
+  const diagnostic = boundedRecoveryDiagnostic(input.diagnostic || "The GitHub origin is not accessible.");
+  if (!task.branchName && branchName) task.branchName = branchName;
+  if (!task.prUrl && prUrl) task.prUrl = prUrl;
+  run.branchName = branchName;
+  run.prUrl = prUrl;
+  run.recoveryGitHubOwner = owner;
+  run.recoveryGitHubRepository = repository;
+
+  const recoveryProbe = {
+    sourceRunId: run.id,
+    projectId: run.projectId,
+    owner,
+    repository,
+    role: String(run.role || "").trim(),
+    actionType: String(run.actionType || "").trim(),
+    branchName,
+    prUrl,
+    resumeStatus,
+    probeCount: 0,
+    nextProbeAt: new Date(nowMs + GITHUB_REMOTE_RECOVERY_DELAYS_MS[0]).toISOString(),
+    lastProbeAt: "",
+    lastCode: "inaccessible_github_remote",
+    lastDiagnostic: diagnostic,
+    lease: null,
+  };
+  task.automationBlocker = {
+    type: "configuration",
+    reason: "inaccessible_github_remote",
+    message: diagnostic,
+    remediation: String(input.remediation || "").trim(),
+    runId: run.id,
+    resumeStatus,
+    blockedAt: now,
+    recoveryProbe,
+  };
+  task.updatedAt = now;
+
+  const contextFailure = recoveryContextFailure(state, task, recoveryProbe);
+  if (contextFailure) {
+    makeRecoveryNonProbeable(state, task, recoveryProbe, contextFailure, diagnostic, now);
+  }
+  return task.automationBlocker.recoveryProbe;
+}
+
+export function claimDueGitHubRemoteRecoveryProbesInState(state, input = {}) {
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const leaseMs = Math.max(5_000, Number(input.leaseMs || 60_000));
+  const limit = Math.min(2, Math.max(1, Number(input.limit || 2)));
+  const claims = [];
+
+  for (const task of state.tasks || []) {
+    if (claims.length >= limit) break;
+    if (task.status !== "blocked") continue;
+    const probe = task.automationBlocker?.recoveryProbe;
+    if (
+      task.automationBlocker?.type !== "configuration"
+      || task.automationBlocker?.reason !== "inaccessible_github_remote"
+      || !probe
+    ) continue;
+
+    const dueAt = Date.parse(probe.nextProbeAt || "");
+    if (!Number.isFinite(dueAt) || dueAt > nowMs) continue;
+    const leaseExpiresAt = Date.parse(probe.lease?.expiresAt || "");
+    if (Number.isFinite(leaseExpiresAt) && leaseExpiresAt > nowMs) continue;
+
+    const contextFailure = recoveryContextFailure(state, task, probe);
+    if (contextFailure) {
+      makeRecoveryNonProbeable(state, task, probe, contextFailure, contextFailure, now);
+      continue;
+    }
+
+    const lease = {
+      id: String(input.leaseIdFactory?.(task, probe) || randomUUID()),
+      claimedAt: now,
+      expiresAt: new Date(nowMs + leaseMs).toISOString(),
+    };
+    probe.lease = lease;
+    task.updatedAt = now;
+    claims.push({
+      taskId: task.id,
+      leaseId: lease.id,
+      probe: structuredClone(probe),
+      sourceRun: structuredClone((state.runs || []).find((run) => run.id === probe.sourceRunId)),
+      project: structuredClone(findProject(state, probe.projectId)),
+    });
+  }
+  return claims;
+}
+
+export async function claimDueGitHubRemoteRecoveryProbes(input = {}) {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => claimDueGitHubRemoteRecoveryProbesInState(state, input));
+}
+
+export function renewGitHubRemoteRecoveryProbeLeaseInState(state, claim, input = {}) {
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const task = findTask(state, claim.taskId);
+  const probe = task?.automationBlocker?.recoveryProbe;
+  if (!probe || probe.lease?.id !== claim.leaseId) return false;
+  if (!recoveryProbeMatchesClaim(probe, claim)) return false;
+  const leaseExpiresAt = Date.parse(probe.lease.expiresAt || "");
+  if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= nowMs) return false;
+  probe.lease.expiresAt = new Date(nowMs + Math.max(5_000, Number(input.leaseMs || 60_000))).toISOString();
+  task.updatedAt = input.now || new Date(nowMs).toISOString();
+  return true;
+}
+
+export async function renewGitHubRemoteRecoveryProbeLease(claim, input = {}) {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => renewGitHubRemoteRecoveryProbeLeaseInState(state, claim, input));
+}
+
+export function applyGitHubRemoteRecoveryProbeResultInState(state, claim, result, input = {}) {
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const task = findTask(state, claim.taskId);
+  const probe = task?.automationBlocker?.recoveryProbe;
+  if (!task || !probe || probe.lease?.id !== claim.leaseId) {
+    return { applied: false, reason: "probe_lease_mismatch" };
+  }
+  if (!recoveryProbeMatchesClaim(probe, claim)) {
+    return { applied: false, reason: "probe_context_mismatch" };
+  }
+  const leaseExpiresAt = Date.parse(probe.lease.expiresAt || "");
+  if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= nowMs) {
+    return { applied: false, reason: "probe_lease_expired" };
+  }
+  const contextFailure = recoveryContextFailure(state, task, probe);
+  if (contextFailure) {
+    makeRecoveryNonProbeable(state, task, probe, contextFailure, contextFailure, now);
+    return { applied: true, status: "non_probeable", code: contextFailure };
+  }
+
+  const code = String(result?.code || (result?.ok ? "verified" : "github_remote_recovery_unverified"));
+  const diagnostic = boundedRecoveryDiagnostic(result?.diagnostic || code);
+  const probeCount = Math.max(0, Number(probe.probeCount || 0)) + 1;
+  if (result?.ok) {
+    const resumeStatus = probe.resumeStatus;
+    task.status = resumeStatus;
+    task.assignedAgentRole = "";
+    task.retryNotBefore = "";
+    task.lastAutomationFailure = "";
+    task.updatedAt = now;
+    delete task.automationBlocker;
+    state.comments = state.comments || [];
+    state.events = state.events || [];
+    addAutomationComment(
+      state,
+      task,
+      `Verified GitHub remote recovery for ${probe.owner}/${probe.repository} as ${probe.role}; restored ${resumeStatus} without launching a worker run.`,
+      now,
+      "StudioOps Runner",
+    );
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "github_remote_recovery_verified",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.id} restored to ${resumeStatus} after exact GitHub remote verification`,
+      createdAt: now,
+    });
+    return { applied: true, status: "recovered", resumeStatus };
+  }
+
+  if (result?.probeable === false) {
+    makeRecoveryNonProbeable(state, task, {
+      ...probe,
+      probeCount,
+      lastProbeAt: now,
+    }, code, diagnostic, now);
+    return { applied: true, status: "non_probeable", code };
+  }
+
+  const delayIndex = Math.min(probeCount, GITHUB_REMOTE_RECOVERY_DELAYS_MS.length - 1);
+  const nextProbeAt = new Date(nowMs + GITHUB_REMOTE_RECOVERY_DELAYS_MS[delayIndex]).toISOString();
+  task.assignedAgentRole = "owner";
+  task.automationBlocker = {
+    ...task.automationBlocker,
+    message: diagnostic,
+    recoveryProbe: {
+      ...probe,
+      probeCount,
+      nextProbeAt,
+      lastProbeAt: now,
+      lastCode: code,
+      lastDiagnostic: diagnostic,
+      lease: null,
+    },
+  };
+  task.updatedAt = now;
+  return { applied: true, status: "waiting", code, probeCount, nextProbeAt };
+}
+
+export async function applyGitHubRemoteRecoveryProbeResult(claim, result, input = {}) {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => applyGitHubRemoteRecoveryProbeResultInState(state, claim, result, input));
 }
 
 function nextId(items, prefix) {
