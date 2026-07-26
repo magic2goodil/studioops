@@ -383,10 +383,12 @@ Commands:
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
-  qa-integrate                  Merge lead-approved PR heads into QA integration branches
-  qa-pass TASK_ID --body        Mark local QA passed and queue promotion to main
-  qa-fail TASK_ID --body        Mark local QA failed and return the task for changes
-  promote                       Merge owner-QA-passed PR heads into target branches
+  qa-integrate                  Assemble reviewed commits into immutable local QA candidates
+  qa-pass TASK_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --body NOTES
+                                Approve the exact immutable candidate tested in local QA
+  qa-fail TASK_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --body NOTES
+                                Fail the exact immutable candidate and return its tasks for changes
+  promote                       Create a release-candidate PR from an owner-approved candidate
   notifier                      Send local owner/failure notifications
   self-update                   Fast-forward StudioOps main and restart workers
   backup [--output PATH]        Create a transactionally consistent SQLite backup
@@ -413,6 +415,10 @@ Task fields:
   --trust-lead-approvals        Alias for --trust-leads
   --no-trust-leads              Disable Trust Leads for a project
   --integration-branch          Non-production branch used for QA integration bundles
+  --subject-sha                 Exact full source SHA submitted for the current review cycle
+  --partial-tasks               Explicit subset for an authorized partial QA candidate
+  --partial-actor-id            Non-sensitive actor ID authorizing a partial candidate
+  --partial-reason-code         Bounded reason code for excluding tasks
   --workflow-mode               Project workflow: auto, local, or github
   --parent                      Parent epic/task ID
   --depends-on                  Dependency task IDs, comma or newline separated
@@ -427,6 +433,7 @@ Automation:
   studioops runner --plan
   studioops runner --provider codex-sdk
   studioops qa-integrate --plan
+  studioops qa-integrate --project app --partial-tasks task_1 --partial-actor-id release-owner --partial-reason-code independent_repair
   studioops promote --plan
   studioops notifier --plan
   studioops self-update --plan
@@ -499,8 +506,11 @@ Automation:
       outcome: command === "qa-pass" ? "passed" : "failed",
       body: args.body || args.notes || "",
       author: args.author || "Owner QA",
+      candidateId: args.candidate || args["candidate-id"],
+      manifestDigest: args.digest || args["manifest-digest"],
+      integrationSha: args["integration-sha"] || args.sha,
     });
-    console.log(`${result.task.id}: QA ${result.outcome}. Status now ${result.task.status}.`);
+    console.log(`${result.candidate.id}: QA ${result.candidate.qaDecision.outcome}. Status now ${result.candidate.status}.`);
     return;
   }
 
@@ -685,6 +695,8 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "branch-name")) patch.branchName = args["branch-name"];
     if (Object.prototype.hasOwnProperty.call(args, "pr")) patch.prUrl = args.pr;
     if (Object.prototype.hasOwnProperty.call(args, "pr-url")) patch.prUrl = args["pr-url"];
+    if (Object.prototype.hasOwnProperty.call(args, "subject-sha")) patch.subjectSha = args["subject-sha"];
+    if (Object.prototype.hasOwnProperty.call(args, "sha")) patch.subjectSha = args.sha;
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
     if (Object.prototype.hasOwnProperty.call(args, "type")) patch.type = args.type;
     if (Object.prototype.hasOwnProperty.call(args, "lane")) patch.lane = args.lane;
@@ -747,6 +759,8 @@ Automation:
       outcome: args.outcome,
       body: args.body,
       author: args.author,
+      subjectSha: args["subject-sha"] || args.sha,
+      candidateCycle: args["candidate-cycle"] || args.cycle,
     });
     console.log(`Recorded review ${result.review.id}: ${result.review.stageKey} -> ${result.review.outcome}`);
     for (const action of result.actions || []) console.log(`- ${action}`);
@@ -910,6 +924,9 @@ Automation:
     const options = {
       project: args.project || args.projects,
       task: args.task || args.tasks || args["task-id"],
+      partialTasks: args["partial-tasks"],
+      partialActorId: args["partial-actor-id"],
+      partialReasonCode: args["partial-reason-code"],
       dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
       force: Boolean(args.force || args.reintegrate),
       validationTimeoutMs: args["validation-timeout-ms"],

@@ -36,7 +36,9 @@ function promptCommand(task, role) {
 }
 
 function reviewCommand(task, stage) {
-  return `node src/mission-control-cli.js review ${task.id} --stage ${stage.key} --outcome approved --body "Reviewed ${stage.label || stage.key}."`;
+  const subject = task.reviewSubjectSha || "<full-head-sha>";
+  const cycle = Number(task.reviewCycle || 0) || "<candidate-cycle>";
+  return `node src/mission-control-cli.js review ${task.id} --stage ${stage.key} --subject-sha ${subject} --candidate-cycle ${cycle} --outcome approved --body "Reviewed ${stage.label || stage.key}."`;
 }
 
 function dependenciesForTask(state, task) {

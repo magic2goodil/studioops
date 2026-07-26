@@ -10,6 +10,11 @@ import {
   prepareGitHubAppAuth,
   redactSecrets,
 } from "./github-app-auth.js";
+import {
+  assertCandidateEnvelope,
+  invalidateCandidate,
+} from "./candidate-manifest.js";
+import { verifyCandidateRepositoryState } from "./candidate-repository.js";
 import { mutateState, readState } from "./store.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
 
@@ -424,6 +429,31 @@ function promotionBranchName(projectPlan) {
   return `qa/promotion-${project}-${Date.now()}`;
 }
 
+function candidateHasValidQaPass(candidate) {
+  try {
+    assertCandidateEnvelope(candidate);
+  } catch {
+    return false;
+  }
+  const decision = candidate.qaDecision;
+  if (
+    candidate.status !== "qa_passed"
+    || candidate.invalidation
+    || decision?.outcome !== "passed"
+    || decision.candidateId !== candidate.id
+    || decision.manifestDigest !== candidate.manifestDigest
+    || decision.integrationSha !== candidate.manifest.integration.sha
+    || !String(decision.author || "").trim()
+    || !Number.isFinite(Date.parse(decision.repositoryVerifiedAt || ""))
+    || !Number.isFinite(Date.parse(decision.decidedAt || ""))
+  ) {
+    return false;
+  }
+  const expectedTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
+  const decidedTaskIds = normalizeList(decision.taskIds).sort();
+  return JSON.stringify(expectedTaskIds) === JSON.stringify(decidedTaskIds);
+}
+
 function hasUnmetPromotionDependency(task, tasksById, selectedIds, completedIds) {
   for (const dependencyId of task.dependsOnTaskIds || []) {
     if (selectedIds.has(dependencyId) && !completedIds.has(dependencyId)) return true;
@@ -467,33 +497,55 @@ function orderPromotionTasks(projectTasks, candidates) {
 export function planPromotions(state, input = {}) {
   const projectPlans = (state.projects || [])
     .filter((project) => projectMatches(project, input))
-    .map((project) => {
-      const projectTasks = (state.tasks || []).filter((task) => task.projectId === project.id);
-      const candidates = projectTasks
-        .filter((task) => task.status === "approved_for_main")
-        .filter((task) => taskMatches(task, input));
-      const ordered = orderPromotionTasks(projectTasks, candidates);
-      return {
-        projectId: project.id,
-        projectKey: project.key,
-        projectName: project.name,
-        repoPath: project.repoPath || "",
-        repoUrl: project.repoUrl || "",
-        defaultBranch: project.defaultBranch || "main",
-        targetBranch: promotionTargetBranch(project),
-        enabled: promotionEnabled(project),
-        skipReason: promotionEnabled(project) ? "" : "promotion is disabled for this project.",
-        validationCommands: promotionValidationCommands(project),
-        tasks: ordered.ordered.map((task) => ({
-          id: task.id,
-          title: task.title,
-          status: task.status,
-          branchName: task.branchName || "",
-          prUrl: task.prUrl || "",
-          dependsOnTaskIds: task.dependsOnTaskIds || [],
-        })),
-        blockedTasks: ordered.blocked,
-      };
+    .flatMap((project) => {
+      const projectTasks = new Map(
+        (state.tasks || [])
+          .filter((task) => task.projectId === project.id)
+          .map((task) => [task.id, task]),
+      );
+      return (state.candidates || [])
+        .filter((candidate) => candidate.projectId === project.id)
+        .filter(candidateHasValidQaPass)
+        .filter((candidate) => {
+          const candidateFilter = normalizeList(input.candidate || input.candidates || input.candidateId);
+          if (candidateFilter.length && !candidateFilter.includes(candidate.id)) return false;
+          const taskFilter = normalizeList(input.task || input.tasks || input.taskId);
+          return !taskFilter.length || candidate.manifest?.sources?.some((source) => taskFilter.includes(source.taskId));
+        })
+        .map((candidate) => ({
+          projectId: project.id,
+          projectKey: project.key,
+          projectName: project.name,
+          repoPath: project.repoPath || "",
+          repoUrl: project.repoUrl || "",
+          defaultBranch: project.defaultBranch || "main",
+          targetBranch: candidate.manifest.base.branch,
+          enabled: (
+            promotionEnabled(project)
+            && promotionTargetBranch(project) === candidate.manifest.base.branch
+          ),
+          skipReason: !promotionEnabled(project)
+            ? "promotion is disabled for this project."
+            : promotionTargetBranch(project) !== candidate.manifest.base.branch
+              ? `promotion target ${promotionTargetBranch(project)} does not match candidate base ${candidate.manifest.base.branch}; rebuild the candidate against the intended target.`
+              : "",
+          validationCommands: promotionValidationCommands(project),
+          candidate,
+          tasks: candidate.manifest.sources.map((source) => {
+            const task = projectTasks.get(source.taskId);
+            return {
+              id: source.taskId,
+              title: task?.title || source.taskId,
+              status: task?.status || "",
+              branchName: task?.branchName || "",
+              prUrl: task?.prUrl || "",
+              dependsOnTaskIds: task?.dependsOnTaskIds || [],
+              sourceRef: source.sourceRef,
+              headSha: source.headSha,
+            };
+          }),
+          blockedTasks: [],
+        }));
     });
 
   return {
@@ -512,6 +564,94 @@ function allTaskResults(tasks, status, output) {
     source: sourceLabel(task),
     output: truncateOutput(output),
   }));
+}
+
+function integrityFailure(message, expected = "", observed = "") {
+  const error = new Error(message);
+  error.code = "CANDIDATE_INTEGRITY";
+  error.expected = expected;
+  error.observed = observed;
+  return error;
+}
+
+async function checkoutExactCandidate(repoPath, projectPlan, options = {}) {
+  const candidate = projectPlan.candidate;
+  assertCandidateEnvelope(candidate);
+  const manifest = candidate.manifest;
+  if (projectPlan.targetBranch !== manifest.base.branch) {
+    throw integrityFailure(
+      `Promotion target ${projectPlan.targetBranch} does not match candidate base ${manifest.base.branch}.`,
+      manifest.base.branch,
+      projectPlan.targetBranch,
+    );
+  }
+  const repositoryVerification = await verifyCandidateRepositoryState({
+    repoPath,
+  }, candidate, options);
+  if (!repositoryVerification.ok) {
+    if (repositoryVerification.status === "drift") {
+      throw integrityFailure(
+        repositoryVerification.reason,
+        repositoryVerification.expected,
+        repositoryVerification.observed,
+      );
+    }
+    throw new Error(repositoryVerification.reason);
+  }
+  const targetBranch = await prepareTargetBranch(repoPath, projectPlan, options);
+  const observedBase = await branchHead(repoPath, `refs/remotes/origin/${targetBranch}`, options);
+  if (observedBase !== manifest.base.sha) {
+    throw integrityFailure(
+      `Candidate base drift: expected ${manifest.base.sha}, observed ${observedBase || "missing"}.`,
+      manifest.base.sha,
+      observedBase,
+    );
+  }
+
+  const candidateRef = `refs/studioops/candidates/${safeRefSegment(candidate.id)}/integration`;
+  const candidateFetch = await git(
+    repoPath,
+    ["fetch", "origin", `${manifest.integration.branch}:${candidateRef}`],
+    { ...options, allowFailure: true },
+  );
+  if (!candidateFetch.ok) {
+    throw new Error(`Could not fetch candidate branch ${manifest.integration.branch}: ${truncateOutput(candidateFetch.output)}`);
+  }
+  const observedIntegration = await branchHead(repoPath, candidateRef, options);
+  if (observedIntegration !== manifest.integration.sha) {
+    throw integrityFailure(
+      `Candidate branch drift: expected ${manifest.integration.sha}, observed ${observedIntegration || "missing"}.`,
+      manifest.integration.sha,
+      observedIntegration,
+    );
+  }
+
+  for (const source of manifest.sources) {
+    const localRef = `refs/studioops/candidates/${safeRefSegment(candidate.id)}/sources/${safeRefSegment(source.taskId)}`;
+    const fetched = await git(
+      repoPath,
+      ["fetch", "origin", `${source.sourceRef}:${localRef}`],
+      { ...options, allowFailure: true },
+    );
+    if (!fetched.ok) throw new Error(`Could not verify source ${source.taskId}: ${truncateOutput(fetched.output)}`);
+    const observed = await branchHead(repoPath, localRef, options);
+    if (observed !== source.headSha) {
+      throw integrityFailure(
+        `Candidate source drift for ${source.taskId}: expected ${source.headSha}, observed ${observed || "missing"}.`,
+        source.headSha,
+        observed,
+      );
+    }
+  }
+
+  const ancestry = await git(
+    repoPath,
+    ["merge-base", "--is-ancestor", manifest.base.sha, manifest.integration.sha],
+    { ...options, allowFailure: true },
+  );
+  if (!ancestry.ok) throw integrityFailure("Candidate integration commit does not descend from its recorded base.");
+  await git(repoPath, ["checkout", "--detach", manifest.integration.sha], options);
+  return manifest.integration.sha;
 }
 
 async function promoteProject(projectPlan, options = {}) {
@@ -565,43 +705,68 @@ async function promoteProject(projectPlan, options = {}) {
     const executionRepoPath = workspace.executionRepoPath;
     const gitOptions = { env: options.env, secrets: options.secrets };
 
-    await prepareTargetBranch(executionRepoPath, projectPlan, gitOptions);
-
-    const mergedTasks = [];
-    for (const task of projectPlan.tasks) {
-      const taskResult = await mergeTaskSource(executionRepoPath, task, gitOptions);
-      result.tasks.push(taskResult);
-      if (taskResult.status === "merged") mergedTasks.push(taskResult);
-    }
-
-    if (!mergedTasks.length) {
-      result.status = result.tasks.some((task) => task.status === "conflict") ? "conflict" : "blocked";
-      result.output = "No approved task could be promoted.";
-      return result;
-    }
+    await checkoutExactCandidate(executionRepoPath, projectPlan, gitOptions);
+    const candidateTasks = allTaskResults(projectPlan.tasks, "candidate_verified", "Exact candidate identity verified.");
+    result.tasks.push(...candidateTasks);
 
     result.validation = await runValidationCommands(executionRepoPath, validationCommands, options);
     const failedValidation = result.validation.find((item) => !item.ok);
     if (failedValidation) {
       result.status = "validation_failed";
       result.output = `Validation failed: ${failedValidation.command}`;
-      for (const task of mergedTasks) task.status = "validation_failed";
+      for (const task of candidateTasks) task.status = "validation_failed";
       return result;
+    }
+
+    const prePushVerification = await verifyCandidateRepositoryState({
+      repoPath: executionRepoPath,
+    }, projectPlan.candidate, gitOptions);
+    if (!prePushVerification.ok) {
+      if (prePushVerification.status === "drift") {
+        throw integrityFailure(
+          prePushVerification.reason,
+          prePushVerification.expected,
+          prePushVerification.observed,
+        );
+      }
+      throw new Error(prePushVerification.reason);
     }
 
     const commit = await branchHead(executionRepoPath, "HEAD", gitOptions);
     result.commit = commit;
+    if (commit !== projectPlan.candidate.manifest.integration.sha) {
+      result.status = "blocked";
+      result.output = `Promotion checkout drift: expected ${projectPlan.candidate.manifest.integration.sha}, observed ${commit || "missing"}.`;
+      for (const task of candidateTasks) task.status = "blocked";
+      return result;
+    }
 
     result.promotionBranch = promotionBranchName(projectPlan);
     const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${result.promotionBranch}`], { ...gitOptions, allowFailure: true });
     if (!push.ok) {
       result.status = "push_failed";
       result.output = `Non-force push to release-candidate branch ${result.promotionBranch} failed.\n${truncateOutput(push.output)}`;
-      for (const task of mergedTasks) task.status = "push_failed";
+      for (const task of candidateTasks) task.status = "push_failed";
       return result;
     }
 
-    const taskList = projectPlan.tasks.map((task) => `- ${task.id}: ${task.title}${task.prUrl ? ` (${task.prUrl})` : ""}`).join("\n");
+    const prePrVerification = await verifyCandidateRepositoryState({
+      repoPath: executionRepoPath,
+    }, projectPlan.candidate, gitOptions);
+    if (!prePrVerification.ok) {
+      if (prePrVerification.status === "drift") {
+        throw integrityFailure(
+          prePrVerification.reason,
+          prePrVerification.expected,
+          prePrVerification.observed,
+        );
+      }
+      throw new Error(prePrVerification.reason);
+    }
+
+    const taskList = projectPlan.tasks
+      .map((task) => `- ${task.id}: ${task.title}${task.prUrl ? ` (${task.prUrl})` : ""} at ${task.headSha}`)
+      .join("\n");
     const pr = await runCommand("gh", [
       "pr",
       "create",
@@ -612,7 +777,7 @@ async function promoteProject(projectPlan, options = {}) {
       "--title",
       `QA-approved release candidate: ${projectPlan.projectName || projectPlan.projectKey}`,
       "--body",
-      `## QA-approved tasks\n\n${taskList}\n\nValidation passed in StudioOps. Production deployment remains release/tag gated.`,
+      `## Immutable StudioOps candidate\n\nCandidate: ${projectPlan.candidate.id}\nManifest: ${projectPlan.candidate.manifestDigest}\nIntegration SHA: ${projectPlan.candidate.manifest.integration.sha}\n\n## QA-approved tasks\n\n${taskList}\n\nValidation passed against the exact candidate in StudioOps. Production deployment remains release/tag gated.`,
     ], {
       cwd: executionRepoPath,
       env: options.env,
@@ -623,18 +788,25 @@ async function promoteProject(projectPlan, options = {}) {
     if (!pr.ok) {
       result.status = "pr_failed";
       result.output = `Release-candidate branch was pushed, but the pull request could not be created.\n${truncateOutput(pr.output)}`;
-      for (const task of mergedTasks) task.status = "pr_failed";
+      for (const task of candidateTasks) task.status = "pr_failed";
       return result;
     }
 
     result.prUrl = String(pr.output || "").trim().split(/\s+/).find((value) => /^https:\/\/github\.com\/.+\/pull\/\d+/.test(value)) || "";
     result.status = "pr_ready";
     result.output = truncateOutput(pr.output || `Created release-candidate PR from ${result.promotionBranch}.`);
-    for (const task of mergedTasks) task.status = "pr_ready";
+    for (const task of candidateTasks) task.status = "pr_ready";
     return result;
   } catch (error) {
     result.status = "blocked";
     result.output = truncateOutput(error.message);
+    if (error.code === "CANDIDATE_INTEGRITY") {
+      result.candidateInvalidation = {
+        reason: error.message,
+        expected: error.expected || "",
+        observed: error.observed || "",
+      };
+    }
     result.tasks = result.tasks.length ? result.tasks : allTaskResults(projectPlan.tasks, "blocked", error.message);
     return result;
   } finally {
@@ -796,6 +968,18 @@ async function recordProjectResult(projectResult) {
     state.comments = state.comments || [];
     state.events = state.events || [];
     state.qaBundles = state.qaBundles || [];
+    state.candidates = state.candidates || [];
+    const candidate = state.candidates.find((item) => item.id === projectResult.candidate?.id);
+    if (!candidate) throw new Error(`Promotion result has no persisted candidate: ${projectResult.candidate?.id || "missing"}`);
+    assertCandidateEnvelope(candidate);
+    if (projectResult.candidateInvalidation) {
+      invalidateCandidate(candidate, projectResult.candidateInvalidation);
+      const invalidatedBundle = state.qaBundles.find((item) => item.id === candidate.qaBundleId);
+      if (invalidatedBundle) {
+        invalidatedBundle.status = "invalidated";
+        invalidatedBundle.updatedAt = now;
+      }
+    }
     let promotedCount = 0;
     const promotedTaskIds = new Set();
 
@@ -827,15 +1011,18 @@ async function recordProjectResult(projectResult) {
     }
 
     if (promotedCount > 0) {
-      for (const bundle of state.qaBundles) {
-        const bundleTaskIds = (bundle.tasks || []).map((task) => task.id);
-        const includedTaskIds = bundleTaskIds.filter((taskId) => promotedTaskIds.has(taskId));
-        if (!includedTaskIds.length) continue;
+      const expectedTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
+      const actualTaskIds = [...promotedTaskIds].sort();
+      if (JSON.stringify(actualTaskIds) !== JSON.stringify(expectedTaskIds)) {
+        throw new Error(`Promotion result does not exactly match candidate ${candidate.id}.`);
+      }
+      const bundle = state.qaBundles.find((item) => item.id === candidate.qaBundleId);
+      if (bundle) {
         bundle.status = "release_candidate_ready";
         bundle.promotionBranch = projectResult.promotionBranch || "";
         bundle.promotionPrUrl = projectResult.prUrl || "";
         bundle.promotionCommit = projectResult.commit || "";
-        bundle.promotedTaskIds = includedTaskIds;
+        bundle.promotedTaskIds = expectedTaskIds;
         bundle.promotionReadyAt = now;
         bundle.promotionNotifiedAt = "";
         bundle.notificationStatus = "";
@@ -843,6 +1030,15 @@ async function recordProjectResult(projectResult) {
         bundle.notificationRetryNotBefore = "";
         bundle.updatedAt = now;
       }
+      candidate.status = "release_candidate_ready";
+      candidate.promotion = {
+        branch: projectResult.promotionBranch || "",
+        prUrl: projectResult.prUrl || "",
+        commitSha: projectResult.commit || "",
+        manifestDigest: candidate.manifestDigest,
+        readyAt: now,
+      };
+      candidate.updatedAt = now;
       state.events.push({
         id: nextId(state.events, "event"),
         type: "release_candidate_ready",

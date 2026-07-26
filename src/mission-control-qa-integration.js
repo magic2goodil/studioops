@@ -44,6 +44,9 @@ async function optionsFrom(args) {
   return {
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     task: args.task || args.tasks || args["task-id"],
+    partialTasks: args["partial-tasks"],
+    partialActorId: args["partial-actor-id"],
+    partialReasonCode: args["partial-reason-code"],
     dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
     force: Boolean(args.force || args.reintegrate),
     validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
@@ -92,14 +95,15 @@ Usage:
   studioops-qa-integration --plan
   studioops-qa-integration --project myapp
   studioops-qa-integration --project myapp --force
+  studioops-qa-integration --project myapp --partial-tasks task_1 --partial-actor-id release-owner --partial-reason-code independent_repair
   studioops-qa-integration --watch --interval 300
   studioops qa-integrate --plan
   studioops qa-integrate --github-apps-dir ~/.codex/studioops/credentials/github-apps
 
-The worker merges qa_review task PR heads into a project's configured
-non-production integrationBranch only when trustLeadApprovals is enabled. It
-skips tasks whose current integration result is already ready unless --force
-is supplied. It does not merge PRs to production, deploy, or force-push.
+The worker assembles exact reviewed task commits into a unique, non-production
+candidate branch only when trustLeadApprovals is enabled. It freezes a candidate
+only after configured checks pass and the healthy local preview resolves to the
+same integration commit. It does not merge to production, deploy, or force-push.
 
 For GitHub repositories, the worker uses short-lived GitHub App installation
 tokens by default. If no dedicated qa-integration-worker app exists, it falls
