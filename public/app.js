@@ -581,6 +581,7 @@ function inboxGroups(inbox) {
 
 function inboxGroupMarkup(group) {
   const items = Array.isArray(group.items) ? group.items : [];
+  const count = Number(group.count ?? items.length);
   const ages = items
     .map((item) => (item.ageMs === null || item.ageMs === undefined ? Number.NaN : Number(item.ageMs)))
     .filter(Number.isFinite);
@@ -591,7 +592,10 @@ function inboxGroupMarkup(group) {
   return `
     <details id="inbox-group-${escapeHtml(group.id)}" class="owner-inbox-group ${escapeHtml(group.id)}"${open}>
       <summary>
-        <span class="inbox-group-count" aria-hidden="true">${escapeHtml(group.count ?? items.length)}</span>
+        <span class="inbox-group-count">
+          <span aria-hidden="true">${escapeHtml(count)}</span>
+          <span class="visually-hidden">${plural(count, "record")} in this group.</span>
+        </span>
         <span class="inbox-group-copy">
           <strong>${escapeHtml(group.label || group.id)}</strong>
           <span>${escapeHtml(group.description || "")}</span>
@@ -1392,13 +1396,16 @@ refreshButton.addEventListener("click", () => {
 
 function focusInboxGroup(groupId) {
   const group = document.querySelector(`#inbox-group-${groupId}`);
+  const scrollBehavior = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ? "auto"
+    : "smooth";
   if (group) {
     group.open = true;
-    group.scrollIntoView({ behavior: "smooth", block: "start" });
+    group.scrollIntoView({ behavior: scrollBehavior, block: "start" });
     group.querySelector("summary")?.focus({ preventScroll: true });
     return;
   }
-  ownerInbox.scrollIntoView({ behavior: "smooth", block: "start" });
+  ownerInbox.scrollIntoView({ behavior: scrollBehavior, block: "start" });
   document.querySelector("#ownerInboxTitle")?.focus({ preventScroll: true });
 }
 

@@ -28,12 +28,12 @@
     </header>
 
     <section id="systemStatus" class="system-status" aria-live="polite" hidden></section>
-    <section id="ownerInbox" class="owner-inbox" aria-labelledby="ownerInboxTitle" aria-live="polite" aria-busy="true">
+    <section id="ownerInbox" class="owner-inbox" aria-labelledby="ownerInboxTitle" aria-busy="true">
       <div class="owner-inbox-heading">
         <div>
           <p class="eyebrow">Persistent handoff · read only</p>
           <h2 id="ownerInboxTitle" tabindex="-1">Owner inbox</h2>
-          <p id="ownerInboxSummary" class="owner-inbox-summary">Loading current decisions and operational records…</p>
+          <p id="ownerInboxSummary" class="owner-inbox-summary" role="status" aria-atomic="true">Loading current decisions and operational records…</p>
         </div>
         <span id="ownerInboxCount">Loading…</span>
       </div>

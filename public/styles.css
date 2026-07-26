@@ -65,6 +65,10 @@ summary:focus-visible,
   outline-offset: 3px;
 }
 
+.owner-inbox-group > summary:focus-visible {
+  outline-offset: -4px;
+}
+
 button:disabled {
   cursor: wait;
   filter: grayscale(0.35);
@@ -522,7 +526,7 @@ h2 {
 
 .owner-inbox-actions .primary-action {
   border-color: rgba(143, 99, 255, 0.42);
-  background: linear-gradient(135deg, rgba(143, 99, 255, 0.92), rgba(95, 140, 255, 0.82));
+  background: linear-gradient(135deg, rgba(143, 99, 255, 0.75), rgba(95, 140, 255, 0.64));
   color: var(--text);
 }
 
@@ -583,6 +587,15 @@ h2 {
 .clipboard-fallback {
   position: fixed;
   inset: auto auto 0 -9999px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .layout {
