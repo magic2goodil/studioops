@@ -10,6 +10,27 @@ const PROMOTION_SHA = "d".repeat(40);
 const PREVIEW_URL = "http://127.0.0.1:5080/";
 const INTEGRATION_BRANCH = "qa/candidate-dollos";
 
+function currentReviews() {
+  return [
+    ["backend", "backend_review", "backend-reviewer"],
+    ["frontend", "frontend_review", "frontend-reviewer"],
+    ["accessibility", "accessibility_review", "accessibility-reviewer"],
+    ["lead", "lead_review", "lead-reviewer"],
+  ].map(([stageKey, status, role], index) => ({
+    id: `review_${index + 1}`,
+    taskId: "task_7",
+    projectId: "project_1",
+    cycle: 1,
+    candidateCycle: 1,
+    subjectSha: SUBJECT_SHA,
+    stageKey,
+    status,
+    role,
+    outcome: "approved",
+    createdAt: `2026-07-23T15:0${index}:00.000Z`,
+  }));
+}
+
 function fixtureState() {
   return {
     meta: {},
@@ -50,6 +71,7 @@ function fixtureState() {
       notificationChannel: "macos",
       externalNotifiedAt: "2026-07-23T15:02:36.000Z",
     }],
+    reviews: currentReviews(),
     qaBundles: [],
     candidates: [],
   };
@@ -119,6 +141,17 @@ function addCurrentBundle(state, status = "ready", input = {}) {
   const releaseReady = status === "release_candidate_ready";
   if (releaseReady) {
     candidate.status = "release_candidate_ready";
+    candidate.qaDecision = {
+      outcome: "passed",
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      integrationSha: candidate.manifest.integration.sha,
+      taskIds: ["task_7"],
+      repositoryVerifiedAt: "2026-07-23T15:04:30.000Z",
+      author: "Owner QA",
+      notes: "Validated locally.",
+      decidedAt: "2026-07-23T15:04:45.000Z",
+    };
     candidate.promotion = {
       branch: "release/candidate-dollos",
       prUrl: input.promotionPrUrl || "",
@@ -147,6 +180,7 @@ function addCurrentBundle(state, status = "ready", input = {}) {
     promotionPrUrl: input.promotionPrUrl || "",
     promotionCommit: releaseReady ? candidate.promotion.commitSha : "",
     promotedTaskIds: releaseReady ? ["task_7"] : [],
+    qaDecision: releaseReady ? candidate.qaDecision : null,
     tasks: [{ id: "task_7" }],
     updatedAt: "2026-07-23T15:05:00.000Z",
   }];
@@ -167,6 +201,16 @@ test("current owner exceptions remain decision-counted after desktop notificatio
   assert.equal(inbox.items[0].prUrl, "https://github.com/example/dollos/pull/36");
   assert.equal(inbox.items[0].checklist[0].taskId, "task_7");
   assert.match(inbox.items[0].checklist[0].text, /ritual duration/);
+});
+
+test("standalone owner decisions require every current exact-SHA review", () => {
+  const state = fixtureState();
+  state.reviews = state.reviews.filter((review) => review.stageKey !== "backend");
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.legacy, 1);
+  assert.equal(group(inbox, "legacy").items[0].classification, "legacy_record");
 });
 
 test("legacy user_review records remain visible without incrementing owner decisions", () => {
@@ -315,6 +359,34 @@ test("release candidates count only with immutable evidence and a concrete PR ac
   assert.equal(decision.primaryAction.href, "https://github.com/example/dollos/pull/99");
 });
 
+test("release candidates without a passed immutable QA decision route to Operations", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "release_candidate_ready", {
+    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+  });
+  state.candidates[0].qaDecision = null;
+  state.qaBundles[0].qaDecision = null;
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+});
+
+test("release candidates with stale QA decision bindings route to Operations", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "release_candidate_ready", {
+    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+  });
+  state.candidates[0].qaDecision.integrationSha = BASE_SHA;
+  state.qaBundles[0].qaDecision = state.candidates[0].qaDecision;
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+});
+
 test("release candidates with a mismatched promotion handoff route to Operations", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
@@ -458,6 +530,23 @@ test("inbox response items expose only whitelisted project identity fields", () 
   assert.doesNotMatch(responseBody, /private-project-config/);
   assert.doesNotMatch(responseBody, /\/private\/studioops/);
   assert.doesNotMatch(responseBody, /token@example/);
+});
+
+test("owner-facing operational strings redact local paths and credential-shaped values", () => {
+  const state = fixtureState();
+  state.tasks[0].status = "blocked";
+  state.tasks[0].automationBlocker = {
+    reason: "Read /Users/example/.codex/studioops/private-checkout with token=secret-value",
+  };
+  state.runs[0].notificationError = "Bearer abcdefghijklmnopqrstuvwxyz failed at file:///tmp/private.log";
+
+  const responseBody = JSON.stringify(buildOwnerInbox(state));
+  assert.doesNotMatch(responseBody, /\/Users\/example/);
+  assert.doesNotMatch(responseBody, /file:\/\/\/tmp/);
+  assert.doesNotMatch(responseBody, /secret-value/);
+  assert.doesNotMatch(responseBody, /abcdefghijklmnopqrstuvwxyz/);
+  assert.match(responseBody, /\[local path\]/);
+  assert.match(responseBody, /\[redacted credential\]/);
 });
 
 test("empty, stale, and mixed-category summaries are deterministic and rendering is read-only", () => {

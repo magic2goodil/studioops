@@ -1,4 +1,8 @@
-import { findProject, findTask } from "./store.js";
+import {
+  candidateReviewEvidenceForTask,
+  findProject,
+  findTask,
+} from "./store.js";
 import { projectUsesTrustLeadQa } from "./integration-policy.js";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
 
@@ -7,6 +11,11 @@ const QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed", "release_cand
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const FULL_GIT_SHA = /^[0-9a-f]{40}$/i;
 const GROUP_ORDER = ["decisions", "operations", "legacy"];
+const OWNER_URL_FIELDS = new Set(["href", "taskUrl", "prUrl", "previewUrl"]);
+const CREDENTIAL_PATTERN = /\b(?:Bearer\s+[A-Za-z0-9._~-]{16,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})\b/gi;
+const SECRET_ASSIGNMENT_PATTERN = /\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi;
+const LOCAL_PATH_PATTERN = /(^|[\s("'=])\/(?:Users|home|private|var\/folders|tmp|Volumes|opt|etc)\/[^\s"'<>)]*/g;
+const WINDOWS_PATH_PATTERN = /\b[A-Za-z]:\\(?:[^\\\s"'<>]+\\)*[^\\\s"'<>]*/g;
 
 const GROUP_DEFINITIONS = {
   decisions: {
@@ -77,14 +86,71 @@ function recoveryChecklist(circuit = {}) {
   ].map((text) => ({ taskId: "", taskTitle: "", text }));
 }
 
-function currentReviewEvidence(task) {
+function currentReviewEvidence(state, task) {
   const cycle = Number(task?.reviewCycle || 0);
   return task?.assignedAgentRole === "owner"
     && cycle > 0
     && Number(task.reviewSubjectCycle || 0) === cycle
     && FULL_GIT_SHA.test(String(task.reviewSubjectSha || ""))
     && !task.legacyQaDecisionUntrusted
-    && !task.legacyStatus;
+    && !task.legacyStatus
+    && candidateReviewEvidenceForTask(state, task).ok;
+}
+
+function passedQaDecision(candidate, bundle, sourceTaskIds) {
+  const decision = candidate?.qaDecision;
+  if (
+    !decision
+    || decision.outcome !== "passed"
+    || decision.candidateId !== candidate.id
+    || decision.manifestDigest !== candidate.manifestDigest
+    || decision.integrationSha !== candidate.manifest.integration.sha
+    || JSON.stringify([...(decision.taskIds || [])].sort()) !== JSON.stringify(sourceTaskIds)
+    || !String(decision.author || "").trim()
+    || !Number.isFinite(Date.parse(decision.decidedAt || ""))
+    || !Number.isFinite(Date.parse(decision.repositoryVerifiedAt || ""))
+  ) return false;
+  return !bundle?.qaDecision
+    || JSON.stringify(bundle.qaDecision) === JSON.stringify(decision);
+}
+
+function redactOwnerText(value) {
+  return String(value ?? "")
+    .replace(/file:\/\/\/[^\s"'<>)]*/gi, "[local path]")
+    .replace(LOCAL_PATH_PATTERN, (_, prefix) => `${prefix}[local path]`)
+    .replace(WINDOWS_PATH_PATTERN, "[local path]")
+    .replace(CREDENTIAL_PATTERN, "[redacted credential]")
+    .replace(SECRET_ASSIGNMENT_PATTERN, (_, label) => `${label}=[redacted credential]`);
+}
+
+function safeOwnerUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.startsWith("/")) return raw;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return "";
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) return "";
+  for (const key of parsed.searchParams.keys()) {
+    if (/token|secret|password|api[_-]?key/i.test(key)) return "";
+  }
+  return redactOwnerText(raw);
+}
+
+function sanitizeOwnerValue(value, key = "") {
+  if (typeof value === "string") {
+    return OWNER_URL_FIELDS.has(key) ? safeOwnerUrl(value) : redactOwnerText(value);
+  }
+  if (Array.isArray(value)) return value.map((item) => sanitizeOwnerValue(item));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([entryKey, entryValue]) => [
+      entryKey,
+      sanitizeOwnerValue(entryValue, entryKey),
+    ]),
+  );
 }
 
 function candidateForBundle(state, bundle) {
@@ -128,7 +194,8 @@ function candidateForBundle(state, bundle) {
     const promotion = candidate.promotion;
     const promotedTaskIds = [...(bundle.promotedTaskIds || [])].sort();
     if (
-      !promotion
+      !passedQaDecision(candidate, bundle, sourceTaskIds)
+      || !promotion
       || !bundle.promotionPrUrl
       || promotion.prUrl !== bundle.promotionPrUrl
       || promotion.branch !== bundle.promotionBranch
@@ -601,7 +668,7 @@ export function buildOwnerInbox(state, input = {}) {
     if (representedTaskIds.has(task.id)) continue;
 
     if (task.status === "user_review") {
-      const hasCurrentReviewEvidence = currentReviewEvidence(task);
+      const hasCurrentReviewEvidence = currentReviewEvidence(state, task);
       groupedItems[hasCurrentReviewEvidence ? "decisions" : "legacy"].push(
         hasCurrentReviewEvidence
           ? currentTaskDecisionItem(state, task, input)
@@ -614,7 +681,7 @@ export function buildOwnerInbox(state, input = {}) {
       const previewUrl = projectPreviewUrl(project);
       const qaValidationReady = task.integrationStatus === "ready"
         || (!projectUsesTrustLeadQa(project) && Boolean(previewUrl));
-      const currentStandaloneQa = currentReviewEvidence(task)
+      const currentStandaloneQa = currentReviewEvidence(state, task)
         && qaValidationReady
         && Boolean(previewUrl)
         && !task.qaBundleId;
@@ -633,15 +700,15 @@ export function buildOwnerInbox(state, input = {}) {
 
   const groups = GROUP_ORDER.map((id) => {
     const timedItems = groupedItems[id].map((item) => addTiming(item, generatedAtMs, staleAfterMs));
-    return groupSummary(id, sortItems(timedItems));
+    return sanitizeOwnerValue(groupSummary(id, sortItems(timedItems)));
   });
   const counts = Object.fromEntries(groups.map((group) => [group.id, group.count]));
   const allItems = groups.flatMap((group) => group.items);
 
-  const operatorPause = state.meta?.operatorPause?.active ? {
+  const operatorPause = state.meta?.operatorPause?.active ? sanitizeOwnerValue({
     ...state.meta.operatorPause,
     active: true,
-  } : null;
+  }) : null;
 
   return {
     generatedAt,
