@@ -296,7 +296,7 @@ test("a successful active final attempt leaves the next review stage dispatchabl
   const nextReport = await dispatchSupervisorActions([{
     id: "task_2:continue_review:lead",
     type: "continue_review",
-    role: "primary-team-lead",
+    role: "lead-reviewer",
     projectId: "project_1",
     projectKey: "demo",
     projectName: "Demo",
@@ -306,7 +306,8 @@ test("a successful active final attempt leaves the next review stage dispatchabl
   }], { state });
 
   assert.equal(nextReport.runs.length, 1);
-  assert.equal(nextReport.runs[0].role, "primary-team-lead");
+  assert.equal(nextReport.runs[0].role, "lead-reviewer");
+  assert.equal(nextReport.runs[0].group, "reviewer");
   assert.equal(state.tasks[1].automationCircuit, undefined);
 });
 
