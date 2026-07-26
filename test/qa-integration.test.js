@@ -78,6 +78,157 @@ async function stateWithReviewEvidence(state) {
   return state;
 }
 
+async function runQaIntegrationFixture(root, options = {}) {
+  const script = `
+    import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+    const report = await runQaIntegration(${JSON.stringify({
+      workspaceRoot: path.join(root, "qa-workspaces"),
+      ...(options.env?.PATH ? { path: options.env.PATH } : {}),
+      ...(options.env ? { env: options.env } : {}),
+      ...options.input,
+    })});
+    console.log(JSON.stringify(report));
+  `;
+  const result = await run(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: root,
+    env: options.env,
+  });
+  return JSON.parse(result.stdout.trim());
+}
+
+async function createProtectedBranchFixture(root) {
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  const fakeBin = path.join(root, "fake-bin");
+  const prMarker = path.join(root, "pr-created");
+  const prCreateLog = path.join(root, "pr-create.log");
+
+  await git(root, ["init", "--bare", remotePath]);
+  await git(root, ["clone", remotePath, repoPath]);
+  await git(repoPath, ["config", "user.email", "studioops-test@example.com"]);
+  await git(repoPath, ["config", "user.name", "StudioOps Test"]);
+  await git(repoPath, ["checkout", "-b", "main"]);
+  await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+  await git(repoPath, ["add", "app.txt"]);
+  await git(repoPath, ["commit", "-m", "base"]);
+  await git(repoPath, ["push", "origin", "main"]);
+  await git(repoPath, ["push", "origin", "main:qa/integration"]);
+  const baseSha = await git(repoPath, ["rev-parse", "main"]);
+
+  await git(repoPath, ["checkout", "-b", "feature/task"]);
+  await writeFile(path.join(repoPath, "feature.txt"), "protected QA feature\n", "utf8");
+  await git(repoPath, ["add", "feature.txt"]);
+  await git(repoPath, ["commit", "-m", "feature"]);
+  await git(repoPath, ["push", "origin", "feature/task"]);
+
+  const hookPath = path.join(remotePath, "hooks", "pre-receive");
+  await writeFile(hookPath, `#!/bin/sh
+while read old_sha new_sha ref_name
+do
+  if [ "$ref_name" = "refs/heads/qa/integration" ] && [ "$old_sha" != "0000000000000000000000000000000000000000" ]; then
+    echo "remote: error: GH006: Protected branch update failed for refs/heads/qa/integration." >&2
+    echo "remote: Changes must be made through a pull request." >&2
+    exit 1
+  fi
+done
+exit 0
+`, "utf8");
+  await chmod(hookPath, 0o755);
+
+  await mkdir(fakeBin, { recursive: true });
+  const fakeGh = path.join(fakeBin, "gh");
+  await writeFile(fakeGh, `#!/usr/bin/env node
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+const args = process.argv.slice(2);
+const marker = process.env.FAKE_GH_PR_MARKER;
+const createLog = process.env.FAKE_GH_CREATE_LOG;
+if (args[0] === "pr" && args[1] === "create") {
+  writeFileSync(marker, "created\\n");
+  appendFileSync(createLog, "create\\n");
+  console.log("https://github.com/example/demo/pull/42");
+  process.exit(0);
+}
+if (args[0] === "pr" && args[1] === "list") {
+  if (!existsSync(marker)) {
+    console.log("[]");
+    process.exit(0);
+  }
+  const head = args[args.indexOf("--head") + 1];
+  const base = args[args.indexOf("--base") + 1];
+  const line = execFileSync("git", ["ls-remote", "origin", "refs/heads/" + head], { encoding: "utf8" }).trim();
+  const oid = line.split(/\\s+/)[0] || "";
+  const checkMode = process.env.FAKE_GH_CHECK_STATE || "pending";
+  const checks = checkMode === "failed"
+    ? [{ name: "integration-test", status: "COMPLETED", conclusion: "FAILURE", detailsUrl: "https://example.test/check" }]
+    : checkMode === "passed"
+      ? [{ name: "integration-test", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://example.test/check" }]
+      : [{ name: "integration-test", status: "IN_PROGRESS", conclusion: "", detailsUrl: "https://example.test/check" }];
+  console.log(JSON.stringify([{
+    number: 42,
+    url: "https://github.com/example/demo/pull/42",
+    state: process.env.FAKE_GH_PR_STATE || "OPEN",
+    headRefName: head,
+    headRefOid: oid,
+    baseRefName: base,
+    mergeStateStatus: process.env.FAKE_GH_MERGE_STATE || "BLOCKED",
+    reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || "REVIEW_REQUIRED",
+    statusCheckRollup: checks,
+    mergeCommit: null
+  }]));
+  process.exit(0);
+}
+console.error("unexpected gh invocation: " + args.join(" "));
+process.exit(1);
+`, "utf8");
+  await chmod(fakeGh, 0o755);
+
+  await mkdir(path.join(root, "data"), { recursive: true });
+  await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
+    meta: {},
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath,
+      repoUrl: "",
+      defaultBranch: "main",
+      validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+      reviewPolicy: {
+        trustLeadApprovals: true,
+        integrationBranch: "qa/integration",
+      },
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Feature task",
+      status: "qa_review",
+      branchName: "feature/task",
+      prUrl: "",
+    }],
+    comments: [],
+    events: [],
+    reviews: [],
+    runs: [],
+  }), null, 2)}\n`, "utf8");
+
+  return {
+    remotePath,
+    repoPath,
+    fakeBin,
+    hookPath,
+    prMarker,
+    prCreateLog,
+    baseSha,
+    env: {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      FAKE_GH_PR_MARKER: prMarker,
+      FAKE_GH_CREATE_LOG: prCreateLog,
+    },
+  };
+}
+
 test("review policy Trust Leads settings override stale top-level mirrors", () => {
   const staleProject = {
     defaultBranch: "main",
@@ -854,7 +1005,7 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
 
     assert.equal(report.projects[0].status, "ready");
     assert.equal(report.projects[0].tasks[0].status, "ready");
-    assert.match(report.projects[0].integrationBranch, /^qa\/candidate-/);
+    assert.equal(report.projects[0].integrationBranch, "qa/integration");
     assert.equal(report.projects[0].localQaPreview.branch, report.projects[0].integrationBranch);
     assert.equal(report.projects[0].localQaPreview.after, report.projects[0].commit);
     assert.equal(report.projects[0].candidate.manifest.integration.sha, report.projects[0].commit);
@@ -1387,6 +1538,134 @@ test("QA integration keeps sanitized project workspace segments inside the works
     assert.equal(relativeWorkspace.startsWith(".."), false);
     assert.equal(path.isAbsolute(relativeWorkspace), false);
     assert.match(relativeWorkspace, /^workspace\//);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("protected QA branches use one idempotent integration PR and advance only after policy merge", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-"));
+
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    const pendingProject = pending.projects[0];
+    const pendingTask = pendingProject.tasks[0];
+
+    assert.equal(pendingProject.status, "pr_waiting", JSON.stringify(pendingProject, null, 2));
+    assert.equal(pendingTask.status, "pr_waiting");
+    assert.equal(pendingProject.protectedBranchFallback, true);
+    assert.match(pendingProject.integrationCandidateBranch, /^studioops\/qa-candidate\/demo-[0-9a-f]{12}$/);
+    assert.equal(pendingProject.integrationCandidateCommit, pendingProject.commit);
+    assert.equal(pendingProject.integrationPr.url, "https://github.com/example/demo/pull/42");
+    assert.equal(pendingProject.integrationCheckState.state, "pending");
+    assert.match(pendingProject.integrationBlocker, /required human review/);
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      fixture.baseSha,
+    );
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", `refs/heads/${pendingProject.integrationCandidateBranch}`]),
+      pendingProject.commit,
+    );
+
+    let persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].integrationCandidateCommit, pendingProject.commit);
+    assert.equal(persisted.tasks[0].integrationPrUrl, pendingProject.integrationPr.url);
+    assert.equal(persisted.tasks[0].integrationCheckState.state, "pending");
+    assert.match(persisted.tasks[0].integrationBlocker, /required human review/);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+
+    const failed = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_CHECK_STATE: "failed",
+        FAKE_GH_REVIEW_DECISION: "",
+      },
+    });
+    assert.equal(failed.projects[0].status, "checks_failed");
+    assert.equal(failed.projects[0].commit, pendingProject.commit);
+    assert.equal(failed.projects[0].integrationCandidateBranch, pendingProject.integrationCandidateBranch);
+    assert.equal(failed.projects[0].integrationCheckState.failed, 1);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+
+    const checksPassed = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_CHECK_STATE: "passed",
+        FAKE_GH_REVIEW_DECISION: "REVIEW_REQUIRED",
+      },
+    });
+    assert.equal(checksPassed.projects[0].status, "pr_waiting");
+    assert.equal(checksPassed.projects[0].integrationCheckState.state, "passed");
+    assert.match(checksPassed.projects[0].integrationBlocker, /required human review/);
+
+    await rm(fixture.hookPath);
+    await git(fixture.repoPath, [
+      "fetch",
+      "origin",
+      `refs/heads/${pendingProject.integrationCandidateBranch}`,
+    ]);
+    await git(fixture.repoPath, [
+      "push",
+      "origin",
+      "FETCH_HEAD:refs/heads/qa/integration",
+    ]);
+    const merged = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_PR_STATE: "MERGED",
+        FAKE_GH_CHECK_STATE: "passed",
+        FAKE_GH_REVIEW_DECISION: "APPROVED",
+        FAKE_GH_MERGE_STATE: "CLEAN",
+      },
+    });
+
+    assert.equal(merged.projects[0].status, "preview_missing");
+    assert.match(merged.projects[0].integrationCandidateCleanup, /Removed merged integration-candidate branch/);
+    assert.equal(
+      await git(fixture.remotePath, ["for-each-ref", "--format=%(refname)", `refs/heads/${pendingProject.integrationCandidateBranch}`]),
+      "",
+    );
+    persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].integrationPrUrl, "https://github.com/example/demo/pull/42");
+    assert.equal(persisted.tasks[0].integrationCandidateCommit, pendingProject.commit);
+    assert.notEqual(persisted.tasks[0].integrationStatus, "ready");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("protected QA handoff refuses changed candidate heads without force-pushing", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-drift-"));
+
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    const project = pending.projects[0];
+
+    await git(fixture.repoPath, ["fetch", "origin", project.integrationCandidateBranch]);
+    await git(fixture.repoPath, ["checkout", "-B", "tamper-candidate", "FETCH_HEAD"]);
+    await writeFile(path.join(fixture.repoPath, "remote-change.txt"), "unexpected\n", "utf8");
+    await git(fixture.repoPath, ["add", "remote-change.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "unexpected candidate change"]);
+    const changedHead = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", `HEAD:refs/heads/${project.integrationCandidateBranch}`]);
+
+    const drift = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: fixture.env,
+    });
+    assert.equal(drift.projects[0].status, "candidate_drift");
+    assert.match(drift.projects[0].integrationBlocker, /will not overwrite/);
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", `refs/heads/${project.integrationCandidateBranch}`]),
+      changedHead,
+    );
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -149,6 +149,11 @@ function actionBase(state, task, type, role, reason, options = {}) {
     integrationBranch,
     integrationBranchUrl: task.integrationBranchUrl || branchWebUrl(project, integrationBranch),
     integrationStatus: task.integrationStatus || "",
+    integrationCandidateBranch: task.integrationCandidateBranch || "",
+    integrationCandidateCommit: task.integrationCandidateCommit || "",
+    integrationPrUrl: task.integrationPrUrl || "",
+    integrationCheckState: task.integrationCheckState || null,
+    integrationBlocker: task.integrationBlocker || "",
     promptCommand: role && role !== "owner" && !String(role).includes("integration-worker") ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     integrationCommand: options.integrationCommand || "",
@@ -386,7 +391,24 @@ function taskActions(state, task, options = {}) {
     if (task.integrationStatus === "preview_blocked") {
       return [actionBase(state, task, "repair_qa_preview", "owner", "The QA branch is validated, but the configured local preview did not restart or pass its health check. Repair the preview service without rebuilding the feature PR.", options)];
     }
-    if (["conflict", "validation_failed", "push_failed", "blocked"].includes(task.integrationStatus)) {
+    if (["pr_waiting", "pr_merged"].includes(task.integrationStatus)) {
+      const reviewRequired = String(task.integrationPrReviewDecision || "").toUpperCase() === "REVIEW_REQUIRED";
+      return [actionBase(
+        state,
+        task,
+        "track_qa_integration_pr",
+        reviewRequired ? "owner" : "qa-integration-worker",
+        task.integrationBlocker || "The protected QA branch integration PR is waiting for repository policy to complete.",
+        {
+          ...options,
+          integrationCommand: `npm run qa-integrate -- --project ${project.key}`,
+        },
+      )];
+    }
+    if (task.integrationStatus === "pr_closed") {
+      return [actionBase(state, task, "qa_integration_pr_closed", "owner", task.integrationBlocker || "The protected QA branch integration PR was closed without merging.", options)];
+    }
+    if (["conflict", "validation_failed", "push_failed", "checks_failed", "candidate_drift", "candidate_publish_failed", "blocked"].includes(task.integrationStatus)) {
       return [actionBase(state, task, "qa_integration_blocked", "builder", `QA integration is blocked with status ${task.integrationStatus}. Review task comments and update the PR branch before rerunning integration.`, options)];
     }
     return [actionBase(state, task, "run_qa_integration", "qa-integration-worker", "Task is lead-approved and waiting for the QA integration branch worker.", {
@@ -466,6 +488,10 @@ export function formatSupervisorReport(report) {
     if (action.branchName) lines.push(`  Branch: ${action.branchName}`);
     if (action.integrationBranch) lines.push(`  QA branch: ${action.integrationBranch}${action.integrationBranchUrl ? ` (${action.integrationBranchUrl})` : ""}`);
     if (action.integrationStatus) lines.push(`  QA status: ${action.integrationStatus}`);
+    if (action.integrationCandidateBranch) lines.push(`  QA candidate: ${action.integrationCandidateBranch}${action.integrationCandidateCommit ? ` at ${action.integrationCandidateCommit}` : ""}`);
+    if (action.integrationPrUrl) lines.push(`  QA integration PR: ${action.integrationPrUrl}`);
+    if (action.integrationCheckState?.state) lines.push(`  QA checks: ${action.integrationCheckState.state}`);
+    if (action.integrationBlocker) lines.push(`  QA blocker: ${action.integrationBlocker}`);
     if (action.promptCommand) lines.push(`  Prompt: ${action.promptCommand}`);
     if (action.reviewCommand) lines.push(`  Review command: ${action.reviewCommand}`);
     if (action.integrationCommand) lines.push(`  Integration command: ${action.integrationCommand}`);
