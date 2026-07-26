@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -13,12 +14,14 @@ const promotionModuleUrl = pathToFileURL(path.join(process.cwd(), "src/promotion
 const storeModuleUrl = pathToFileURL(path.join(process.cwd(), "src/store.js")).href;
 
 async function run(command, args, options = {}) {
+  const baseEnv = options.cwd && command === process.execPath
+    ? await environmentForTestControlRoot(options.cwd)
+    : process.env;
   return execFileAsync(command, args, {
     cwd: options.cwd,
     env: {
-      ...process.env,
+      ...baseEnv,
       GIT_TERMINAL_PROMPT: "0",
-      ...(options.cwd ? { STUDIOOPS_ROOT: options.cwd } : {}),
       ...(options.env || {}),
     },
     timeout: options.timeout || 60_000,

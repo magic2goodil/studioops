@@ -47,8 +47,14 @@ test("STUDIOOPS_HOME supports an explicit home-relative local root", () => {
 
 test("STUDIOOPS_WORKING_ROOT selects the CLI and maintenance database instance", () => {
   const previousRoot = process.env.STUDIOOPS_ROOT;
+  const previousLegacyRoot = process.env.MISSION_CONTROL_ROOT;
   const previousWorkingRoot = process.env.STUDIOOPS_WORKING_ROOT;
+  const previousDataDir = process.env.STUDIOOPS_DATA_DIR;
+  const previousLegacyDataDir = process.env.MISSION_CONTROL_DATA_DIR;
   delete process.env.STUDIOOPS_ROOT;
+  delete process.env.MISSION_CONTROL_ROOT;
+  delete process.env.STUDIOOPS_DATA_DIR;
+  delete process.env.MISSION_CONTROL_DATA_DIR;
   process.env.STUDIOOPS_WORKING_ROOT = "~/.codex/studioops-test-control-plane";
   try {
     const expected = path.join(os.homedir(), ".codex", "studioops-test-control-plane");
@@ -57,7 +63,13 @@ test("STUDIOOPS_WORKING_ROOT selects the CLI and maintenance database instance",
   } finally {
     if (previousRoot === undefined) delete process.env.STUDIOOPS_ROOT;
     else process.env.STUDIOOPS_ROOT = previousRoot;
+    if (previousLegacyRoot === undefined) delete process.env.MISSION_CONTROL_ROOT;
+    else process.env.MISSION_CONTROL_ROOT = previousLegacyRoot;
     if (previousWorkingRoot === undefined) delete process.env.STUDIOOPS_WORKING_ROOT;
     else process.env.STUDIOOPS_WORKING_ROOT = previousWorkingRoot;
+    if (previousDataDir === undefined) delete process.env.STUDIOOPS_DATA_DIR;
+    else process.env.STUDIOOPS_DATA_DIR = previousDataDir;
+    if (previousLegacyDataDir === undefined) delete process.env.MISSION_CONTROL_DATA_DIR;
+    else process.env.MISSION_CONTROL_DATA_DIR = previousLegacyDataDir;
   }
 });
