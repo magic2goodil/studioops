@@ -9,6 +9,7 @@ import {
 } from "./integration-policy.js";
 import { missionControlDataDir } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode } from "./config.js";
+import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
@@ -87,12 +88,6 @@ const GITHUB_REMOTE_RECOVERY_DELAYS_MS = [
   8 * 60_000,
   15 * 60_000,
 ];
-const VALID_GITHUB_REMOTE_RECOVERY_RESUME_STATUSES = new Set([
-  "backend_review",
-  "frontend_review",
-  "accessibility_review",
-  "lead_review",
-]);
 const VALID_DELIVERY_MODES = new Set(["functional", "prototype", "visual-only"]);
 const ARCHITECTURE_TASK_PATTERN = /\b(app|application|platform|product|system|dashboard|portal|website|web app|mobile|native|mockup|redesign)\b/i;
 
@@ -208,7 +203,25 @@ function recoveryProbeMatchesClaim(probe, claim) {
   ].every((key) => probe[key] === claimed[key]);
 }
 
-function recoveryResumeStatusIsValid(probe) {
+function recoveryProjectMatchesClaim(state, claim) {
+  const current = findProject(state, claim?.probe?.projectId);
+  const claimed = claim?.project;
+  return Boolean(
+    current
+    && claimed
+    && String(current.repoPath || "").trim() === String(claimed.repoPath || "").trim(),
+  );
+}
+
+function recoverySuppressionReason(state, task, input = {}) {
+  if (activeSelfUpdateLease(state, input)) return "self_update_in_progress";
+  const project = findProject(state, task?.projectId);
+  if (project?.automationCircuit?.state === "open") return "project_circuit_open";
+  if (task?.automationCircuit?.state === "open") return "task_circuit_open";
+  return "";
+}
+
+function recoveryResumeStatusIsValid(state, probe) {
   if (["start_builder", "unblock_task"].includes(probe.actionType)) {
     return probe.resumeStatus === "queued";
   }
@@ -219,7 +232,11 @@ function recoveryResumeStatusIsValid(probe) {
     return probe.resumeStatus === "qa_review";
   }
   if (["start_review", "continue_review"].includes(probe.actionType)) {
-    return VALID_GITHUB_REMOTE_RECOVERY_RESUME_STATUSES.has(probe.resumeStatus);
+    const project = findProject(state, probe.projectId);
+    return reviewStagesForProject(project).some((stage) => (
+      stage.role === probe.role
+      && stage.status === probe.resumeStatus
+    ));
   }
   return false;
 }
@@ -233,7 +250,7 @@ function recoveryContextFailure(state, task, probe) {
   if (!probe || task.automationBlocker.recoveryProbe !== probe) {
     return "github_remote_recovery_probe_changed";
   }
-  if (!recoveryResumeStatusIsValid(probe)) {
+  if (!recoveryResumeStatusIsValid(state, probe)) {
     return "github_remote_recovery_invalid_resume_status";
   }
   if (!probe.sourceRunId) return "github_remote_recovery_source_run_missing";
@@ -363,6 +380,7 @@ export function claimDueGitHubRemoteRecoveryProbesInState(state, input = {}) {
   const leaseMs = Math.max(5_000, Number(input.leaseMs || 60_000));
   const limit = Math.min(2, Math.max(1, Number(input.limit || 2)));
   const claims = [];
+  if (activeSelfUpdateLease(state, { nowMs })) return claims;
 
   for (const task of state.tasks || []) {
     if (claims.length >= limit) break;
@@ -373,6 +391,7 @@ export function claimDueGitHubRemoteRecoveryProbesInState(state, input = {}) {
       || task.automationBlocker?.reason !== "inaccessible_github_remote"
       || !probe
     ) continue;
+    if (recoverySuppressionReason(state, task, { nowMs })) continue;
 
     const dueAt = Date.parse(probe.nextProbeAt || "");
     if (!Number.isFinite(dueAt) || dueAt > nowMs) continue;
@@ -416,6 +435,8 @@ export function renewGitHubRemoteRecoveryProbeLeaseInState(state, claim, input =
   const probe = task?.automationBlocker?.recoveryProbe;
   if (!probe || probe.lease?.id !== claim.leaseId) return false;
   if (!recoveryProbeMatchesClaim(probe, claim)) return false;
+  if (!recoveryProjectMatchesClaim(state, claim)) return false;
+  if (recoverySuppressionReason(state, task, { nowMs })) return false;
   const leaseExpiresAt = Date.parse(probe.lease.expiresAt || "");
   if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= nowMs) return false;
   probe.lease.expiresAt = new Date(nowMs + Math.max(5_000, Number(input.leaseMs || 60_000))).toISOString();
@@ -440,6 +461,13 @@ export function applyGitHubRemoteRecoveryProbeResultInState(state, claim, result
   }
   if (!recoveryProbeMatchesClaim(probe, claim)) {
     return { applied: false, reason: "probe_context_mismatch" };
+  }
+  if (!recoveryProjectMatchesClaim(state, claim)) {
+    return { applied: false, reason: "probe_project_context_mismatch" };
+  }
+  const suppressionReason = recoverySuppressionReason(state, task, { nowMs });
+  if (suppressionReason) {
+    return { applied: false, reason: `probe_suppressed:${suppressionReason}` };
   }
   const leaseExpiresAt = Date.parse(probe.lease.expiresAt || "");
   if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= nowMs) {

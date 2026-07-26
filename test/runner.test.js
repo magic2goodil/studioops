@@ -18,6 +18,7 @@ import {
   prepareRunWorkspace,
   resolveProjectWorkflowMode,
   runGitHubRemoteRecoveryProbes,
+  runQueuedRuns,
 } from "../src/runner.js";
 
 const execFileAsync = promisify(execFile);
@@ -689,6 +690,33 @@ test("periodic GitHub recovery failure then success restores state without a run
   assert.equal(state.runs[0].attempt, attempt);
   assert.equal(state.comments.filter((comment) => /restored queued/.test(comment.body)).length, 1);
   assert.equal(state.events.filter((event) => event.type === "github_remote_recovery_verified").length, 1);
+});
+
+test("recovery probes do not delay ordinary claimed worker launch", async () => {
+  const order = [];
+  let finishProbe;
+  const reportPromise = runQueuedRuns({
+    state: { meta: {} },
+    disk: { pressure: false },
+    reconcileStaleRuns: async () => [],
+    claimRuns: async () => [{ id: "run_ready", taskId: "task_1" }],
+    runClaimedRun: async (run) => {
+      order.push(`run:${run.id}`);
+      return { ...run, status: "completed", exitCode: "" };
+    },
+    runGitHubRemoteRecoveryProbes: async () => {
+      order.push("probe");
+      return new Promise((resolve) => { finishProbe = resolve; });
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["run:run_ready", "probe"]);
+  finishProbe([{ taskId: "task_blocked", status: "waiting", code: "unavailable" }]);
+  const report = await reportPromise;
+  assert.deepEqual(report.claimed, ["run_ready"]);
+  assert.equal(report.results[0].status, "completed");
+  assert.equal(report.recoveryProbes[0].status, "waiting");
 });
 
 test("periodic recovery verifies exact repository branch and pull request head", async () => {

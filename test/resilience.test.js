@@ -67,6 +67,53 @@ function githubRecoveryState(nowMs = NOW) {
   return state;
 }
 
+function githubReviewRecoveryState(nowMs = NOW) {
+  const run = {
+    id: "run_review",
+    taskId: "task_1",
+    projectId: "project_1",
+    status: "cancelled",
+    exitCode: "inaccessible_github_remote",
+    group: "reviewer",
+    role: "backend-reviewer",
+    actionType: "start_review",
+    branchName: "codex/demo-task",
+    prUrl: "https://github.com/example/demo/pull/12",
+  };
+  const state = stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+    branchName: run.branchName,
+    prUrl: run.prUrl,
+  }, [run]);
+  state.projects[0].reviewPipeline = [
+    {
+      key: "backend",
+      label: "Backend Review",
+      role: "backend-reviewer",
+      status: "backend_review",
+      required: true,
+    },
+    {
+      key: "lead",
+      label: "Lead Review",
+      role: "lead-reviewer",
+      status: "lead_review",
+      required: true,
+    },
+  ];
+  scheduleGitHubRemoteRecoveryProbeInState(state, run, {
+    nowMs,
+    owner: "example",
+    repository: "demo",
+    branchName: run.branchName,
+    prUrl: run.prUrl,
+    resumeStatus: "backend_review",
+    diagnostic: "remote unavailable",
+  });
+  return state;
+}
+
 test("automation reconciles orphaned executable tasks back to the queue", async () => {
   const state = stateWith({ assignedAgentRole: "builder", assignedThreadId: "thread_1" });
   const result = await automationTick({ state, nowMs: NOW, orphanGraceMs: 60_000 });
@@ -327,6 +374,89 @@ test("GitHub recovery lease compare-and-set prevents duplicate writes and permit
     "recovered",
   );
   assert.equal(state.comments.filter((comment) => /Verified GitHub remote recovery/.test(comment.body)).length, 1);
+});
+
+test("GitHub review recovery resume status must match the exact project role stage", () => {
+  const valid = githubReviewRecoveryState();
+  assert.equal(claimDueGitHubRemoteRecoveryProbesInState(valid, {
+    nowMs: NOW + 60_000,
+  }).length, 1);
+
+  const mismatched = githubReviewRecoveryState();
+  mismatched.tasks[0].automationBlocker.recoveryProbe.resumeStatus = "lead_review";
+  assert.deepEqual(claimDueGitHubRemoteRecoveryProbesInState(mismatched, {
+    nowMs: NOW + 60_000,
+  }), []);
+  assert.equal(
+    mismatched.tasks[0].automationBlocker.reason,
+    "github_remote_recovery_invalid_resume_status",
+  );
+  assert.equal(mismatched.tasks[0].automationBlocker.recoveryProbe.nextProbeAt, "");
+});
+
+test("GitHub recovery claims honor self-update and project or task circuit suppressors", () => {
+  const selfUpdate = githubRecoveryState();
+  selfUpdate.meta = {
+    selfUpdateLease: {
+      id: "self_update_active",
+      expiresAt: new Date(NOW + 5 * 60_000).toISOString(),
+    },
+  };
+  assert.deepEqual(claimDueGitHubRemoteRecoveryProbesInState(selfUpdate, {
+    nowMs: NOW + 60_000,
+  }), []);
+
+  const projectCircuit = githubRecoveryState();
+  projectCircuit.projects[0].automationCircuit = { state: "open" };
+  assert.deepEqual(claimDueGitHubRemoteRecoveryProbesInState(projectCircuit, {
+    nowMs: NOW + 60_000,
+  }), []);
+
+  const taskCircuit = githubRecoveryState();
+  taskCircuit.tasks[0].automationCircuit = { state: "open" };
+  assert.deepEqual(claimDueGitHubRemoteRecoveryProbesInState(taskCircuit, {
+    nowMs: NOW + 60_000,
+  }), []);
+
+  const circuitOpenedDuringProbe = githubRecoveryState();
+  const [claim] = claimDueGitHubRemoteRecoveryProbesInState(circuitOpenedDuringProbe, {
+    nowMs: NOW + 60_000,
+    leaseMs: 30_000,
+  });
+  circuitOpenedDuringProbe.tasks[0].automationCircuit = { state: "open" };
+  assert.deepEqual(
+    applyGitHubRemoteRecoveryProbeResultInState(circuitOpenedDuringProbe, claim, {
+      ok: true,
+      code: "verified",
+    }, { nowMs: NOW + 60_001 }),
+    {
+      applied: false,
+      reason: "probe_suppressed:task_circuit_open",
+    },
+  );
+});
+
+test("GitHub recovery result loses its CAS when the project checkout changes", () => {
+  const state = githubRecoveryState();
+  const [claim] = claimDueGitHubRemoteRecoveryProbesInState(state, {
+    nowMs: NOW + 60_000,
+    leaseMs: 30_000,
+    leaseIdFactory: () => "lease_checkout",
+  });
+  state.projects[0].repoPath = "/tmp/different-checkout";
+
+  const result = applyGitHubRemoteRecoveryProbeResultInState(state, claim, {
+    ok: true,
+    code: "verified",
+  }, { nowMs: NOW + 60_001 });
+
+  assert.deepEqual(result, {
+    applied: false,
+    reason: "probe_project_context_mismatch",
+  });
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationBlocker.reason, "inaccessible_github_remote");
+  assert.equal(state.comments.length, 0);
 });
 
 test("changed recovery target and exact source role become owner-actionable non-probeable blockers", () => {

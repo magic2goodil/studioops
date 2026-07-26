@@ -1856,7 +1856,7 @@ export async function runQueuedRuns(input = {}) {
       results: [],
     };
   }
-  const state = await readState();
+  const state = input.state || await readState();
   if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
     return {
       generatedAt: new Date().toISOString(),
@@ -1868,10 +1868,15 @@ export async function runQueuedRuns(input = {}) {
       results: [],
     };
   }
-  const recovered = await reconcileStaleRuns(input);
-  const recoveryProbes = await runGitHubRemoteRecoveryProbes(input);
-  const claimed = await claimRuns(input);
-  const results = await Promise.all(claimed.map((run) => runClaimedRun(run, input)));
+  const reconcile = input.reconcileStaleRuns || reconcileStaleRuns;
+  const claim = input.claimRuns || claimRuns;
+  const execute = input.runClaimedRun || runClaimedRun;
+  const recoverGitHub = input.runGitHubRemoteRecoveryProbes || runGitHubRemoteRecoveryProbes;
+  const recovered = await reconcile(input);
+  const claimed = await claim(input);
+  const resultsPromise = Promise.all(claimed.map((run) => execute(run, input)));
+  const recoveryProbesPromise = recoverGitHub(input);
+  const [results, recoveryProbes] = await Promise.all([resultsPromise, recoveryProbesPromise]);
   return {
     generatedAt: new Date().toISOString(),
     disk,
