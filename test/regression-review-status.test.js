@@ -3,7 +3,7 @@ import test from "node:test";
 import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
 import { planRunnableRuns } from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
-import { normalizeReviewPipeline } from "../src/store.js";
+import { generatePrompt, normalizeReviewPipeline } from "../src/store.js";
 
 function fixtureState(taskPatch = {}, reviews = []) {
   return {
@@ -21,6 +21,7 @@ function fixtureState(taskPatch = {}, reviews = []) {
           role: "qa-reviewer",
           status: "regression_review",
           required: true,
+          description: "Run the release regression checklist against the exact candidate commit.",
         },
         {
           key: "lead",
@@ -88,6 +89,17 @@ test("review pipelines reject the human QA status", () => {
     }]),
     /reserved for human local QA/,
   );
+});
+
+test("regression reviewer prompts preserve the custom stage and checklist", () => {
+  const state = fixtureState({ status: "regression_review" });
+  const prompt = generatePrompt(state, "task_1", "qa-reviewer");
+
+  assert.match(prompt, /You are the Regression QA reviewer/);
+  assert.match(prompt, /Run the release regression checklist against the exact candidate commit/);
+  assert.match(prompt, /--stage regression/);
+  assert.doesNotMatch(prompt, /--stage lead/);
+  assert.match(prompt, /missing, skipped, stale, fixture-only/);
 });
 
 test("dispatcher skips actions generated for an older task status without creating a run", async () => {

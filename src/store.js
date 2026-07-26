@@ -2142,7 +2142,8 @@ export function generatePrompt(state, taskId, role = "builder") {
   }
 
   if (role !== "builder") {
-    const reviewerProfile = reviewerProfileForRole(role);
+    const reviewerStage = reviewStages.find((stage) => stage.role === role) || null;
+    const reviewerProfile = reviewerProfileForRole(role, reviewerStage);
     return `You are the ${reviewerProfile.label} for StudioOps task ${task.id}.
 
 Project: ${project.name}
@@ -2290,13 +2291,14 @@ Builder instructions:
 `;
 }
 
-function reviewerProfileForRole(role) {
+function reviewerProfileForRole(role, stage = null) {
   const normalized = String(role || "reviewer").toLowerCase().replaceAll("_", "-");
+  const stageHint = String(stage?.key || "").trim();
   if (normalized.includes("backend")) {
     return {
       label: "backend reviewer",
       domain: "backend/data/security",
-      stageHint: "backend",
+      stageHint: stageHint || "backend",
       focus: [
         "API contracts and error handling",
         "data model ownership, migrations, indexes, pagination, and query shape",
@@ -2309,7 +2311,7 @@ function reviewerProfileForRole(role) {
     return {
       label: "frontend reviewer",
       domain: "frontend/product UI",
-      stageHint: "frontend",
+      stageHint: stageHint || "frontend",
       focus: [
         "mockup fidelity, visual hierarchy, spacing, typography, and interaction quality",
         "mobile, tablet, desktop, direct URL refresh, and no horizontal overflow",
@@ -2322,7 +2324,7 @@ function reviewerProfileForRole(role) {
     return {
       label: "accessibility expert reviewer",
       domain: "accessibility/a11y product UI",
-      stageHint: "accessibility",
+      stageHint: stageHint || "accessibility",
       focus: [
         "WCAG-oriented color contrast, readable typography, non-color-only states, and zoom-safe text",
         "visible focus states, keyboard reachability, logical tab order, skip/escape behavior, and no keyboard traps",
@@ -2332,10 +2334,27 @@ function reviewerProfileForRole(role) {
       ],
     };
   }
+  if (
+    normalized.includes("regression")
+    || normalized === "qa-reviewer"
+    || stage?.status === "regression_review"
+  ) {
+    return {
+      label: stage?.label ? `${stage.label} reviewer` : "regression QA reviewer",
+      domain: "release regression/QA",
+      stageHint: stageHint || "regression",
+      focus: [
+        "the exact candidate commit and every mandatory journey in the project regression standard",
+        "missing, skipped, stale, fixture-only, or otherwise non-production-shaped regression evidence",
+        "repeatability, test isolation, realistic state transitions, and clear failure diagnostics",
+        "release and rollback risk without merging or deploying production",
+      ],
+    };
+  }
   return {
     label: "primary team lead reviewer",
     domain: "product/architecture/release",
-    stageHint: "lead",
+    stageHint: stageHint || "lead",
     focus: [
       "acceptance criteria, product intent, scope control, and user-facing risk",
       "whether backend, frontend, and accessibility reviews are complete or explicitly waived",
