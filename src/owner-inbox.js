@@ -3,6 +3,24 @@ import { projectUsesTrustLeadQa } from "./integration-policy.js";
 
 const OWNER_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_bundle_ready"]);
 const QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed", "release_candidate_ready"]);
+const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const FULL_GIT_SHA = /^[0-9a-f]{40}$/i;
+const GROUP_ORDER = ["decisions", "operations", "legacy"];
+
+const GROUP_DEFINITIONS = {
+  decisions: {
+    label: "Owner decisions",
+    description: "Validated QA, release approvals, and explicit exceptions that require a human decision now.",
+  },
+  operations: {
+    label: "Operations",
+    description: "Automation recovery and engineering exceptions. These do not require product or code approval.",
+  },
+  legacy: {
+    label: "Legacy records",
+    description: "Historical handoffs without current QA or immutable review evidence. They remain visible but are not action-ready.",
+  },
+};
 
 function latestRunForTask(state, taskId) {
   return [...(state.runs || [])]
@@ -58,55 +76,134 @@ function recoveryChecklist(circuit = {}) {
   ].map((text) => ({ taskId: "", taskTitle: "", text }));
 }
 
-function taskInboxItem(state, task, input = {}) {
+function currentReviewEvidence(task) {
+  const cycle = Number(task?.reviewCycle || 0);
+  return task?.assignedAgentRole === "owner"
+    && cycle > 0
+    && Number(task.reviewSubjectCycle || 0) === cycle
+    && FULL_GIT_SHA.test(String(task.reviewSubjectSha || ""))
+    && !task.legacyQaDecisionUntrusted
+    && !task.legacyStatus;
+}
+
+function candidateForBundle(state, bundle) {
+  if (!bundle?.candidateId) return null;
+  const candidate = (state.candidates || []).find((item) => item.id === bundle.candidateId);
+  const expectedCandidateStatus = bundle.status === "release_candidate_ready" ? "release_candidate_ready" : "ready";
+  const expectedTaskStatus = bundle.status === "release_candidate_ready" ? "user_review" : "qa_review";
+  const sourceTaskIds = (candidate?.manifest?.sources || []).map((source) => source.taskId).sort();
+  const bundleTaskIds = (bundle.tasks || []).map((task) => task.id || task.taskId || task).sort();
+  const tasks = bundleTaskRecords(state, bundle);
+  if (
+    !candidate
+    || candidate.integrityError
+    || candidate.invalidation
+    || candidate.status !== expectedCandidateStatus
+    || candidate.projectId !== bundle.projectId
+    || candidate.qaBundleId !== bundle.id
+    || !bundle.manifestDigest
+    || candidate.manifestDigest !== bundle.manifestDigest
+    || !FULL_GIT_SHA.test(String(candidate.manifest?.integration?.sha || ""))
+    || sourceTaskIds.length === 0
+    || JSON.stringify(sourceTaskIds) !== JSON.stringify(bundleTaskIds)
+    || tasks.length !== sourceTaskIds.length
+    || tasks.some((task) => (
+      task.status !== expectedTaskStatus
+      || task.assignedAgentRole !== "owner"
+      || task.candidateId !== candidate.id
+    ))
+  ) return null;
+  return candidate;
+}
+
+function bundleHasCurrentEvidence(state, bundle) {
+  return Boolean(candidateForBundle(state, bundle));
+}
+
+function isSyntheticDiagnostic(project, record = {}) {
+  if (
+    project?.synthetic === true
+    || project?.diagnostic === true
+    || project?.fixtureOnly === true
+    || record?.synthetic === true
+    || record?.diagnostic === true
+    || record?.fixtureOnly === true
+  ) return true;
+  const identity = [project?.key, project?.name, record?.title]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return /\b(fixture|synthetic|diagnostic)\b/.test(identity);
+}
+
+function taskRecord(state, task, input = {}) {
   const project = findProject(state, task.projectId);
-  const run = latestRunForTask(state, task.id);
-  const blocked = task.automationCircuit?.state === "open"
-    || (task.status === "blocked" && Boolean(task.automationBlocker));
-  const qaReady = task.status === "qa_review";
-  const previewUrl = projectPreviewUrl(project);
   return {
-    id: `task:${task.id}`,
-    kind: blocked ? "automation_blocked" : qaReady ? "qa_review" : "owner_review",
-    severity: blocked ? "critical" : "action",
+    project,
     projectId: project?.id || task.projectId,
     projectKey: project?.key || task.projectId,
     projectName: project?.name || task.projectId,
     taskId: task.id,
     title: task.title,
-    status: blocked ? "automation_blocked" : task.status,
     taskUrl: taskUrl(input.baseUrl, task.id),
     prUrl: task.prUrl || "",
     branchName: task.branchName || "",
     integrationBranch: task.integrationBranch || project?.reviewPolicy?.integrationBranch || project?.integrationBranch || "",
-    previewUrl,
-    nextAction: blocked
-      ? task.automationCircuit?.resumeAction || "Inspect the blocker and reset the circuit after remediation."
-      : qaReady
-        ? "Open the local QA preview and record a pass or failure."
-        : "Review the task and pull request, then approve or request changes.",
-    blocker: blocked ? {
-      reason: task.automationCircuit?.normalizedReason
-        || task.automationBlocker?.reason
-        || task.lastAutomationFailure
-        || "Automation is blocked.",
-      attempts: Number(task.automationCircuit?.attemptsConsumed || task.automationBlocker?.attempts || 0),
-      maxAttempts: Number(task.automationCircuit?.maxAttempts || 0),
-    } : null,
-    checklistLabel: blocked ? "Recovery checklist" : qaReady ? "QA checklist" : "Review checklist",
-    checklist: blocked ? recoveryChecklist(task.automationCircuit) : checklistForTask(task),
-    notification: notificationSummary(run),
     updatedAt: task.updatedAt || task.createdAt || "",
   };
 }
 
-function projectInboxItem(project) {
+function operationTaskItem(state, task, input = {}) {
+  const record = taskRecord(state, task, input);
+  const circuit = task.automationCircuit || {};
+  const reason = circuit.normalizedReason
+    || task.automationBlocker?.reason
+    || task.lastAutomationFailure
+    || "Automation is blocked.";
+  const diagnostic = isSyntheticDiagnostic(record.project, task);
+  return {
+    id: `task:${task.id}`,
+    group: "operations",
+    classification: diagnostic ? "non_production_diagnostic" : "automation_recovery",
+    kind: "automation_blocked",
+    severity: diagnostic ? "diagnostic" : "critical",
+    ...record,
+    status: "automation_blocked",
+    previewUrl: "",
+    nextAction: diagnostic
+      ? "Inspect this synthetic failure only when validating StudioOps diagnostics; it is not production work."
+      : circuit.resumeAction || "Inspect the blocker and reset the circuit after remediation.",
+    primaryAction: {
+      type: "task",
+      label: diagnostic ? "Open diagnostic record" : "Open recovery task",
+      href: record.taskUrl,
+      taskId: task.id,
+    },
+    blocker: {
+      reason,
+      attempts: Number(circuit.attemptsConsumed || task.automationBlocker?.attempts || 0),
+      maxAttempts: Number(circuit.maxAttempts || 0),
+    },
+    checklistLabel: "Recovery checklist",
+    checklist: recoveryChecklist(circuit),
+    notification: notificationSummary(latestRunForTask(state, task.id)),
+    diagnostic,
+    diagnosticLabel: diagnostic ? "Non-production diagnostic" : "",
+  };
+}
+
+function projectOperationItem(project) {
   const circuit = project.automationCircuit || {};
   const target = project.key || project.id;
+  const nextAction = circuit.resumeAction
+    || `studioops circuit-reset --project ${target} --reason verified`;
+  const diagnostic = isSyntheticDiagnostic(project, circuit);
   return {
     id: `project:${project.id}:automation-circuit`,
+    group: "operations",
+    classification: diagnostic ? "non_production_diagnostic" : "automation_recovery",
     kind: "project_automation_blocked",
-    severity: "critical",
+    severity: diagnostic ? "diagnostic" : "critical",
     projectId: project.id,
     projectKey: project.key || project.id,
     projectName: project.name || project.key || project.id,
@@ -116,9 +213,15 @@ function projectInboxItem(project) {
     prUrl: "",
     branchName: "",
     integrationBranch: project.reviewPolicy?.integrationBranch || project.integrationBranch || "",
-    previewUrl: projectPreviewUrl(project),
-    nextAction: circuit.resumeAction
-      || `studioops circuit-reset --project ${target} --reason verified`,
+    previewUrl: "",
+    nextAction: diagnostic
+      ? "Inspect this synthetic circuit only when validating StudioOps diagnostics; it is not production work."
+      : nextAction,
+    primaryAction: {
+      type: "command",
+      label: diagnostic ? "Copy diagnostic command" : "Copy recovery command",
+      value: nextAction,
+    },
     blocker: {
       reason: circuit.normalizedReason || circuit.reasonCode || "Project automation is blocked.",
       attempts: Number(circuit.attemptsConsumed || 0),
@@ -132,7 +235,73 @@ function projectInboxItem(project) {
       attemptedAt: "",
       error: "",
     },
+    diagnostic,
+    diagnosticLabel: diagnostic ? "Non-production diagnostic" : "",
     updatedAt: circuit.openedAt || project.updatedAt || project.createdAt || "",
+  };
+}
+
+function currentTaskDecisionItem(state, task, input = {}) {
+  const record = taskRecord(state, task, input);
+  const previewUrl = projectPreviewUrl(record.project);
+  const qaReady = task.status === "qa_review";
+  return {
+    id: `task:${task.id}`,
+    group: "decisions",
+    classification: qaReady ? "qa_decision" : "owner_exception",
+    kind: qaReady ? "qa_review" : "owner_review",
+    severity: "action",
+    ...record,
+    status: task.status,
+    previewUrl: qaReady ? previewUrl : "",
+    nextAction: qaReady
+      ? "Test the current local QA preview against this task and record a pass or failure."
+      : "Review the exact reviewed subject and record the required owner decision.",
+    primaryAction: qaReady ? {
+      type: "preview",
+      label: "Open local QA preview",
+      href: previewUrl,
+    } : {
+      type: "task",
+      label: "Open owner decision",
+      href: record.taskUrl,
+      taskId: task.id,
+    },
+    blocker: null,
+    checklistLabel: qaReady ? "QA checklist" : "Decision checklist",
+    checklist: checklistForTask(task),
+    notification: notificationSummary(latestRunForTask(state, task.id)),
+    diagnostic: false,
+    diagnosticLabel: "",
+  };
+}
+
+function legacyTaskItem(state, task, input = {}, reason = "") {
+  const record = taskRecord(state, task, input);
+  const diagnostic = isSyntheticDiagnostic(record.project, task);
+  return {
+    id: `task:${task.id}`,
+    group: "legacy",
+    classification: "legacy_record",
+    kind: task.status === "qa_review" ? "legacy_qa_review" : "legacy_owner_review",
+    severity: "legacy",
+    ...record,
+    status: task.legacyStatus || task.status,
+    previewUrl: "",
+    nextAction: reason
+      || "Open this historical record for context. It is not QA-ready and does not count as an owner decision.",
+    primaryAction: {
+      type: "task",
+      label: "Open historical task",
+      href: record.taskUrl,
+      taskId: task.id,
+    },
+    blocker: null,
+    checklistLabel: "Historical acceptance criteria",
+    checklist: checklistForTask(task),
+    notification: notificationSummary(latestRunForTask(state, task.id)),
+    diagnostic,
+    diagnosticLabel: diagnostic ? "Non-production diagnostic" : "",
   };
 }
 
@@ -142,34 +311,61 @@ function bundleTaskRecords(state, bundle) {
     .filter(Boolean);
 }
 
-function bundleInboxItem(state, bundle, input = {}) {
+function bundleRecord(state, bundle, input = {}) {
   const project = findProject(state, bundle.projectId);
   const tasks = bundleTaskRecords(state, bundle);
   return {
-    id: `bundle:${bundle.id}`,
-    kind: bundle.status === "release_candidate_ready" ? "release_candidate" : "qa_bundle",
-    severity: "action",
-    projectId: project?.id || bundle.projectId,
-    projectKey: project?.key || bundle.projectId,
-    projectName: project?.name || bundle.projectId,
-    bundleId: bundle.id,
-    title: bundle.status === "release_candidate_ready"
-      ? `${tasks.length} change${tasks.length === 1 ? "" : "s"} ready for release review`
-      : `${tasks.length} change${tasks.length === 1 ? "" : "s"} ready for local QA`,
-    status: bundle.status,
+    project,
     tasks: tasks.map((task) => ({
       id: task.id,
       title: task.title,
       taskUrl: taskUrl(input.baseUrl, task.id),
       prUrl: task.prUrl || "",
     })),
-    prUrl: bundle.promotionPrUrl || "",
+    projectId: project?.id || bundle.projectId,
+    projectKey: project?.key || bundle.projectId,
+    projectName: project?.name || bundle.projectId,
+    bundleId: bundle.id,
+    taskId: tasks.length === 1 ? tasks[0].id : "",
+    taskUrl: tasks.length === 1 ? taskUrl(input.baseUrl, tasks[0].id) : "",
     integrationBranch: bundle.integrationBranch || "",
-    previewUrl: bundle.previewUrl || projectPreviewUrl(project),
-    nextAction: bundle.status === "release_candidate_ready"
-      ? "Review the release-candidate pull request. Production still requires explicit approval."
-      : "Open the local QA preview and test the listed tasks as one bundle.",
-    checklistLabel: "QA checklist",
+    updatedAt: bundle.updatedAt || bundle.createdAt || "",
+  };
+}
+
+function currentBundleDecisionItem(state, bundle, input = {}) {
+  const record = bundleRecord(state, bundle, input);
+  const tasks = bundleTaskRecords(state, bundle);
+  const releaseReady = bundle.status === "release_candidate_ready";
+  const previewUrl = bundle.previewUrl || projectPreviewUrl(record.project);
+  const prUrl = bundle.promotionPrUrl || "";
+  return {
+    id: `bundle:${bundle.id}`,
+    group: "decisions",
+    classification: releaseReady ? "release_approval" : "qa_decision",
+    kind: releaseReady ? "release_candidate" : "qa_bundle",
+    severity: "action",
+    ...record,
+    title: releaseReady
+      ? `${record.tasks.length} change${record.tasks.length === 1 ? "" : "s"} ready for release approval`
+      : `${record.tasks.length} change${record.tasks.length === 1 ? "" : "s"} ready for local QA`,
+    status: bundle.status,
+    prUrl,
+    previewUrl: releaseReady ? "" : previewUrl,
+    nextAction: releaseReady
+      ? "Review the exact release-candidate pull request and record the explicit release decision."
+      : "Test the current local QA preview and listed tasks as one immutable candidate.",
+    primaryAction: releaseReady ? {
+      type: "pr",
+      label: "Review release candidate",
+      href: prUrl,
+    } : {
+      type: "preview",
+      label: "Open local QA preview",
+      href: previewUrl,
+    },
+    blocker: null,
+    checklistLabel: releaseReady ? "Release checklist" : "QA checklist",
     checklist: tasks.flatMap(checklistForTask),
     notification: {
       status: bundle.notificationStatus || (bundle.notifiedAt || bundle.promotionNotifiedAt ? "sent" : "pending"),
@@ -177,43 +373,242 @@ function bundleInboxItem(state, bundle, input = {}) {
       attemptedAt: bundle.notifiedAt || bundle.promotionNotifiedAt || bundle.notificationFailedAt || "",
       error: bundle.notificationError || "",
     },
-    updatedAt: bundle.updatedAt || bundle.createdAt || "",
+    diagnostic: false,
+    diagnosticLabel: "",
+  };
+}
+
+function bundleOperationItem(state, bundle, input = {}, evidenceInvalid = false) {
+  const record = bundleRecord(state, bundle, input);
+  const releaseReady = bundle.status === "release_candidate_ready";
+  const reason = evidenceInvalid
+    ? "The QA bundle's immutable candidate evidence is missing, invalid, or no longer current."
+    : releaseReady
+      ? "The release-candidate record is missing its pull-request handoff."
+      : "The immutable QA candidate does not have an available local preview.";
+  const task = record.tasks[0];
+  return {
+    id: `bundle:${bundle.id}:operations`,
+    group: "operations",
+    classification: "handoff_recovery",
+    kind: releaseReady ? "release_handoff_blocked" : "qa_preview_blocked",
+    severity: "critical",
+    ...record,
+    title: evidenceInvalid
+      ? "QA handoff evidence needs recovery"
+      : releaseReady ? "Release handoff needs recovery" : "QA preview needs recovery",
+    status: evidenceInvalid
+      ? "candidate_evidence_invalid"
+      : releaseReady ? "release_handoff_blocked" : "preview_unavailable",
+    prUrl: "",
+    previewUrl: "",
+    nextAction: `${reason} Repair the handoff before asking the owner for a decision.`,
+    primaryAction: task ? {
+      type: "task",
+      label: "Open recovery task",
+      href: taskUrl(input.baseUrl, task.id),
+      taskId: task.id,
+    } : {
+      type: "command",
+      label: "Copy bundle identifier",
+      value: bundle.id,
+    },
+    blocker: {
+      reason,
+      attempts: 0,
+      maxAttempts: 0,
+    },
+    checklistLabel: "Recovery checklist",
+    checklist: recoveryChecklist({
+      nextCheapProbe: evidenceInvalid
+        ? "Verify the candidate manifest, bundle link, exact integration SHA, and task membership."
+        : releaseReady
+        ? "Verify the recorded promotion result and recover the release-candidate PR URL."
+        : "Verify the local preview service and its health check for this immutable candidate.",
+      remediation: "Repair the handoff evidence, then rerun the applicable QA or promotion workflow.",
+    }),
+    notification: {
+      status: bundle.notificationStatus || "pending",
+      channel: bundle.notificationChannel || "",
+      attemptedAt: bundle.notificationFailedAt || "",
+      error: bundle.notificationError || "",
+    },
+    diagnostic: false,
+    diagnosticLabel: "",
+  };
+}
+
+function legacyBundleItem(state, bundle, input = {}) {
+  const record = bundleRecord(state, bundle, input);
+  const tasks = bundleTaskRecords(state, bundle);
+  const diagnostic = isSyntheticDiagnostic(record.project, bundle);
+  return {
+    id: `bundle:${bundle.id}:legacy`,
+    group: "legacy",
+    classification: "legacy_record",
+    kind: "legacy_qa_bundle",
+    severity: diagnostic ? "diagnostic" : "legacy",
+    ...record,
+    title: record.tasks.length
+      ? `${record.tasks.length} historical QA record${record.tasks.length === 1 ? "" : "s"}`
+      : "Historical QA bundle",
+    status: bundle.legacyStatus || bundle.status || "legacy_untrusted",
+    prUrl: bundle.promotionPrUrl || "",
+    previewUrl: "",
+    nextAction: "Open the historical task records for context. This bundle is not bound to current immutable QA evidence.",
+    primaryAction: record.tasks[0] ? {
+      type: "task",
+      label: "Open historical task",
+      href: taskUrl(input.baseUrl, record.tasks[0].id),
+      taskId: record.tasks[0].id,
+    } : {
+      type: "command",
+      label: "Copy bundle identifier",
+      value: bundle.id,
+    },
+    blocker: null,
+    checklistLabel: "Historical acceptance criteria",
+    checklist: tasks.flatMap(checklistForTask),
+    notification: {
+      status: bundle.notificationStatus || "not_applicable",
+      channel: bundle.notificationChannel || "",
+      attemptedAt: bundle.notifiedAt || bundle.notificationFailedAt || "",
+      error: bundle.notificationError || "",
+    },
+    diagnostic,
+    diagnosticLabel: diagnostic ? "Non-production diagnostic" : "",
+  };
+}
+
+function itemTimestamp(item) {
+  const value = Date.parse(item.updatedAt || "");
+  return Number.isFinite(value) ? value : null;
+}
+
+function addTiming(item, generatedAtMs, staleAfterMs) {
+  const updatedAtMs = itemTimestamp(item);
+  const ageMs = updatedAtMs === null ? null : Math.max(0, generatedAtMs - updatedAtMs);
+  return {
+    ...item,
+    ageMs,
+    stale: ageMs !== null && ageMs >= staleAfterMs,
+  };
+}
+
+function sortItems(items) {
+  return items.sort((a, b) => {
+    if (a.diagnostic !== b.diagnostic) return a.diagnostic ? 1 : -1;
+    return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+  });
+}
+
+function groupSummary(id, items) {
+  const timestamps = items.map(itemTimestamp).filter((value) => value !== null);
+  const oldestAt = timestamps.length ? new Date(Math.min(...timestamps)).toISOString() : "";
+  return {
+    id,
+    ...GROUP_DEFINITIONS[id],
+    count: items.length,
+    oldestAt,
+    items,
   };
 }
 
 export function buildOwnerInbox(state, input = {}) {
-  const activeBundleTaskIds = new Set(
-    (state.qaBundles || [])
-      .filter((bundle) => QA_BUNDLE_STATUSES.has(bundle.status))
-      .flatMap((bundle) => (bundle.tasks || []).map((task) => task.id || task.taskId || task)),
-  );
-  const items = [];
+  const generatedAtDate = input.now ? new Date(input.now) : new Date();
+  const generatedAtMs = Number.isFinite(generatedAtDate.getTime()) ? generatedAtDate.getTime() : Date.now();
+  const generatedAt = new Date(generatedAtMs).toISOString();
+  const staleAfterMs = Number.isFinite(Number(input.staleAfterMs))
+    ? Math.max(0, Number(input.staleAfterMs))
+    : STALE_AFTER_MS;
+  const groupedItems = {
+    decisions: [],
+    operations: [],
+    legacy: [],
+  };
+  const representedTaskIds = new Set();
 
   for (const bundle of state.qaBundles || []) {
-    if (QA_BUNDLE_STATUSES.has(bundle.status)) items.push(bundleInboxItem(state, bundle, input));
+    const tasks = bundleTaskRecords(state, bundle);
+    const activeBundle = QA_BUNDLE_STATUSES.has(bundle.status);
+    const currentEvidence = activeBundle && bundleHasCurrentEvidence(state, bundle);
+    if (currentEvidence) {
+      const previewUrl = bundle.previewUrl || projectPreviewUrl(findProject(state, bundle.projectId));
+      const hasRequiredHandoff = bundle.status === "release_candidate_ready"
+        ? Boolean(bundle.promotionPrUrl && tasks.length)
+        : Boolean(previewUrl && tasks.length);
+      groupedItems[hasRequiredHandoff ? "decisions" : "operations"].push(
+        hasRequiredHandoff
+          ? currentBundleDecisionItem(state, bundle, input)
+          : bundleOperationItem(state, bundle, input),
+      );
+      tasks.forEach((task) => representedTaskIds.add(task.id));
+      continue;
+    }
+    if (activeBundle && bundle.candidateId) {
+      groupedItems.operations.push(bundleOperationItem(state, bundle, input, true));
+      tasks.forEach((task) => representedTaskIds.add(task.id));
+      continue;
+    }
+    if (bundle.status === "legacy_untrusted" || activeBundle) {
+      groupedItems.legacy.push(legacyBundleItem(state, bundle, input));
+      tasks.forEach((task) => representedTaskIds.add(task.id));
+    }
   }
 
   for (const project of state.projects || []) {
-    if (project.automationCircuit?.state === "open") items.push(projectInboxItem(project));
+    if (project.automationCircuit?.state === "open") {
+      groupedItems.operations.push(projectOperationItem(project));
+    }
   }
 
   for (const task of state.tasks || []) {
     const project = findProject(state, task.projectId);
     const blocked = task.automationCircuit?.state === "open"
       || (task.status === "blocked" && Boolean(task.automationBlocker));
-    const ownerReview = task.status === "user_review";
-    const qaValidationReady = task.integrationStatus === "ready"
-      || (!projectUsesTrustLeadQa(project) && Boolean(projectPreviewUrl(project)));
-    const standaloneQa = task.status === "qa_review"
-      && qaValidationReady
-      && !activeBundleTaskIds.has(task.id);
-    if (blocked || ownerReview || standaloneQa) items.push(taskInboxItem(state, task, input));
+    if (blocked) {
+      groupedItems.operations.push(operationTaskItem(state, task, input));
+      continue;
+    }
+    if (representedTaskIds.has(task.id)) continue;
+
+    if (task.status === "user_review") {
+      const hasCurrentReviewEvidence = currentReviewEvidence(task);
+      groupedItems[hasCurrentReviewEvidence ? "decisions" : "legacy"].push(
+        hasCurrentReviewEvidence
+          ? currentTaskDecisionItem(state, task, input)
+          : legacyTaskItem(state, task, input),
+      );
+      continue;
+    }
+
+    if (task.status === "qa_review") {
+      const previewUrl = projectPreviewUrl(project);
+      const qaValidationReady = task.integrationStatus === "ready"
+        || (!projectUsesTrustLeadQa(project) && Boolean(previewUrl));
+      const currentStandaloneQa = currentReviewEvidence(task)
+        && qaValidationReady
+        && Boolean(previewUrl)
+        && !task.qaBundleId;
+      groupedItems[currentStandaloneQa ? "decisions" : "legacy"].push(
+        currentStandaloneQa
+          ? currentTaskDecisionItem(state, task, input)
+          : legacyTaskItem(
+            state,
+            task,
+            input,
+            "This QA record is missing current immutable handoff evidence. It remains available but is not counted as an owner decision.",
+          ),
+      );
+    }
   }
 
-  items.sort((a, b) => {
-    if (a.severity !== b.severity) return a.severity === "critical" ? -1 : 1;
-    return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+  const groups = GROUP_ORDER.map((id) => {
+    const timedItems = groupedItems[id].map((item) => addTiming(item, generatedAtMs, staleAfterMs));
+    return groupSummary(id, sortItems(timedItems));
   });
+  const counts = Object.fromEntries(groups.map((group) => [group.id, group.count]));
+  const allItems = groups.flatMap((group) => group.items);
 
   const operatorPause = state.meta?.operatorPause?.active ? {
     ...state.meta.operatorPause,
@@ -221,9 +616,12 @@ export function buildOwnerInbox(state, input = {}) {
   } : null;
 
   return {
-    generatedAt: new Date().toISOString(),
-    count: items.length,
-    items,
+    generatedAt,
+    count: counts.decisions,
+    totalCount: allItems.length,
+    counts,
+    groups,
+    items: allItems,
     operatorPause,
   };
 }

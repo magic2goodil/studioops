@@ -14,8 +14,11 @@
       </div>
       <div class="topbar-actions">
         <span id="productPlan" class="plan-badge">Community · local</span>
-        <button id="attentionButton" class="attention-button" type="button" aria-controls="ownerInbox" hidden>
-          Action required <span id="attentionCount">0</span>
+        <button id="attentionButton" class="attention-button" type="button" aria-controls="ownerInbox" disabled>
+          Owner decisions <span id="attentionCount" aria-hidden="true">…</span>
+        </button>
+        <button id="operationsButton" class="operations-button" type="button" aria-controls="ownerInbox" hidden>
+          Operations <span id="operationsCount" aria-hidden="true">0</span>
         </button>
         <button id="newTaskButton" type="button">New Task</button>
         <button id="automationButton" type="button">Run Automation Tick</button>
@@ -25,15 +28,21 @@
     </header>
 
     <section id="systemStatus" class="system-status" aria-live="polite" hidden></section>
-    <section id="ownerInbox" class="owner-inbox" aria-labelledby="ownerInboxTitle" aria-live="polite" hidden>
+    <section id="ownerInbox" class="owner-inbox" aria-labelledby="ownerInboxTitle" aria-live="polite" aria-busy="true">
       <div class="owner-inbox-heading">
         <div>
-          <p class="eyebrow">Persistent handoff</p>
-          <h2 id="ownerInboxTitle">Action required</h2>
+          <p class="eyebrow">Persistent handoff · read only</p>
+          <h2 id="ownerInboxTitle" tabindex="-1">Owner inbox</h2>
+          <p id="ownerInboxSummary" class="owner-inbox-summary">Loading current decisions and operational records…</p>
         </div>
-        <span id="ownerInboxCount">0 items</span>
+        <span id="ownerInboxCount">Loading…</span>
       </div>
-      <div id="ownerInboxList" class="owner-inbox-list"></div>
+      <div id="ownerInboxList" class="owner-inbox-list">
+        <div class="inbox-state" role="status">
+          <strong>Loading owner inbox</strong>
+          <span>Classifying decision, operations, and legacy records without changing task state.</span>
+        </div>
+      </div>
     </section>
 
     <main id="appLayout" class="layout">

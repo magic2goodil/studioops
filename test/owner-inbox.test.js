@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildOwnerInbox } from "../src/owner-inbox.js";
 
+const SUBJECT_SHA = "a".repeat(40);
+const MANIFEST_DIGEST = `sha256:${"b".repeat(64)}`;
+
 function fixtureState() {
   return {
     meta: {},
@@ -21,6 +24,10 @@ function fixtureState() {
       projectId: "project_1",
       title: "Fix ritual duration",
       status: "user_review",
+      assignedAgentRole: "owner",
+      reviewCycle: 1,
+      reviewSubjectSha: SUBJECT_SHA,
+      reviewSubjectCycle: 1,
       branchName: "codex/dollos-task_7",
       prUrl: "https://github.com/example/dollos/pull/36",
       acceptanceCriteria: [
@@ -39,32 +46,86 @@ function fixtureState() {
       externalNotifiedAt: "2026-07-23T15:02:36.000Z",
     }],
     qaBundles: [],
+    candidates: [],
   };
 }
 
-test("owner handoffs remain in the inbox after a desktop notification was sent", () => {
+function addCurrentBundle(state, status = "ready", input = {}) {
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: status === "release_candidate_ready" ? "user_review" : "qa_review",
+    integrationStatus: "ready",
+    qaBundleId: "qa_bundle_1",
+    candidateId: "candidate_1",
+  };
+  state.qaBundles = [{
+    id: "qa_bundle_1",
+    projectId: "project_1",
+    status,
+    candidateId: "candidate_1",
+    manifestDigest: MANIFEST_DIGEST,
+    previewUrl: input.previewUrl === undefined ? "http://127.0.0.1:5080/" : input.previewUrl,
+    promotionPrUrl: input.promotionPrUrl || "",
+    tasks: [{ id: "task_7" }],
+    updatedAt: "2026-07-23T15:05:00.000Z",
+  }];
+  state.candidates = [{
+    id: "candidate_1",
+    projectId: "project_1",
+    qaBundleId: "qa_bundle_1",
+    manifestDigest: MANIFEST_DIGEST,
+    status: status === "release_candidate_ready" ? "release_candidate_ready" : "ready",
+    manifest: {
+      integration: { sha: "c".repeat(40) },
+      sources: [{ taskId: "task_7" }],
+    },
+  }];
+}
+
+function group(inbox, id) {
+  return inbox.groups.find((item) => item.id === id);
+}
+
+test("current owner exceptions remain decision-counted after desktop notification delivery", () => {
   const inbox = buildOwnerInbox(fixtureState());
   assert.equal(inbox.count, 1);
+  assert.equal(inbox.counts.decisions, 1);
+  assert.equal(inbox.items[0].classification, "owner_exception");
   assert.equal(inbox.items[0].taskId, "task_7");
   assert.equal(inbox.items[0].notification.status, "sent");
-  assert.equal(inbox.items[0].previewUrl, "http://127.0.0.1:5080/");
   assert.equal(inbox.items[0].prUrl, "https://github.com/example/dollos/pull/36");
   assert.equal(inbox.items[0].checklist[0].taskId, "task_7");
   assert.match(inbox.items[0].checklist[0].text, /ritual duration/);
 });
 
-test("non-Trust-Leads QA tasks with a configured local preview remain visible", () => {
+test("legacy user_review records remain visible without incrementing owner decisions", () => {
   const state = fixtureState();
-  state.tasks[0].status = "qa_review";
-  delete state.tasks[0].integrationStatus;
+  state.tasks[0].reviewSubjectSha = "";
 
   const inbox = buildOwnerInbox(state);
-  assert.equal(inbox.count, 1);
-  assert.equal(inbox.items[0].kind, "qa_review");
-  assert.equal(inbox.items[0].previewUrl, "http://127.0.0.1:5080/");
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.totalCount, 1);
+  assert.equal(inbox.counts.legacy, 1);
+  assert.equal(group(inbox, "legacy").items[0].kind, "legacy_owner_review");
+  assert.match(group(inbox, "legacy").items[0].nextAction, /not QA-ready/);
+  assert.equal(group(inbox, "legacy").items[0].primaryAction.label, "Open historical task");
 });
 
-test("Trust Leads QA handoffs remain hidden until integration and preview validation are ready", () => {
+test("non-Trust-Leads standalone QA requires current review evidence and exposes preview plus task", () => {
+  const state = fixtureState();
+  state.tasks[0].status = "qa_review";
+  state.tasks[0].integrationStatus = "ready";
+
+  const inbox = buildOwnerInbox(state);
+  const decision = group(inbox, "decisions").items[0];
+  assert.equal(inbox.count, 1);
+  assert.equal(decision.kind, "qa_review");
+  assert.equal(decision.previewUrl, "http://127.0.0.1:5080/");
+  assert.equal(decision.taskUrl, "/tasks/task_7");
+  assert.equal(decision.primaryAction.type, "preview");
+});
+
+test("Trust Leads QA handoffs remain legacy until integration and preview validation are ready", () => {
   const state = fixtureState();
   state.projects[0].reviewPolicy = {
     trustLeadApprovals: true,
@@ -73,15 +134,17 @@ test("Trust Leads QA handoffs remain hidden until integration and preview valida
   state.tasks[0].status = "qa_review";
   delete state.tasks[0].integrationStatus;
 
-  assert.equal(buildOwnerInbox(state).count, 0);
+  let inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.legacy, 1);
 
   state.tasks[0].integrationStatus = "ready";
-  const inbox = buildOwnerInbox(state);
+  inbox = buildOwnerInbox(state);
   assert.equal(inbox.count, 1);
-  assert.equal(inbox.items[0].kind, "qa_review");
+  assert.equal(group(inbox, "decisions").items[0].kind, "qa_review");
 });
 
-test("desktop delivery failures remain visible on the persistent handoff", () => {
+test("desktop delivery failures remain visible on a current owner decision", () => {
   const state = fixtureState();
   state.runs[0] = {
     ...state.runs[0],
@@ -92,12 +155,12 @@ test("desktop delivery failures remain visible on the persistent handoff", () =>
   };
 
   const inbox = buildOwnerInbox(state);
-  assert.equal(inbox.items[0].notification.status, "failed");
-  assert.equal(inbox.items[0].notification.error, "osascript unavailable");
-  assert.equal(inbox.items[0].notification.attemptedAt, "2026-07-23T15:03:00.000Z");
+  assert.equal(group(inbox, "decisions").items[0].notification.status, "failed");
+  assert.equal(group(inbox, "decisions").items[0].notification.error, "osascript unavailable");
+  assert.equal(group(inbox, "decisions").items[0].notification.attemptedAt, "2026-07-23T15:03:00.000Z");
 });
 
-test("open circuits and operator pauses remain visibly actionable", () => {
+test("open circuits and operator pauses remain operational without becoming owner decisions", () => {
   const state = fixtureState();
   state.meta.operatorPause = {
     active: true,
@@ -121,13 +184,18 @@ test("open circuits and operator pauses remain visibly actionable", () => {
   };
 
   const inbox = buildOwnerInbox(state);
+  const operation = group(inbox, "operations").items[0];
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
   assert.equal(inbox.operatorPause.active, true);
-  assert.equal(inbox.items[0].kind, "automation_blocked");
-  assert.equal(inbox.items[0].blocker.attempts, 2);
-  assert.match(inbox.items[0].nextAction, /circuit-reset/);
+  assert.equal(operation.kind, "automation_blocked");
+  assert.equal(operation.blocker.attempts, 2);
+  assert.match(operation.nextAction, /circuit-reset/);
+  assert.equal(operation.primaryAction.label, "Open recovery task");
+  assert.doesNotMatch(operation.nextAction, /code review/i);
 });
 
-test("project circuits remain visibly owner-gated and resettable", () => {
+test("project circuits remain visibly resettable in Operations", () => {
   const state = fixtureState();
   state.tasks[0].status = "ready";
   state.projects[0].automationCircuit = {
@@ -137,30 +205,155 @@ test("project circuits remain visibly owner-gated and resettable", () => {
   };
 
   const inbox = buildOwnerInbox(state);
-  assert.equal(inbox.count, 1);
-  assert.equal(inbox.items[0].kind, "project_automation_blocked");
-  assert.equal(inbox.items[0].blocker.reason, "Repository access is unavailable.");
-  assert.match(inbox.items[0].nextAction, /circuit-reset --project dollos/);
-  assert.equal(inbox.items[0].notification.status, "not_applicable");
+  const operation = group(inbox, "operations").items[0];
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(operation.kind, "project_automation_blocked");
+  assert.equal(operation.blocker.reason, "Repository access is unavailable.");
+  assert.match(operation.primaryAction.value, /circuit-reset --project dollos/);
+  assert.equal(operation.notification.status, "not_applicable");
 });
 
-test("ready QA bundles expose task acceptance criteria as a durable checklist", () => {
+test("immutable ready QA bundles expose preview and task evidence as one decision", () => {
+  const state = fixtureState();
+  addCurrentBundle(state);
+
+  const inbox = buildOwnerInbox(state);
+  const decision = group(inbox, "decisions").items[0];
+  assert.equal(inbox.count, 1);
+  assert.equal(decision.kind, "qa_bundle");
+  assert.equal(decision.primaryAction.type, "preview");
+  assert.equal(decision.tasks[0].id, "task_7");
+  assert.equal(decision.tasks[0].taskUrl, "/tasks/task_7");
+  assert.equal(decision.checklist[0].taskId, "task_7");
+  assert.match(decision.checklist[0].text, /ritual duration/);
+});
+
+test("release candidates count only with immutable evidence and a concrete PR action", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "release_candidate_ready", {
+    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+  });
+
+  const inbox = buildOwnerInbox(state);
+  const decision = group(inbox, "decisions").items[0];
+  assert.equal(inbox.count, 1);
+  assert.equal(decision.classification, "release_approval");
+  assert.equal(decision.primaryAction.type, "pr");
+  assert.equal(decision.primaryAction.href, "https://github.com/example/dollos/pull/99");
+});
+
+test("current bundles with missing owner handoff evidence route to Operations", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "ready", { previewUrl: "" });
+  state.projects[0].localQaPreview.previewUrl = "";
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].kind, "qa_preview_blocked");
+  assert.match(group(inbox, "operations").items[0].nextAction, /before asking the owner/);
+});
+
+test("active bundles with invalid candidate evidence route to Operations", () => {
+  const state = fixtureState();
+  addCurrentBundle(state);
+  state.candidates[0].manifest.integration.sha = "not-a-sha";
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+  assert.match(group(inbox, "operations").items[0].blocker.reason, /candidate evidence/);
+});
+
+test("legacy QA bundles remain available without being promoted to decisions", () => {
   const state = fixtureState();
   state.tasks[0].status = "qa_review";
-  state.tasks[0].integrationStatus = "ready";
   state.tasks[0].qaBundleId = "qa_bundle_1";
   state.qaBundles = [{
     id: "qa_bundle_1",
     projectId: "project_1",
-    status: "ready",
+    status: "legacy_untrusted",
+    legacyStatus: "ready",
     previewUrl: "http://127.0.0.1:5080/",
     tasks: [{ id: "task_7" }],
     updatedAt: "2026-07-23T15:05:00.000Z",
   }];
 
   const inbox = buildOwnerInbox(state);
-  assert.equal(inbox.count, 1);
-  assert.equal(inbox.items[0].kind, "qa_bundle");
-  assert.equal(inbox.items[0].checklist[0].taskId, "task_7");
-  assert.match(inbox.items[0].checklist[0].text, /ritual duration/);
+  const legacy = group(inbox, "legacy").items[0];
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.legacy, 1);
+  assert.equal(legacy.kind, "legacy_qa_bundle");
+  assert.equal(legacy.status, "ready");
+  assert.match(legacy.nextAction, /not bound to current immutable QA evidence/);
+});
+
+test("synthetic circuit failures are explicitly labeled non-production diagnostics", () => {
+  const state = fixtureState();
+  state.tasks[0].status = "ready";
+  state.projects[0] = {
+    ...state.projects[0],
+    key: "fixture",
+    name: "Circuit Fixture",
+    automationCircuit: {
+      state: "open",
+      normalizedReason: "Synthetic failure.",
+      resumeAction: "studioops circuit-probe --project fixture",
+    },
+  };
+
+  const operation = group(buildOwnerInbox(state), "operations").items[0];
+  assert.equal(operation.diagnostic, true);
+  assert.equal(operation.diagnosticLabel, "Non-production diagnostic");
+  assert.equal(operation.classification, "non_production_diagnostic");
+  assert.match(operation.nextAction, /not production work/);
+});
+
+test("empty, stale, and mixed-category summaries are deterministic and rendering is read-only", () => {
+  const empty = buildOwnerInbox({
+    meta: {},
+    projects: [],
+    tasks: [],
+    runs: [],
+    qaBundles: [],
+    candidates: [],
+  }, { now: "2026-07-26T12:00:00.000Z" });
+  assert.equal(empty.count, 0);
+  assert.equal(empty.totalCount, 0);
+  assert.deepEqual(empty.counts, { decisions: 0, operations: 0, legacy: 0 });
+  assert.equal(empty.groups.length, 3);
+
+  const state = fixtureState();
+  state.tasks[0].updatedAt = "2026-07-20T12:00:00.000Z";
+  state.tasks.push({
+    id: "task_8",
+    projectId: "project_1",
+    title: "Old handoff",
+    status: "user_review",
+    assignedAgentRole: "owner",
+    reviewSubjectSha: "",
+    updatedAt: "2026-07-25T12:00:00.000Z",
+  }, {
+    id: "task_9",
+    projectId: "project_1",
+    title: "Automation recovery",
+    status: "blocked",
+    automationBlocker: { reason: "worker_failed" },
+    updatedAt: "2026-07-26T11:00:00.000Z",
+  });
+  const before = structuredClone(state);
+  const mixed = buildOwnerInbox(state, {
+    now: "2026-07-26T12:00:00.000Z",
+    staleAfterMs: 24 * 60 * 60 * 1000,
+  });
+
+  assert.equal(mixed.count, 1);
+  assert.deepEqual(mixed.counts, { decisions: 1, operations: 1, legacy: 1 });
+  assert.equal(mixed.totalCount, 3);
+  assert.equal(group(mixed, "decisions").items[0].stale, true);
+  assert.equal(group(mixed, "decisions").items[0].ageMs, 6 * 24 * 60 * 60 * 1000);
+  assert.equal(group(mixed, "decisions").oldestAt, "2026-07-20T12:00:00.000Z");
+  assert.deepEqual(state, before, "building the inbox must not mutate workflow records");
 });
