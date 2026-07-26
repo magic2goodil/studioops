@@ -719,6 +719,34 @@ test("recovery probes do not delay ordinary claimed worker launch", async () => 
   assert.equal(report.recoveryProbes[0].status, "waiting");
 });
 
+test("a completed recovery probe applies without waiting for a slower sibling", async () => {
+  const claims = [
+    { taskId: "task_fast", leaseId: "lease_fast" },
+    { taskId: "task_slow", leaseId: "lease_slow" },
+  ];
+  let releaseSlowProbe;
+  let fastApplied = false;
+  const reportPromise = runGitHubRemoteRecoveryProbes({
+    claimRecoveryProbes: async () => claims,
+    performRecoveryProbe: async (claim) => {
+      if (claim.taskId === "task_fast") {
+        return { ok: true, code: "github_remote_recovery_verified" };
+      }
+      return new Promise((resolve) => { releaseSlowProbe = resolve; });
+    },
+    applyRecoveryProbeResult: async (claim) => {
+      if (claim.taskId === "task_fast") fastApplied = true;
+      return { applied: true, status: "recovered" };
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fastApplied, true);
+  releaseSlowProbe({ ok: false, probeable: true, code: "inaccessible_github_remote" });
+  const results = await reportPromise;
+  assert.deepEqual(results.map((result) => result.taskId), ["task_fast", "task_slow"]);
+});
+
 test("periodic recovery verifies exact repository branch and pull request head", async () => {
   const claim = {
     probe: {
@@ -792,6 +820,23 @@ test("periodic recovery verifies exact repository branch and pull request head",
   });
   assert.equal(closedPr.probeable, false);
   assert.equal(closedPr.code, "github_remote_recovery_pr_closed");
+
+  const changedInaccessibleOrigin = await performGitHubRemoteRecoveryProbe(claim, {
+    preflightRun: async () => ({
+      ok: false,
+      code: "inaccessible_github_remote",
+      message: "The changed origin is inaccessible.",
+      originUrl: "https://github.com/example/different-repository.git",
+      owner: "example",
+      repository: "different-repository",
+    }),
+    cleanupGitHubAppAuth: async () => {},
+  });
+  assert.equal(changedInaccessibleOrigin.probeable, false);
+  assert.equal(
+    changedInaccessibleOrigin.code,
+    "github_remote_recovery_repository_changed",
+  );
 });
 
 test("dead or overlong running jobs are identified for automatic recovery", () => {

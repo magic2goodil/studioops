@@ -1661,12 +1661,24 @@ async function defaultRecoveryPrCheck(run, authContext, input = {}) {
   }
 }
 
-function exactRepositoryMatches(probe, originUrl) {
-  const repository = parseGitHubRepoUrl(originUrl);
+function recoveryPreflightRepository(preflight = {}) {
+  const repository = parseGitHubRepoUrl(preflight.originUrl);
+  if (repository) {
+    return {
+      owner: repository.owner.toLowerCase(),
+      repository: repository.name.toLowerCase(),
+    };
+  }
+  const owner = String(preflight.owner || "").trim().toLowerCase();
+  const name = String(preflight.repository || "").trim().replace(/\.git$/i, "").toLowerCase();
+  return owner && name ? { owner, repository: name } : null;
+}
+
+function exactRepositoryMatches(probe, repository) {
   return Boolean(
     repository
-    && repository.owner.toLowerCase() === probe.owner
-    && repository.name.toLowerCase() === probe.repository,
+    && repository.owner === probe.owner
+    && repository.repository === probe.repository,
   );
 }
 
@@ -1696,6 +1708,18 @@ export async function performGitHubRemoteRecoveryProbe(claim, input = {}) {
       },
       cleanupGitHubAppAuth: async () => {},
     });
+    const preflightRepository = recoveryPreflightRepository(preflight);
+    if (
+      preflightRepository
+      && !exactRepositoryMatches(probe, preflightRepository)
+    ) {
+      return {
+        ok: false,
+        probeable: false,
+        code: "github_remote_recovery_repository_changed",
+        diagnostic: "The current project checkout no longer resolves to the recorded GitHub repository.",
+      };
+    }
     if (!preflight?.ok) {
       const diagnostic = redactSecrets(
         preflight?.message || preflight?.code || "GitHub remote preflight did not verify access.",
@@ -1710,7 +1734,7 @@ export async function performGitHubRemoteRecoveryProbe(claim, input = {}) {
     }
     if (
       preflight.workflowMode !== "github"
-      || !exactRepositoryMatches(probe, preflight.originUrl)
+      || !exactRepositoryMatches(probe, preflightRepository)
     ) {
       return {
         ok: false,
@@ -1802,15 +1826,18 @@ export async function performGitHubRemoteRecoveryProbe(claim, input = {}) {
 
 export async function runGitHubRemoteRecoveryProbes(input = {}) {
   const leaseMs = Math.max(15_000, Number(input.recoveryProbeLeaseMs || 90_000));
-  const claims = await claimDueGitHubRemoteRecoveryProbes({
+  const claimProbes = input.claimRecoveryProbes || claimDueGitHubRemoteRecoveryProbes;
+  const renewLease = input.renewRecoveryProbeLease || renewGitHubRemoteRecoveryProbeLease;
+  const applyResult = input.applyRecoveryProbeResult || applyGitHubRemoteRecoveryProbeResult;
+  const claims = await claimProbes({
     ...input,
     leaseMs,
     limit: Math.min(2, Math.max(1, Number(input.recoveryProbeLimit || 2))),
   });
-  const networkResults = await Promise.all(claims.map(async (claim) => {
+  return Promise.all(claims.map(async (claim) => {
     const renewalIntervalMs = Math.max(5_000, Math.floor(leaseMs / 3));
     const renewalTimer = input.state ? null : setInterval(() => {
-      renewGitHubRemoteRecoveryProbeLease(claim, {
+      renewLease(claim, {
         ...input,
         nowMs: Date.now(),
         leaseMs,
@@ -1820,24 +1847,17 @@ export async function runGitHubRemoteRecoveryProbes(input = {}) {
     }, renewalIntervalMs);
     renewalTimer?.unref();
     try {
+      const result = await (input.performRecoveryProbe || performGitHubRemoteRecoveryProbe)(claim, input);
+      const applied = await applyResult(claim, result, input);
       return {
-        claim,
-        result: await (input.performRecoveryProbe || performGitHubRemoteRecoveryProbe)(claim, input),
+        taskId: claim.taskId,
+        code: result.code,
+        ...applied,
       };
     } finally {
       if (renewalTimer) clearInterval(renewalTimer);
     }
   }));
-  const results = [];
-  for (const item of networkResults) {
-    const applied = await applyGitHubRemoteRecoveryProbeResult(item.claim, item.result, input);
-    results.push({
-      taskId: item.claim.taskId,
-      code: item.result.code,
-      ...applied,
-    });
-  }
-  return results;
 }
 
 export async function runQueuedRuns(input = {}) {

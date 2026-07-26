@@ -436,6 +436,45 @@ test("GitHub recovery claims honor self-update and project or task circuit suppr
   );
 });
 
+test("GitHub recovery claims and results honor an operator pause activated during probing", () => {
+  const paused = githubRecoveryState();
+  paused.meta = {
+    operatorPause: {
+      active: true,
+      reason: "Incident verification",
+    },
+  };
+  assert.deepEqual(claimDueGitHubRemoteRecoveryProbesInState(paused, {
+    nowMs: NOW + 60_000,
+  }), []);
+  assert.equal(claimDueGitHubRemoteRecoveryProbesInState(paused, {
+    nowMs: NOW + 60_000,
+    ignoreOperatorPause: true,
+  }).length, 1);
+
+  const pausedDuringProbe = githubRecoveryState();
+  const [claim] = claimDueGitHubRemoteRecoveryProbesInState(pausedDuringProbe, {
+    nowMs: NOW + 60_000,
+    leaseMs: 30_000,
+  });
+  pausedDuringProbe.meta = {
+    operatorPause: {
+      active: true,
+      reason: "Incident verification",
+    },
+  };
+  assert.deepEqual(
+    applyGitHubRemoteRecoveryProbeResultInState(pausedDuringProbe, claim, {
+      ok: true,
+      code: "verified",
+    }, { nowMs: NOW + 60_001 }),
+    {
+      applied: false,
+      reason: "probe_suppressed:operator_pause",
+    },
+  );
+});
+
 test("GitHub recovery result loses its CAS when the project checkout changes", () => {
   const state = githubRecoveryState();
   const [claim] = claimDueGitHubRemoteRecoveryProbesInState(state, {

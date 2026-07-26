@@ -214,6 +214,7 @@ function recoveryProjectMatchesClaim(state, claim) {
 }
 
 function recoverySuppressionReason(state, task, input = {}) {
+  if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) return "operator_pause";
   if (activeSelfUpdateLease(state, input)) return "self_update_in_progress";
   const project = findProject(state, task?.projectId);
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";
@@ -380,7 +381,7 @@ export function claimDueGitHubRemoteRecoveryProbesInState(state, input = {}) {
   const leaseMs = Math.max(5_000, Number(input.leaseMs || 60_000));
   const limit = Math.min(2, Math.max(1, Number(input.limit || 2)));
   const claims = [];
-  if (activeSelfUpdateLease(state, { nowMs })) return claims;
+  if (activeSelfUpdateLease(state, { ...input, nowMs })) return claims;
 
   for (const task of state.tasks || []) {
     if (claims.length >= limit) break;
@@ -391,7 +392,7 @@ export function claimDueGitHubRemoteRecoveryProbesInState(state, input = {}) {
       || task.automationBlocker?.reason !== "inaccessible_github_remote"
       || !probe
     ) continue;
-    if (recoverySuppressionReason(state, task, { nowMs })) continue;
+    if (recoverySuppressionReason(state, task, { ...input, nowMs })) continue;
 
     const dueAt = Date.parse(probe.nextProbeAt || "");
     if (!Number.isFinite(dueAt) || dueAt > nowMs) continue;
@@ -436,7 +437,7 @@ export function renewGitHubRemoteRecoveryProbeLeaseInState(state, claim, input =
   if (!probe || probe.lease?.id !== claim.leaseId) return false;
   if (!recoveryProbeMatchesClaim(probe, claim)) return false;
   if (!recoveryProjectMatchesClaim(state, claim)) return false;
-  if (recoverySuppressionReason(state, task, { nowMs })) return false;
+  if (recoverySuppressionReason(state, task, { ...input, nowMs })) return false;
   const leaseExpiresAt = Date.parse(probe.lease.expiresAt || "");
   if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= nowMs) return false;
   probe.lease.expiresAt = new Date(nowMs + Math.max(5_000, Number(input.leaseMs || 60_000))).toISOString();
@@ -465,7 +466,7 @@ export function applyGitHubRemoteRecoveryProbeResultInState(state, claim, result
   if (!recoveryProjectMatchesClaim(state, claim)) {
     return { applied: false, reason: "probe_project_context_mismatch" };
   }
-  const suppressionReason = recoverySuppressionReason(state, task, { nowMs });
+  const suppressionReason = recoverySuppressionReason(state, task, { ...input, nowMs });
   if (suppressionReason) {
     return { applied: false, reason: `probe_suppressed:${suppressionReason}` };
   }
