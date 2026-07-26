@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildOwnerInbox } from "../src/owner-inbox.js";
+import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
 
 const SUBJECT_SHA = "a".repeat(40);
-const MANIFEST_DIGEST = `sha256:${"b".repeat(64)}`;
+const BASE_SHA = "b".repeat(40);
+const INTEGRATION_SHA = "c".repeat(40);
+const PROMOTION_SHA = "d".repeat(40);
+const PREVIEW_URL = "http://127.0.0.1:5080/";
+const INTEGRATION_BRANCH = "qa/candidate-dollos";
 
 function fixtureState() {
   return {
@@ -13,7 +18,7 @@ function fixtureState() {
       key: "dollos",
       name: "DollOS",
       localQaPreview: {
-        previewUrl: "http://127.0.0.1:5080/",
+        previewUrl: PREVIEW_URL,
       },
       reviewPolicy: {
         integrationBranch: "qa/dollos",
@@ -50,36 +55,102 @@ function fixtureState() {
   };
 }
 
+function candidateManifest() {
+  return {
+    candidateId: "candidate_1",
+    projectId: "project_1",
+    base: {
+      branch: "main",
+      sha: BASE_SHA,
+    },
+    sources: [{
+      taskId: "task_7",
+      sourceRef: "refs/heads/codex/dollos-task_7",
+      headSha: SUBJECT_SHA,
+      candidateCycle: 1,
+      reviews: [{
+        id: "review_1",
+        stageKey: "lead",
+        role: "lead-reviewer",
+        outcome: "approved",
+        subjectSha: SUBJECT_SHA,
+        candidateCycle: 1,
+        reviewedAt: "2026-07-23T15:00:00.000Z",
+      }],
+    }],
+    integration: {
+      branch: INTEGRATION_BRANCH,
+      sha: INTEGRATION_SHA,
+    },
+    checks: [{
+      id: "check_1",
+      kind: "local-validation",
+      name: "npm run check",
+      outcome: "passed",
+      subjectSha: INTEGRATION_SHA,
+      evidenceDigest: `sha256:${"e".repeat(64)}`,
+    }],
+    preview: {
+      url: PREVIEW_URL,
+      status: "healthy",
+      commitSha: INTEGRATION_SHA,
+      verifiedAt: "2026-07-23T15:04:00.000Z",
+      attestation: {
+        kind: "header",
+        key: "x-studioops-commit",
+        observedSha: INTEGRATION_SHA,
+      },
+    },
+    assembly: {
+      mode: "atomic",
+      requestedTaskIds: ["task_7"],
+      includedTaskIds: ["task_7"],
+      excludedTaskIds: [],
+    },
+  };
+}
+
 function addCurrentBundle(state, status = "ready", input = {}) {
+  const candidate = createCandidateEnvelope({
+    qaBundleId: "qa_bundle_1",
+    manifest: candidateManifest(),
+    createdAt: "2026-07-23T15:04:00.000Z",
+  });
+  const releaseReady = status === "release_candidate_ready";
+  if (releaseReady) {
+    candidate.status = "release_candidate_ready";
+    candidate.promotion = {
+      branch: "release/candidate-dollos",
+      prUrl: input.promotionPrUrl || "",
+      commitSha: PROMOTION_SHA,
+      manifestDigest: candidate.manifestDigest,
+      readyAt: "2026-07-23T15:05:00.000Z",
+    };
+  }
   state.tasks[0] = {
     ...state.tasks[0],
-    status: status === "release_candidate_ready" ? "user_review" : "qa_review",
+    status: releaseReady ? "user_review" : "qa_review",
     integrationStatus: "ready",
     qaBundleId: "qa_bundle_1",
-    candidateId: "candidate_1",
+    candidateId: candidate.id,
   };
   state.qaBundles = [{
     id: "qa_bundle_1",
     projectId: "project_1",
     status,
-    candidateId: "candidate_1",
-    manifestDigest: MANIFEST_DIGEST,
-    previewUrl: input.previewUrl === undefined ? "http://127.0.0.1:5080/" : input.previewUrl,
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationBranch: INTEGRATION_BRANCH,
+    integrationCommit: INTEGRATION_SHA,
+    previewUrl: input.previewUrl === undefined ? PREVIEW_URL : input.previewUrl,
+    promotionBranch: releaseReady ? candidate.promotion.branch : "",
     promotionPrUrl: input.promotionPrUrl || "",
+    promotionCommit: releaseReady ? candidate.promotion.commitSha : "",
+    promotedTaskIds: releaseReady ? ["task_7"] : [],
     tasks: [{ id: "task_7" }],
     updatedAt: "2026-07-23T15:05:00.000Z",
   }];
-  state.candidates = [{
-    id: "candidate_1",
-    projectId: "project_1",
-    qaBundleId: "qa_bundle_1",
-    manifestDigest: MANIFEST_DIGEST,
-    status: status === "release_candidate_ready" ? "release_candidate_ready" : "ready",
-    manifest: {
-      integration: { sha: "c".repeat(40) },
-      sources: [{ taskId: "task_7" }],
-    },
-  }];
+  state.candidates = [candidate];
 }
 
 function group(inbox, id) {
@@ -220,6 +291,7 @@ test("immutable ready QA bundles expose preview and task evidence as one decisio
 
   const inbox = buildOwnerInbox(state);
   const decision = group(inbox, "decisions").items[0];
+  assert.equal(state.candidates[0].status, "frozen");
   assert.equal(inbox.count, 1);
   assert.equal(decision.kind, "qa_bundle");
   assert.equal(decision.primaryAction.type, "preview");
@@ -241,6 +313,19 @@ test("release candidates count only with immutable evidence and a concrete PR ac
   assert.equal(decision.classification, "release_approval");
   assert.equal(decision.primaryAction.type, "pr");
   assert.equal(decision.primaryAction.href, "https://github.com/example/dollos/pull/99");
+});
+
+test("release candidates with a mismatched promotion handoff route to Operations", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "release_candidate_ready", {
+    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+  });
+  state.candidates[0].promotion.prUrl = "https://github.com/example/dollos/pull/98";
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
 });
 
 test("current bundles with missing owner handoff evidence route to Operations", () => {
@@ -265,6 +350,44 @@ test("active bundles with invalid candidate evidence route to Operations", () =>
   assert.equal(inbox.counts.operations, 1);
   assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
   assert.match(group(inbox, "operations").items[0].blocker.reason, /candidate evidence/);
+});
+
+test("candidate manifest mutations fail closed even when their digest is replaced", () => {
+  const state = fixtureState();
+  addCurrentBundle(state);
+  state.candidates[0].manifest.internalOverride = true;
+  state.candidates[0].manifestDigest = manifestDigest(state.candidates[0].manifest);
+  state.qaBundles[0].manifestDigest = state.candidates[0].manifestDigest;
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+});
+
+test("candidate digest mismatches fail closed", () => {
+  const state = fixtureState();
+  addCurrentBundle(state);
+  state.candidates[0].manifestDigest = `sha256:${"f".repeat(64)}`;
+  state.qaBundles[0].manifestDigest = state.candidates[0].manifestDigest;
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+});
+
+test("candidate checks that no longer pass fail closed even with a recomputed digest", () => {
+  const state = fixtureState();
+  addCurrentBundle(state);
+  state.candidates[0].manifest.checks[0].outcome = "failed";
+  state.candidates[0].manifestDigest = manifestDigest(state.candidates[0].manifest);
+  state.qaBundles[0].manifestDigest = state.candidates[0].manifestDigest;
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
 });
 
 test("legacy QA bundles remain available without being promoted to decisions", () => {
@@ -309,6 +432,32 @@ test("synthetic circuit failures are explicitly labeled non-production diagnosti
   assert.equal(operation.diagnosticLabel, "Non-production diagnostic");
   assert.equal(operation.classification, "non_production_diagnostic");
   assert.match(operation.nextAction, /not production work/);
+});
+
+test("inbox response items expose only whitelisted project identity fields", () => {
+  const state = fixtureState();
+  state.projects[0].repoPath = "/private/studioops/repositories/dollos";
+  state.projects[0].repoUrl = "https://token@example.invalid/private.git";
+  state.projects[0].qaIntegration = {
+    internalMarker: "private-project-config",
+    localPreview: {
+      previewUrl: PREVIEW_URL,
+      checkoutPath: "/private/studioops/preview-checkout",
+    },
+  };
+  addCurrentBundle(state);
+
+  const inbox = buildOwnerInbox(state);
+  for (const item of inbox.items) {
+    assert.equal(Object.hasOwn(item, "project"), false);
+    assert.equal(typeof item.projectId, "string");
+    assert.equal(typeof item.projectKey, "string");
+    assert.equal(typeof item.projectName, "string");
+  }
+  const responseBody = JSON.stringify(inbox);
+  assert.doesNotMatch(responseBody, /private-project-config/);
+  assert.doesNotMatch(responseBody, /\/private\/studioops/);
+  assert.doesNotMatch(responseBody, /token@example/);
 });
 
 test("empty, stale, and mixed-category summaries are deterministic and rendering is read-only", () => {

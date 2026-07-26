@@ -1,5 +1,6 @@
 import { findProject, findTask } from "./store.js";
 import { projectUsesTrustLeadQa } from "./integration-policy.js";
+import { assertCandidateEnvelope } from "./candidate-manifest.js";
 
 const OWNER_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_bundle_ready"]);
 const QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed", "release_candidate_ready"]);
@@ -89,30 +90,53 @@ function currentReviewEvidence(task) {
 function candidateForBundle(state, bundle) {
   if (!bundle?.candidateId) return null;
   const candidate = (state.candidates || []).find((item) => item.id === bundle.candidateId);
-  const expectedCandidateStatus = bundle.status === "release_candidate_ready" ? "release_candidate_ready" : "ready";
+  if (!candidate) return null;
+  try {
+    assertCandidateEnvelope(candidate);
+  } catch {
+    return null;
+  }
+  const releaseReady = bundle.status === "release_candidate_ready";
+  const expectedCandidateStatus = releaseReady ? "release_candidate_ready" : "frozen";
   const expectedTaskStatus = bundle.status === "release_candidate_ready" ? "user_review" : "qa_review";
-  const sourceTaskIds = (candidate?.manifest?.sources || []).map((source) => source.taskId).sort();
+  const sourceTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
   const bundleTaskIds = (bundle.tasks || []).map((task) => task.id || task.taskId || task).sort();
   const tasks = bundleTaskRecords(state, bundle);
   if (
-    !candidate
-    || candidate.integrityError
+    candidate.integrityError
     || candidate.invalidation
     || candidate.status !== expectedCandidateStatus
     || candidate.projectId !== bundle.projectId
     || candidate.qaBundleId !== bundle.id
     || !bundle.manifestDigest
     || candidate.manifestDigest !== bundle.manifestDigest
-    || !FULL_GIT_SHA.test(String(candidate.manifest?.integration?.sha || ""))
+    || candidate.manifest.integration.branch !== bundle.integrationBranch
+    || candidate.manifest.integration.sha !== bundle.integrationCommit
+    || candidate.manifest.preview.url !== bundle.previewUrl
     || sourceTaskIds.length === 0
     || JSON.stringify(sourceTaskIds) !== JSON.stringify(bundleTaskIds)
     || tasks.length !== sourceTaskIds.length
     || tasks.some((task) => (
       task.status !== expectedTaskStatus
       || task.assignedAgentRole !== "owner"
+      || task.projectId !== bundle.projectId
+      || task.qaBundleId !== bundle.id
       || task.candidateId !== candidate.id
     ))
   ) return null;
+  if (releaseReady) {
+    const promotion = candidate.promotion;
+    const promotedTaskIds = [...(bundle.promotedTaskIds || [])].sort();
+    if (
+      !promotion
+      || !bundle.promotionPrUrl
+      || promotion.prUrl !== bundle.promotionPrUrl
+      || promotion.branch !== bundle.promotionBranch
+      || promotion.commitSha !== bundle.promotionCommit
+      || promotion.manifestDigest !== candidate.manifestDigest
+      || JSON.stringify(promotedTaskIds) !== JSON.stringify(sourceTaskIds)
+    ) return null;
+  }
   return candidate;
 }
 
@@ -140,27 +164,29 @@ function taskRecord(state, task, input = {}) {
   const project = findProject(state, task.projectId);
   return {
     project,
-    projectId: project?.id || task.projectId,
-    projectKey: project?.key || task.projectId,
-    projectName: project?.name || task.projectId,
-    taskId: task.id,
-    title: task.title,
-    taskUrl: taskUrl(input.baseUrl, task.id),
-    prUrl: task.prUrl || "",
-    branchName: task.branchName || "",
-    integrationBranch: task.integrationBranch || project?.reviewPolicy?.integrationBranch || project?.integrationBranch || "",
-    updatedAt: task.updatedAt || task.createdAt || "",
+    record: {
+      projectId: project?.id || task.projectId,
+      projectKey: project?.key || task.projectId,
+      projectName: project?.name || task.projectId,
+      taskId: task.id,
+      title: task.title,
+      taskUrl: taskUrl(input.baseUrl, task.id),
+      prUrl: task.prUrl || "",
+      branchName: task.branchName || "",
+      integrationBranch: task.integrationBranch || project?.reviewPolicy?.integrationBranch || project?.integrationBranch || "",
+      updatedAt: task.updatedAt || task.createdAt || "",
+    },
   };
 }
 
 function operationTaskItem(state, task, input = {}) {
-  const record = taskRecord(state, task, input);
+  const { project, record } = taskRecord(state, task, input);
   const circuit = task.automationCircuit || {};
   const reason = circuit.normalizedReason
     || task.automationBlocker?.reason
     || task.lastAutomationFailure
     || "Automation is blocked.";
-  const diagnostic = isSyntheticDiagnostic(record.project, task);
+  const diagnostic = isSyntheticDiagnostic(project, task);
   return {
     id: `task:${task.id}`,
     group: "operations",
@@ -242,8 +268,8 @@ function projectOperationItem(project) {
 }
 
 function currentTaskDecisionItem(state, task, input = {}) {
-  const record = taskRecord(state, task, input);
-  const previewUrl = projectPreviewUrl(record.project);
+  const { project, record } = taskRecord(state, task, input);
+  const previewUrl = projectPreviewUrl(project);
   const qaReady = task.status === "qa_review";
   return {
     id: `task:${task.id}`,
@@ -277,8 +303,8 @@ function currentTaskDecisionItem(state, task, input = {}) {
 }
 
 function legacyTaskItem(state, task, input = {}, reason = "") {
-  const record = taskRecord(state, task, input);
-  const diagnostic = isSyntheticDiagnostic(record.project, task);
+  const { project, record } = taskRecord(state, task, input);
+  const diagnostic = isSyntheticDiagnostic(project, task);
   return {
     id: `task:${task.id}`,
     group: "legacy",
@@ -316,28 +342,30 @@ function bundleRecord(state, bundle, input = {}) {
   const tasks = bundleTaskRecords(state, bundle);
   return {
     project,
-    tasks: tasks.map((task) => ({
-      id: task.id,
-      title: task.title,
-      taskUrl: taskUrl(input.baseUrl, task.id),
-      prUrl: task.prUrl || "",
-    })),
-    projectId: project?.id || bundle.projectId,
-    projectKey: project?.key || bundle.projectId,
-    projectName: project?.name || bundle.projectId,
-    bundleId: bundle.id,
-    taskId: tasks.length === 1 ? tasks[0].id : "",
-    taskUrl: tasks.length === 1 ? taskUrl(input.baseUrl, tasks[0].id) : "",
-    integrationBranch: bundle.integrationBranch || "",
-    updatedAt: bundle.updatedAt || bundle.createdAt || "",
+    record: {
+      tasks: tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        taskUrl: taskUrl(input.baseUrl, task.id),
+        prUrl: task.prUrl || "",
+      })),
+      projectId: project?.id || bundle.projectId,
+      projectKey: project?.key || bundle.projectId,
+      projectName: project?.name || bundle.projectId,
+      bundleId: bundle.id,
+      taskId: tasks.length === 1 ? tasks[0].id : "",
+      taskUrl: tasks.length === 1 ? taskUrl(input.baseUrl, tasks[0].id) : "",
+      integrationBranch: bundle.integrationBranch || "",
+      updatedAt: bundle.updatedAt || bundle.createdAt || "",
+    },
   };
 }
 
 function currentBundleDecisionItem(state, bundle, input = {}) {
-  const record = bundleRecord(state, bundle, input);
+  const { project, record } = bundleRecord(state, bundle, input);
   const tasks = bundleTaskRecords(state, bundle);
   const releaseReady = bundle.status === "release_candidate_ready";
-  const previewUrl = bundle.previewUrl || projectPreviewUrl(record.project);
+  const previewUrl = bundle.previewUrl || projectPreviewUrl(project);
   const prUrl = bundle.promotionPrUrl || "";
   return {
     id: `bundle:${bundle.id}`,
@@ -379,7 +407,7 @@ function currentBundleDecisionItem(state, bundle, input = {}) {
 }
 
 function bundleOperationItem(state, bundle, input = {}, evidenceInvalid = false) {
-  const record = bundleRecord(state, bundle, input);
+  const { record } = bundleRecord(state, bundle, input);
   const releaseReady = bundle.status === "release_candidate_ready";
   const reason = evidenceInvalid
     ? "The QA bundle's immutable candidate evidence is missing, invalid, or no longer current."
@@ -439,9 +467,9 @@ function bundleOperationItem(state, bundle, input = {}, evidenceInvalid = false)
 }
 
 function legacyBundleItem(state, bundle, input = {}) {
-  const record = bundleRecord(state, bundle, input);
+  const { project, record } = bundleRecord(state, bundle, input);
   const tasks = bundleTaskRecords(state, bundle);
-  const diagnostic = isSyntheticDiagnostic(record.project, bundle);
+  const diagnostic = isSyntheticDiagnostic(project, bundle);
   return {
     id: `bundle:${bundle.id}:legacy`,
     group: "legacy",
