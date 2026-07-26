@@ -1,6 +1,6 @@
 # ADR 0001: Immutable Candidate Trust Chain
 
-- Status: Proposed (Ultra gate pending)
+- Status: Accepted
 - Date: 2026-07-25
 - Decision owner: StudioOps Ultra implementation lead
 - Governing task: `task_74`
@@ -268,9 +268,12 @@ build those controls on this immutable identity.
 
 ## Ultra lead review gate
 
-Pending. This ADR must not be marked accepted until an independent Ultra review
-approves one exact implementation commit against the task 74 acceptance
-criteria and the audit's required handoff contracts.
+Passed. An independent Ultra review approved exact implementation commit
+`0598df340dab83c1822f7db1e6fcdb6c58f12158` against the task 74 acceptance
+criteria and the audit's required handoff contracts. The SHA-bound validation
+artifact `task_74-0598df3-validation.log` records 152/152 hermetic tests,
+`git diff --check`, and a clean worktree; its SHA-256 is
+`7e82a1b40052cd3cbce64fbd0ea213c111b519d5e38e68f8c662101873ce9e6a`.
 
 Residual risks are explicit dependencies, not accepted gaps in this decision:
 
