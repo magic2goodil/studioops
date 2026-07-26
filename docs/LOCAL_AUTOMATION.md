@@ -173,7 +173,9 @@ Projects can also opt into keeping their QA branch and local preview checkout cu
         "com.example.myapp.local": "~/Library/LaunchAgents/com.example.myapp.local.plist"
       },
       "previewUrl": "http://127.0.0.1:4174/",
-      "healthCheckUrl": "http://127.0.0.1:4174/health"
+      "healthCheckUrl": "http://127.0.0.1:4174/health",
+      "identityHeader": "x-studioops-commit",
+      "identityJsonField": "commitSha"
     }
   }
 }
@@ -192,15 +194,36 @@ studioops update-project myapp \
 
 `syncDefaultBranchIntoIntegration` merges the latest configured default branch into the non-production QA branch before task PR heads are integrated. This is useful after the owner merges a PR to `main`: the QA branch catches up on the next sweep instead of leaving the local preview stale.
 
-`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, StudioOps preserves them in a Git stash before fast-forwarding. Missing preview LaunchAgents are bootstrapped from the configured plist (or the standard `~/Library/LaunchAgents/<label>.plist` path), restarted, and health-checked before the bundle is marked ready.
+`localPreview` fast-forwards a stable local checkout to the exact candidate
+branch after successful integration. The configured static branch remains the
+maintenance/default-sync branch and cannot override a candidate branch. It
+never force-pulls. If `stashDirty` is false, uncommitted preview checkout
+changes block the sync and are reported. If `stashDirty` is true, StudioOps
+preserves them in a Git stash before fast-forwarding. Missing preview
+LaunchAgents are bootstrapped from the configured plist (or the standard
+`~/Library/LaunchAgents/<label>.plist` path) and restarted.
+
+The health endpoint must attest the commit actually served by the running
+preview. Return the full Git SHA in the configured `identityHeader` (default
+`X-StudioOps-Commit`) or JSON `identityJsonField` (default `commitSha`). A plain
+HTTP 200 is insufficient and blocks candidate freeze.
 
 ## Main Promotion
 
 After the owner reviews the local QA preview, mark the task from the UI or CLI:
 
 ```bash
-studioops qa-pass task_123 --body "Checked locally."
-studioops qa-fail task_123 --body "Hero image still covers the full page."
+studioops qa-pass task_123 \
+  --candidate candidate_opaque \
+  --manifest-digest sha256:full-digest \
+  --integration-sha full-git-sha \
+  --body "Checked locally."
+
+studioops qa-fail task_123 \
+  --candidate candidate_opaque \
+  --manifest-digest sha256:full-digest \
+  --integration-sha full-git-sha \
+  --body "Hero image still covers the full page."
 ```
 
 `qa-pass` moves the task to `approved_for_main` and queues it for the promotion worker. `qa-fail` moves it back to `needs_changes` with the owner notes preserved as a task comment.

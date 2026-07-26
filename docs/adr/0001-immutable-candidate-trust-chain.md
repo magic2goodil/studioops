@@ -60,10 +60,13 @@ Schema `studioops.candidate-manifest.v1` contains only release-integrity data:
 - exact target/base branch and base SHA;
 - source entries sorted by task ID, each with task ID, source ref, exact head
   SHA, candidate cycle, and required review records;
-- review ID, stage, outcome, candidate cycle, and exact subject SHA;
+- review ID, stage, outcome, candidate cycle, exact subject SHA, and review
+  timestamp;
 - exact unique integration branch and integration SHA;
-- validation/check evidence IDs, outcome, evidence digest, and subject SHA;
-- preview URL, health status, verification time, and verified commit SHA;
+- validation/check evidence IDs, outcome, evidence digest, and the exact
+  integration subject SHA;
+- preview URL, health status, verification time, verified commit SHA, and the
+  response header or JSON field that attested the running commit;
 - atomic or explicitly authorized partial-assembly policy and exact membership.
 
 The manifest excludes prompts, source contents, raw command output, credentials,
@@ -125,8 +128,20 @@ the requested, included, and excluded task IDs plus the authorization. Excluded
 tasks remain outside the candidate and cannot be described as QA-ready.
 
 Integration validation becomes check evidence keyed to the integration SHA.
-Task 78 may add remote CI/check-run evidence to the same schema; absent evidence
-is never invented.
+Manifest check labels are generic and raw validation commands/output stay
+outside the manifest so local paths, credentials, and logs cannot enter release
+authority. Task 78 may add remote CI/check-run evidence to the same schema;
+absent evidence is never invented.
+
+Task filters and retry windows cannot silently narrow an atomic candidate. If
+any selected member is retry-delayed, the whole atomic assembly waits. Selecting
+fewer than all eligible members requires the same explicit partial-candidate
+authorization recorded in the manifest.
+
+An HTTP success response is not preview identity. The configured preview health
+endpoint must return the exact running commit in `X-StudioOps-Commit` or the
+configured JSON identity field. StudioOps compares that attestation with the
+preview checkout and integration SHA before freeze.
 
 ### Drift and invalidation
 
@@ -187,6 +202,10 @@ SQLite gains a `candidates` table and indexes for project, status, and digest.
 The existing transactional write path persists candidates atomically with tasks,
 reviews, events, and QA bundles.
 
+Candidate rows are append-only history. Generic mutation and full-state import
+cannot delete an existing candidate, reuse its ID with another manifest, replace
+its digest, or rewrite a recorded invalidation, QA decision, or promotion.
+
 Existing QA bundles and task-level QA passes do not contain enough evidence to
 be trusted. Migration marks them `legacy_untrusted`; it does not synthesize a
 manifest or approval. They remain visible for history but are ineligible for new
@@ -199,7 +218,8 @@ through the tested application migration path.
 
 1. A candidate's canonical manifest and digest never change.
 2. Every required review names the current cycle and exact source head SHA.
-3. Every check and preview verification names the SHA it tested.
+3. Every check names the integration SHA, and the running preview attests that
+   same SHA.
 4. Candidate assembly is atomic unless explicit partial authorization is
    recorded before assembly.
 5. A changed source or candidate ref invalidates all downstream authorization.
