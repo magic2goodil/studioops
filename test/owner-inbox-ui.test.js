@@ -35,6 +35,12 @@ test("grouped inbox controls remain native, keyboard reachable, and count owner 
   assert.doesNotMatch(html, /tabindex="[1-9]/);
 });
 
+test("standalone QA decisions render both the preview action and their task link", async () => {
+  const { app } = await uiSources();
+  assert.match(app, /item\.taskId && item\.primaryAction\?\.type !== "task"/);
+  assert.match(app, /\$\{showTaskLinks \? `<div class="owner-inbox-tasks"/);
+});
+
 test("inbox layout defines desktop, tablet, mobile, focus, and reduced-motion behavior", async () => {
   const { css } = await uiSources();
   assert.match(css, /button:focus-visible,[\s\S]*summary:focus-visible/);

@@ -523,6 +523,8 @@ function inboxSecondaryActions(item) {
 
 function inboxItemMarkup(item) {
   const identity = item.taskId || item.bundleId || "project";
+  const showTaskLinks = item.tasks?.length
+    || (item.taskId && item.primaryAction?.type !== "task");
   const diagnostic = item.diagnostic
     ? `<span class="inbox-label diagnostic">${escapeHtml(item.diagnosticLabel || "Non-production diagnostic")}</span>`
     : "";
@@ -558,7 +560,7 @@ function inboxItemMarkup(item) {
         ${inboxPrimaryAction(item)}
         ${inboxSecondaryActions(item)}
       </div>
-      ${item.tasks?.length ? `<div class="owner-inbox-tasks" aria-label="Tasks in this handoff">${inboxTaskLinks(item)}</div>` : ""}
+      ${showTaskLinks ? `<div class="owner-inbox-tasks" aria-label="Tasks in this handoff">${inboxTaskLinks(item)}</div>` : ""}
       <small class="notification-delivery ${escapeHtml(item.notification?.status || "pending")}">${escapeHtml(notificationStatusText(item.notification))}</small>
     </article>
   `;
