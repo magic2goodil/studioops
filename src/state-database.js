@@ -550,6 +550,7 @@ async function initialState() {
 }
 
 export async function ensureStateDatabase() {
+  assertIsolatedTestEnvironment();
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   await secureStoragePaths();
   const db = openDatabase();
