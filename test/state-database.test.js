@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { maintenanceWriteBlocker } from "../src/state-database.js";
+import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -57,9 +58,10 @@ async function writeLegacyState(root, state = baseState()) {
 }
 
 async function runStoreScript(root, source) {
+  const env = await environmentForTestControlRoot(root);
   return execFileAsync(process.execPath, ["--input-type=module", "-e", source], {
     cwd: root,
-    env: { ...process.env, MISSION_CONTROL_ROOT: root },
+    env,
     timeout: 30_000,
   });
 }

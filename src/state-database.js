@@ -3,7 +3,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileExists } from "./config.js";
-import { missionControlDataDir, missionControlRoot } from "./runtime-paths.js";
+import {
+  assertIsolatedTestEnvironment,
+  missionControlDataDir,
+  missionControlRoot,
+} from "./runtime-paths.js";
 
 const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
@@ -29,6 +33,7 @@ async function secureStoragePaths() {
 
 function openDatabase() {
   if (database) return database;
+  assertIsolatedTestEnvironment();
   database = new DatabaseSync(DATABASE_FILE);
   database.exec("PRAGMA busy_timeout = 10000");
   database.exec("PRAGMA journal_mode = WAL");
