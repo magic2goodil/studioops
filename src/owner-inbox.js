@@ -9,7 +9,7 @@ import { assertCandidateEnvelope } from "./candidate-manifest.js";
 const OWNER_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_bundle_ready"]);
 const QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed", "release_candidate_ready"]);
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
-const FULL_GIT_SHA = /^[0-9a-f]{40}$/i;
+const FULL_GIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const GROUP_ORDER = ["decisions", "operations", "legacy"];
 const OWNER_URL_FIELDS = new Set(["href", "taskUrl", "prUrl", "previewUrl"]);
 const CREDENTIAL_PATTERN = /\b(?:Bearer\s+[A-Za-z0-9._~-]{16,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})\b/gi;
@@ -39,11 +39,11 @@ function latestRunForTask(state, taskId) {
 }
 
 function projectPreviewUrl(project) {
-  return String(
+  return safeExternalOwnerUrl(
     project?.localQaPreview?.previewUrl
     || project?.qaIntegration?.localPreview?.previewUrl
     || "",
-  ).trim();
+  );
 }
 
 function taskUrl(baseUrl, taskId) {
@@ -105,13 +105,23 @@ function passedQaDecision(candidate, bundle, sourceTaskIds) {
     || decision.candidateId !== candidate.id
     || decision.manifestDigest !== candidate.manifestDigest
     || decision.integrationSha !== candidate.manifest.integration.sha
-    || JSON.stringify([...(decision.taskIds || [])].sort()) !== JSON.stringify(sourceTaskIds)
+    || !Array.isArray(decision.taskIds)
+    || JSON.stringify([...decision.taskIds].sort()) !== JSON.stringify(sourceTaskIds)
     || !String(decision.author || "").trim()
     || !Number.isFinite(Date.parse(decision.decidedAt || ""))
     || !Number.isFinite(Date.parse(decision.repositoryVerifiedAt || ""))
   ) return false;
-  return !bundle?.qaDecision
-    || JSON.stringify(bundle.qaDecision) === JSON.stringify(decision);
+  const bundleDecision = bundle?.qaDecision;
+  if (!bundleDecision) return true;
+  return bundleDecision.outcome === decision.outcome
+    && bundleDecision.candidateId === decision.candidateId
+    && bundleDecision.manifestDigest === decision.manifestDigest
+    && bundleDecision.integrationSha === decision.integrationSha
+    && Array.isArray(bundleDecision.taskIds)
+    && JSON.stringify([...bundleDecision.taskIds].sort()) === JSON.stringify(sourceTaskIds)
+    && bundleDecision.author === decision.author
+    && bundleDecision.decidedAt === decision.decidedAt
+    && bundleDecision.repositoryVerifiedAt === decision.repositoryVerifiedAt;
 }
 
 function redactOwnerText(value) {
@@ -123,9 +133,12 @@ function redactOwnerText(value) {
     .replace(SECRET_ASSIGNMENT_PATTERN, (_, label) => `${label}=[redacted credential]`);
 }
 
-function safeOwnerUrl(value) {
+function safeOwnerUrl(value, key = "") {
   const raw = String(value || "").trim();
-  if (!raw || raw.startsWith("/")) return raw;
+  if (!raw) return "";
+  if (raw.startsWith("/")) {
+    return ["href", "taskUrl"].includes(key) && /^\/tasks\/[^/?#]+$/.test(raw) ? raw : "";
+  }
   let parsed;
   try {
     parsed = new URL(raw);
@@ -139,9 +152,14 @@ function safeOwnerUrl(value) {
   return redactOwnerText(raw);
 }
 
+function safeExternalOwnerUrl(value) {
+  const safe = safeOwnerUrl(value);
+  return /^https?:\/\//i.test(safe) ? safe : "";
+}
+
 function sanitizeOwnerValue(value, key = "") {
   if (typeof value === "string") {
-    return OWNER_URL_FIELDS.has(key) ? safeOwnerUrl(value) : redactOwnerText(value);
+    return OWNER_URL_FIELDS.has(key) ? safeOwnerUrl(value, key) : redactOwnerText(value);
   }
   if (Array.isArray(value)) return value.map((item) => sanitizeOwnerValue(item));
   if (!value || typeof value !== "object") return value;
@@ -196,7 +214,7 @@ function candidateForBundle(state, bundle) {
     if (
       !passedQaDecision(candidate, bundle, sourceTaskIds)
       || !promotion
-      || !bundle.promotionPrUrl
+      || !safeExternalOwnerUrl(bundle.promotionPrUrl)
       || promotion.prUrl !== bundle.promotionPrUrl
       || promotion.branch !== bundle.promotionBranch
       || promotion.commitSha !== bundle.promotionCommit
@@ -630,8 +648,8 @@ export function buildOwnerInbox(state, input = {}) {
     if (currentEvidence) {
       const previewUrl = bundle.previewUrl || projectPreviewUrl(findProject(state, bundle.projectId));
       const hasRequiredHandoff = bundle.status === "release_candidate_ready"
-        ? Boolean(bundle.promotionPrUrl && tasks.length)
-        : Boolean(previewUrl && tasks.length);
+        ? Boolean(safeExternalOwnerUrl(bundle.promotionPrUrl) && tasks.length)
+        : Boolean(safeExternalOwnerUrl(previewUrl) && tasks.length);
       groupedItems[hasRequiredHandoff ? "decisions" : "operations"].push(
         hasRequiredHandoff
           ? currentBundleDecisionItem(state, bundle, input)

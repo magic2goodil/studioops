@@ -213,6 +213,17 @@ test("standalone owner decisions require every current exact-SHA review", () => 
   assert.equal(group(inbox, "legacy").items[0].classification, "legacy_record");
 });
 
+test("standalone owner decisions accept full SHA-256 Git object IDs", () => {
+  const state = fixtureState();
+  const subjectSha = "f".repeat(64);
+  state.tasks[0].reviewSubjectSha = subjectSha;
+  for (const review of state.reviews) review.subjectSha = subjectSha;
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 1);
+  assert.equal(inbox.counts.decisions, 1);
+});
+
 test("legacy user_review records remain visible without incrementing owner decisions", () => {
   const state = fixtureState();
   state.tasks[0].reviewSubjectSha = "";
@@ -385,6 +396,37 @@ test("release candidates with stale QA decision bindings route to Operations", (
   assert.equal(inbox.count, 0);
   assert.equal(inbox.counts.operations, 1);
   assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+});
+
+test("malformed QA task membership fails closed without crashing the inbox", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "release_candidate_ready", {
+    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+  });
+  state.candidates[0].qaDecision.taskIds = { task_7: true };
+  state.qaBundles[0].qaDecision = state.candidates[0].qaDecision;
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+});
+
+test("release candidates with unsafe or local primary actions route to Operations", () => {
+  for (const promotionPrUrl of [
+    "javascript:alert(1)",
+    "/Users/example/.codex/private-checkout",
+    "//external.example/release",
+  ]) {
+    const state = fixtureState();
+    addCurrentBundle(state, "release_candidate_ready", { promotionPrUrl });
+
+    const inbox = buildOwnerInbox(state);
+    assert.equal(inbox.count, 0, promotionPrUrl);
+    assert.equal(inbox.counts.operations, 1, promotionPrUrl);
+    assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
+    assert.doesNotMatch(JSON.stringify(inbox), /\/Users\/example|javascript:|external\.example/);
+  }
 });
 
 test("release candidates with a mismatched promotion handoff route to Operations", () => {
