@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
 
 const ROOT = new URL("../", import.meta.url);
 
@@ -11,6 +12,19 @@ async function uiSources() {
     readFile(new URL("public/styles.css", ROOT), "utf8"),
   ]);
   return { html, app, css };
+}
+
+function extractFunction(source, name) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `${name} must exist`);
+  const bodyStart = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`Could not extract ${name}`);
 }
 
 function blend(foreground, background, alpha) {
@@ -65,6 +79,33 @@ test("standalone QA decisions render both the preview action and their task link
   const { app } = await uiSources();
   assert.match(app, /item\.taskId && item\.primaryAction\?\.type !== "task"/);
   assert.match(app, /\$\{showTaskLinks \? `<div class="owner-inbox-tasks"/);
+});
+
+test("missing PR URLs cannot render a false pull request action", async () => {
+  const { app } = await uiSources();
+  const context = {
+    URL,
+    window: { location: { origin: "https://local.studioops.com" } },
+  };
+  vm.createContext(context);
+  vm.runInContext([
+    extractFunction(app, "escapeHtml"),
+    extractFunction(app, "safeHttpUrl"),
+    extractFunction(app, "inboxSecondaryActions"),
+  ].join("\n"), context);
+
+  const missingPrAction = vm.runInContext(
+    'inboxSecondaryActions({ group: "decisions", primaryAction: {}, prUrl: "" })',
+    context,
+  );
+  const validPrAction = vm.runInContext(
+    'inboxSecondaryActions({ group: "decisions", primaryAction: {}, prUrl: "https://github.com/example/repo/pull/1" })',
+    context,
+  );
+
+  assert.equal(missingPrAction, "");
+  assert.match(validPrAction, /Open pull request/);
+  assert.match(validPrAction, /https:\/\/github\.com\/example\/repo\/pull\/1/);
 });
 
 test("inbox layout defines desktop, tablet, mobile, focus, and reduced-motion behavior", async () => {

@@ -72,8 +72,10 @@ function escapeHtml(value) {
 }
 
 function safeHttpUrl(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return "";
   try {
-    const url = new URL(String(value || ""), window.location.origin);
+    const url = new URL(candidate, window.location.origin);
     return ["http:", "https:"].includes(url.protocol) ? url.href : "";
   } catch {
     return "";
