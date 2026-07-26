@@ -1,0 +1,35 @@
+{
+  "generatedAt": "2026-07-26",
+  "engine": "Google Chrome for Testing 149.0.7827.55",
+  "deviceScaleFactor": 1,
+  "fixturePolicy": "synthetic-only",
+  "canonicalAssetSha256": "3ae6318136d074f0613e6b972757022cb8460473e5eda2669ba581c63de57fa6",
+  "contentContractSha256": "4d7586403c27ec666f3a1edc14ce44f36987d64bd31e16c2d765d4ce768e21e9",
+  "references": [
+    {
+      "file": "390x844-action-required.png",
+      "route": "/action-required",
+      "width": 390,
+      "height": 844,
+      "sha256": "1ca4629fe0a090726beb475de6270fa201f37b3732b758aa4571192a10fec82c",
+      "annotation": "Compact mobile shell and typed one-action decision rows."
+    },
+    {
+      "file": "834x1112-task.png",
+      "route": "/tasks/task_synthetic",
+      "width": 834,
+      "height": 1112,
+      "sha256": "dddf711b8741a61cf9d8f0b2d22ccff4f904c1d24cf7521e72625a738a224f2c",
+      "annotation": "Requested task starts main; exact tabs and collapsed diagnostics."
+    },
+    {
+      "file": "1440x1000-qa-candidate.png",
+      "route": "/qa/candidates/candidate_synthetic",
+      "width": 1440,
+      "height": 1000,
+      "sha256": "a0acdc5eed5eb0dc407f58f92c400763ab12be5a2702b4f71660042fe9dcd280",
+      "annotation": "Requested immutable candidate starts main with integrity and packet evidence."
+    }
+  ]
+}
+

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>StudioOps owner-first design reference</title>
+    <link rel="stylesheet" href="./owner-first.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+    <div class="app-shell">
+      <header class="app-header">
+        <a class="brand" href="#/" aria-label="StudioOps Portfolio">
+          <img
+            src="../../../plugins/studioops/assets/studioops-logo.png"
+            width="40"
+            height="40"
+            alt="StudioOps"
+          >
+          <span class="brand__copy">
+            <strong data-copy="brand.productName"></strong>
+            <small data-copy="brand.environment"></small>
+          </span>
+        </a>
+        <div class="header-state">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span>Local · current</span>
+        </div>
+        <button class="icon-button header-more" type="button" disabled aria-label="Open navigation menu">
+          <span aria-hidden="true">•••</span>
+        </button>
+      </header>
+
+      <aside class="app-rail">
+        <nav class="primary-nav" aria-label="Primary">
+          <a href="#/" data-nav="portfolio"><span aria-hidden="true">◫</span><span data-copy="navigation.portfolio"></span></a>
+          <a href="#/work" data-nav="work"><span aria-hidden="true">≡</span><span data-copy="navigation.work"></span></a>
+          <a href="#/qa" data-nav="qa"><span aria-hidden="true">✓</span><span data-copy="navigation.qaRelease"></span></a>
+          <a href="#/action-required" data-nav="action"><span aria-hidden="true">!</span><span data-copy="navigation.actionRequired"></span><b>4</b></a>
+          <a href="#/operations" data-nav="operations"><span aria-hidden="true">⌁</span><span data-copy="navigation.operations"></span></a>
+          <a href="#/policies" data-nav="policies"><span aria-hidden="true">◇</span><span data-copy="navigation.policies"></span></a>
+        </nav>
+        <div class="rail-note">
+          <span data-copy="brand.referenceBadge"></span>
+          <small>Visual-only · no API calls</small>
+        </div>
+      </aside>
+
+      <main id="main" tabindex="-1"></main>
+
+      <nav class="bottom-nav" aria-label="Primary mobile">
+        <a href="#/" data-mobile-nav="portfolio"><span aria-hidden="true">◫</span><span>Portfolio</span></a>
+        <a href="#/work" data-mobile-nav="work"><span aria-hidden="true">≡</span><span>Work</span></a>
+        <a href="#/qa" data-mobile-nav="qa"><span aria-hidden="true">✓</span><span>QA</span></a>
+        <a href="#/action-required" data-mobile-nav="action"><span class="bottom-count" aria-hidden="true">4</span><span>Action</span></a>
+        <button type="button" disabled aria-label="More navigation is unavailable in this visual reference"><span aria-hidden="true">•••</span><span>More</span></button>
+      </nav>
+    </div>
+    <noscript>This design reference requires JavaScript to load checksum-protected synthetic copy.</noscript>
+    <script type="module" src="./owner-first.js"></script>
+  </body>
+</html>
+
