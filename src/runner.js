@@ -807,9 +807,6 @@ export function reviewerRunSupersessionReason(run, task) {
   if (
     runCandidateCycle <= 0
     || taskCandidateCycle <= runCandidateCycle
-    || !run.reviewSubjectSha
-    || !task.reviewSubjectSha
-    || run.reviewSubjectSha === task.reviewSubjectSha
   ) {
     return "";
   }

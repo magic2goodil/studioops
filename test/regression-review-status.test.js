@@ -6,9 +6,17 @@ import {
   planDispatches,
 } from "../src/dispatcher.js";
 import { executionAttemptKey } from "../src/execution-policy.js";
-import { completeRun, planRunnableRuns } from "../src/runner.js";
+import {
+  completeRun,
+  planRunnableRuns,
+  reviewerRunSupersessionReason,
+} from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
-import { generatePrompt, normalizeReviewPipeline } from "../src/store.js";
+import {
+  candidateReviewEvidenceForTask,
+  generatePrompt,
+  normalizeReviewPipeline,
+} from "../src/store.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const REVIEWER_FIX_SHA = "b".repeat(40);
@@ -400,6 +408,61 @@ test("dispatcher cannot bypass an earlier stage when review stages share a role"
   );
 });
 
+test("one shared-role approval cannot satisfy multiple required review stages", () => {
+  const state = fixtureState({
+    status: "regression_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 2,
+  }, [
+    {
+      id: "review_1",
+      taskId: "task_1",
+      stageKey: "backend",
+      status: "backend_review",
+      role: "qa-reviewer",
+      cycle: 1,
+      candidateCycle: 2,
+      subjectSha: REVIEWER_FIX_SHA,
+      outcome: "approved",
+      createdAt: "2026-07-26T10:00:00.000Z",
+    },
+  ]);
+  state.projects[0].reviewPipeline = [
+    {
+      key: "backend",
+      label: "Backend Review",
+      role: "qa-reviewer",
+      status: "backend_review",
+      required: true,
+    },
+    {
+      key: "regression",
+      label: "Regression QA",
+      role: "qa-reviewer",
+      status: "regression_review",
+      required: true,
+    },
+    {
+      key: "lead",
+      label: "Primary Lead Review",
+      role: "lead-reviewer",
+      status: "lead_review",
+      required: true,
+    },
+  ];
+
+  const report = createSupervisorReport(state);
+  const evidence = candidateReviewEvidenceForTask(state, state.tasks[0]);
+
+  assert.equal(report.actions.length, 1);
+  assert.equal(report.actions[0].type, "continue_review");
+  assert.equal(report.actions[0].role, "qa-reviewer");
+  assert.equal(report.actions[0].taskStatus, "regression_review");
+  assert.match(report.actions[0].reason, /Regression QA has not recorded an outcome/);
+  assert.equal(evidence.ok, false);
+  assert.match(evidence.error, /Regression QA is not complete/);
+});
+
 test("reviewer SHA-fix supersession completes neutrally without consuming retries", async () => {
   const state = fixtureState({
     status: "backend_review",
@@ -491,4 +554,23 @@ test("reviewer SHA-fix supersession completes neutrally without consuming retrie
   assert.equal(dispatch.runs[0].attempt, 1);
   assert.notEqual(dispatch.runs[0].attemptKey, completed.attemptKey);
   assert.equal(state.tasks[0].automationCircuit, undefined);
+});
+
+test("candidate cycle supersedes a reviewer run even when the SHA later reverts", () => {
+  const revertedTask = {
+    id: "task_1",
+    reviewCycle: 1,
+    reviewSubjectCycle: 3,
+    reviewSubjectSha: SUBJECT_SHA,
+  };
+  const originalCandidateRun = {
+    group: "reviewer",
+    candidateCycle: 1,
+    reviewSubjectSha: SUBJECT_SHA,
+  };
+
+  assert.equal(
+    reviewerRunSupersessionReason(originalCandidateRun, revertedTask),
+    "review_candidate_superseded",
+  );
 });

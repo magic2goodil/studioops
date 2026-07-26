@@ -1654,7 +1654,11 @@ export function latestCurrentReviewForStage(state, task, stage) {
   return (state.reviews || [])
     .filter((review) => review.taskId === task.id)
     .filter((review) => reviewMatchesCurrentCandidate(task, review))
-    .filter((review) => review.stageKey === stage.key || review.status === stage.status || review.role === stage.role)
+    .filter((review) => (
+      review.stageKey
+        ? review.stageKey === stage.key
+        : Boolean(review.status) && review.status === stage.status
+    ))
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
 }
 
