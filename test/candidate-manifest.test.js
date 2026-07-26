@@ -225,6 +225,22 @@ test("reviews fail closed on malformed SHA, wrong subject, or wrong cycle", () =
   assert.throws(
     () => buildCandidateManifest({
       ...base,
+      sources: [
+        base.sources[0],
+        {
+          ...base.sources[1],
+          reviews: [
+            { ...base.sources[1].reviews[0], id: base.sources[0].reviews[0].id },
+            base.sources[1].reviews[1],
+          ],
+        },
+      ],
+    }),
+    /Duplicate candidate review ID/,
+  );
+  assert.throws(
+    () => buildCandidateManifest({
+      ...base,
       checks: [base.checks[0], { ...base.checks[0] }],
     }),
     /Duplicate check ID/,
@@ -285,7 +301,7 @@ test("partial candidates require exact membership and explicit authorization", (
       requestedTaskIds: ["task_1", "task_2"],
       includedTaskIds: ["task_2"],
       excludedTaskIds: ["task_1"],
-      authorization: { author: "Release owner", reason: "Ship the independent repair first." },
+      authorization: { actorId: "release-owner", reasonCode: "independent_repair" },
     },
   });
   assert.equal(partial.assembly.mode, "authorized_partial");
@@ -301,7 +317,24 @@ test("partial candidates require exact membership and explicit authorization", (
         excludedTaskIds: ["task_1"],
       },
     }),
-    /partial-candidate author/,
+    /partial-candidate actor ID/,
+  );
+  assert.throws(
+    () => buildCandidateManifest({
+      ...base,
+      sources: [base.sources[0]],
+      assembly: {
+        mode: "authorized_partial",
+        requestedTaskIds: ["task_1", "task_2"],
+        includedTaskIds: ["task_2"],
+        excludedTaskIds: ["task_1"],
+        authorization: {
+          actorId: "owner@example.com",
+          reasonCode: "independent_repair",
+        },
+      },
+    }),
+    /non-sensitive opaque identifier/,
   );
 });
 

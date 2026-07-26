@@ -417,8 +417,8 @@ Task fields:
   --integration-branch          Non-production branch used for QA integration bundles
   --subject-sha                 Exact full source SHA submitted for the current review cycle
   --partial-tasks               Explicit subset for an authorized partial QA candidate
-  --partial-author              Person authorizing a partial QA candidate
-  --partial-reason              Reason tasks may be excluded from a partial QA candidate
+  --partial-actor-id            Non-sensitive actor ID authorizing a partial candidate
+  --partial-reason-code         Bounded reason code for excluding tasks
   --workflow-mode               Project workflow: auto, local, or github
   --parent                      Parent epic/task ID
   --depends-on                  Dependency task IDs, comma or newline separated
@@ -433,7 +433,7 @@ Automation:
   studioops runner --plan
   studioops runner --provider codex-sdk
   studioops qa-integrate --plan
-  studioops qa-integrate --project app --partial-tasks task_1 --partial-author "Release owner" --partial-reason "Independent repair"
+  studioops qa-integrate --project app --partial-tasks task_1 --partial-actor-id release-owner --partial-reason-code independent_repair
   studioops promote --plan
   studioops notifier --plan
   studioops self-update --plan
@@ -925,8 +925,8 @@ Automation:
       project: args.project || args.projects,
       task: args.task || args.tasks || args["task-id"],
       partialTasks: args["partial-tasks"],
-      partialAuthor: args["partial-author"],
-      partialReason: args["partial-reason"],
+      partialActorId: args["partial-actor-id"],
+      partialReasonCode: args["partial-reason-code"],
       dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
       force: Boolean(args.force || args.reintegrate),
       validationTimeoutMs: args["validation-timeout-ms"],

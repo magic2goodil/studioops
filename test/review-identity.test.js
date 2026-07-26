@@ -24,15 +24,13 @@ test("reviews require the exact current candidate cycle and subject SHA", async 
         status: "backend_review",
         required: true,
       },
-      {
-        key: "lead",
-        label: "Lead Review",
-        role: "lead-reviewer",
-        status: "lead_review",
-        required: true,
-      },
     ],
   });
+  assert.equal(project.reviewPipeline.some((stage) => (
+    stage.key === "lead"
+    && stage.role === "lead-reviewer"
+    && stage.required === true
+  )), true);
   const task = await addTask({
     project: project.id,
     title: "Commit-bound review",
