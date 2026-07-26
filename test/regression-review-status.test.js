@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
-import { planRunnableRuns } from "../src/runner.js";
+import {
+  dispatchSupervisorActions,
+  executionAttemptWasConsumed,
+  planDispatches,
+} from "../src/dispatcher.js";
+import { executionAttemptKey } from "../src/execution-policy.js";
+import { completeRun, planRunnableRuns } from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { generatePrompt, normalizeReviewPipeline } from "../src/store.js";
 
@@ -330,4 +335,160 @@ test("dispatcher rejects stale identity and later-lane actions for an incomplete
   assert.equal(laterLane.skipped[0].reason, "earlier_review_incomplete:backend");
   assert.equal(ownerHandoff.selected.length, 0);
   assert.equal(ownerHandoff.skipped[0].reason, "earlier_review_incomplete:backend");
+});
+
+test("dispatcher cannot bypass an earlier stage when review stages share a role", () => {
+  const state = fixtureState({
+    status: "backend_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 2,
+  });
+  state.projects[0].reviewPipeline = [
+    {
+      key: "backend",
+      label: "Backend Review",
+      role: "qa-reviewer",
+      status: "backend_review",
+      required: true,
+    },
+    {
+      key: "regression",
+      label: "Regression QA",
+      role: "qa-reviewer",
+      status: "regression_review",
+      required: true,
+    },
+    {
+      key: "lead",
+      label: "Primary Lead Review",
+      role: "lead-reviewer",
+      status: "lead_review",
+      required: true,
+    },
+  ];
+  const action = {
+    id: "task_1:start_review",
+    type: "start_review",
+    role: "qa-reviewer",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_1",
+    taskTitle: "Review candidate",
+    taskStatus: "backend_review",
+    priority: "high",
+    nextStatus: "regression_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+  };
+
+  const laterSharedRoleLane = planDispatches(state, [action]);
+  const disagreeingRole = planDispatches(state, [{
+    ...action,
+    role: "lead-reviewer",
+  }]);
+
+  assert.equal(laterSharedRoleLane.selected.length, 0);
+  assert.equal(
+    laterSharedRoleLane.skipped[0].reason,
+    "earlier_review_incomplete:backend",
+  );
+  assert.equal(disagreeingRole.selected.length, 0);
+  assert.equal(
+    disagreeingRole.skipped[0].reason,
+    "review_stage_role_mismatch",
+  );
+});
+
+test("reviewer SHA-fix supersession completes neutrally without consuming retries", async () => {
+  const state = fixtureState({
+    status: "backend_review",
+    assignedAgentRole: "backend-reviewer",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 2,
+  });
+  state.projects[0].reviewPipeline = [
+    {
+      key: "backend",
+      label: "Backend Review",
+      role: "backend-reviewer",
+      status: "backend_review",
+      required: true,
+    },
+    {
+      key: "frontend",
+      label: "Frontend Review",
+      role: "frontend-reviewer",
+      status: "frontend_review",
+      required: true,
+    },
+  ];
+  const supersededTask = {
+    ...state.tasks[0],
+    status: "frontend_review",
+    reviewSubjectSha: SUBJECT_SHA,
+    reviewSubjectCycle: 1,
+  };
+  const supersededAction = {
+    type: "continue_review",
+    role: "frontend-reviewer",
+    reviewSubjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+  };
+  state.runs.push({
+    id: "run_1",
+    taskId: "task_1",
+    projectId: "project_1",
+    actionType: "continue_review",
+    group: "reviewer",
+    role: "frontend-reviewer",
+    status: "running",
+    attemptKey: executionAttemptKey(supersededTask, supersededAction),
+    attempt: 1,
+    maxAttempts: 1,
+    startedAt: "2026-07-26T10:00:00.000Z",
+    reviewSubjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+  });
+
+  const completed = await completeRun("run_1", {
+    state,
+    status: "completed",
+    notes: "Committed the reviewer fix and updated the review subject without an outcome.",
+  });
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.completionDisposition, "superseded");
+  assert.equal(completed.neutralCompletionReason, "review_candidate_superseded");
+  assert.equal(completed.attemptConsumed, false);
+  assert.equal(executionAttemptWasConsumed(completed), false);
+  assert.doesNotMatch(completed.notes, /review_outcome_missing/);
+  assert.equal(state.tasks[0].status, "backend_review");
+  assert.equal(state.tasks[0].automationBlocker, undefined);
+  assert.equal(state.events.at(-1).type, "run_superseded");
+
+  const restartedAction = {
+    id: "task_1:continue_review",
+    type: "continue_review",
+    role: "backend-reviewer",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_1",
+    taskTitle: "Review candidate",
+    taskStatus: "backend_review",
+    priority: "high",
+    nextStatus: "backend_review",
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+  };
+  const dispatch = await dispatchSupervisorActions([restartedAction], {
+    state,
+    executionPolicy: { maxAttempts: 1 },
+  });
+
+  assert.equal(dispatch.runs.length, 1);
+  assert.equal(dispatch.runs[0].attempt, 1);
+  assert.notEqual(dispatch.runs[0].attemptKey, completed.attemptKey);
+  assert.equal(state.tasks[0].automationCircuit, undefined);
 });

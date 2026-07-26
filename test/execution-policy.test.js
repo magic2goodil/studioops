@@ -39,3 +39,30 @@ test("execution attempts are scoped to workflow cycle, action, and role", () => 
     "task_4:2:continue_review:frontend-reviewer",
   );
 });
+
+test("reviewer execution attempts are scoped to exact candidate identity", () => {
+  const oldCandidate = executionAttemptKey(
+    {
+      id: "task_5",
+      reviewCycle: 2,
+      reviewSubjectCycle: 3,
+      reviewSubjectSha: "a".repeat(40),
+    },
+    { type: "continue_review", role: "frontend-reviewer" },
+  );
+  const newCandidate = executionAttemptKey(
+    {
+      id: "task_5",
+      reviewCycle: 2,
+      reviewSubjectCycle: 4,
+      reviewSubjectSha: "b".repeat(40),
+    },
+    { type: "continue_review", role: "frontend-reviewer" },
+  );
+
+  assert.equal(
+    oldCandidate,
+    `task_5:2:candidate-3:sha-${"a".repeat(40)}:continue_review:frontend-reviewer`,
+  );
+  assert.notEqual(oldCandidate, newCandidate);
+});

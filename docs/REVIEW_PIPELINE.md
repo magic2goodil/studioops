@@ -56,7 +56,7 @@ Valid outcomes are `approved`, `skipped`, and `changes_requested`.
 
 Each time a builder moves work into `builder_review`, StudioOps increments the task's builder review cycle. Every submitted source SHA also has a candidate cycle. Review evidence is valid only when its builder cycle, candidate cycle, and full source SHA all match the task's current review subject.
 
-A reviewer-side commit does not consume another builder review cycle. When the reviewer records the new full source SHA, StudioOps advances the candidate cycle, makes every prior-candidate approval stale, cancels queued reviewer runs for the superseded candidate, and routes the task to the earliest required review lane. Later reviewers, lead approval, QA handoff, and owner handoff remain blocked until every required lane approves or skips the new candidate in order. Reusing an older SHA does not resurrect its former approvals because the candidate cycle has changed.
+A reviewer-side commit does not consume another builder review cycle. When the reviewer records the new full source SHA, StudioOps advances the candidate cycle, makes every prior-candidate approval stale, cancels queued reviewer runs for the superseded candidate, and routes the task to the earliest required review lane. A running reviewer that performed the fix finishes neutrally without an outcome and without consuming an execution attempt. Reviewer retry and circuit accounting is scoped to the exact candidate cycle and SHA. Later reviewers, lead approval, QA handoff, and owner handoff remain blocked until every required lane approves or skips the new candidate in order. Reusing an older SHA does not resurrect its former approvals because the candidate cycle has changed.
 
 ## Default Flow
 

@@ -123,6 +123,7 @@ function activeRunMatches(run, action, task) {
 }
 
 export function executionAttemptWasConsumed(run = {}) {
+  if (run.attemptConsumed === false) return false;
   if (run.status === "cancelled") return Boolean(run.startedAt);
   return ["running", "completed", "failed"].includes(run.status);
 }
@@ -207,8 +208,38 @@ function dispatchSafetyReason(state, task, action, options) {
   return "";
 }
 
+function resolveReviewTargetStage(stages, task, action) {
+  const targetStatus = String(
+    action.nextStatus
+    || action.taskStatus
+    || task.status
+    || "",
+  );
+  if (targetStatus) {
+    const statusStage = stages.find((stage) => stage.status === targetStatus) || null;
+    if (statusStage) {
+      if (action.role && statusStage.role !== action.role) {
+        return { stage: null, reason: "review_stage_role_mismatch" };
+      }
+      return { stage: statusStage, reason: "" };
+    }
+    if (action.nextStatus) {
+      return { stage: null, reason: "review_stage_unknown" };
+    }
+  }
+
+  const roleStages = stages.filter((stage) => stage.role === action.role);
+  if (roleStages.length > 1) {
+    return { stage: null, reason: "review_stage_ambiguous" };
+  }
+  return {
+    stage: roleStages[0] || null,
+    reason: roleStages.length ? "" : "review_stage_unknown",
+  };
+}
+
 function reviewDispatchSafetyReason(state, task, action) {
-  if (!task.reviewSubjectSha) return "";
+  if (!task.reviewSubjectSha && !REVIEW_ACTIONS.has(action.type)) return "";
   if (action.reviewSubjectSha && action.reviewSubjectSha !== task.reviewSubjectSha) {
     return "review_subject_changed";
   }
@@ -228,11 +259,9 @@ function reviewDispatchSafetyReason(state, task, action) {
   }
   if (!REVIEW_ACTIONS.has(action.type)) return "";
   const stages = reviewStagesForProject(project);
-  const targetStage = stages.find((stage) => (
-    stage.status === action.nextStatus
-    || stage.role === action.role
-  )) || null;
-  if (!targetStage) return "review_stage_unknown";
+  const target = resolveReviewTargetStage(stages, task, action);
+  if (target.reason) return target.reason;
+  const targetStage = target.stage;
   if (
     earliestRequiredStage
     && stages.indexOf(targetStage) > stages.indexOf(earliestRequiredStage)
