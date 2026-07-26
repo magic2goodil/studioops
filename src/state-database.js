@@ -12,6 +12,7 @@ const STATE_INTEGRITY_VERSION = 3;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
+const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
 const DATA_DIR = missionControlDataDir();
 export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
@@ -146,6 +147,10 @@ function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
 export function compactOperationalHistory(state, input = {}) {
   const commentLimit = Math.max(1, Number(input.commentLimit || ACTIVE_QA_COMMENTS_PER_TASK));
   const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
+  const staleReviewRunLimit = Math.max(
+    1,
+    Number(input.staleReviewRunLimit || ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH),
+  );
   const qaEventEvidence = new Set((Array.isArray(state.events) ? state.events : [])
     .filter((event) => /^qa_integration_/.test(event.type || ""))
     .map((event) => `${event.taskId || ""}|${event.createdAt || ""}`));
@@ -168,9 +173,35 @@ export function compactOperationalHistory(state, input = {}) {
     (event) => event.taskId || `${event.projectId || "unassigned"}:${event.type || "qa"}`,
     eventLimit,
   );
+  const runs = archiveOldestBeyondLimit(
+    Array.isArray(state.runs) ? state.runs : [],
+    (run) => (
+      run.status === "cancelled"
+      && run.actionType === "continue_review"
+      && (
+        String(run.exitCode || "").startsWith("task_status_changed:")
+        || String(run.notes || "").includes("dispatch-loop incident")
+      )
+    ),
+    (run) => run.dispatchKey || `${run.taskId || "unassigned"}:${run.role || "reviewer"}`,
+    staleReviewRunLimit,
+  );
   state.comments = comments.active;
   state.events = events.active;
-  return { comments: comments.archived, events: events.archived };
+  state.runs = runs.active;
+  return { comments: comments.archived, events: events.archived, runs: runs.archived };
+}
+
+function archivePayload(entityType, item) {
+  if (entityType !== "runs") return item;
+  const {
+    prompt: _prompt,
+    ...auditRecord
+  } = item;
+  return {
+    ...auditRecord,
+    promptOmitted: true,
+  };
 }
 
 function archiveOperationalHistory(db, archived, now) {
@@ -188,7 +219,7 @@ function archiveOperationalHistory(db, archived, now) {
         item.taskId || "",
         item.createdAt || "",
         now,
-        JSON.stringify(item),
+        JSON.stringify(archivePayload(entityType, item)),
       );
     }
   }
@@ -204,10 +235,12 @@ function recordOperationalArchiveMetadata(state, archived, now, backupPath = "")
     migratedAt: previous.migratedAt || now,
     updatedAt: now,
     backupPath: backupPath || previous.backupPath || "",
-    comments: Number(previous.comments || 0) + archived.comments.length,
-    events: Number(previous.events || 0) + archived.events.length,
+    comments: Number(previous.comments || 0) + (archived.comments || []).length,
+    events: Number(previous.events || 0) + (archived.events || []).length,
+    runs: Number(previous.runs || 0) + (archived.runs || []).length,
     activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
     activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
+    activeStaleReviewRunsPerDispatch: ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH,
   };
 }
 

@@ -908,6 +908,7 @@ async function renderDetail() {
       <button type="button" data-status="backend_review">Backend Review</button>
       <button type="button" data-status="frontend_review">Frontend Review</button>
       <button type="button" data-status="accessibility_review">Accessibility Review</button>
+      <button type="button" data-status="regression_review">Regression Review</button>
       <button type="button" data-status="lead_review">Lead Review</button>
       <button type="button" data-status="qa_review">QA Review</button>
       <button type="button" data-status="approved_for_main">Approved For Main</button>

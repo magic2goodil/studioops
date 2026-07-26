@@ -33,6 +33,7 @@ const VALID_STATUSES = new Set([
   "backend_review",
   "frontend_review",
   "accessibility_review",
+  "regression_review",
   "lead_review",
   "qa_review",
   "approved_for_main",
@@ -233,7 +234,7 @@ function standardReference(item) {
   return path.join(process.cwd(), value);
 }
 
-function normalizeReviewPipeline(value) {
+export function normalizeReviewPipeline(value) {
   if (!Array.isArray(value)) return [];
   const stages = value
     .map((stage) => ({
@@ -245,6 +246,22 @@ function normalizeReviewPipeline(value) {
       description: String(stage.description || "").trim(),
     }))
     .filter((stage) => stage.key && stage.role);
+  for (const stage of stages) {
+    if (!stage.status || !VALID_STATUSES.has(stage.status)) {
+      throw new Error(`Invalid review status for ${stage.key}: ${stage.status || "(missing)"}`);
+    }
+    if (stage.status === "qa_review") {
+      throw new Error(
+        `Review stage ${stage.key} cannot use qa_review; that status is reserved for human local QA. Use regression_review for automated regression review.`,
+      );
+    }
+  }
+  const duplicateStatus = stages.find((stage, index) => (
+    stages.findIndex((candidate) => candidate.status === stage.status) !== index
+  ));
+  if (duplicateStatus) {
+    throw new Error(`Review status must be unique within a pipeline: ${duplicateStatus.status}`);
+  }
   return reviewStagesWithDefaultAccessibility(stages);
 }
 
@@ -1565,13 +1582,12 @@ function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLa
 }
 
 function moveTaskToQaReview(state, task, project, now, author, body, actions, actionLabel = "ready for QA review") {
-  const policy = reviewPolicyForProject(project);
   const integrationBranch = integrationBranchName(project);
   const integrationBranchUrl = branchWebUrl(project, integrationBranch);
-  if (task.status !== "qa_review" || task.assignedAgentRole !== (policy.qaReviewerRole || "qa-reviewer")) {
+  if (task.status !== "qa_review" || task.assignedAgentRole !== "owner") {
     setTaskWorkflowState(state, task, {
       status: "qa_review",
-      assignedAgentRole: policy.qaReviewerRole || "qa-reviewer",
+      assignedAgentRole: "owner",
       reviewerThreadId: "",
       integrationStatus: task.integrationStatus || "pending",
       integrationBranch,
