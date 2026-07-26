@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { planDispatches } from "../src/dispatcher.js";
+import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
+import { planRunnableRuns } from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { normalizeReviewPipeline } from "../src/store.js";
 
@@ -89,9 +90,9 @@ test("review pipelines reject the human QA status", () => {
   );
 });
 
-test("dispatcher skips actions generated for an older task status", () => {
+test("dispatcher skips actions generated for an older task status without creating a run", async () => {
   const state = fixtureState({ status: "lead_review" });
-  const report = planDispatches(state, [{
+  const action = {
     id: "task_1:continue_review",
     type: "continue_review",
     role: "qa-reviewer",
@@ -103,8 +104,48 @@ test("dispatcher skips actions generated for an older task status", () => {
     taskStatus: "regression_review",
     priority: "high",
     reason: "Regression review has not recorded an outcome.",
-  }]);
+  };
+  const plan = planDispatches(state, [action]);
+  const dispatch = await dispatchSupervisorActions([action], { state });
 
-  assert.equal(report.selected.length, 0);
-  assert.equal(report.skipped[0].reason, "task_status_changed:regression_review->lead_review");
+  assert.equal(plan.selected.length, 0);
+  assert.equal(plan.skipped[0].reason, "task_status_changed:regression_review->lead_review");
+  assert.equal(dispatch.runs.length, 0);
+  assert.equal(state.runs.length, 0);
+});
+
+test("repeated automation sweeps create one regression run and no local-QA reviewer runs", async () => {
+  const regressionState = fixtureState();
+
+  for (let sweep = 0; sweep < 3; sweep += 1) {
+    const supervisor = createSupervisorReport(regressionState);
+    await dispatchSupervisorActions(supervisor.actions, { state: regressionState });
+    planRunnableRuns(regressionState, { limit: 3 });
+  }
+
+  assert.equal(regressionState.tasks[0].status, "regression_review");
+  assert.equal(regressionState.runs.length, 1);
+  assert.equal(regressionState.runs[0].role, "qa-reviewer");
+  assert.equal(planRunnableRuns(regressionState, { limit: 3 }).runnable.length, 1);
+
+  const localQaState = fixtureState({
+    status: "qa_review",
+    assignedAgentRole: "owner",
+    integrationStatus: "ready",
+  });
+  localQaState.projects[0].reviewPolicy = {
+    trustLeadApprovals: true,
+    integrationBranch: "qa/demo",
+  };
+
+  for (let sweep = 0; sweep < 3; sweep += 1) {
+    const supervisor = createSupervisorReport(localQaState);
+    assert.equal(supervisor.actions[0].type, "qa_bundle_ready");
+    await dispatchSupervisorActions(supervisor.actions, { state: localQaState });
+    assert.equal(planRunnableRuns(localQaState, { limit: 3 }).runnable.length, 0);
+  }
+
+  assert.equal(localQaState.tasks[0].status, "qa_review");
+  assert.equal(localQaState.tasks[0].assignedAgentRole, "owner");
+  assert.equal(localQaState.runs.length, 0);
 });
