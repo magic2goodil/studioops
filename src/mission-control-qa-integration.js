@@ -45,8 +45,8 @@ async function optionsFrom(args) {
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     task: args.task || args.tasks || args["task-id"],
     partialTasks: args["partial-tasks"],
-    partialAuthor: args["partial-author"],
-    partialReason: args["partial-reason"],
+    partialActorId: args["partial-actor-id"],
+    partialReasonCode: args["partial-reason-code"],
     dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
     force: Boolean(args.force || args.reintegrate),
     validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
@@ -95,7 +95,7 @@ Usage:
   studioops-qa-integration --plan
   studioops-qa-integration --project myapp
   studioops-qa-integration --project myapp --force
-  studioops-qa-integration --project myapp --partial-tasks task_1 --partial-author "Release owner" --partial-reason "Independent repair"
+  studioops-qa-integration --project myapp --partial-tasks task_1 --partial-actor-id release-owner --partial-reason-code independent_repair
   studioops-qa-integration --watch --interval 300
   studioops qa-integrate --plan
   studioops qa-integrate --github-apps-dir ~/.codex/studioops/credentials/github-apps

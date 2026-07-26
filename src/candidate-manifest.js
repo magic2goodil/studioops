@@ -108,6 +108,22 @@ function stringList(value, label) {
   return [...new Set(normalized)].sort();
 }
 
+function normalizeOpaqueActorId(value) {
+  const actorId = requiredString(value, "partial-candidate actor ID");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(actorId)) {
+    throw new Error("Partial-candidate actor ID must be a non-sensitive opaque identifier.");
+  }
+  return actorId;
+}
+
+function normalizeReasonCode(value) {
+  const reasonCode = requiredString(value, "partial-candidate reason code");
+  if (!/^[a-z][a-z0-9_-]{2,63}$/.test(reasonCode)) {
+    throw new Error("Partial-candidate reason code must be a bounded machine-readable code.");
+  }
+  return reasonCode;
+}
+
 function normalizeReview(input, source) {
   const review = {
     id: requiredString(input?.id, "review ID"),
@@ -149,6 +165,9 @@ function normalizeSource(input) {
     "review ID",
   );
   if (!source.reviews.length) throw new Error(`Source ${source.taskId} has no complete review evidence.`);
+  if (!source.reviews.some((review) => isPrimaryLeadReview(review) && review.outcome === "approved")) {
+    throw new Error(`Source ${source.taskId} has no approved primary lead review.`);
+  }
   return source;
 }
 
@@ -213,8 +232,8 @@ function normalizeAssembly(input, sourceTaskIds) {
     includedTaskIds,
     excludedTaskIds,
     authorization: {
-      author: requiredString(input?.authorization?.author, "partial-candidate author"),
-      reason: requiredString(input?.authorization?.reason, "partial-candidate reason"),
+      actorId: normalizeOpaqueActorId(input?.authorization?.actorId),
+      reasonCode: normalizeReasonCode(input?.authorization?.reasonCode),
     },
   };
 }
@@ -253,6 +272,11 @@ export function buildCandidateManifest(input = {}) {
     "source task ID",
   );
   if (!sources.length) throw new Error("Candidate manifest requires at least one source.");
+  uniqueBy(
+    sources.flatMap((source) => source.reviews),
+    "id",
+    "candidate review ID",
+  );
   const baseSha = normalizeGitSha(input.base?.sha, "base SHA");
   const integrationSha = normalizeGitSha(input.integration?.sha, "integration SHA");
   const checks = uniqueBy(

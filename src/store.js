@@ -251,6 +251,16 @@ function normalizeReviewPipeline(value) {
       description: String(stage.description || "").trim(),
     }))
     .filter((stage) => stage.key && stage.role);
+  if (!stages.length) return [];
+  const leadIndex = stages.findIndex(isLeadReviewStage);
+  if (leadIndex === -1) {
+    stages.push({ ...DEFAULT_REVIEW_PIPELINE.find((stage) => stage.key === "lead") });
+  } else {
+    stages[leadIndex] = {
+      ...stages[leadIndex],
+      required: true,
+    };
+  }
   return reviewStagesWithDefaultAccessibility(stages);
 }
 

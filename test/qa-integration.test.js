@@ -243,8 +243,8 @@ test("QA integration plans only an explicitly authorized partial candidate subse
   const plan = planQaIntegrations(state, {
     project: "demo",
     partialTasks: "task_1",
-    partialAuthor: "Release owner",
-    partialReason: "The repair is independent and urgent.",
+    partialActorId: "release-owner",
+    partialReasonCode: "independent_repair",
   });
 
   assert.deepEqual(plan.projects[0].tasks.map((task) => task.id), ["task_1"]);
@@ -254,20 +254,38 @@ test("QA integration plans only an explicitly authorized partial candidate subse
     includedTaskIds: ["task_1"],
     excludedTaskIds: ["task_2"],
     authorization: {
-      author: "Release owner",
-      reason: "The repair is independent and urgent.",
+      actorId: "release-owner",
+      reasonCode: "independent_repair",
     },
   });
   assert.throws(
     () => planQaIntegrations(state, { project: "demo", partialTasks: "task_1" }),
-    /partial-author and --partial-reason/,
+    /partial-actor-id/,
+  );
+  assert.throws(
+    () => planQaIntegrations(state, {
+      project: "demo",
+      partialTasks: "task_1",
+      partialActorId: "owner@example.com",
+      partialReasonCode: "independent_repair",
+    }),
+    /non-sensitive --partial-actor-id/,
+  );
+  assert.throws(
+    () => planQaIntegrations(state, {
+      project: "demo",
+      partialTasks: "task_1",
+      partialActorId: "release-owner",
+      partialReasonCode: "Contains descriptive text and a path /Users/example",
+    }),
+    /bounded --partial-reason-code/,
   );
   assert.throws(
     () => planQaIntegrations(state, {
       project: "demo",
       partialTasks: "task_1,task_2",
-      partialAuthor: "Release owner",
-      partialReason: "Not actually partial.",
+      partialActorId: "release-owner",
+      partialReasonCode: "not_partial",
     }),
     /must exclude at least one/,
   );

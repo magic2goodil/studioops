@@ -219,6 +219,88 @@ test("SQLite rejects mutation of a frozen candidate manifest and rolls back atom
       /cannot be deleted/,
     );
 
+    const qaDecision = {
+      outcome: "passed",
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      integrationSha,
+      taskIds: ["task_1"],
+      author: "Owner QA",
+      notes: "",
+      repositoryVerifiedAt: "2026-07-25T12:29:59.000Z",
+      decidedAt: "2026-07-25T12:30:00.000Z",
+    };
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.candidates[0].qaDecision = ${JSON.stringify(qaDecision)};
+        state.candidates[0].status = "qa_passed";
+      });
+    `);
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates[0].qaDecision = {
+            ...state.candidates[0].qaDecision,
+            notes: "rewritten"
+          };
+        });
+      `),
+      /qaDecision record is append-only/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { readState, writeState } from ${JSON.stringify(storeModuleUrl)};
+        const state = await readState();
+        state.candidates[0].qaDecision = {
+          ...state.candidates[0].qaDecision,
+          author: "replacement"
+        };
+        await writeState(state);
+      `),
+      /qaDecision record is append-only/,
+    );
+
+    const promotion = {
+      branch: "qa/promotion-demo",
+      prUrl: "https://github.com/example/demo/pull/1",
+      commitSha: integrationSha,
+      manifestDigest: candidate.manifestDigest,
+      readyAt: "2026-07-25T13:00:00.000Z",
+    };
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.candidates[0].promotion = ${JSON.stringify(promotion)};
+        state.candidates[0].status = "release_candidate_ready";
+      });
+    `);
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates[0].promotion = {
+            ...state.candidates[0].promotion,
+            prUrl: "https://github.com/example/demo/pull/2"
+          };
+        });
+      `),
+      /promotion record is append-only/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { readState, writeState } from ${JSON.stringify(storeModuleUrl)};
+        const state = await readState();
+        state.candidates[0].promotion = {
+          ...state.candidates[0].promotion,
+          branch: "qa/replaced"
+        };
+        await writeState(state);
+      `),
+      /promotion record is append-only/,
+    );
+
     await runStoreScript(root, `
       import { mutateState } from ${JSON.stringify(storeModuleUrl)};
       import { invalidateCandidate } from ${JSON.stringify(candidateManifestModuleUrl)};

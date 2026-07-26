@@ -1,6 +1,6 @@
 # ADR 0001: Immutable Candidate Trust Chain
 
-- Status: Accepted
+- Status: Proposed (Ultra gate pending)
 - Date: 2026-07-25
 - Decision owner: StudioOps Ultra implementation lead
 - Governing task: `task_74`
@@ -123,9 +123,11 @@ is healthy at the exact integration SHA, after which the candidate branch is
 immutable and any movement invalidates the candidate.
 
 Partial assembly is permitted only when the caller explicitly supplies the
-included task IDs, an authorization reason, and an author. The manifest records
-the requested, included, and excluded task IDs plus the authorization. Excluded
-tasks remain outside the candidate and cannot be described as QA-ready.
+included task IDs, a non-sensitive opaque actor ID, and a bounded reason code.
+Descriptive notes, names, email addresses, secrets, and local paths stay outside
+the manifest. The manifest records requested, included, and excluded task IDs
+plus the coded authorization. Excluded tasks remain outside the candidate and
+cannot be described as QA-ready.
 
 Integration validation becomes check evidence keyed to the integration SHA.
 Manifest check labels are generic and raw validation commands/output stay
@@ -264,21 +266,11 @@ Task 74 does not solve actor authentication, fenced leases, hosted redundancy,
 notification delivery, or the complete owner QA packet. Tasks 75, 76, 78, and 80
 build those controls on this immutable identity.
 
-## Ultra lead review
+## Ultra lead review gate
 
-Accepted after a trust-boundary review against the task 74 acceptance criteria
-and the audit's required handoff contracts.
-
-The review confirmed:
-
-- the manifest names every required identity and exact SHA;
-- mutable status is separated from immutable release evidence;
-- review, QA, and promotion all consume the same digest-bound subject;
-- atomic assembly is the default and partial assembly is explicit and bounded;
-- target, source, candidate, preview, and promotion drift fail closed;
-- legacy approvals are not silently upgraded;
-- implementation can remain compatible with later actor authorization, fenced
-  leases, remote CI provenance, and durable owner notifications.
+Pending. This ADR must not be marked accepted until an independent Ultra review
+approves one exact implementation commit against the task 74 acceptance
+criteria and the audit's required handoff contracts.
 
 Residual risks are explicit dependencies, not accepted gaps in this decision:
 

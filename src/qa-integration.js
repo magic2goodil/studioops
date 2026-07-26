@@ -913,14 +913,29 @@ function partialCandidateRequest(input = {}) {
     )),
   ].sort();
   if (!includedTaskIds.length) return null;
-  const author = String(input.partialAuthor || input["partial-author"] || "").trim();
-  const reason = String(input.partialReason || input["partial-reason"] || "").trim();
-  if (!author || !reason) {
-    throw new Error("Authorized partial QA assembly requires --partial-author and --partial-reason.");
+  const actorId = String(
+    input.partialActorId
+    || input["partial-actor-id"]
+    || input.partialAuthor
+    || input["partial-author"]
+    || "",
+  ).trim();
+  const reasonCode = String(
+    input.partialReasonCode
+    || input["partial-reason-code"]
+    || input.partialReason
+    || input["partial-reason"]
+    || "",
+  ).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(actorId)) {
+    throw new Error("Authorized partial QA assembly requires a non-sensitive --partial-actor-id.");
+  }
+  if (!/^[a-z][a-z0-9_-]{2,63}$/.test(reasonCode)) {
+    throw new Error("Authorized partial QA assembly requires a bounded --partial-reason-code.");
   }
   return {
     includedTaskIds,
-    authorization: { author, reason },
+    authorization: { actorId, reasonCode },
   };
 }
 
