@@ -8,10 +8,13 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { maintenanceWriteBlocker } from "../src/state-database.js";
+import { environmentForTestControlRoot } from "../scripts/test-environment.js";
+import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
 const storeModuleUrl = pathToFileURL(path.join(process.cwd(), "src/store.js")).href;
+const candidateManifestModuleUrl = pathToFileURL(path.join(process.cwd(), "src/candidate-manifest.js")).href;
 
 test("maintenance lease blocks non-owner writes until it expires", () => {
   const state = {
@@ -57,9 +60,10 @@ async function writeLegacyState(root, state = baseState()) {
 }
 
 async function runStoreScript(root, source) {
+  const env = await environmentForTestControlRoot(root);
   return execFileAsync(process.execPath, ["--input-type=module", "-e", source], {
     cwd: root,
-    env: { ...process.env, MISSION_CONTROL_ROOT: root },
+    env,
     timeout: 30_000,
   });
 }
@@ -116,6 +120,216 @@ test("concurrent worker processes serialize updates without dropping comments", 
   }
 });
 
+test("SQLite rejects mutation of a frozen candidate manifest and rolls back atomically", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-candidate-immutability-"));
+  const sourceSha = "a".repeat(40);
+  const integrationSha = "b".repeat(40);
+  const candidate = createCandidateEnvelope({
+    createdAt: "2026-07-25T12:00:00.000Z",
+    manifest: {
+      candidateId: "candidate_immutable",
+      projectId: "project_1",
+      base: { branch: "main", sha: "c".repeat(40) },
+      sources: [{
+        taskId: "task_1",
+        sourceRef: "refs/heads/codex/task-1",
+        headSha: sourceSha,
+        candidateCycle: 1,
+        reviews: [{
+          id: "review_1",
+          stageKey: "lead",
+          role: "lead-reviewer",
+          outcome: "approved",
+          subjectSha: sourceSha,
+          candidateCycle: 1,
+          reviewedAt: "2026-07-25T11:00:00.000Z",
+        }],
+      }],
+      integration: { branch: "qa/candidate-immutable", sha: integrationSha },
+      checks: [{
+        id: "check_1",
+        kind: "local-validation",
+        name: "npm test",
+        outcome: "passed",
+        subjectSha: integrationSha,
+        evidenceDigest: `sha256:${"d".repeat(64)}`,
+      }],
+      preview: {
+        url: "http://127.0.0.1:4174/",
+        status: "healthy",
+        commitSha: integrationSha,
+        verifiedAt: "2026-07-25T12:00:00.000Z",
+        attestation: {
+          kind: "header",
+          key: "x-studioops-commit",
+          observedSha: integrationSha,
+        },
+      },
+      assembly: {
+        mode: "atomic",
+        requestedTaskIds: ["task_1"],
+        includedTaskIds: ["task_1"],
+        excludedTaskIds: [],
+      },
+    },
+  });
+
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.candidates.push(${JSON.stringify(candidate)});
+      });
+    `);
+
+    const altered = structuredClone(candidate);
+    altered.manifest.base.sha = "e".repeat(40);
+    altered.manifestDigest = manifestDigest(altered.manifest);
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates[0] = ${JSON.stringify(altered)};
+        });
+      `),
+      /manifest is immutable/,
+    );
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.candidates[0].manifest.base.sha, candidate.manifest.base.sha);
+    assert.equal(persisted.candidates[0].manifestDigest, candidate.manifestDigest);
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates = [];
+        });
+      `),
+      /cannot be deleted/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { readState, writeState } from ${JSON.stringify(storeModuleUrl)};
+        const state = await readState();
+        state.candidates = [];
+        await writeState(state);
+      `),
+      /cannot be deleted/,
+    );
+
+    const qaDecision = {
+      outcome: "passed",
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      integrationSha,
+      taskIds: ["task_1"],
+      author: "Owner QA",
+      notes: "",
+      repositoryVerifiedAt: "2026-07-25T12:29:59.000Z",
+      decidedAt: "2026-07-25T12:30:00.000Z",
+    };
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.candidates[0].qaDecision = ${JSON.stringify(qaDecision)};
+        state.candidates[0].status = "qa_passed";
+      });
+    `);
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates[0].qaDecision = {
+            ...state.candidates[0].qaDecision,
+            notes: "rewritten"
+          };
+        });
+      `),
+      /qaDecision record is append-only/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { readState, writeState } from ${JSON.stringify(storeModuleUrl)};
+        const state = await readState();
+        state.candidates[0].qaDecision = {
+          ...state.candidates[0].qaDecision,
+          author: "replacement"
+        };
+        await writeState(state);
+      `),
+      /qaDecision record is append-only/,
+    );
+
+    const promotion = {
+      branch: "qa/promotion-demo",
+      prUrl: "https://github.com/example/demo/pull/1",
+      commitSha: integrationSha,
+      manifestDigest: candidate.manifestDigest,
+      readyAt: "2026-07-25T13:00:00.000Z",
+    };
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.candidates[0].promotion = ${JSON.stringify(promotion)};
+        state.candidates[0].status = "release_candidate_ready";
+      });
+    `);
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates[0].promotion = {
+            ...state.candidates[0].promotion,
+            prUrl: "https://github.com/example/demo/pull/2"
+          };
+        });
+      `),
+      /promotion record is append-only/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { readState, writeState } from ${JSON.stringify(storeModuleUrl)};
+        const state = await readState();
+        state.candidates[0].promotion = {
+          ...state.candidates[0].promotion,
+          branch: "qa/replaced"
+        };
+        await writeState(state);
+      `),
+      /promotion record is append-only/,
+    );
+
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      import { invalidateCandidate } from ${JSON.stringify(candidateManifestModuleUrl)};
+      await mutateState((state) => {
+        invalidateCandidate(state.candidates[0], {
+          reason: "Source drift.",
+          expected: "${sourceSha}",
+          observed: "${"f".repeat(40)}"
+        });
+      });
+    `);
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates[0].invalidation = null;
+          state.candidates[0].status = "frozen";
+        });
+      `),
+      /invalidation record is append-only/,
+    );
+    const invalidated = readPersistedState(root).candidates[0];
+    assert.equal(invalidated.status, "invalidated");
+    assert.equal(invalidated.invalidation.reason, "Source drift.");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("SQLite import removes orphaned and cross-project QA bundle references", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-bundle-integrity-"));
   try {
@@ -144,6 +358,8 @@ test("SQLite import removes orphaned and cross-project QA bundle references", as
     const persisted = readPersistedState(root);
     assert.equal(persisted.tasks.find((task) => task.id === "task_1").qaBundleId, undefined);
     assert.equal(persisted.tasks.find((task) => task.id === "task_2").qaBundleId, "qa_bundle_1");
+    assert.equal(persisted.qaBundles[0].status, "legacy_untrusted");
+    assert.equal(persisted.qaBundles[0].legacyStatus, "ready");
     assert.deepEqual(persisted.qaBundles[0].tasks.map((task) => task.id), ["task_2"]);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -175,10 +391,71 @@ test("SQLite migration reconstructs bundles for previously integrated QA tasks",
     const persisted = readPersistedState(root);
     assert.equal(persisted.qaBundles.length, 1);
     assert.equal(persisted.qaBundles[0].projectId, "project_1");
+    assert.equal(persisted.qaBundles[0].status, "legacy_untrusted");
     assert.equal(persisted.qaBundles[0].previewUrl, "http://127.0.0.1:4174/");
     assert.equal(persisted.qaBundles[0].integrationBranchUrl, "https://github.com/example/demo/tree/qa/demo");
     assert.equal(persisted.tasks[0].qaBundleId, persisted.qaBundles[0].id);
     assert.deepEqual(persisted.qaBundles[0].tasks.map((task) => task.id), ["task_1"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy QA bundles remain visible but cannot authorize a new QA decision", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-legacy-qa-ineligible-"));
+  try {
+    const state = baseState();
+    state.tasks[0].status = "qa_review";
+    state.tasks[0].qaBundleId = "qa_bundle_legacy";
+    state.qaBundles.push({
+      id: "qa_bundle_legacy",
+      projectId: "project_1",
+      status: "ready",
+      tasks: [{ id: "task_1", title: state.tasks[0].title }],
+    });
+    await writeLegacyState(root, state);
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { recordQaBundleDecision } from ${JSON.stringify(storeModuleUrl)};
+        await recordQaBundleDecision("qa_bundle_legacy", {
+          outcome: "passed",
+          author: "Owner QA",
+          candidateId: "candidate_missing",
+          manifestDigest: "sha256:${"a".repeat(64)}",
+          integrationSha: "${"b".repeat(40)}"
+        });
+      `),
+      /legacy and has no immutable candidate/,
+    );
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.qaBundles[0].status, "legacy_untrusted");
+    assert.equal(persisted.tasks[0].status, "qa_review");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy task-level QA approvals remain visible but are not promotion authority", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-legacy-task-approval-"));
+  try {
+    const state = baseState();
+    state.tasks[0].status = "approved_for_main";
+    state.tasks[0].promotionStatus = "queued";
+    state.tasks[0].qaDecision = {
+      outcome: "passed",
+      author: "Legacy owner",
+      decidedAt: "2026-07-24T12:00:00.000Z",
+    };
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].status, "legacy_untrusted");
+    assert.equal(persisted.tasks[0].legacyStatus, "approved_for_main");
+    assert.equal(persisted.tasks[0].legacyQaDecisionUntrusted, true);
+    assert.equal(persisted.tasks[0].promotionStatus, "");
+    assert.match(persisted.tasks[0].integrityBlocker, /immutable candidate/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

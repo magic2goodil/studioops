@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { projectFromConfig } from "../src/config.js";
 import {
   integrationBranchName,
@@ -24,12 +25,14 @@ const execFileAsync = promisify(execFile);
 const qaIntegrationModuleUrl = pathToFileURL(path.join(process.cwd(), "src/qa-integration.js")).href;
 
 async function run(command, args, options = {}) {
+  const baseEnv = options.cwd && command === process.execPath
+    ? await environmentForTestControlRoot(options.cwd)
+    : process.env;
   return execFileAsync(command, args, {
     cwd: options.cwd,
     env: {
-      ...process.env,
+      ...baseEnv,
       GIT_TERMINAL_PROMPT: "0",
-      ...(options.cwd ? { STUDIOOPS_ROOT: options.cwd } : {}),
       ...(options.env || {}),
     },
     timeout: options.timeout || 60_000,
@@ -40,6 +43,39 @@ async function run(command, args, options = {}) {
 async function git(repoPath, args) {
   const result = await run("git", args, { cwd: repoPath });
   return `${result.stdout || ""}${result.stderr || ""}`.trim();
+}
+
+async function stateWithReviewEvidence(state) {
+  state.reviews = state.reviews || [];
+  for (const task of state.tasks || []) {
+    if (task.status !== "qa_review" || !task.branchName || task.reviewSubjectSha) continue;
+    const project = (state.projects || []).find((item) => item.id === task.projectId);
+    if (!project?.repoPath) continue;
+    try {
+      const subjectSha = await git(project.repoPath, ["rev-parse", task.branchName]);
+      task.reviewCycle = 1;
+      task.reviewSubjectSha = subjectSha;
+      task.reviewSubjectCycle = 1;
+      for (const stageKey of ["backend", "frontend", "accessibility", "lead"]) {
+        state.reviews.push({
+          id: `review_${state.reviews.length + 1}`,
+          taskId: task.id,
+          projectId: task.projectId,
+          cycle: 1,
+          candidateCycle: 1,
+          stageKey,
+          status: `${stageKey}_review`,
+          role: `${stageKey}-reviewer`,
+          outcome: "approved",
+          subjectSha,
+          createdAt: "2026-07-25T12:00:00.000Z",
+        });
+      }
+    } catch {
+      // Negative repository fixtures intentionally remain untrusted.
+    }
+  }
+  return state;
 }
 
 test("review policy Trust Leads settings override stale top-level mirrors", () => {
@@ -134,6 +170,125 @@ test("QA integration honors retry windows for unchanged blocked work", () => {
   assert.equal(projectPlanHasWork(deferredPlan.projects[0]), false);
   assert.equal(planQaIntegrations(state, { project: "demo", nowMs: nowMs + 16 * 60_000 }).taskCount, 1);
   assert.equal(planQaIntegrations(state, { project: "demo", nowMs, force: true }).taskCount, 1);
+});
+
+test("atomic QA planning cannot silently omit filtered or retry-delayed tasks", () => {
+  const nowMs = Date.parse("2026-07-22T20:00:00.000Z");
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath: "/tmp/demo",
+      defaultBranch: "main",
+      reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/demo" },
+    }],
+    tasks: [
+      {
+        id: "task_1",
+        projectId: "project_1",
+        title: "Ready task",
+        status: "qa_review",
+        branchName: "codex/task-1",
+      },
+      {
+        id: "task_2",
+        projectId: "project_1",
+        title: "Retry-delayed task",
+        status: "qa_review",
+        branchName: "codex/task-2",
+        integrationRetryNotBefore: "2026-07-22T20:15:00.000Z",
+      },
+    ],
+  };
+
+  assert.throws(
+    () => planQaIntegrations(state, { project: "demo", task: "task_1", nowMs }),
+    /requires explicit partial-candidate authorization/,
+  );
+  const deferred = planQaIntegrations(state, { project: "demo", nowMs });
+  assert.equal(deferred.taskCount, 0);
+  assert.equal(deferred.projects[0].deferredTaskCount, 2);
+  assert.equal(projectPlanHasWork(deferred.projects[0]), false);
+});
+
+test("QA integration plans only an explicitly authorized partial candidate subset", () => {
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath: "/tmp/demo",
+      defaultBranch: "main",
+      reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/demo" },
+    }],
+    tasks: [
+      {
+        id: "task_1",
+        projectId: "project_1",
+        title: "Independent repair",
+        status: "qa_review",
+        branchName: "codex/task-1",
+      },
+      {
+        id: "task_2",
+        projectId: "project_1",
+        title: "Deferred enhancement",
+        status: "qa_review",
+        branchName: "codex/task-2",
+      },
+    ],
+    reviews: [],
+  };
+  const plan = planQaIntegrations(state, {
+    project: "demo",
+    partialTasks: "task_1",
+    partialActorId: "release-owner",
+    partialReasonCode: "independent_repair",
+  });
+
+  assert.deepEqual(plan.projects[0].tasks.map((task) => task.id), ["task_1"]);
+  assert.deepEqual(plan.projects[0].assembly, {
+    mode: "authorized_partial",
+    requestedTaskIds: ["task_1", "task_2"],
+    includedTaskIds: ["task_1"],
+    excludedTaskIds: ["task_2"],
+    authorization: {
+      actorId: "release-owner",
+      reasonCode: "independent_repair",
+    },
+  });
+  assert.throws(
+    () => planQaIntegrations(state, { project: "demo", partialTasks: "task_1" }),
+    /partial-actor-id/,
+  );
+  assert.throws(
+    () => planQaIntegrations(state, {
+      project: "demo",
+      partialTasks: "task_1",
+      partialActorId: "owner@example.com",
+      partialReasonCode: "independent_repair",
+    }),
+    /non-sensitive --partial-actor-id/,
+  );
+  assert.throws(
+    () => planQaIntegrations(state, {
+      project: "demo",
+      partialTasks: "task_1",
+      partialActorId: "release-owner",
+      partialReasonCode: "Contains descriptive text and a path /Users/example",
+    }),
+    /bounded --partial-reason-code/,
+  );
+  assert.throws(
+    () => planQaIntegrations(state, {
+      project: "demo",
+      partialTasks: "task_1,task_2",
+      partialActorId: "release-owner",
+      partialReasonCode: "not_partial",
+    }),
+    /must exclude at least one/,
+  );
 });
 
 test("QA result fingerprints ignore isolated workspace names but detect material changes", () => {
@@ -236,7 +391,7 @@ test("validation commands use the QA integration PATH override", async () => {
     await git(repoPath, ["checkout", "main"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -267,7 +422,7 @@ test("validation commands use the QA integration PATH override", async () => {
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -284,11 +439,11 @@ test("validation commands use the QA integration PATH override", async () => {
     });
     const report = JSON.parse(runResult.stdout.trim());
 
-    assert.equal(report.projects[0].status, "ready");
-    assert.equal(report.projects[0].tasks[0].status, "ready");
+    assert.equal(report.projects[0].status, "preview_missing");
+    assert.equal(report.projects[0].tasks[0].status, "preview_missing");
 
     const state = readPersistedState(root);
-    assert.equal(state.tasks[0].integrationStatus, "ready");
+    assert.equal(state.tasks[0].integrationStatus, "preview_missing");
     assert.equal(state.tasks[0].integrationValidation.commands[0].ok, true);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -322,7 +477,7 @@ test("QA integration redacts GitHub token values from validation output before s
     const validationCommand = `${JSON.stringify(process.execPath)} -e "console.log(process.env.GH_TOKEN); console.error(process.env.MISSION_CONTROL_GITHUB_TOKEN)"`;
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -353,7 +508,7 @@ test("QA integration redacts GitHub token values from validation output before s
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -374,8 +529,8 @@ test("QA integration redacts GitHub token values from validation output before s
     const reportText = JSON.stringify(report);
     const stateText = JSON.stringify(readPersistedState(root));
 
-    assert.equal(report.projects[0].status, "ready");
-    assert.equal(report.projects[0].tasks[0].status, "ready");
+    assert.equal(report.projects[0].status, "preview_missing");
+    assert.equal(report.projects[0].tasks[0].status, "preview_missing");
     assert.equal(reportText.includes(fakeToken), false);
     assert.match(reportText, /\[REDACTED_GITHUB_APP_TOKEN\]/);
     assert.equal(stateText.includes(fakeToken), false);
@@ -411,7 +566,7 @@ test("failed validation leaves the owner checkout untouched and does not push", 
     const ownerStatusBefore = await git(repoPath, ["status", "--porcelain"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -442,7 +597,7 @@ test("failed validation leaves the owner checkout untouched and does not push", 
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -474,12 +629,131 @@ test("failed validation leaves the owner checkout untouched and does not push", 
   }
 });
 
-test("successful QA integration uses an isolated workspace without switching the registered repo", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
+test("QA integration rejects source drift before merge or candidate push", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-source-drift-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
 
   try {
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await git(repoPath, ["config", "user.email", "studioops-test@example.com"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    await git(repoPath, ["push", "origin", "main"]);
+
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "feature.txt"), "reviewed\n", "utf8");
+    await git(repoPath, ["add", "feature.txt"]);
+    await git(repoPath, ["commit", "-m", "reviewed feature"]);
+    const reviewedSourceSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "origin", "feature/task"]);
+
+    await git(repoPath, ["checkout", "main"]);
+    await git(repoPath, ["checkout", "-b", "feature/stable"]);
+    await writeFile(path.join(repoPath, "stable.txt"), "stable\n", "utf8");
+    await git(repoPath, ["add", "stable.txt"]);
+    await git(repoPath, ["commit", "-m", "stable feature"]);
+    await git(repoPath, ["push", "origin", "feature/stable"]);
+
+    const state = await stateWithReviewEvidence({
+      meta: {},
+      projects: [{
+        id: "project_1",
+        key: "demo",
+        name: "Demo",
+        repoPath,
+        defaultBranch: "main",
+        validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+        reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/integration" },
+      }],
+      tasks: [
+        {
+          id: "task_2",
+          projectId: "project_1",
+          title: "Stable feature task",
+          status: "qa_review",
+          branchName: "feature/stable",
+        },
+        {
+          id: "task_1",
+          projectId: "project_1",
+          title: "Drifting feature task",
+          status: "qa_review",
+          branchName: "feature/task",
+        },
+      ],
+      comments: [],
+      events: [],
+      reviews: [],
+      runs: [],
+    });
+    await mkdir(path.join(root, "data"), { recursive: true });
+    await writeFile(
+      path.join(root, "data", "mission-control.json"),
+      `${JSON.stringify(state, null, 2)}\n`,
+      "utf8",
+    );
+
+    await git(repoPath, ["checkout", "feature/task"]);
+    await writeFile(path.join(repoPath, "feature.txt"), "moved after review\n", "utf8");
+    await git(repoPath, ["commit", "-am", "move source after review"]);
+    const movedSourceSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "origin", "feature/task"]);
+
+    const script = `
+      import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      const report = await runQaIntegration({
+        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))}
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const report = JSON.parse(runResult.stdout.trim());
+    const persisted = readPersistedState(root);
+
+    assert.equal(report.projects[0].status, "blocked");
+    assert.equal(report.projects[0].tasks[0].status, "merged");
+    assert.equal(report.projects[0].tasks[1].status, "source_drift");
+    assert.equal(report.projects[0].tasks[1].expectedHeadSha, reviewedSourceSha);
+    assert.equal(report.projects[0].tasks[1].headSha, movedSourceSha);
+    assert.equal(persisted.candidates.length, 0);
+    assert.equal(
+      await git(remotePath, ["for-each-ref", "--format=%(refname)", "refs/heads/qa/candidate-"]),
+      "",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("successful QA integration freezes an immutable candidate at the healthy preview commit", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  const previewPath = path.join(root, "preview");
+  let attestsPreview = false;
+  const healthServer = createServer(async (_request, response) => {
+    try {
+      const commitSha = await git(previewPath, ["rev-parse", "HEAD"]);
+      const headers = {
+        "content-type": "application/json",
+      };
+      if (attestsPreview) headers["x-studioops-commit"] = commitSha;
+      response.writeHead(200, headers);
+      response.end(JSON.stringify(attestsPreview ? { ok: true, commitSha } : { ok: true }));
+    } catch {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end('{"ok":false}');
+    }
+  });
+
+  try {
+    await new Promise((resolve) => healthServer.listen(0, "127.0.0.1", resolve));
+    const healthPort = healthServer.address().port;
     await git(root, ["init", "--bare", remotePath]);
     await git(root, ["clone", remotePath, repoPath]);
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
@@ -496,12 +770,15 @@ test("successful QA integration uses an isolated workspace without switching the
     await git(repoPath, ["commit", "-am", "feature"]);
     await git(repoPath, ["push", "origin", "feature/task"]);
 
+    await git(root, ["clone", remotePath, previewPath]);
+    await git(previewPath, ["checkout", "-b", "main", "origin/main"]);
+
     await git(repoPath, ["checkout", "-b", "owner/work", "main"]);
     await writeFile(path.join(repoPath, "owner-notes.txt"), "uncommitted owner note\n", "utf8");
     const ownerStatusBefore = await git(repoPath, ["status", "--porcelain"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -512,6 +789,13 @@ test("successful QA integration uses an isolated workspace without switching the
           repoUrl: "",
           defaultBranch: "main",
           validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          localQaPreview: {
+            enabled: true,
+            checkoutPath: previewPath,
+            branch: "qa/integration",
+            previewUrl: `http://127.0.0.1:${healthPort}/`,
+            healthCheckUrl: `http://127.0.0.1:${healthPort}/health`,
+          },
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -542,11 +826,27 @@ test("successful QA integration uses an isolated workspace without switching the
           tasks: [],
         },
       ],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
+    const rejectedRun = await run(process.execPath, ["--input-type=module", "-e", `
+      import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      const report = await runQaIntegration({
+        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))},
+        previewHealthAttempts: 1
+      });
+      console.log(JSON.stringify(report));
+    `], { cwd: root });
+    const rejectedReport = JSON.parse(rejectedRun.stdout.trim());
+    assert.equal(rejectedReport.projects[0].status, "preview_identity_mismatch");
+    assert.equal(readPersistedState(root).candidates.length, 0);
+
+    attestsPreview = true;
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
-      const report = await runQaIntegration({ workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))} });
+      const report = await runQaIntegration({
+        force: true,
+        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))}
+      });
       console.log(JSON.stringify(report));
     `;
     const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
@@ -554,19 +854,52 @@ test("successful QA integration uses an isolated workspace without switching the
 
     assert.equal(report.projects[0].status, "ready");
     assert.equal(report.projects[0].tasks[0].status, "ready");
+    assert.match(report.projects[0].integrationBranch, /^qa\/candidate-/);
+    assert.equal(report.projects[0].localQaPreview.branch, report.projects[0].integrationBranch);
+    assert.equal(report.projects[0].localQaPreview.after, report.projects[0].commit);
+    assert.equal(report.projects[0].candidate.manifest.integration.sha, report.projects[0].commit);
+    assert.equal(report.projects[0].candidate.manifest.preview.commitSha, report.projects[0].commit);
+    assert.equal(report.projects[0].candidate.manifest.sources[0].headSha, await git(remotePath, ["rev-parse", "refs/heads/feature/task"]));
     assert.ok(report.projects[0].workspacePath.startsWith(path.join(root, "qa-workspaces")));
     assert.notEqual(report.projects[0].workspacePath, repoPath);
     assert.equal(await git(repoPath, ["symbolic-ref", "--short", "HEAD"]), "owner/work");
     assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
-    assert.equal(await git(remotePath, ["show", "refs/heads/qa/integration:app.txt"]), "feature");
+    assert.equal(await git(remotePath, ["show", `refs/heads/${report.projects[0].integrationBranch}:app.txt`]), "feature");
 
     const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "ready");
     assert.equal(state.tasks[0].integrationWorkspacePath, report.projects[0].workspacePath);
     assert.match(state.comments[0].body, /Workspace:/);
-    assert.deepEqual(state.qaBundles.map((bundle) => bundle.id), ["qa_bundle_1", "qa_bundle_2"]);
-    assert.equal(state.tasks[0].qaBundleId, "qa_bundle_2");
+    assert.equal(state.qaBundles.length, 2);
+    assert.equal(state.candidates.length, 1);
+    assert.equal(state.tasks[0].candidateId, state.candidates[0].id);
+    assert.equal(state.tasks[0].candidateManifestDigest, state.candidates[0].manifestDigest);
+    assert.equal(state.qaBundles.find((bundle) => bundle.candidateId === state.candidates[0].id)?.status, "ready");
+
+    const secondRun = await run(process.execPath, ["--input-type=module", "-e", `
+      import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      const report = await runQaIntegration({
+        force: true,
+        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))}
+      });
+      console.log(JSON.stringify(report));
+    `], { cwd: root });
+    const secondReport = JSON.parse(secondRun.stdout.trim());
+    const replacedState = readPersistedState(root);
+    const currentCandidate = replacedState.candidates.find((candidate) => candidate.id === secondReport.projects[0].candidate.id);
+    const supersededCandidate = replacedState.candidates.find((candidate) => candidate.id === report.projects[0].candidate.id);
+    assert.equal(secondReport.projects[0].status, "ready");
+    assert.equal(replacedState.candidates.length, 2);
+    assert.equal(currentCandidate.status, "frozen");
+    assert.equal(supersededCandidate.status, "invalidated");
+    assert.match(supersededCandidate.invalidation.reason, /Superseded by newer candidate/);
+    assert.equal(
+      replacedState.qaBundles.find((bundle) => bundle.candidateId === supersededCandidate.id).status,
+      "invalidated",
+    );
+    assert.equal(replacedState.tasks[0].candidateId, currentCandidate.id);
   } finally {
+    await new Promise((resolve) => healthServer.close(resolve));
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -576,9 +909,18 @@ test("QA integration can sync default branch changes into QA and refresh a local
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const previewPath = path.join(root, "preview");
-  const healthServer = createServer((_request, response) => {
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end('{"ok":true}');
+  const healthServer = createServer(async (_request, response) => {
+    try {
+      const commitSha = await git(previewPath, ["rev-parse", "HEAD"]);
+      response.writeHead(200, {
+        "content-type": "application/json",
+        "x-studioops-commit": commitSha,
+      });
+      response.end(JSON.stringify({ ok: true, commitSha }));
+    } catch {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end('{"ok":false}');
+    }
   });
 
   try {
@@ -604,7 +946,7 @@ test("QA integration can sync default branch changes into QA and refresh a local
     await git(repoPath, ["push", "origin", "main"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -637,7 +979,7 @@ test("QA integration can sync default branch changes into QA and refresh a local
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -647,14 +989,12 @@ test("QA integration can sync default branch changes into QA and refresh a local
     const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
     const report = JSON.parse(runResult.stdout.trim());
 
-    assert.equal(report.projects[0].status, "ready");
+    assert.equal(report.projects[0].status, "no_changes", JSON.stringify(report.projects[0], null, 2));
     assert.equal(report.projects[0].defaultBranchSync.status, "merged");
-    assert.equal(report.projects[0].localQaPreview.stashed, true);
-    assert.match(report.projects[0].localQaPreview.status, /^(updated|current)$/);
-    assert.equal(report.projects[0].localQaPreview.healthCheckUrl, `http://127.0.0.1:${healthPort}/health`);
+    assert.equal(report.projects[0].localQaPreview.status, "updated");
+    assert.equal(report.projects[0].localQaPreview.after, await git(remotePath, ["rev-parse", "refs/heads/qa/integration"]));
     assert.equal(await git(remotePath, ["show", "refs/heads/qa/integration:app.txt"]), "main update");
     assert.equal(await readFile(path.join(previewPath, "app.txt"), "utf8"), "main update\n");
-    assert.match(await git(previewPath, ["stash", "list"]), /StudioOps local QA preview sync/);
   } finally {
     await new Promise((resolve) => healthServer.close(resolve));
     await rm(root, { recursive: true, force: true });
@@ -691,7 +1031,7 @@ test("QA integration preserves a distinct origin push URL in the isolated worksp
     const ownerStatusBefore = await git(repoPath, ["status", "--porcelain"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -722,7 +1062,7 @@ test("QA integration preserves a distinct origin push URL in the isolated worksp
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -732,8 +1072,8 @@ test("QA integration preserves a distinct origin push URL in the isolated worksp
     const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
     const report = JSON.parse(runResult.stdout.trim());
 
-    assert.equal(report.projects[0].status, "ready");
-    assert.equal(await git(pushRemotePath, ["show", "refs/heads/qa/integration:app.txt"]), "feature");
+    assert.equal(report.projects[0].status, "preview_missing");
+    assert.equal(await git(pushRemotePath, ["show", `refs/heads/${report.projects[0].integrationBranch}:app.txt`]), "feature");
     assert.equal(await git(fetchRemotePath, ["show", "refs/heads/qa/integration:app.txt"]), "base");
     assert.equal(await git(repoPath, ["symbolic-ref", "--short", "HEAD"]), "owner/work");
     assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
@@ -766,7 +1106,7 @@ test("QA integration refuses a repo without origin instead of pushing back into 
     const qaHeadBefore = await git(repoPath, ["rev-parse", "refs/heads/qa/integration"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -797,7 +1137,7 @@ test("QA integration refuses a repo without origin instead of pushing back into 
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -849,7 +1189,7 @@ test("QA integration refuses workspace roots inside the registered repo", async 
     const ownerStatusBefore = await git(repoPath, ["status", "--porcelain"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -880,7 +1220,7 @@ test("QA integration refuses workspace roots inside the registered repo", async 
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -916,7 +1256,7 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
     await git(repoPath, ["commit", "-m", "base"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -947,7 +1287,7 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -1000,7 +1340,7 @@ test("QA integration keeps sanitized project workspace segments inside the works
     await git(repoPath, ["push", "origin", "feature/task"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
-    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify({
+    await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
       projects: [
         {
@@ -1031,7 +1371,7 @@ test("QA integration keeps sanitized project workspace segments inside the works
       events: [],
       reviews: [],
       runs: [],
-    }, null, 2)}\n`, "utf8");
+    }), null, 2)}\n`, "utf8");
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -1042,7 +1382,7 @@ test("QA integration keeps sanitized project workspace segments inside the works
     const report = JSON.parse(runResult.stdout.trim());
     const relativeWorkspace = path.relative(workspaceRoot, report.projects[0].workspacePath);
 
-    assert.equal(report.projects[0].status, "ready");
+    assert.equal(report.projects[0].status, "preview_missing");
     assert.ok(relativeWorkspace);
     assert.equal(relativeWorkspace.startsWith(".."), false);
     assert.equal(path.isAbsolute(relativeWorkspace), false);

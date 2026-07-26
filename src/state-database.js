@@ -2,13 +2,18 @@ import { backup, DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import { assertCandidateEnvelope } from "./candidate-manifest.js";
 import { fileExists } from "./config.js";
-import { missionControlDataDir, missionControlRoot } from "./runtime-paths.js";
+import {
+  assertIsolatedTestEnvironment,
+  missionControlDataDir,
+  missionControlRoot,
+} from "./runtime-paths.js";
 
-const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles"];
+const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
-const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles"]);
-const STATE_INTEGRITY_VERSION = 3;
+const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles", "candidates"]);
+const STATE_INTEGRITY_VERSION = 4;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
@@ -30,6 +35,7 @@ async function secureStoragePaths() {
 
 function openDatabase() {
   if (database) return database;
+  assertIsolatedTestEnvironment();
   database = new DatabaseSync(DATABASE_FILE);
   database.exec("PRAGMA busy_timeout = 10000");
   database.exec("PRAGMA journal_mode = WAL");
@@ -100,6 +106,15 @@ function openDatabase() {
       updated_at TEXT NOT NULL DEFAULT '',
       payload TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS candidates (
+      id TEXT PRIMARY KEY,
+      sequence INTEGER NOT NULL,
+      project_id TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT '',
+      manifest_digest TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS operational_archive (
       entity_type TEXT NOT NULL,
       entity_id TEXT NOT NULL,
@@ -118,6 +133,8 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_runs_status_updated ON runs(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
     CREATE INDEX IF NOT EXISTS idx_qa_bundles_project_status ON qa_bundles(project_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_candidates_project_status ON candidates(project_id, status, updated_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_manifest_digest ON candidates(manifest_digest);
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
   `);
   return database;
@@ -266,10 +283,45 @@ export function reconcileStateIntegrity(state) {
   state.projects = Array.isArray(state.projects) ? state.projects : [];
   state.tasks = Array.isArray(state.tasks) ? state.tasks : [];
   state.qaBundles = Array.isArray(state.qaBundles) ? state.qaBundles : [];
+  state.candidates = Array.isArray(state.candidates) ? state.candidates : [];
 
   const projectIds = new Set(state.projects.map((project) => project.id));
   const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
   const bundlesById = new Map(state.qaBundles.map((bundle) => [bundle.id, bundle]));
+  const candidatesById = new Map(state.candidates.map((candidate) => [candidate.id, candidate]));
+
+  for (const candidate of state.candidates) {
+    try {
+      assertCandidateEnvelope(candidate);
+    } catch (error) {
+      candidate.status = "invalidated";
+      candidate.integrityError = error.message;
+    }
+  }
+
+  for (const task of state.tasks) {
+    const candidate = candidatesById.get(task.candidateId);
+    const decision = candidate?.qaDecision;
+    const hasTrustedApproval = Boolean(
+      candidate
+      && !candidate.integrityError
+      && ["qa_passed", "release_candidate_ready"].includes(candidate.status)
+      && decision?.outcome === "passed"
+      && decision.candidateId === candidate.id
+      && decision.manifestDigest === candidate.manifestDigest
+      && decision.integrationSha === candidate.manifest?.integration?.sha
+      && candidate.manifest?.sources?.some((source) => source.taskId === task.id),
+    );
+    if (task.qaDecision?.outcome === "passed" && !hasTrustedApproval) {
+      task.legacyQaDecisionUntrusted = true;
+    }
+    if (task.status === "approved_for_main" && !hasTrustedApproval) {
+      task.legacyStatus = task.legacyStatus || task.status;
+      task.status = "legacy_untrusted";
+      task.promotionStatus = "";
+      task.integrityBlocker = "Legacy task-level QA approval is not bound to an immutable candidate.";
+    }
+  }
 
   for (const task of state.tasks) {
     if (!task.qaBundleId) continue;
@@ -279,6 +331,16 @@ export function reconcileStateIntegrity(state) {
 
   for (const bundle of state.qaBundles) {
     if (!projectIds.has(bundle.projectId)) bundle.status = "blocked";
+    if (bundle.candidateId) {
+      const candidate = candidatesById.get(bundle.candidateId);
+      if (!candidate || candidate.projectId !== bundle.projectId || candidate.qaBundleId !== bundle.id) {
+        bundle.status = "blocked";
+        bundle.candidateIntegrityError = "QA bundle candidate link is invalid.";
+      }
+    } else if (["ready", "passed", "partially_reviewed", "release_candidate_ready"].includes(bundle.status)) {
+      bundle.legacyStatus = bundle.legacyStatus || bundle.status;
+      bundle.status = "legacy_untrusted";
+    }
     const seenTaskIds = new Set();
     bundle.tasks = (Array.isArray(bundle.tasks) ? bundle.tasks : [])
       .map((entry) => tasksById.get(entry?.id))
@@ -429,6 +491,25 @@ function upsertEntity(db, table, item, sequence) {
       .run(item.id, sequence, item.projectId || "", item.taskId || "", item.status || "", item.role || "", item.updatedAt || "", payload);
     return;
   }
+  if (table === "candidates") {
+    db.prepare(`
+      INSERT INTO candidates(id, sequence, project_id, status, manifest_digest, updated_at, payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
+        status = excluded.status, manifest_digest = excluded.manifest_digest,
+        updated_at = excluded.updated_at, payload = excluded.payload
+    `)
+      .run(
+        item.id,
+        sequence,
+        item.projectId || "",
+        item.status || "",
+        item.manifestDigest || "",
+        item.updatedAt || "",
+        payload,
+      );
+    return;
+  }
   db.prepare(`
     INSERT INTO qa_bundles(id, sequence, project_id, status, integration_commit, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
@@ -438,6 +519,7 @@ function upsertEntity(db, table, item, sequence) {
 }
 
 function writeStateToOpenDatabase(db, state) {
+  assertFullCandidateHistoryPreserved(db, state.candidates || []);
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -472,6 +554,47 @@ function mutationSnapshot(state) {
   return snapshot;
 }
 
+function assertAppendOnlyCandidateFields(previousCandidate, candidate) {
+  for (const field of ["invalidation", "qaDecision", "promotion"]) {
+    if (
+      previousCandidate[field]
+      && JSON.stringify(previousCandidate[field]) !== JSON.stringify(candidate[field])
+    ) {
+      throw new Error(`Candidate ${candidate.id} ${field} record is append-only.`);
+    }
+  }
+  if (candidate.invalidation && candidate.status !== "invalidated") {
+    throw new Error(`Candidate ${candidate.id} cannot leave invalidated status.`);
+  }
+}
+
+function assertCandidateTransition(previousCandidate, candidate) {
+  assertCandidateEnvelope(candidate);
+  for (const field of ["id", "projectId", "qaBundleId", "createdAt"]) {
+    if (previousCandidate[field] !== candidate[field]) {
+      throw new Error(`Candidate ${previousCandidate.id} ${field} is immutable.`);
+    }
+  }
+  if (
+    JSON.stringify(previousCandidate.manifest) !== JSON.stringify(candidate.manifest)
+    || previousCandidate.manifestDigest !== candidate.manifestDigest
+  ) {
+    throw new Error(`Candidate ${candidate.id} manifest is immutable.`);
+  }
+  assertAppendOnlyCandidateFields(previousCandidate, candidate);
+}
+
+function assertFullCandidateHistoryPreserved(db, candidates) {
+  const currentById = new Map((candidates || []).map((candidate) => [candidate.id, candidate]));
+  for (const row of db.prepare("SELECT id, payload FROM candidates").all()) {
+    const previousCandidate = parsePayload(row.payload, null);
+    const candidate = currentById.get(row.id);
+    if (!candidate) throw new Error(`Candidate ${row.id} cannot be deleted.`);
+    assertCandidateTransition(previousCandidate, candidate);
+  }
+  for (const candidate of candidates || []) assertCandidateEnvelope(candidate);
+}
+
 function writeMutationToOpenDatabase(db, state, snapshot) {
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
@@ -491,6 +614,13 @@ function writeMutationToOpenDatabase(db, state, snapshot) {
     for (const [sequence, item] of (state[table] || []).entries()) {
       currentIds.add(item.id);
       const prior = previousItems.get(item.id);
+      if (table === "candidates") {
+        assertCandidateEnvelope(item);
+        if (prior) {
+          const previousCandidate = JSON.parse(prior.payload);
+          assertCandidateTransition(previousCandidate, item);
+        }
+      }
       const changed = !prior
         || prior.sequence !== sequence
         || (MUTABLE_ENTITY_TABLES.has(table) && prior.payload !== JSON.stringify(item));
@@ -498,7 +628,10 @@ function writeMutationToOpenDatabase(db, state, snapshot) {
     }
     const tableName = TABLE_NAME[table] || table;
     for (const id of previousItems.keys()) {
-      if (!currentIds.has(id)) db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
+      if (!currentIds.has(id)) {
+        if (table === "candidates") throw new Error(`Candidate ${id} cannot be deleted.`);
+        db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
+      }
     }
   }
 }
@@ -574,10 +707,21 @@ async function initialState() {
     if (!(await fileExists(candidate))) continue;
     return reconcileStateIntegrity(JSON.parse(await readFile(candidate, "utf8")));
   }
-  return { meta: {}, projects: [], tasks: [], comments: [], reviews: [], events: [], runs: [], qaBundles: [] };
+  return {
+    meta: {},
+    projects: [],
+    tasks: [],
+    comments: [],
+    reviews: [],
+    events: [],
+    runs: [],
+    qaBundles: [],
+    candidates: [],
+  };
 }
 
 export async function ensureStateDatabase() {
+  assertIsolatedTestEnvironment();
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   await secureStoragePaths();
   const db = openDatabase();

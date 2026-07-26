@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +18,17 @@ import {
   prepareGitHubAppAuth,
   redactSecrets,
 } from "./github-app-auth.js";
-import { mutateState, readState } from "./store.js";
+import {
+  candidateReviewEvidenceForTask,
+  mutateState,
+  readState,
+} from "./store.js";
+import {
+  createCandidateEnvelope,
+  invalidateCandidate,
+  normalizeGitSha,
+} from "./candidate-manifest.js";
+import { verifyCandidateRepositoryState } from "./candidate-repository.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -142,7 +152,7 @@ function localQaPreviewConfig(projectPlan) {
   return {
     enabled: true,
     checkoutPath: resolveWorkspaceRoot(config.checkoutPath || config.path || projectPlan.repoPath),
-    branch: normalizeBranchName(config.branch || projectPlan.integrationBranch),
+    branch: normalizeBranchName(projectPlan.candidateBranch || config.branch || projectPlan.integrationBranch),
     createIfMissing: booleanOption(config.createIfMissing, false),
     stashDirty: booleanOption(config.stashDirty, false),
     postUpdateCommands: normalizeList(config.postUpdateCommands || config.commands),
@@ -150,11 +160,20 @@ function localQaPreviewConfig(projectPlan) {
     launchAgentPlists: config.launchAgentPlists || {},
     previewUrl: String(config.previewUrl || config.url || "").trim(),
     healthCheckUrl: String(config.healthCheckUrl || config.healthUrl || config.previewUrl || config.url || "").trim(),
+    identityHeader: String(config.identityHeader || "x-studioops-commit").trim().toLowerCase(),
+    identityJsonField: String(config.identityJsonField || "commitSha").trim(),
   };
 }
 
 function localPreviewFailed(preview) {
-  return ["blocked", "post_update_failed", "restart_failed", "health_check_failed"].includes(preview?.status);
+  return [
+    "blocked",
+    "post_update_failed",
+    "restart_failed",
+    "health_check_failed",
+    "identity_check_missing",
+    "identity_mismatch",
+  ].includes(preview?.status);
 }
 
 function syncDefaultBranchEnabled(projectPlan) {
@@ -400,7 +419,14 @@ async function fetchTaskSource(repoPath, task, options = {}) {
     if (branchFormat.ok) {
       const branchFetch = await git(repoPath, ["fetch", "origin", `refs/heads/${branchName}:${localRef}`], { ...options, allowFailure: true });
       if (branchFetch.ok) {
-        return { ok: true, ref: localRef, label: branchName, fetchOutput: branchFetch.output };
+        return {
+          ok: true,
+          ref: localRef,
+          sourceRef: `refs/heads/${branchName}`,
+          headSha: await branchHead(repoPath, localRef, options),
+          label: branchName,
+          fetchOutput: branchFetch.output,
+        };
       }
       errors.push(`branch ${branchName}: ${branchFetch.output}`);
     } else {
@@ -412,7 +438,14 @@ async function fetchTaskSource(repoPath, task, options = {}) {
   if (prNumber) {
     const prFetch = await git(repoPath, ["fetch", "origin", `refs/pull/${prNumber}/head:${localRef}`], { ...options, allowFailure: true });
     if (prFetch.ok) {
-      return { ok: true, ref: localRef, label: `pull/${prNumber}`, fetchOutput: prFetch.output };
+      return {
+        ok: true,
+        ref: localRef,
+        sourceRef: `refs/pull/${prNumber}/head`,
+        headSha: await branchHead(repoPath, localRef, options),
+        label: `pull/${prNumber}`,
+        fetchOutput: prFetch.output,
+      };
     }
     errors.push(`PR ${prNumber}: ${prFetch.output}`);
   }
@@ -526,6 +559,55 @@ async function ensureLocalQaPreviewCheckout(projectPlan, preview, options = {}) 
   return { ok: true, created: true };
 }
 
+async function readLimitedResponseBody(response, maxBytes = 64 * 1024) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error(`Health response exceeded ${maxBytes} bytes.`);
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
+}
+
+async function previewIdentityFromResponse(response, preview) {
+  const headerValue = String(response.headers.get(preview.identityHeader) || "").trim();
+  if (headerValue) {
+    return {
+      kind: "header",
+      key: preview.identityHeader,
+      observedSha: normalizeGitSha(headerValue, "preview identity header"),
+    };
+  }
+  const body = await readLimitedResponseBody(response);
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new Error(
+      `Health response must provide ${preview.identityHeader} or JSON field ${preview.identityJsonField}.`,
+    );
+  }
+  return {
+    kind: "json",
+    key: preview.identityJsonField,
+    observedSha: normalizeGitSha(parsed?.[preview.identityJsonField], "preview identity JSON field"),
+  };
+}
+
 async function syncLocalQaPreview(projectPlan, options = {}) {
   const preview = localQaPreviewConfig(projectPlan);
   const result = {
@@ -542,6 +624,7 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     restartResults: [],
     previewUrl: preview.previewUrl || "",
     healthCheckUrl: preview.healthCheckUrl || "",
+    attestation: null,
   };
   if (!preview.enabled) return result;
   if (!preview.branch) {
@@ -688,28 +771,38 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     return result;
   }
 
-  if (preview.healthCheckUrl) {
-    let healthError = "";
-    let healthy = false;
-    for (let attempt = 1; attempt <= 8; attempt += 1) {
-      try {
-        const response = await fetch(preview.healthCheckUrl, { signal: AbortSignal.timeout(5_000) });
-        if (response.ok) {
-          healthy = true;
+  if (!preview.healthCheckUrl) {
+    result.status = "identity_check_missing";
+    result.output = "Local QA preview requires a healthCheckUrl that attests the running commit.";
+    return result;
+  }
+  let healthError = "";
+  let attestation = null;
+  const healthAttempts = Math.max(1, Number(options.previewHealthAttempts || 8));
+  for (let attempt = 1; attempt <= healthAttempts; attempt += 1) {
+    try {
+      const response = await fetch(preview.healthCheckUrl, { signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) {
+        healthError = `HTTP ${response.status}`;
+      } else {
+        const observed = await previewIdentityFromResponse(response, preview);
+        if (observed.observedSha === result.after) {
+          attestation = observed;
           break;
         }
-        healthError = `HTTP ${response.status}`;
-      } catch (error) {
-        healthError = error.message;
+        healthError = `expected ${result.after}, observed ${observed.observedSha}`;
       }
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    } catch (error) {
+      healthError = error.message;
     }
-    if (!healthy) {
-      result.status = "health_check_failed";
-      result.output = `Local QA preview health check failed at ${preview.healthCheckUrl}: ${healthError}`;
-      return result;
-    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
+  if (!attestation) {
+    result.status = healthError.startsWith("expected ") ? "identity_mismatch" : "health_check_failed";
+    result.output = `Local QA preview identity check failed at ${preview.healthCheckUrl}: ${healthError}`;
+    return result;
+  }
+  result.attestation = attestation;
 
   result.status = result.before && result.after && result.before !== result.after ? "updated" : "current";
   result.output = result.status === "updated"
@@ -719,6 +812,15 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
 }
 
 async function mergeTaskSource(repoPath, task, options = {}) {
+  if (task.reviewEvidenceError || !task.expectedHeadSha) {
+    return {
+      taskId: task.id,
+      title: task.title,
+      status: "review_evidence_invalid",
+      source: sourceLabel(task),
+      output: task.reviewEvidenceError || "Task has no reviewed source SHA.",
+    };
+  }
   const source = await fetchTaskSource(repoPath, task, options);
   if (!source.ok) {
     return {
@@ -729,6 +831,18 @@ async function mergeTaskSource(repoPath, task, options = {}) {
       output: truncateOutput(source.error),
     };
   }
+  if (source.headSha !== task.expectedHeadSha) {
+    return {
+      taskId: task.id,
+      title: task.title,
+      status: "source_drift",
+      source: source.label,
+      sourceRef: source.sourceRef,
+      headSha: source.headSha,
+      expectedHeadSha: task.expectedHeadSha,
+      output: `Source drift detected: reviewed ${task.expectedHeadSha}, observed ${source.headSha}.`,
+    };
+  }
 
   const merge = await git(repoPath, ["merge", "--no-ff", "--no-edit", source.ref], { allowFailure: true });
   if (merge.ok) {
@@ -737,6 +851,10 @@ async function mergeTaskSource(repoPath, task, options = {}) {
       title: task.title,
       status: "merged",
       source: source.label,
+      sourceRef: source.sourceRef,
+      headSha: source.headSha,
+      candidateCycle: task.candidateCycle,
+      reviews: task.reviews,
       output: truncateOutput(merge.output),
     };
   }
@@ -785,6 +903,42 @@ function taskMatches(task, options = {}) {
   return taskFilter.includes(task.id);
 }
 
+function partialCandidateRequest(input = {}) {
+  const includedTaskIds = [
+    ...new Set(normalizeList(
+      input.partialTasks
+      || input["partial-tasks"]
+      || input.includedTaskIds
+      || input["included-task-ids"],
+    )),
+  ].sort();
+  if (!includedTaskIds.length) return null;
+  const actorId = String(
+    input.partialActorId
+    || input["partial-actor-id"]
+    || input.partialAuthor
+    || input["partial-author"]
+    || "",
+  ).trim();
+  const reasonCode = String(
+    input.partialReasonCode
+    || input["partial-reason-code"]
+    || input.partialReason
+    || input["partial-reason"]
+    || "",
+  ).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(actorId)) {
+    throw new Error("Authorized partial QA assembly requires a non-sensitive --partial-actor-id.");
+  }
+  if (!/^[a-z][a-z0-9_-]{2,63}$/.test(reasonCode)) {
+    throw new Error("Authorized partial QA assembly requires a bounded --partial-reason-code.");
+  }
+  return {
+    includedTaskIds,
+    authorization: { actorId, reasonCode },
+  };
+}
+
 function retryWindowElapsed(task, nowMs) {
   const retryAt = Date.parse(task.integrationRetryNotBefore || "");
   return !Number.isFinite(retryAt) || retryAt <= nowMs;
@@ -792,18 +946,60 @@ function retryWindowElapsed(task, nowMs) {
 
 export function planQaIntegrations(state, input = {}) {
   const nowMs = Number(input.nowMs || Date.now());
+  const partialRequest = partialCandidateRequest(input);
+  const explicitTaskFilter = normalizeList(input.task || input.tasks || input.taskId);
+  if (partialRequest) {
+    const knownTaskIds = new Set((state.tasks || []).map((task) => task.id));
+    const unknownTaskId = partialRequest.includedTaskIds.find((taskId) => !knownTaskIds.has(taskId));
+    if (unknownTaskId) throw new Error(`Unknown partial-candidate task: ${unknownTaskId}`);
+  }
   const projectPlans = (state.projects || [])
     .filter((project) => projectMatches(project, input))
     .map((project) => {
       const integrationBranch = integrationBranchName(project);
       const safetyError = integrationBranchSafetyError(project);
       const trustEnabled = trustLeadApprovalsEnabled(project);
-      const pendingTasks = (state.tasks || [])
+      const eligibleTasks = (state.tasks || [])
         .filter((task) => task.projectId === project.id)
         .filter((task) => task.status === "qa_review")
-        .filter((task) => input.force || task.integrationStatus !== "ready")
-        .filter((task) => taskMatches(task, input));
-      const tasks = pendingTasks.filter((task) => input.force || retryWindowElapsed(task, nowMs));
+        .filter((task) => input.force || task.integrationStatus !== "ready");
+      const taskScoped = eligibleTasks.filter((task) => taskMatches(task, input));
+      if (
+        !partialRequest
+        && explicitTaskFilter.length
+        && taskScoped.length
+        && taskScoped.length !== eligibleTasks.length
+      ) {
+        throw new Error(
+          "Selecting fewer than all eligible QA tasks requires explicit partial-candidate authorization.",
+        );
+      }
+      const requestedTasks = partialRequest ? eligibleTasks : taskScoped;
+      const includedTasks = partialRequest
+        ? eligibleTasks.filter((task) => partialRequest.includedTaskIds.includes(task.id))
+        : taskScoped;
+      if (partialRequest && includedTasks.length && includedTasks.length === eligibleTasks.length) {
+        throw new Error("Authorized partial QA assembly must exclude at least one requested task.");
+      }
+      const candidateReady = input.force || includedTasks.every((task) => retryWindowElapsed(task, nowMs));
+      const tasks = candidateReady ? includedTasks : [];
+      const assembly = partialRequest && includedTasks.length
+        ? {
+            mode: "authorized_partial",
+            requestedTaskIds: eligibleTasks.map((task) => task.id).sort(),
+            includedTaskIds: includedTasks.map((task) => task.id).sort(),
+            excludedTaskIds: requestedTasks
+              .filter((task) => !partialRequest.includedTaskIds.includes(task.id))
+              .map((task) => task.id)
+              .sort(),
+            authorization: partialRequest.authorization,
+          }
+        : {
+            mode: "atomic",
+            requestedTaskIds: tasks.map((task) => task.id).sort(),
+            includedTaskIds: tasks.map((task) => task.id).sort(),
+            excludedTaskIds: [],
+          };
       return {
         projectId: project.id,
         projectKey: project.key,
@@ -820,18 +1016,40 @@ export function planQaIntegrations(state, input = {}) {
         integrationBranch,
         integrationBranchUrl: branchWebUrl(project, integrationBranch),
         validationCommands: normalizeList(project.validationCommands),
-        deferredTaskCount: pendingTasks.length - tasks.length,
-        tasks: tasks.map((task) => ({
-          id: task.id,
-          title: task.title,
-          status: task.status,
-          branchName: task.branchName || "",
-          prUrl: task.prUrl || "",
-          integrationStatus: task.integrationStatus || "",
-          integrationRetryNotBefore: task.integrationRetryNotBefore || "",
-        })),
+        deferredTaskCount: candidateReady ? 0 : includedTasks.length,
+        assembly,
+        tasks: tasks.map((task) => {
+          const reviewEvidence = candidateReviewEvidenceForTask(state, task);
+          return {
+            id: task.id,
+            title: task.title,
+            status: task.status,
+            branchName: task.branchName || "",
+            prUrl: task.prUrl || "",
+            integrationStatus: task.integrationStatus || "",
+            integrationRetryNotBefore: task.integrationRetryNotBefore || "",
+            expectedHeadSha: reviewEvidence.subjectSha || "",
+            candidateCycle: reviewEvidence.candidateCycle || 0,
+            reviews: reviewEvidence.reviews || [],
+            reviewEvidenceError: reviewEvidence.ok ? "" : reviewEvidence.error,
+          };
+        }),
       };
     });
+
+  if (partialRequest) {
+    const eligibleIncludedTaskIds = new Set(
+      projectPlans.flatMap((project) => project.assembly.includedTaskIds),
+    );
+    const unavailableTaskId = partialRequest.includedTaskIds.find(
+      (taskId) => !eligibleIncludedTaskIds.has(taskId),
+    );
+    if (unavailableTaskId) {
+      throw new Error(
+        `Partial-candidate task ${unavailableTaskId} is not an eligible qa_review task in the selected project scope.`,
+      );
+    }
+  }
 
   return {
     generatedAt: new Date().toISOString(),
@@ -869,18 +1087,33 @@ function appendOutput(existing, addition) {
 }
 
 async function integrateProject(projectPlan, options = {}) {
+  const assemblingCandidate = projectPlan.tasks.length > 0;
+  const candidateId = assemblingCandidate ? `candidate_${randomUUID()}` : "";
+  const candidateBranch = assemblingCandidate
+    ? `qa/candidate-${workspaceSegment(projectPlan.projectKey || projectPlan.projectId)}-${candidateId.slice(-12)}`
+    : projectPlan.integrationBranch;
+  const candidatePlan = {
+    ...projectPlan,
+    integrationBranch: candidateBranch,
+    candidateBranch: assemblingCandidate ? candidateBranch : "",
+    integrationBranchUrl: branchWebUrl({
+      repoUrl: projectPlan.repoUrl,
+      reviewPolicy: { integrationBranch: candidateBranch },
+    }, candidateBranch),
+  };
   const project = {
-    id: projectPlan.projectId,
-    key: projectPlan.projectKey,
-    name: projectPlan.projectName,
-    repoPath: projectPlan.repoPath,
-    repoUrl: projectPlan.repoUrl,
-    defaultBranch: projectPlan.defaultBranch,
-    integrationBranch: projectPlan.integrationBranch,
+    id: candidatePlan.projectId,
+    key: candidatePlan.projectKey,
+    name: candidatePlan.projectName,
+    repoPath: candidatePlan.repoPath,
+    repoUrl: candidatePlan.repoUrl,
+    defaultBranch: candidatePlan.defaultBranch,
+    integrationBranch: candidatePlan.integrationBranch,
   };
   const repoPath = String(project.repoPath || "").trim();
   const result = {
-    ...projectPlan,
+    ...candidatePlan,
+    candidateId,
     tasks: [],
     status: "skipped",
     output: "",
@@ -891,9 +1124,11 @@ async function integrateProject(projectPlan, options = {}) {
     workspaceStrategy: "",
     defaultBranchSync: null,
     localQaPreview: null,
+    baseSha: "",
+    candidate: null,
   };
-  const shouldSyncDefaultBranch = syncDefaultBranchEnabled(projectPlan);
-  const shouldSyncLocalPreview = localQaPreviewConfig(projectPlan).enabled;
+  const shouldSyncDefaultBranch = syncDefaultBranchEnabled(candidatePlan);
+  const shouldSyncLocalPreview = localQaPreviewConfig(candidatePlan).enabled;
 
   if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && !shouldSyncLocalPreview) {
     result.status = "no_tasks";
@@ -914,7 +1149,7 @@ async function integrateProject(projectPlan, options = {}) {
   }
 
   if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && shouldSyncLocalPreview) {
-    result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
+    result.localQaPreview = await syncLocalQaPreview(candidatePlan, options);
     result.status = localPreviewFailed(result.localQaPreview)
       ? "preview_blocked"
       : "preview_ready";
@@ -927,20 +1162,21 @@ async function integrateProject(projectPlan, options = {}) {
   let preparedHead = "";
   let pushed = false;
   try {
-    workspace = await prepareQaWorkspace(repoPath, projectPlan, options);
+    workspace = await prepareQaWorkspace(repoPath, candidatePlan, options);
     executionRepoPath = workspace.executionRepoPath;
     result.workspacePath = workspace.workspacePath;
     result.workspaceStrategy = workspace.strategy;
 
     const gitOptions = { env: options.env, secrets: options.secrets };
-    const prepared = await prepareIntegrationBranch(executionRepoPath, project, projectPlan.integrationBranch, gitOptions);
+    const prepared = await prepareIntegrationBranch(executionRepoPath, project, candidatePlan.integrationBranch, gitOptions);
     result.output = prepared;
     const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     preparedHead = preparedCommit.output.trim();
+    result.baseSha = preparedHead;
 
     let branchChanged = false;
     if (shouldSyncDefaultBranch) {
-      result.defaultBranchSync = await mergeDefaultBranchIntoIntegration(executionRepoPath, projectPlan, gitOptions);
+      result.defaultBranchSync = await mergeDefaultBranchIntoIntegration(executionRepoPath, candidatePlan, gitOptions);
       if (!result.defaultBranchSync.ok) {
         result.status = result.defaultBranchSync.status || "blocked";
         result.output = result.defaultBranchSync.output;
@@ -972,7 +1208,7 @@ async function integrateProject(projectPlan, options = {}) {
         result.status = "no_changes";
         result.output = result.defaultBranchSync?.output || "No QA integration changes were needed.";
         if (shouldSyncLocalPreview) {
-          result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
+          result.localQaPreview = await syncLocalQaPreview(candidatePlan, options);
           result.output = appendOutput(result.output, result.localQaPreview.output);
           if (localPreviewFailed(result.localQaPreview)) {
             result.status = "preview_blocked";
@@ -1002,26 +1238,105 @@ async function integrateProject(projectPlan, options = {}) {
     const commit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     result.commit = commit.output.trim();
 
-    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${projectPlan.integrationBranch}`], { ...gitOptions, allowFailure: true });
+    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${candidatePlan.integrationBranch}`], { ...gitOptions, allowFailure: true });
     if (!push.ok) {
       result.status = "push_failed";
-      result.output = `Non-force push to ${projectPlan.integrationBranch} failed. The remote branch may have changed; rerun QA integration after fetching/reconciling it.\n${truncateOutput(push.output)}`;
+      result.output = `Non-force push to ${candidatePlan.integrationBranch} failed. The remote branch may have changed; rebuild a new candidate.\n${truncateOutput(push.output)}`;
       for (const task of mergedTasks) task.status = "push_failed";
       return result;
     }
 
     result.status = "ready";
-    result.output = truncateOutput(push.output || `Pushed ${projectPlan.integrationBranch}.`);
+    result.output = truncateOutput(push.output || `Pushed ${candidatePlan.integrationBranch}.`);
     pushed = true;
     for (const task of mergedTasks) task.status = "ready";
     if (shouldSyncLocalPreview) {
-      result.localQaPreview = await syncLocalQaPreview(projectPlan, options);
+      result.localQaPreview = await syncLocalQaPreview(candidatePlan, options);
       result.output = appendOutput(result.output, result.localQaPreview.output);
       if (localPreviewFailed(result.localQaPreview)) {
         result.status = "preview_blocked";
         for (const task of mergedTasks) task.status = "preview_blocked";
       }
     }
+    if (!shouldSyncLocalPreview) {
+      result.status = "preview_missing";
+      result.output = appendOutput(result.output, "A healthy local QA preview is required before a candidate can be frozen.");
+      for (const task of mergedTasks) task.status = "preview_missing";
+      return result;
+    }
+    const previewConfig = localQaPreviewConfig(candidatePlan);
+    if (
+      result.localQaPreview?.after !== result.commit
+      || !["current", "updated"].includes(result.localQaPreview?.status)
+      || !previewConfig.previewUrl
+      || result.localQaPreview?.attestation?.observedSha !== result.commit
+    ) {
+      result.status = "preview_identity_mismatch";
+      result.output = appendOutput(result.output, "Local QA preview identity does not match the integration commit.");
+      for (const task of mergedTasks) task.status = "preview_identity_mismatch";
+      return result;
+    }
+    if (!assemblingCandidate) {
+      result.status = "no_changes";
+      result.output = appendOutput(
+        result.output,
+        "The configured QA branch and attested local preview were synchronized; no immutable task candidate was requested.",
+      );
+      return result;
+    }
+    const checks = result.validation.map((item, index) => ({
+      id: `check_${index + 1}`,
+      kind: "local-validation",
+      name: `project-validation-${index + 1}`,
+      outcome: item.ok ? "passed" : "failed",
+      subjectSha: result.commit,
+      evidenceDigest: `sha256:${createHash("sha256").update(JSON.stringify({
+        command: item.command,
+        ok: item.ok,
+        output: stableQaOutput(item.output, result.workspacePath),
+      })).digest("hex")}`,
+    }));
+    const candidate = createCandidateEnvelope({
+      manifest: {
+        candidateId,
+        projectId: result.projectId,
+        base: {
+          branch: result.defaultBranch,
+          sha: result.baseSha,
+        },
+        sources: mergedTasks.map((task) => ({
+          taskId: task.taskId,
+          sourceRef: task.sourceRef,
+          headSha: task.headSha,
+          candidateCycle: task.candidateCycle,
+          reviews: task.reviews,
+        })),
+        integration: {
+          branch: result.integrationBranch,
+          sha: result.commit,
+        },
+        checks,
+        preview: {
+          url: previewConfig.previewUrl,
+          status: "healthy",
+          commitSha: result.localQaPreview.after,
+          verifiedAt: new Date().toISOString(),
+          attestation: result.localQaPreview.attestation,
+        },
+        assembly: result.assembly,
+      },
+    });
+    const candidateVerification = await verifyCandidateRepositoryState(project, candidate, gitOptions);
+    if (!candidateVerification.ok) {
+      result.status = candidateVerification.status === "drift"
+        ? "candidate_drift"
+        : "candidate_verification_unavailable";
+      result.output = appendOutput(result.output, candidateVerification.reason);
+      for (const task of mergedTasks) task.status = result.status;
+      return result;
+    }
+    candidate.repositoryVerification = candidateVerification;
+    result.candidate = candidate;
     return result;
   } catch (error) {
     result.status = "blocked";
@@ -1030,11 +1345,11 @@ async function integrateProject(projectPlan, options = {}) {
     return result;
   } finally {
     if (preparedHead && !pushed && executionRepoPath) {
-      const reset = await resetPreparedIntegrationBranch(executionRepoPath, projectPlan.integrationBranch, preparedHead);
+      const reset = await resetPreparedIntegrationBranch(executionRepoPath, candidatePlan.integrationBranch, preparedHead);
       if (!reset.ok) {
         result.output = appendOutput(
           result.output,
-          `Cleanup warning: ${reset.output || `could not reset ${projectPlan.integrationBranch} to ${preparedHead}`}`,
+          `Cleanup warning: ${reset.output || `could not reset ${candidatePlan.integrationBranch} to ${preparedHead}`}`,
         );
       }
     }
@@ -1197,6 +1512,7 @@ async function recordProjectResult(projectResult) {
     state.comments = state.comments || [];
     state.events = state.events || [];
     state.qaBundles = state.qaBundles || [];
+    state.candidates = state.candidates || [];
 
     for (const taskResult of projectResult.tasks || []) {
       const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
@@ -1227,10 +1543,40 @@ async function recordProjectResult(projectResult) {
     }
 
     const readyTasks = (projectResult.tasks || []).filter((task) => task.status === "ready");
-    if (projectResult.status === "ready" && readyTasks.length) {
+    if (projectResult.status === "ready" && readyTasks.length && projectResult.candidate) {
+      const readyTaskIds = new Set(readyTasks.map((task) => task.taskId));
+      for (const candidate of state.candidates) {
+        if (
+          candidate.projectId !== projectResult.projectId
+          || candidate.id === projectResult.candidate.id
+          || candidate.status !== "frozen"
+          || candidate.invalidation
+          || !candidate.manifest.sources.some((source) => readyTaskIds.has(source.taskId))
+        ) {
+          continue;
+        }
+        invalidateCandidate(candidate, {
+          reason: `Superseded by newer candidate ${projectResult.candidate.id}.`,
+          expected: candidate.manifest.integration.sha,
+          observed: projectResult.candidate.manifest.integration.sha,
+          invalidatedAt: now,
+        });
+        const supersededBundle = state.qaBundles.find((item) => item.id === candidate.qaBundleId);
+        if (supersededBundle) {
+          supersededBundle.status = "invalidated";
+          supersededBundle.updatedAt = now;
+        }
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: "candidate_invalidated",
+          projectId: candidate.projectId,
+          message: `${candidate.id}: superseded by ${projectResult.candidate.id}.`,
+          createdAt: now,
+        });
+      }
       let bundle = state.qaBundles.find((item) => (
         item.projectId === projectResult.projectId
-        && item.integrationCommit === projectResult.commit
+        && item.candidateId === projectResult.candidate.id
       ));
       let bundleChanged = false;
       if (!bundle) {
@@ -1240,6 +1586,8 @@ async function recordProjectResult(projectResult) {
           projectKey: projectResult.projectKey,
           projectName: projectResult.projectName,
           status: "ready",
+          candidateId: projectResult.candidate.id,
+          manifestDigest: projectResult.candidate.manifestDigest,
           integrationBranch: projectResult.integrationBranch,
           integrationBranchUrl: projectResult.integrationBranchUrl,
           integrationCommit: projectResult.commit,
@@ -1255,6 +1603,8 @@ async function recordProjectResult(projectResult) {
           notificationRetryNotBefore: "",
         };
         state.qaBundles.push(bundle);
+        projectResult.candidate.qaBundleId = bundle.id;
+        state.candidates.push(projectResult.candidate);
         bundleChanged = true;
       }
       const existingTaskIds = new Set(bundle.tasks.map((item) => item.id));
@@ -1262,6 +1612,8 @@ async function recordProjectResult(projectResult) {
         const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
         if (!task) continue;
         task.qaBundleId = bundle.id;
+        task.candidateId = projectResult.candidate.id;
+        task.candidateManifestDigest = projectResult.candidate.manifestDigest;
         task.updatedAt = now;
         if (!existingTaskIds.has(task.id)) {
           bundle.tasks.push({
