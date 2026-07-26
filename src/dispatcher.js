@@ -417,13 +417,13 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: "missing_task" });
       continue;
     }
+    if (hasExistingDispatch(state, action, task)) {
+      skipped.push({ action, reason: "already_dispatched" });
+      continue;
+    }
     const safetyReason = dispatchSafetyReason(state, task, action, options);
     if (safetyReason) {
       skipped.push({ action, reason: safetyReason });
-      continue;
-    }
-    if (hasExistingDispatch(state, action, task)) {
-      skipped.push({ action, reason: "already_dispatched" });
       continue;
     }
     const group = runGroupFor(action);

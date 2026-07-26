@@ -36,6 +36,46 @@ function fixtureState() {
   };
 }
 
+function finalAttemptReviewFixture(status = "running") {
+  const state = fixtureState();
+  const attemptKey = "task_2:0:continue_review:frontend-reviewer";
+  const action = {
+    id: "task_2:continue_review",
+    type: "continue_review",
+    role: "frontend-reviewer",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+    taskStatus: "builder_review",
+    priority: "high",
+    reason: "Frontend review has not recorded an outcome yet.",
+  };
+  const finalAttempt = {
+    id: "run_2",
+    taskId: "task_2",
+    projectId: "project_1",
+    attemptKey,
+    actionType: action.type,
+    group: "reviewer",
+    role: action.role,
+    status,
+    attempt: 2,
+    maxAttempts: 2,
+  };
+  state.runs.push(
+    {
+      ...finalAttempt,
+      id: "run_1",
+      status: "failed",
+      attempt: 1,
+    },
+    finalAttempt,
+  );
+  return { state, action, finalAttempt, attemptKey };
+}
+
 test("QA-ready tasks do not create duplicate per-task owner notification runs", () => {
   const state = fixtureState();
   const report = planDispatches(state, [
@@ -227,6 +267,69 @@ test("queued runs still block duplicate dispatches", () => {
   assert.equal(report.selected.length, 0);
   assert.equal(report.skipped.length, 1);
   assert.equal(report.skipped[0].reason, "already_dispatched");
+});
+
+test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {
+  for (const status of ["queued", "running"]) {
+    const { state, action } = finalAttemptReviewFixture(status);
+
+    const report = await dispatchSupervisorActions([action], { state });
+
+    assert.equal(report.runs.length, 0, status);
+    assert.equal(report.skipped[0].reason, "already_dispatched", status);
+    assert.equal(state.tasks[1].automationCircuit, undefined, status);
+    assert.equal(state.tasks[1].status, "qa_review", status);
+    assert.equal(
+      state.events.some((event) => event.type === "automation_circuit_opened"),
+      false,
+      status,
+    );
+  }
+});
+
+test("a successful active final attempt leaves the next review stage dispatchable", async () => {
+  const { state, action, finalAttempt } = finalAttemptReviewFixture();
+  const activeReport = await dispatchSupervisorActions([action], { state });
+  assert.equal(activeReport.skipped[0].reason, "already_dispatched");
+
+  finalAttempt.status = "completed";
+  const nextReport = await dispatchSupervisorActions([{
+    id: "task_2:continue_review:lead",
+    type: "continue_review",
+    role: "primary-team-lead",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+    taskStatus: "lead_review",
+  }], { state });
+
+  assert.equal(nextReport.runs.length, 1);
+  assert.equal(nextReport.runs[0].role, "primary-team-lead");
+  assert.equal(state.tasks[1].automationCircuit, undefined);
+});
+
+test("a failed final attempt opens the bounded circuit after no matching run remains active", async () => {
+  const { state, action, finalAttempt, attemptKey } = finalAttemptReviewFixture();
+  const activeReport = await dispatchSupervisorActions([action], { state });
+  assert.equal(activeReport.skipped[0].reason, "already_dispatched");
+
+  finalAttempt.status = "failed";
+  const exhaustedReport = await dispatchSupervisorActions([action], { state });
+
+  assert.equal(exhaustedReport.runs.length, 0);
+  assert.equal(exhaustedReport.skipped[0].reason, "attempt_budget_exhausted");
+  assert.equal(state.tasks[1].status, "blocked");
+  assert.equal(state.tasks[1].automationCircuit.state, "open");
+  assert.equal(state.tasks[1].automationCircuit.attemptsConsumed, 2);
+  assert.equal(state.tasks[1].automationCircuit.maxAttempts, 2);
+  assert.equal(state.tasks[1].automationBlocker.attemptKey, attemptKey);
+  assert.match(state.comments.at(-1).body, /2\/2 dispatch-attempt budget is exhausted/);
+  assert.ok(state.events.some((event) => (
+    event.type === "automation_circuit_opened"
+    && event.taskId === "task_2"
+  )));
 });
 
 test("exhausted attempt budgets stop redispatch", () => {
