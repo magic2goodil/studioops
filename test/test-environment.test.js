@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import {
   access,
+  chmod,
   mkdtemp,
+  mkdir,
   readFile,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -65,6 +68,12 @@ test("suite launcher overrides conflicting inherited StudioOps paths", async () 
 
 test("database access fails closed in an unmarked Node test context", async () => {
   const inheritedRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-unmarked-test-"));
+  const inheritedDataDir = path.join(inheritedRoot, "live-data");
+  const inheritedDatabase = path.join(inheritedDataDir, "mission-control.sqlite3");
+  await mkdir(inheritedDataDir);
+  await writeFile(inheritedDatabase, "live-database-sentinel\n", "utf8");
+  await chmod(inheritedDataDir, 0o755);
+  await chmod(inheritedDatabase, 0o644);
   try {
     const env = conflictingEnvironment(inheritedRoot);
     delete env.STUDIOOPS_TEST_ISOLATION;
@@ -82,7 +91,9 @@ test("database access fails closed in an unmarked Node test context", async () =
         return true;
       },
     );
-    await assert.rejects(access(path.join(inheritedRoot, "live-data", "mission-control.sqlite3")));
+    assert.equal(await readFile(inheritedDatabase, "utf8"), "live-database-sentinel\n");
+    assert.equal((await stat(inheritedDataDir)).mode & 0o777, 0o755);
+    assert.equal((await stat(inheritedDatabase)).mode & 0o777, 0o644);
   } finally {
     await rm(inheritedRoot, { recursive: true, force: true });
   }
