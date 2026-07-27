@@ -549,6 +549,7 @@ export async function addTask(input) {
       type: String(input.type || "feature").trim(),
       area: String(input.area || "").trim(),
       lane: String(input.lane || "").trim(),
+      labels: normalizeList(input.labels || input.label),
       workAreas: normalizeList(input.workAreas || input.workArea || input["work-area"]),
       parentTaskId,
       dependsOnTaskIds,
@@ -671,6 +672,9 @@ export async function updateTask(taskId, patch) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, "acceptanceCriteria")) {
       task.acceptanceCriteria = normalizeList(patch.acceptanceCriteria);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "labels")) {
+      task.labels = normalizeList(patch.labels);
     }
     if (Object.prototype.hasOwnProperty.call(patch, "dependsOnTaskIds")) {
       task.dependsOnTaskIds = normalizeList(patch.dependsOnTaskIds);
