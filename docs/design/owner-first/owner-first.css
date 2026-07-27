@@ -691,9 +691,21 @@ h3 {
     display: flex;
     justify-content: center;
     padding: 0.5rem;
+    position: relative;
   }
 
-  .primary-nav a span:nth-child(2),
+  .primary-nav a span:nth-child(2) {
+    border: 0;
+    clip: rect(0 0 0 0);
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    padding: 0;
+    position: absolute;
+    white-space: nowrap;
+    width: 1px;
+  }
+
   .primary-nav b,
   .rail-note {
     display: none;

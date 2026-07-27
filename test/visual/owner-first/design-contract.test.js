@@ -104,6 +104,31 @@ test("route-first prototype excludes the global-feed-before-route defect", async
   assert.match(script, /<h1 id="page-title" tabindex="-1">/);
 });
 
+test("compact tablet rail preserves accessible navigation names", async () => {
+  const prototype = await readFile(path.join(designDirectory, "prototype.html"), "utf8");
+  const css = await readFile(path.join(designDirectory, "owner-first.css"), "utf8");
+
+  for (const route of ["portfolio", "work", "qa", "actions", "operations", "policies"]) {
+    assert.match(
+      prototype,
+      new RegExp(
+        `<a href="#/${route}" data-nav="${route}">[\\s\\S]*?<span data-copy="navigation\\.[^"]+"><\\/span>`,
+      ),
+      `Compact rail route ${route} must retain its canonical text label in the DOM.`,
+    );
+  }
+  assert.doesNotMatch(
+    css,
+    /\.primary-nav a span:nth-child\(2\),\s*\.primary-nav b[\s\S]*?display:\s*none/,
+    "Compact rail labels must not be removed from the accessibility tree.",
+  );
+  assert.match(
+    css,
+    /\.primary-nav a span:nth-child\(2\) \{[\s\S]*?clip: rect\(0 0 0 0\);[\s\S]*?position: absolute;/,
+    "Compact rail labels should be visually hidden while preserving link names.",
+  );
+});
+
 test("task workspace uses the exact approved tab contract", async () => {
   const content = JSON.parse(await readFile(path.join(designDirectory, "content-contract.json")));
   assert.deepEqual(
