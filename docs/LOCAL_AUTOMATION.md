@@ -59,6 +59,75 @@ studioops automation-resume --reason "Backup, integrity, and worker health verif
 
 An operator pause suppresses new builder and reviewer claims while still allowing owner-review notifications to reach the persistent inbox.
 
+## Tiered model routing
+
+StudioOps can route ordinary implementation, specialist review, high-risk work,
+and explicitly mechanical tasks to different Codex models. Model selection is
+recorded on each run so the cost and quality decision remains auditable.
+
+```json
+{
+  "defaults": {
+    "executionPolicy": {
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "medium",
+      "mechanicalLabels": ["spark-ok"],
+      "escalationLabels": ["ultra-review"],
+      "modelTiers": {
+        "mechanical": {
+          "model": "gpt-5.3-codex-spark",
+          "reasoningEffort": "high"
+        },
+        "economy": {
+          "model": "gpt-5.6-luna",
+          "reasoningEffort": "medium"
+        },
+        "balanced": {
+          "model": "gpt-5.6-terra",
+          "reasoningEffort": "high"
+        },
+        "critical": {
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "high"
+        },
+        "frontier": {
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "ultra"
+        }
+      },
+      "tierRouting": {
+        "defaultTier": "economy",
+        "mechanicalTier": "mechanical",
+        "architectTier": "critical",
+        "leadTier": "critical",
+        "complexTier": "critical",
+        "escalationTier": "frontier"
+      },
+      "roles": {
+        "backend-reviewer": {
+          "tier": "balanced"
+        },
+        "frontend-reviewer": {
+          "tier": "balanced"
+        },
+        "accessibility-reviewer": {
+          "tier": "balanced"
+        }
+      }
+    }
+  }
+}
+```
+
+Tier names are stable policy concepts; model IDs and reasoning effort are
+replaceable local configuration. Architecture, lead, and complex work take
+precedence over cheaper routes.
+Complex work includes security, privacy, consent, authentication, database,
+migration, deployment, release, production, infrastructure, and data-loss
+terms. Spark is never selected implicitly: a low-risk builder task must carry
+one of the configured `mechanicalLabels`. An explicit `escalationLabels` match
+selects the configured frontier tier, including `ultra` effort when supported.
+
 By default, the web UI is only available on the local machine:
 
 ```text

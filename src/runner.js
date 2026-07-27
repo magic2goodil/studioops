@@ -1151,6 +1151,7 @@ export async function claimRuns(input = {}) {
       run.provider = normalizeProvider(input.provider || run.provider);
       const executionPolicy = resolveExecutionPolicy(findTask(state, run.taskId) || {}, run, input);
       run.model = run.model || executionPolicy.model || input.model;
+      run.modelTier = run.modelTier || executionPolicy.modelTier || "";
       run.modelReasoningEffort = run.modelReasoningEffort || executionPolicy.reasoningEffort || input.modelReasoningEffort;
       run.modelSelectionReason = run.modelSelectionReason || executionPolicy.selectionReason;
       run.attempt = Math.max(1, Number(run.attempt || 1));

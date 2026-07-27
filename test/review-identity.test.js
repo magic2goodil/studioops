@@ -12,6 +12,21 @@ import {
 const SUBJECT_SHA = "a".repeat(40);
 const REVIEWER_FIX_SHA = "b".repeat(40);
 
+test("task labels persist through intake and updates for auditable tier routing", async () => {
+  const project = await addProject({ key: "tier-routing", name: "Tier Routing" });
+  const task = await addTask({
+    project: project.id,
+    title: "Format generated documentation",
+    labels: ["spark-ok"],
+    architectureRequired: false,
+  });
+  assert.deepEqual(task.labels, ["spark-ok"]);
+
+  await updateTask(task.id, { labels: ["ultra-review"] });
+  const state = await readState();
+  assert.deepEqual(state.tasks.find((item) => item.id === task.id)?.labels, ["ultra-review"]);
+});
+
 test("reviews require the exact current candidate cycle and subject SHA", async () => {
   const project = await addProject({
     key: "review-identity",

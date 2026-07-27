@@ -454,6 +454,7 @@ function makeRun(state, task, action, options, now) {
     fileScope: profile.fileScope,
     provider: task.preferredRunnerProvider || options.provider || DEFAULTS.provider,
     model: executionPolicy.model,
+    modelTier: executionPolicy.modelTier,
     modelReasoningEffort: executionPolicy.reasoningEffort,
     modelSelectionReason: executionPolicy.selectionReason,
     attemptKey,

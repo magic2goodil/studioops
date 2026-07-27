@@ -154,6 +154,43 @@ async function setup() {
           architectReasoningEffort: "xhigh",
           leadReasoningEffort: "xhigh",
           complexReasoningEffort: "xhigh",
+          mechanicalLabels: ["spark-ok"],
+          escalationLabels: ["ultra-review"],
+          modelTiers: {
+            mechanical: {
+              model: "gpt-5.3-codex-spark",
+              reasoningEffort: "high",
+            },
+            economy: {
+              model: "gpt-5.6-luna",
+              reasoningEffort: "medium",
+            },
+            balanced: {
+              model: "gpt-5.6-terra",
+              reasoningEffort: "high",
+            },
+            critical: {
+              model: "gpt-5.6-sol",
+              reasoningEffort: "high",
+            },
+            frontier: {
+              model: "gpt-5.6-sol",
+              reasoningEffort: "ultra",
+            },
+          },
+          tierRouting: {
+            defaultTier: "economy",
+            mechanicalTier: "mechanical",
+            architectTier: "critical",
+            leadTier: "critical",
+            complexTier: "critical",
+            escalationTier: "frontier",
+          },
+          roles: {
+            "backend-reviewer": { tier: "balanced" },
+            "frontend-reviewer": { tier: "balanced" },
+            "accessibility-reviewer": { tier: "balanced" },
+          },
           maxAttempts: 2,
           retryBackoffMs: 30000,
           staleRunMs: 7200000,
@@ -408,6 +445,7 @@ Task fields:
   --architecture-required       Route this task through systems architecture before builders
   --architecture-approved       Stage a --parent child for atomic approval when parent architecture completes
   --lane                        Work lane: backend, frontend, design, devops, product
+  --labels                      Task policy labels, comma or newline separated
   --work-area                   Expected file/work areas, comma or newline separated
   --branch                      Associated feature branch
   --pr-url                      Associated pull request URL
@@ -662,6 +700,7 @@ Automation:
       type: args.type,
       area: args.area,
       lane: args.lane,
+      labels: args.labels || args.label,
       workAreas: args["work-area"] || args["work-areas"],
       parentTaskId: args.parent || args["parent-task-id"] || args.epic,
       dependsOnTaskIds: args["depends-on"] || args.dependencies,
@@ -701,6 +740,8 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
     if (Object.prototype.hasOwnProperty.call(args, "type")) patch.type = args.type;
     if (Object.prototype.hasOwnProperty.call(args, "lane")) patch.lane = args.lane;
+    if (Object.prototype.hasOwnProperty.call(args, "labels")) patch.labels = args.labels;
+    if (Object.prototype.hasOwnProperty.call(args, "label")) patch.labels = args.label;
     if (Object.prototype.hasOwnProperty.call(args, "work-area")) patch.workAreas = args["work-area"];
     if (Object.prototype.hasOwnProperty.call(args, "work-areas")) patch.workAreas = args["work-areas"];
     if (Object.prototype.hasOwnProperty.call(args, "priority")) patch.priority = args.priority;

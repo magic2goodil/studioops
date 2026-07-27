@@ -1,4 +1,4 @@
-const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
+const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 
 export const DEFAULT_EXECUTION_POLICY = Object.freeze({
   model: "gpt-5.6-sol",
@@ -6,6 +6,10 @@ export const DEFAULT_EXECUTION_POLICY = Object.freeze({
   architectReasoningEffort: "xhigh",
   leadReasoningEffort: "xhigh",
   complexReasoningEffort: "xhigh",
+  mechanicalLabels: ["spark-ok"],
+  escalationLabels: ["ultra-review"],
+  modelTiers: {},
+  tierRouting: {},
   maxAttempts: 2,
   retryBackoffMs: 30 * 1000,
   staleRunMs: 2 * 60 * 60 * 1000,
@@ -34,6 +38,17 @@ function taskText(task = {}) {
   ].filter(Boolean).join(" ");
 }
 
+function normalizedLabels(value) {
+  const labels = Array.isArray(value) ? value : String(value || "").split(",");
+  return new Set(labels.map((label) => String(label).trim().toLowerCase()).filter(Boolean));
+}
+
+function configuredTier(configured, name) {
+  if (!name) return {};
+  const tier = configured.modelTiers?.[name];
+  return tier && typeof tier === "object" ? tier : {};
+}
+
 export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const configured = {
     ...DEFAULT_EXECUTION_POLICY,
@@ -42,30 +57,66 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const role = String(action.role || task.assignedAgentRole || "builder").toLowerCase();
   const rolePolicy = configured.roles?.[role] || {};
   const systemsArchitect = role.includes("architect");
+  const lead = role.includes("lead");
   const complex = COMPLEX_WORK_PATTERN.test(taskText(task));
+  const mechanicalLabels = normalizedLabels(configured.mechanicalLabels);
+  const escalationLabels = normalizedLabels(configured.escalationLabels);
+  const taskLabels = normalizedLabels(task.labels);
+  const escalated = [...taskLabels].some((label) => escalationLabels.has(label));
+  const mechanical = !systemsArchitect
+    && !lead
+    && !complex
+    && role === "builder"
+    && [...taskLabels].some((label) => mechanicalLabels.has(label));
+  const routing = configured.tierRouting || {};
+  const selectedTier = escalated
+    ? routing.escalationTier
+    : systemsArchitect
+      ? routing.architectTier
+      : lead
+        ? routing.leadTier
+        : complex
+          ? routing.complexTier
+          : mechanical
+            ? routing.mechanicalTier
+            : rolePolicy.tier || routing.defaultTier;
+  const tierPolicy = configuredTier(configured, selectedTier);
   const reasoningEffort = normalizedEffort(
-    (systemsArchitect ? configured.architectReasoningEffort : "")
-      || rolePolicy.reasoningEffort
-      || (role.includes("lead") ? configured.leadReasoningEffort : "")
+    tierPolicy.reasoningEffort
+      || (systemsArchitect ? configured.architectReasoningEffort : "")
+      || (lead ? configured.leadReasoningEffort : "")
       || (complex ? configured.complexReasoningEffort : "")
+      || rolePolicy.reasoningEffort
       || configured.reasoningEffort,
     DEFAULT_EXECUTION_POLICY.reasoningEffort,
   );
 
   return {
     model: String(
-      (systemsArchitect ? DEFAULT_EXECUTION_POLICY.model : "")
+      tierPolicy.model
+        || (systemsArchitect ? DEFAULT_EXECUTION_POLICY.model : "")
         || rolePolicy.model
         || configured.model
         || DEFAULT_EXECUTION_POLICY.model,
     ).trim(),
+    modelTier: String(selectedTier || "").trim(),
     reasoningEffort,
     maxAttempts: positiveInteger(rolePolicy.maxAttempts || configured.maxAttempts, DEFAULT_EXECUTION_POLICY.maxAttempts),
     retryBackoffMs: positiveInteger(rolePolicy.retryBackoffMs || configured.retryBackoffMs, DEFAULT_EXECUTION_POLICY.retryBackoffMs),
     staleRunMs: positiveInteger(rolePolicy.staleRunMs || configured.staleRunMs, DEFAULT_EXECUTION_POLICY.staleRunMs),
-    selectionReason: systemsArchitect
-      ? "systems_architect_role"
-      : role.includes("lead") ? "lead_role" : complex ? "complex_task" : "default_role",
+    selectionReason: escalated
+      ? "explicit_escalation"
+      : systemsArchitect
+        ? "systems_architect_role"
+        : lead
+          ? "lead_role"
+          : complex
+            ? "complex_task"
+            : mechanical
+              ? "mechanical_task"
+              : rolePolicy.tier || rolePolicy.model
+                ? "role_policy"
+                : "default_role",
   };
 }
 
