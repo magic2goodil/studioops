@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod,
   cp,
@@ -7,6 +8,7 @@ import {
   readFile,
   readdir,
   readlink,
+  realpath,
   rename,
   rm,
   symlink,
@@ -55,6 +57,11 @@ const MAX_SCAN_FINDINGS = 200;
 const MAX_SCAN_ENTRIES = 5_000;
 const MAX_SCAN_DEPTH = 16;
 const MAX_IDENTITY_FILE_BYTES = 1024 * 1024;
+const MAX_PAYLOAD_FILES = 5_000;
+const MAX_PAYLOAD_ENTRIES = 10_000;
+const MAX_PAYLOAD_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_PAYLOAD_TOTAL_BYTES = 256 * 1024 * 1024;
+const HISTORICAL_QA_AUTHOR = "Mission Control QA Integration";
 
 export const STUDIOOPS_IDENTITY = Object.freeze({
   product: "StudioOps",
@@ -134,9 +141,88 @@ function validCommit(value) {
   return /^[0-9a-f]{40}$/.test(String(value || ""));
 }
 
-async function gitOutput(sourceRoot, args) {
-  const { stdout } = await execFileAsync("git", args, { cwd: sourceRoot, timeout: 15_000 });
-  return String(stdout || "").trim();
+async function gitOutput(sourceRoot, args, input = {}) {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd: sourceRoot,
+    timeout: 15_000,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+  });
+  const output = String(stdout || "");
+  return input.trim === false ? output : output.trim();
+}
+
+async function buildPayloadManifest(root) {
+  const files = [];
+  const counters = { entries: 0, totalBytes: 0 };
+
+  const visit = async (candidate, relativePath) => {
+    counters.entries += 1;
+    if (counters.entries > MAX_PAYLOAD_ENTRIES) {
+      throw new Error(`payload exceeds ${MAX_PAYLOAD_ENTRIES} entries`);
+    }
+    const fileStat = await lstat(candidate);
+    if (fileStat.isSymbolicLink()) {
+      throw new Error(`payload contains a symlink: ${relativePath}`);
+    }
+    if (fileStat.isDirectory()) {
+      const entries = await readdir(candidate, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+      for (const entry of entries) {
+        await visit(path.join(candidate, entry.name), path.join(relativePath, entry.name));
+      }
+      return;
+    }
+    if (!fileStat.isFile()) throw new Error(`payload contains an unsupported file type: ${relativePath}`);
+    if (files.length >= MAX_PAYLOAD_FILES) {
+      throw new Error(`payload exceeds ${MAX_PAYLOAD_FILES} files`);
+    }
+    if (fileStat.size > MAX_PAYLOAD_FILE_BYTES) {
+      throw new Error(`payload file exceeds ${MAX_PAYLOAD_FILE_BYTES} bytes: ${relativePath}`);
+    }
+    counters.totalBytes += fileStat.size;
+    if (counters.totalBytes > MAX_PAYLOAD_TOTAL_BYTES) {
+      throw new Error(`payload exceeds ${MAX_PAYLOAD_TOTAL_BYTES} total bytes`);
+    }
+    const contents = await readFile(candidate);
+    files.push({
+      path: relativePath.split(path.sep).join("/"),
+      size: fileStat.size,
+      mode: fileStat.mode & 0o777,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    });
+  };
+
+  for (const item of RUNTIME_ITEMS) {
+    await visit(path.join(root, item), item);
+  }
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    algorithm: "sha256",
+    digest: createHash("sha256").update(JSON.stringify(files)).digest("hex"),
+    fileCount: files.length,
+    totalBytes: counters.totalBytes,
+    files,
+  };
+}
+
+async function assertPayloadMatchesCommit(sourceRoot, payload) {
+  const trackedOutput = await gitOutput(sourceRoot, [
+    "ls-tree",
+    "-r",
+    "--name-only",
+    "-z",
+    "HEAD",
+    "--",
+    ...RUNTIME_ITEMS,
+  ], { trim: false });
+  const trackedPaths = trackedOutput
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+  const payloadPaths = payload.files.map((item) => item.path).sort();
+  if (!sameJson(payloadPaths, trackedPaths)) {
+    throw new Error("payload paths do not exactly match the tracked HEAD tree");
+  }
 }
 
 function pluginIdentity(plugin = {}) {
@@ -188,6 +274,12 @@ async function inspectCanonicalSource(sourceRoot) {
     problems.push("plugin identity must be studioops with canonical repository, homepage, and a version");
   }
   if (problems.length) throw new Error(`StudioOps runtime source identity rejected: ${problems.join("; ")}`);
+  const payload = await buildPayloadManifest(sourceRoot).catch((error) => {
+    throw new Error(`StudioOps runtime source payload rejected: ${error.message}`);
+  });
+  await assertPayloadMatchesCommit(sourceRoot, payload).catch((error) => {
+    throw new Error(`StudioOps runtime source payload rejected: ${error.message}`);
+  });
   return {
     origin: CANONICAL_REPOSITORY_URL,
     normalizedOrigin,
@@ -199,6 +291,7 @@ async function inspectCanonicalSource(sourceRoot) {
       repository: CANONICAL_REPOSITORY_URL,
       homepage: CANONICAL_REPOSITORY_URL,
     },
+    payload,
   };
 }
 
@@ -215,6 +308,7 @@ function provenanceManifest(source) {
     },
     package: source.package,
     plugin: source.plugin,
+    payload: source.payload,
   };
 }
 
@@ -222,11 +316,43 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-async function validateRelease(releasePath, expectedManifest) {
+async function assertContainedRelease(runtimeRoot, releasePath) {
+  const releasesRoot = path.join(runtimeRoot, "releases");
+  const [runtimeStat, releasesStat, releaseStat] = await Promise.all([
+    lstat(runtimeRoot),
+    lstat(releasesRoot),
+    lstat(releasePath),
+  ]);
+  if (runtimeStat.isSymbolicLink() || !runtimeStat.isDirectory()) {
+    throw new Error("runtime root must be a real directory");
+  }
+  if (releasesStat.isSymbolicLink() || !releasesStat.isDirectory()) {
+    throw new Error("runtime releases root must be a real directory");
+  }
+  if (releaseStat.isSymbolicLink() || !releaseStat.isDirectory()) {
+    throw new Error("runtime release must be a real directory, not a symlink");
+  }
+  const [realRuntimeRoot, realReleasesRoot, realReleasePath] = await Promise.all([
+    realpath(runtimeRoot),
+    realpath(releasesRoot),
+    realpath(releasePath),
+  ]);
+  if (path.dirname(realReleasesRoot) !== realRuntimeRoot || path.basename(realReleasesRoot) !== "releases") {
+    throw new Error("runtime releases root escapes the configured runtime root");
+  }
+  if (path.dirname(realReleasePath) !== realReleasesRoot) {
+    throw new Error("runtime release escapes the immutable releases root");
+  }
+  return realReleasePath;
+}
+
+async function validateRelease(runtimeRoot, releasePath, expectedManifest) {
   let actualManifest;
   let runtimePackage;
   let runtimePlugin;
+  let runtimePayload;
   try {
+    await assertContainedRelease(runtimeRoot, releasePath);
     const [serverStat, provenance, packageJson, pluginJson] = await Promise.all([
       lstat(path.join(releasePath, "src", "server.js")),
       readJson(path.join(releasePath, PROVENANCE_FILE)),
@@ -237,6 +363,7 @@ async function validateRelease(releasePath, expectedManifest) {
     actualManifest = provenance;
     runtimePackage = packageIdentity(packageJson);
     runtimePlugin = pluginIdentity(pluginJson);
+    runtimePayload = await buildPayloadManifest(releasePath);
   } catch (error) {
     throw new Error(`release metadata is incomplete: ${error.message}`);
   }
@@ -248,6 +375,9 @@ async function validateRelease(releasePath, expectedManifest) {
   }
   if (!sameJson(runtimePlugin, expectedManifest.plugin)) {
     throw new Error("runtime plugin identity contradicts its provenance");
+  }
+  if (!sameJson(runtimePayload, expectedManifest.payload)) {
+    throw new Error("runtime payload content contradicts its provenance");
   }
   if (path.basename(releasePath) !== expectedManifest.source.commit) {
     throw new Error("release directory does not match the provenance commit");
@@ -339,14 +469,18 @@ export async function deployRuntime(input = {}) {
 
   let releaseExists = false;
   try {
-    const stat = await lstat(releasePath);
-    releaseExists = stat.isDirectory();
-  } catch {
+    const releaseStat = await lstat(releasePath);
+    if (releaseStat.isSymbolicLink() || !releaseStat.isDirectory()) {
+      throw new Error(`StudioOps runtime release ${version} is not a trusted directory`);
+    }
+    releaseExists = true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
     releaseExists = false;
   }
 
   if (releaseExists) {
-    await validateRelease(releasePath, manifest).catch((error) => {
+    await validateRelease(runtimeRoot, releasePath, manifest).catch((error) => {
       throw new Error(`StudioOps runtime release ${version} cannot be reused: ${error.message}`);
     });
   } else {
@@ -372,7 +506,7 @@ export async function deployRuntime(input = {}) {
       if (error?.code !== "EEXIST" && error?.code !== "ENOTEMPTY") throw error;
       await rm(stagePath, { recursive: true, force: true });
     });
-    await validateRelease(releasePath, manifest).catch((error) => {
+    await validateRelease(runtimeRoot, releasePath, manifest).catch((error) => {
       throw new Error(`StudioOps runtime release ${version} failed provenance validation: ${error.message}`);
     });
   }
@@ -472,12 +606,15 @@ async function inspectRuntimeForVerification(runtimeRoot, errors) {
       result.releasePath = "";
       return result;
     }
+    await assertContainedRelease(runtimeRoot, result.releasePath);
     result.commit = path.basename(result.releasePath);
     if (!validCommit(result.commit)) {
       verificationError(errors, "runtime_commit_invalid", "Runtime release directory is not an exact 40-character commit.");
     }
   } catch (error) {
-    verificationError(errors, "runtime_current_unavailable", `Runtime current target could not be read: ${error.message}`);
+    verificationError(errors, "runtime_target_untrusted", `Runtime current target is not trusted: ${error.message}`);
+    result.releasePath = "";
+    result.commit = "";
   }
   return result;
 }
@@ -504,6 +641,7 @@ async function scanPresentationRoot(root, scope, findings, compatibilityFindings
     { id: "legacy_environment_variable", expression: /\bMISSION_CONTROL_[A-Z0-9_]+\b/ },
     { id: "legacy_database_filename", expression: /\bmission-control\.sqlite3\b/i },
     { id: "legacy_config_filename", expression: /\bmission-control\.config\.md\b/i },
+    { id: "historical_qa_integration_author", expression: /\bMission Control QA Integration\b/ },
   ];
 
   const visit = async (candidate, relativePath, depth) => {
@@ -558,7 +696,8 @@ async function scanPresentationRoot(root, scope, findings, compatibilityFindings
     }
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
-      const stale = scanMatch(lines[index], stalePatterns);
+      const staleLine = lines[index].replaceAll(HISTORICAL_QA_AUTHOR, "");
+      const stale = scanMatch(staleLine, stalePatterns);
       const compatibility = scanMatch(lines[index], compatibilityPatterns);
       for (const match of stale) {
         if (findings.length >= MAX_SCAN_FINDINGS) break;
@@ -610,6 +749,21 @@ export async function verifyStudioOpsIdentity(input = {}) {
   const runtimePlugin = runtime.releasePath
     ? await readIdentityFile(path.join(runtime.releasePath, PLUGIN_MANIFEST_PATH), "plugin", errors, "runtime")
     : { name: "", version: "", repository: "", homepage: "" };
+  let sourcePayload = null;
+  try {
+    sourcePayload = await buildPayloadManifest(sourceRoot);
+    await assertPayloadMatchesCommit(sourceRoot, sourcePayload);
+  } catch (error) {
+    verificationError(errors, "source_payload_unavailable", `Source payload could not be verified: ${error.message}`);
+  }
+  let runtimePayload = null;
+  if (runtime.releasePath) {
+    try {
+      runtimePayload = await buildPayloadManifest(runtime.releasePath);
+    } catch (error) {
+      verificationError(errors, "runtime_payload_unavailable", `Runtime payload could not be verified: ${error.message}`);
+    }
+  }
   let manifest = null;
   const provenance = {
     path: runtime.releasePath ? path.join(runtime.releasePath, PROVENANCE_FILE) : "",
@@ -659,10 +813,18 @@ export async function verifyStudioOpsIdentity(input = {}) {
         repository: STUDIOOPS_IDENTITY.repository,
         homepage: STUDIOOPS_IDENTITY.repository,
       },
+      payload: sourcePayload,
     };
+    const payloadValid = Boolean(runtimePayload)
+      && Boolean(manifest.payload)
+      && sameJson(runtimePayload, manifest.payload);
+    if (!payloadValid) {
+      verificationError(errors, "runtime_payload_mismatch", "Runtime payload content does not match its provenance.");
+    }
     provenance.valid = sameJson(manifest, expected)
       && runtime.commit === source.head
-      && provenance.sourceCommit === runtime.commit;
+      && provenance.sourceCommit === runtime.commit
+      && payloadValid;
     if (!provenance.valid) {
       verificationError(errors, "runtime_provenance_mismatch", "Runtime provenance does not bind the current canonical source commit and identity.");
     }
@@ -714,6 +876,27 @@ export async function verifyStudioOpsIdentity(input = {}) {
       runtime: runtimePlugin,
       valid: pluginIdentityValid,
     },
+    payload: {
+      source: sourcePayload
+        ? {
+          algorithm: sourcePayload.algorithm,
+          digest: sourcePayload.digest,
+          fileCount: sourcePayload.fileCount,
+          totalBytes: sourcePayload.totalBytes,
+        }
+        : null,
+      runtime: runtimePayload
+        ? {
+          algorithm: runtimePayload.algorithm,
+          digest: runtimePayload.digest,
+          fileCount: runtimePayload.fileCount,
+          totalBytes: runtimePayload.totalBytes,
+        }
+        : null,
+      valid: Boolean(sourcePayload)
+        && Boolean(runtimePayload)
+        && sameJson(sourcePayload, runtimePayload),
+    },
     compatibility: {
       detail: "Recognized legacy identifiers retained for compatibility only.",
       recognizedIdentifiers: {
@@ -721,6 +904,7 @@ export async function verifyStudioOpsIdentity(input = {}) {
         environmentVariablePrefix: "MISSION_CONTROL_",
         databaseFilename: "mission-control.sqlite3",
         configFilename: "mission-control.config.md",
+        historicalQaIntegrationAuthor: HISTORICAL_QA_AUTHOR,
       },
       findings: compatibilityFindings,
     },

@@ -607,6 +607,9 @@ function printVerification(report) {
   console.log(
     `Plugin: ${report.plugin.runtime.name || "unavailable"}@${report.plugin.runtime.version || "unavailable"} (${report.plugin.valid ? "valid" : "invalid"})`,
   );
+  console.log(
+    `Payload: ${report.payload.runtime?.digest || "unavailable"} (${report.payload.valid ? "valid" : "invalid"})`,
+  );
   console.log(`Stale user-facing findings: ${report.staleUserFacingFindings.length}`);
   for (const finding of report.staleUserFacingFindings) {
     console.log(`- ${finding.scope}:${finding.path}:${finding.line} ${finding.match}`);

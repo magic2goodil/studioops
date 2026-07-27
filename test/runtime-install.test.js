@@ -55,12 +55,18 @@ async function runtimeFixture(input = {}) {
       homepage: CANONICAL_REPOSITORY,
     })}\n`));
   }
+  if (input.ignoredPayload) {
+    fixtureWrites.push(writeFile(path.join(sourceRoot, ".gitignore"), "src/ignored.js\n"));
+  }
   await Promise.all(fixtureWrites);
   await git(sourceRoot, ["init"]);
   await git(sourceRoot, ["checkout", "-b", "main"]);
   await git(sourceRoot, ["remote", "add", "origin", input.origin || CANONICAL_REPOSITORY]);
   await git(sourceRoot, ["add", "."]);
   await git(sourceRoot, ["-c", "user.name=StudioOps Fixture", "-c", "user.email=fixture", "commit", "-m", "fixture"]);
+  if (input.ignoredPayload) {
+    await writeFile(path.join(sourceRoot, "src", "ignored.js"), "ignored but not committed\n");
+  }
   const npmBin = path.join(root, "npm-fixture");
   await writeFile(npmBin, "#!/bin/sh\nexit 0\n");
   await chmod(npmBin, 0o755);
@@ -155,7 +161,8 @@ test("clean canonical sources stage a versioned provenance manifest and matching
     const manifest = JSON.parse(
       await readFile(path.join(runtime.releasePath, STUDIOOPS_IDENTITY.provenanceFile), "utf8"),
     );
-    assert.deepEqual(manifest, {
+    const { payload, ...identity } = manifest;
+    assert.deepEqual(identity, {
       schemaVersion: 1,
       product: "StudioOps",
       repository: CANONICAL_REPOSITORY,
@@ -173,6 +180,11 @@ test("clean canonical sources stage a versioned provenance manifest and matching
         homepage: CANONICAL_REPOSITORY,
       },
     });
+    assert.equal(payload.algorithm, "sha256");
+    assert.match(payload.digest, /^[0-9a-f]{64}$/);
+    assert.equal(payload.fileCount, payload.files.length);
+    assert.ok(payload.totalBytes > 0);
+    assert.ok(payload.files.some((item) => item.path === "src/server.js" && /^[0-9a-f]{64}$/.test(item.sha256)));
     assert.deepEqual(
       JSON.parse(await readFile(path.join(runtime.releasePath, "plugins", "studioops", ".codex-plugin", "plugin.json"))),
       manifest.plugin,
@@ -205,6 +217,12 @@ test("runtime staging rejects dirty, unrelated, and non-StudioOps sources before
       fixture: { omitPlugin: true },
       prepare: async () => {},
       pattern: /plugin\.json/,
+    },
+    {
+      name: "ignored content outside the commit",
+      fixture: { ignoredPayload: true },
+      prepare: async () => {},
+      pattern: /payload paths do not exactly match the tracked HEAD tree/,
     },
   ]) {
     await t.test(scenario.name, async () => {
@@ -255,6 +273,32 @@ test("same-commit releases with contradictory metadata are rejected without acti
     await assert.rejects(readlink(path.join(fixture.runtimeRoot, "current")), /ENOENT/);
     assert.equal(await readFile(packagePath, "utf8"), `${JSON.stringify(packageJson)}\n`);
     assert.deepEqual(await readdir(retainedRelease), []);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("same-commit releases with modified payload content are rejected before activation", async () => {
+  const fixture = await runtimeFixture();
+  try {
+    const staged = await deployRuntime({
+      sourceRoot: fixture.sourceRoot,
+      runtimeRoot: fixture.runtimeRoot,
+      npmBin: fixture.npmBin,
+      activate: false,
+    });
+    const serverPath = path.join(staged.releasePath, "src", "server.js");
+    await writeFile(serverPath, `${await readFile(serverPath, "utf8")}export const tampered = true;\n`);
+
+    await assert.rejects(
+      deployRuntime({
+        sourceRoot: fixture.sourceRoot,
+        runtimeRoot: fixture.runtimeRoot,
+        npmBin: fixture.npmBin,
+      }),
+      /runtime payload content contradicts its provenance/,
+    );
+    await assert.rejects(readlink(path.join(fixture.runtimeRoot, "current")), /ENOENT/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

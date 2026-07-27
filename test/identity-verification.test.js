@@ -7,8 +7,11 @@ import {
   mkdtemp,
   readFile,
   readlink,
+  rename,
   rm,
   stat,
+  symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
@@ -50,7 +53,8 @@ async function verificationFixture(input = {}) {
     writeFile(
       path.join(sourceRoot, "src", "compatibility.js"),
       "export const legacyLabel = \"com.codex.mission-control.web\";\n"
-        + "export const legacyVariable = \"MISSION_CONTROL_RUNTIME_ROOT\";\n",
+        + "export const legacyVariable = \"MISSION_CONTROL_RUNTIME_ROOT\";\n"
+        + "export const historicalAuthor = \"Mission Control QA Integration\";\n",
     ),
     writeFile(path.join(sourceRoot, "package.json"), `${JSON.stringify(packageJson)}\n`),
     writeFile(path.join(sourceRoot, "package-lock.json"), `${JSON.stringify({
@@ -125,9 +129,14 @@ test("verify reports deterministic canonical source, runtime, package, plugin, a
       homepage: CANONICAL_REPOSITORY,
     });
     assert.equal(report.provenance.valid, true);
+    assert.equal(report.payload.valid, true);
+    assert.match(report.payload.runtime.digest, /^[0-9a-f]{64}$/);
     assert.equal(report.staleUserFacingFindings.length, 0);
     assert.ok(report.compatibility.findings.some((finding) => finding.identifier === "legacy_launchagent_label"));
     assert.ok(report.compatibility.findings.some((finding) => finding.identifier === "legacy_environment_variable"));
+    assert.ok(report.compatibility.findings.some((finding) => (
+      finding.identifier === "historical_qa_integration_author"
+    )));
     assert.equal(report.scan.truncated, false);
     assert.ok(report.scan.filesInspected < report.scan.maxFiles);
 
@@ -158,9 +167,13 @@ test("verify is bounded and read-only and honors STUDIOOPS variables before lega
     }
 
     const databasePath = path.join(fixture.sourceRoot, "data", "mission-control.sqlite3");
+    const packagePath = path.join(fixture.sourceRoot, "package.json");
+    const refreshedMtime = new Date(Date.now() + 5_000);
+    await utimes(packagePath, refreshedMtime, refreshedMtime);
     const watchedPaths = [
       path.join(fixture.sourceRoot, "README.md"),
-      path.join(fixture.sourceRoot, "package.json"),
+      packagePath,
+      path.join(fixture.sourceRoot, ".git", "index"),
       databasePath,
       path.join(fixture.staged.releasePath, "studioops-runtime-provenance.v1.json"),
       path.join(fixture.runtimeRoot, "current"),
@@ -197,6 +210,7 @@ test("verify is bounded and read-only and honors STUDIOOPS variables before lega
     assert.match(commands, /built-in: git 'remote' 'get-url' 'origin'/);
     assert.match(commands, /built-in: git 'rev-parse' 'HEAD'/);
     assert.match(commands, /built-in: git 'status' '--porcelain' '--untracked-files=normal'/);
+    assert.match(commands, /built-in: git 'ls-tree' '-r' '--name-only' '-z' 'HEAD'/);
     assert.doesNotMatch(commands, /\bfetch\b|remote set-url|launchctl|npm|restart|sqlite/i);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
@@ -245,6 +259,51 @@ test("verify exits nonzero with actionable details when runtime provenance is co
         assert.equal(report.ok, false);
         assert.equal(report.provenance.valid, false);
         assert.ok(report.errors.some((item) => item.code === "runtime_provenance_mismatch"));
+        return true;
+      },
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("verify detects modified runtime payload content", async () => {
+  const fixture = await verificationFixture();
+  try {
+    const serverPath = path.join(fixture.staged.releasePath, "src", "server.js");
+    await writeFile(serverPath, `${await readFile(serverPath, "utf8")}export const tampered = true;\n`);
+    await assert.rejects(
+      runVerify(fixture),
+      (error) => {
+        const report = JSON.parse(error.stdout);
+        assert.equal(report.ok, false);
+        assert.equal(report.provenance.valid, false);
+        assert.equal(report.payload.valid, false);
+        assert.ok(report.errors.some((item) => item.code === "runtime_payload_mismatch"));
+        return true;
+      },
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("verify rejects symlinked releases without scanning outside the runtime root", async () => {
+  const fixture = await verificationFixture();
+  try {
+    const externalRelease = path.join(fixture.root, "external-release");
+    await rename(fixture.staged.releasePath, externalRelease);
+    await writeFile(path.join(externalRelease, "src", "outside.js"), "Mission Control outside runtime\n");
+    await symlink(externalRelease, fixture.staged.releasePath, "dir");
+
+    await assert.rejects(
+      runVerify(fixture),
+      (error) => {
+        const report = JSON.parse(error.stdout);
+        assert.equal(report.ok, false);
+        assert.equal(report.runtime.releasePath, "");
+        assert.ok(report.errors.some((item) => item.code === "runtime_target_untrusted"));
+        assert.ok(!report.staleUserFacingFindings.some((finding) => finding.path === "src/outside.js"));
         return true;
       },
     );
