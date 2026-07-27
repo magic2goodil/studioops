@@ -1,8 +1,8 @@
 # StudioOps owner-first IA, responsive design, and component contract
 
-Status: proposed for owner review  
-Task: `task_117`  
-Delivery: visual-only; no runtime behavior is implemented here  
+Status: proposed for owner review
+Task: `task_117`
+Delivery: visual-only; no runtime behavior is implemented here
 Fixture policy: synthetic content only
 
 ## 1. Authority and source order
@@ -58,16 +58,69 @@ and `noindex`. Search metadata is not applicable.
 
 | Route | Owner question | First main content | Data source | Build decision | Owner |
 | --- | --- | --- | --- | --- | --- |
-| `/` | What is healthy, at risk, and next? | Portfolio summary | Aggregate `/api/state` projection | Build in owner UI | `task_83` |
-| `/work` | What is moving through the lifecycle? | Work filters, stages, then rows | Task projection from `/api/state` | Build in owner UI | `task_83` |
-| `/tasks/:id` | What is this task and what happens next? | Requested task header | Current `GET /api/tasks/:id/detail`, redacted projection required | Build route-first | `task_83` |
-| `/qa` | Which immutable candidates await attention? | Candidate queue | Current `/api/qa/review-list`, manifest projection required | Build in QA UI | `task_84` |
-| `/qa/candidates/:id` | Is this exact candidate complete and testable? | Requested candidate header and integrity | Candidate manifest and completeness gate | Build route-first | `task_84` |
-| `/releases` | What is approved, pending, or released? | Release queue/history | Release candidate records | Build later in QA UI | `task_84` |
-| `/releases/:id` | Is this exact release ready and reversible? | Requested release header | RC manifest, reachability, rollback checks | Build later in QA UI | `task_84` |
-| `/action-required` | What decisions need me now? | Compact grouped queue | Owner-inbox projection | Build with owner routes | `task_83`, `task_84` |
-| `/operations` | Is the delivery system healthy? | Service and queue health | `/api/health`, workers, queues, leases, circuits | Build as operator surface | `task_81` |
-| `/policies` | What rules constrain the system? | Lifecycle and quality gates | Execution/project policy | Build as read-first policy surface | `task_79` |
+| `/portfolio` | What is healthy, at risk, and next? | Portfolio summary | `GET /api/ui/v1/portfolio` | Build in owner UI | `task_83` |
+| `/work` | What is moving through the lifecycle? | Work filters, stages, then rows | `GET /api/ui/v1/work` | Build in owner UI | `task_83` |
+| `/tasks/:id` | What is this task and what happens next? | Requested task header | `GET /api/ui/v1/tasks/:id/summary` then independent tab projection | Build route-first | `task_83` |
+| `/qa` | Which immutable candidates await attention? | Candidate queue | `GET /api/ui/v1/qa` | Build in QA UI | `task_84` |
+| `/qa/candidates/:id` | Is this exact candidate complete and testable? | Requested candidate header and integrity | `GET /api/ui/v1/qa/candidates/:id` | Build route-first | `task_84` |
+| `/releases` | What is approved, pending, or released? | Release queue/history | `GET /api/ui/v1/releases` | Build in QA UI | `task_84` |
+| `/releases/:id` | Is this exact release ready and reversible? | Requested release header | `GET /api/ui/v1/releases/:id` | Build in QA UI | `task_84` |
+| `/actions` | What decisions need me now? | Compact grouped queue | `GET /api/ui/v1/actions` | Build with owner routes | `task_84` |
+| `/operations` | Is the delivery system healthy? | Service and queue health | `GET /api/ui/v1/operations` | Build as operator surface | `task_121` |
+| `/policies` | What rules constrain the system? | Lifecycle and quality gates | `GET /api/ui/v1/policies` | Build as read-first policy surface | `task_121` |
+
+`/portfolio` is the default application route. A request for `/` performs a
+local redirect to `/portfolio`; `/` is not a second Portfolio implementation.
+
+### Versioned UI projection contract
+
+`task_119` owns every `/api/ui/v1` read model. Each route response uses this
+envelope and no owner builder may bypass it:
+
+```json
+{
+  "schemaVersion": "1",
+  "generatedAt": "2026-07-26T18:24:00.000Z",
+  "stateVersion": "opaque-state-version",
+  "data": {},
+  "page": {
+    "limit": 50,
+    "nextCursor": "opaque-or-null",
+    "hasMore": false
+  },
+  "capabilities": {
+    "candidate.recordDecision": {
+      "allowed": false,
+      "reasonCode": "owner_authority_unavailable"
+    }
+  }
+}
+```
+
+- `schemaVersion` gates compatible clients. Unknown versions fail closed.
+- `generatedAt` and `stateVersion` drive freshness, stale presentation, ETags,
+  and expected-state mutation checks. Clients never synthesize either value.
+- `data` contains only the requested route or tab projection. Initial task and
+  candidate reads exclude prompts, unrelated history, global feeds, raw
+  commands, and private paths.
+- `page` is present on every response. Lists default to 50 rows and reject a
+  limit above 100. Board columns request 25 cards independently.
+- `nextCursor` is an opaque server encoding of the stable `(updated_at, id)`
+  tuple. Clients preserve but never parse or manufacture it.
+- `capabilities` is server-authorized. A missing, false, stale, or unknown
+  capability disables the associated control and exposes its safe reason.
+
+Task header and each tab fetch independently:
+`/api/ui/v1/tasks/:id/summary`, `/brief`, `/activity`, `/reviews`,
+`/qa-evidence`, `/dependencies`, and `/runs`. History tabs use the same bounded
+cursor contract. The visible route alone revalidates every 15 seconds using a
+private no-cache state-version ETag; polling pauses while hidden or offline,
+aborts stale route requests, and backs off at 1, 2, 5, 15, then 30 seconds.
+
+Legacy `/api/state`, `/api/inbox`, `/api/tasks/:id/detail`, and
+`/api/qa/review-list` endpoints are non-authoritative for owner UI. They must
+not be queried, wrapped, or filtered by downstream owner builders because they
+are unbounded or may contain prompt-bearing/global data.
 
 ### Route-first invariant
 
@@ -116,7 +169,7 @@ Order is fixed:
 5. Operations
 6. Policies
 
-Mobile bottom navigation shows Portfolio, Work, QA, and Action; **More** opens a
+Mobile bottom navigation shows Portfolio, Work, QA, and Actions; **More** opens a
 modal drawer containing all six destinations. The label remains “QA & Release”
 inside the drawer and desktop rail; “QA” is the constrained bottom-nav label.
 Action counts cap visually at `99+`, retain the full accessible label, and are
@@ -228,10 +281,18 @@ Every dynamic route and data component supports these states:
 | --- | --- | --- | --- |
 | Loading | Geometry-matched skeleton; one loading label | Existing stale content may remain inert if mutation safety is unknown | One polite status; do not announce each skeleton |
 | Empty | Explain why empty and the next safe route, if any | At most one contextual action | Focus remains on route heading |
+| Not found | Name the missing local record type without exposing hidden data | Back to the owning bounded list | Focus the route error heading |
 | Error | Human summary and safe reference ID; never raw exception | Retry only when idempotent; Back always safe | Blocking route error gets `role=alert`; focus error heading |
 | Offline | Persistent banner; last-local-snapshot timestamp | Navigation within cached snapshot allowed; all mutations disabled | Polite on transition only |
 | Stale | Timestamp and “may be out of date” text | Immutable-subject decisions disabled until refresh validates identity | Status on transition; focus stays |
 | Permission | Explain required role without leaking data | Hide sensitive content; disabled action includes reason | Focus permission heading for protected route |
+| Partial telemetry | Identify the unavailable subsystem; unknown is never zero or healthy | Unaffected read-only routes remain available | Polite once per changed subsystem |
+| Drift blocked | Name the immutable subject that moved | Disable decision and require a fresh candidate | Blocking alert; focus stays on decision heading |
+| Database busy | Preserve inputs and state version | Bounded safe retry with backoff; no duplicate write | Polite while retrying; alert only after terminal failure |
+| Validation conflict | Explain that newer local state won | Refresh projection; never overwrite | Focus the conflict summary |
+| Pending | Stable progress text without animation dependence | Disable duplicate submit | Polite status |
+| Success | Confirm exact action and subject | Restore normal controls or navigate to result | Polite status; no focus steal |
+| Retry | Safe reason and retry availability | Retry only idempotent operation with same key | Alert after failure; focus remains |
 | Degraded | Identify delayed subsystem and unaffected scope | Decisions unavailable when evidence/freshness is affected | Polite status; no repeated worker updates |
 
 Component-specific default, hover, focus-visible, active, selected, disabled,
@@ -239,25 +300,35 @@ submitting, success, and failure states are enumerated in
 `component-inventory.csv`.
 
 Skeletons reserve final geometry to keep CLS below 0.1. The shell loads before
-route data, route requests are scoped rather than fetching the full board, and
-lists are paginated (50 rows maximum initial slice). Non-critical evidence
-images are lazy loaded with intrinsic dimensions. Candidate identity and first
-route heading are never deferred.
+route data, route requests are scoped rather than fetching the full board, lists
+default to 50 rows with a hard maximum of 100, and board columns load 25 cards
+with independent cursors. Non-critical evidence images are lazy loaded with
+intrinsic dimensions. Candidate identity and first route heading are never
+deferred.
+
+Performance budgets inherited from `task_82` are shell CSS plus JavaScript under
+180 KB raw and 60 KB gzip; list JSON under 120 KB raw; one candidate packet
+under 150 KB raw; FCP under 1.8 seconds; LCP under 2.5 seconds; INP under 200 ms;
+CLS under 0.1; warm local API p95 under 200 ms; and cold p95 under 500 ms at
+10,000 active tasks and 100,000 history rows. An initial route uses no more than
+five SQLite statements. `task_119` proves bounded query plans; `task_122` proves
+browser payload, paint, interaction, and layout budgets.
 
 ## 8. Token contract
 
 `design-tokens.json` is normative and records every exact value:
 
-- **Type:** Inter/system fallback; sizes 12, 14, 16, 18, 24, and 32 px at a
-  16 px root; weights 400, 560, 680, 760; line heights 1.2, 1.5, 1.65.
-- **Color:** canvas `#F5F6FA`, surface `#FFFFFF`, text `#211D36`, muted
-  `#665F78`, brand `#6427E7`, focus `#00A3C4`, and semantic pairs listed in
-  the token file.
-- **Spacing:** 0, 4, 8, 12, 16, 20, 24, 32, 40, 48, 64 px.
-- **Radius:** 0, 6, 10, 16 px, and pill.
+- **Type:** system sans; sizes 12, 14, 16, 20, 24, and 32 px at a 16 px root;
+  weights 400, 560, 680, 760; line heights 1.2, 1.5, 1.65.
+- **Color:** canvas `#0B1020`, surface `#121827`, raised `#182033`, border
+  `#2A344A`, text `#F7F9FC`, muted `#B8C2D6`, primary `#A990FF` with
+  `#0B1020` text, focus `#67E8F9`, success `#57D68D`, warning `#F4B860`,
+  and danger `#FF8799`.
+- **Spacing:** 4, 8, 12, 16, 24, 32, and 48 px.
+- **Radius:** 6, 10, 14, and 18 px.
 - **Elevation:** none, raised, overlay, and focus values in the token file.
 - **Z-index:** base 0, sticky 100, drawer 300, dialog 500, toast 700.
-- **Motion:** 0, 120, 180, 280 ms; exact standard/enter/exit curves in the token
+- **Motion:** 0, 120, 180, 240 ms; exact standard/enter/exit curves in the token
   file; all non-essential motion becomes 0 ms under reduced motion.
 
 No owner builder may introduce a new visual value without updating the token
@@ -284,14 +355,17 @@ banners may not be page-local copies.
 
 ## 10. Control and action contract
 
-This packet distinguishes navigation, existing unsafe/insufficient endpoints,
-and unavailable future actions:
+This packet distinguishes versioned projections, legacy unsafe/insufficient
+endpoints, and unavailable future actions:
 
 | Visible control | Contract in this artifact | Runtime note |
 | --- | --- | --- |
 | Route links and tabs | Real `GET` route shown in this document | Runtime builder implements routing |
-| Existing task detail | Current `GET /api/tasks/:id/detail` | Must add owner-safe projection; prompts cannot ship in primary payload |
-| Existing candidate queue | Current `GET /api/qa/review-list` | Must return immutable candidate summaries |
+| Task summary and tabs | `GET /api/ui/v1/tasks/:id/summary` plus one independent endpoint per tab | `task_119` supplies bounded owner-safe envelopes |
+| Candidate queue and detail | `GET /api/ui/v1/qa` and `GET /api/ui/v1/qa/candidates/:id` | `task_119` supplies manifest-bound projections |
+| Portfolio, Work, Actions | `GET /api/ui/v1/portfolio`, `/work`, and `/actions` | Default 50, maximum 100; boards use 25 per column |
+| Operations and Policies | `GET /api/ui/v1/operations` and `/policies` | Capability-filtered projections owned by `task_121` |
+| Legacy aggregate/detail reads | **Non-authoritative** | `/api/state`, `/api/inbox`, `/api/tasks/:id/detail`, and `/api/qa/review-list` are prohibited for owner UI |
 | Candidate decision | **Unavailable** | Current `POST /api/qa/bundles/:id/decision` is not sufficient until actor authorization and exact manifest binding land |
 | Task raw status update | **Not represented** | Current `PATCH /api/tasks/:id` raw status mutation is prohibited in owner UI |
 | Release approval | **Unavailable** | Requires owner-scoped transition, reachability, immutable subject, risk and rollback record |
@@ -311,14 +385,15 @@ functional.
 - **Keyboard order:** follows visible reading and decision order. CSS visual
   reordering cannot change meaning. Every action is reachable without pointer
   or drag.
-- **Focus:** 3 px cyan focus treatment with sufficient adjacent contrast.
+- **Focus:** 3 px `#67E8F9` focus treatment with sufficient adjacent contrast.
   Client route changes focus the new `h1`; dialogs and menus restore focus to
   their trigger; destructive confirmations initially focus Cancel or the title.
 - **Contrast:** body and muted text meet 4.5:1 on their defined surfaces; large
   text and graphical controls meet 3:1. Semantic soft colors always pair with
-  dark semantic text.
-- **Target size:** every target is at least 44 × 44 CSS px. Inline text links may
-  use the WCAG spacing exception, but primary workflow controls do not.
+  their named semantic text and an icon or label.
+- **Target size:** desktop controls are at least 24 × 24 CSS px and every touch
+  target is at least 44 × 44 CSS px. Inline text links may use the WCAG spacing
+  exception, but primary workflow controls do not.
 - **Reduced motion:** honor `prefers-reduced-motion: reduce`; remove transforms,
   smooth scroll, shimmer, and non-essential transition duration.
 - **Announcements:** route loading, refreshed counts, newly arrived urgent
@@ -384,16 +459,20 @@ The owner shell is local-first but still least-privilege:
 
 This design packet does not complete the runtime. The scoped follow-up is:
 
-- `task_83`: implement owner Portfolio, Work, direct Task, responsive shell, and
-  compact Action Required projections from this contract.
+- `task_119`: implement bounded `/api/ui/v1` route and tab projections, cursor
+  envelopes, freshness, and server-authorized capabilities.
+- `task_120`: implement the shared dark shell and component foundation.
+- `task_83`: implement owner Portfolio, Work, and direct Task routes.
 - `task_84`: implement immutable QA candidate, release, and decision surfaces
-  from this contract.
+  plus the compact Actions queue from this contract.
+- `task_121`: implement bounded Operations and Policies routes.
+- `task_122`: prove the complete vertical slice with browser, accessibility,
+  visual, performance, unsafe-input, and stale-state evidence.
 - `task_80`: provide complete QA-packet, owner-authority, acknowledgement, and
   durable notification contracts before decisions become enabled.
-- `task_81`: provide bounded Operations health and diagnostics projections.
+- `task_81`: provide Operations health and incident telemetry truth.
 - `task_79`: provide enforced policy/read models and actor-scoped transitions.
-- `task_77`: authorize and redact operator diagnostics.
+- `task_75`: enforce actor and capability checks for privileged mutations.
 
 No runtime builder may activate an owner mutation by wiring it to the current
 generic status or caller-supplied decision endpoints.
-

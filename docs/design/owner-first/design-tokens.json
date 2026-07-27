@@ -2,37 +2,27 @@
   "$schema": "https://design-tokens.github.io/community-group/format/",
   "meta": {
     "name": "StudioOps owner-first",
-    "version": "1.0.0",
+    "version": "1.1.0",
+    "architectureSource": "task_82",
     "contrastTarget": "WCAG 2.2 AA",
     "colorSpace": "sRGB"
   },
   "color": {
-    "canvas": { "value": "#F5F6FA" },
-    "surface": { "value": "#FFFFFF" },
-    "surfaceSubtle": { "value": "#F0F2F7" },
-    "surfaceStrong": { "value": "#17142A" },
-    "text": { "value": "#211D36" },
-    "textMuted": { "value": "#665F78" },
-    "textInverse": { "value": "#FFFFFF" },
-    "border": { "value": "#D9DCE7" },
-    "borderStrong": { "value": "#A7A3B5" },
-    "brand": { "value": "#6427E7" },
-    "brandHover": { "value": "#4F1DBD" },
-    "brandSoft": { "value": "#EEE8FF" },
-    "accent": { "value": "#007F96" },
-    "accentSoft": { "value": "#DDF7FA" },
-    "success": { "value": "#197A4B" },
-    "successSoft": { "value": "#E4F7ED" },
-    "warning": { "value": "#8A5400" },
-    "warningSoft": { "value": "#FFF1D6" },
-    "danger": { "value": "#B4233B" },
-    "dangerSoft": { "value": "#FDE8EC" },
-    "focus": { "value": "#00A3C4" },
-    "scrim": { "value": "rgba(23, 20, 42, 0.64)" }
+    "canvas": { "value": "#0B1020" },
+    "surface": { "value": "#121827" },
+    "raised": { "value": "#182033" },
+    "border": { "value": "#2A344A" },
+    "text": { "value": "#F7F9FC" },
+    "muted": { "value": "#B8C2D6" },
+    "primary": { "value": "#A990FF" },
+    "focus": { "value": "#67E8F9" },
+    "success": { "value": "#57D68D" },
+    "warning": { "value": "#F4B860" },
+    "danger": { "value": "#FF8799" }
   },
   "type": {
     "familySans": {
-      "value": "Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif"
+      "value": "ui-sans-serif, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif"
     },
     "familyMono": {
       "value": "\"SFMono-Regular\", Consolas, \"Liberation Mono\", monospace"
@@ -45,7 +35,7 @@
       "caption": { "value": "0.75rem" },
       "bodySmall": { "value": "0.875rem" },
       "body": { "value": "1rem" },
-      "titleSmall": { "value": "1.125rem" },
+      "titleSmall": { "value": "1.25rem" },
       "title": { "value": "1.5rem" },
       "display": { "value": "2rem" }
     },
@@ -61,30 +51,25 @@
     }
   },
   "space": {
-    "0": { "value": "0" },
     "1": { "value": "0.25rem" },
     "2": { "value": "0.5rem" },
     "3": { "value": "0.75rem" },
     "4": { "value": "1rem" },
-    "5": { "value": "1.25rem" },
     "6": { "value": "1.5rem" },
     "8": { "value": "2rem" },
-    "10": { "value": "2.5rem" },
-    "12": { "value": "3rem" },
-    "16": { "value": "4rem" }
+    "12": { "value": "3rem" }
   },
   "radius": {
-    "none": { "value": "0" },
     "small": { "value": "0.375rem" },
     "medium": { "value": "0.625rem" },
-    "large": { "value": "1rem" },
-    "pill": { "value": "999px" }
+    "large": { "value": "0.875rem" },
+    "xlarge": { "value": "1.125rem" }
   },
   "elevation": {
     "none": { "value": "none" },
-    "raised": { "value": "0 1px 2px rgba(23, 20, 42, 0.08), 0 8px 24px rgba(23, 20, 42, 0.06)" },
-    "overlay": { "value": "0 18px 48px rgba(23, 20, 42, 0.22)" },
-    "focus": { "value": "0 0 0 3px rgba(0, 163, 196, 0.35)" }
+    "raised": { "value": "0 8px 24px rgba(0, 0, 0, 0.24)" },
+    "overlay": { "value": "0 18px 48px rgba(0, 0, 0, 0.36)" },
+    "focus": { "value": "0 0 0 3px #67E8F9" }
   },
   "zIndex": {
     "base": { "value": 0 },
@@ -94,10 +79,9 @@
     "toast": { "value": 700 }
   },
   "motion": {
-    "durationInstant": { "value": "0ms" },
     "durationFast": { "value": "120ms" },
     "durationBase": { "value": "180ms" },
-    "durationSlow": { "value": "280ms" },
+    "durationSlow": { "value": "240ms" },
     "easingStandard": { "value": "cubic-bezier(0.2, 0, 0, 1)" },
     "easingEnter": { "value": "cubic-bezier(0, 0, 0, 1)" },
     "easingExit": { "value": "cubic-bezier(0.3, 0, 1, 1)" },
@@ -109,11 +93,10 @@
     "inspector": { "value": "20rem" },
     "headerMobile": { "value": "4rem" },
     "headerDesktop": { "value": "4.5rem" },
+    "desktopTarget": { "value": "1.5rem" },
     "touchTarget": { "value": "2.75rem" },
     "breakpointMobileMax": { "value": "47.99rem" },
     "breakpointTabletMin": { "value": "48rem" },
-    "breakpointDesktopMin": { "value": "64rem" },
-    "breakpointWideMin": { "value": "90rem" }
+    "breakpointDesktopMin": { "value": "75rem" }
   }
 }
-

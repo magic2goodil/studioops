@@ -18,6 +18,13 @@ function copyValue(path) {
   return path.split(".").reduce((value, key) => value?.[key], copy) ?? "";
 }
 
+function formatCopy(template, values) {
+  return Object.entries(values).reduce(
+    (result, [key, value]) => result.replaceAll(`{${key}}`, String(value)),
+    template,
+  );
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -31,6 +38,13 @@ function hydrateStaticCopy() {
   document.querySelectorAll("[data-copy]").forEach((element) => {
     element.textContent = copyValue(element.dataset.copy);
   });
+  document.querySelectorAll("[data-copy-aria-label]").forEach((element) => {
+    element.setAttribute("aria-label", copyValue(element.dataset.copyAriaLabel));
+  });
+  document.querySelectorAll("[data-copy-alt]").forEach((element) => {
+    element.setAttribute("alt", copyValue(element.dataset.copyAlt));
+  });
+  document.title = copy.shell.documentTitle;
 }
 
 function referenceChip() {
@@ -50,7 +64,7 @@ function decisionRow({ title, meta, history, state, tone, action, href = "", una
       <p class="decision-row__history">${escapeHtml(history)}</p>
       <span class="status-badge status-badge--${tone}">${escapeHtml(state)}</span>
       ${primary}
-      <button class="icon-button" type="button" disabled aria-label="${escapeHtml(copy.actions.openMenu)} for ${escapeHtml(title)}">•••</button>
+      <button class="icon-button" type="button" disabled aria-label="${escapeHtml(formatCopy(copy.actions.openMenuFor, { title }))}">•••</button>
     </article>
   `;
 }
@@ -70,13 +84,13 @@ function renderActionRequired() {
         <section class="decision-group" aria-labelledby="qa-group">
           <header class="decision-group__header">
             <h2 id="qa-group">${escapeHtml(copy.actionRequired.qaGroup)}</h2>
-            <span>1 item</span>
+            <span>${escapeHtml(copy.actionRequired.oneItem)}</span>
           </header>
           ${decisionRow({
             title: copy.actionRequired.qaTitle,
             meta: copy.actionRequired.qaMeta,
             history: copy.actionRequired.qaHistory,
-            state: "Ready to test",
+            state: copy.actionRequired.readyState,
             tone: "success",
             action: copy.actions.reviewCandidate,
             href: "#/qa/candidates/candidate_synthetic",
@@ -85,13 +99,13 @@ function renderActionRequired() {
         <section class="decision-group" aria-labelledby="release-group">
           <header class="decision-group__header">
             <h2 id="release-group">${escapeHtml(copy.actionRequired.releaseGroup)}</h2>
-            <span>1 item</span>
+            <span>${escapeHtml(copy.actionRequired.oneItem)}</span>
           </header>
           ${decisionRow({
             title: copy.actionRequired.releaseTitle,
             meta: copy.actionRequired.releaseMeta,
             history: copy.actionRequired.releaseHistory,
-            state: "Authority required",
+            state: copy.actionRequired.authorityState,
             tone: "warning",
             action: copy.actions.approveRelease,
             unavailable: true,
@@ -100,13 +114,13 @@ function renderActionRequired() {
         <section class="decision-group" aria-labelledby="exception-group">
           <header class="decision-group__header">
             <h2 id="exception-group">${escapeHtml(copy.actionRequired.exceptionGroup)}</h2>
-            <span>1 overdue</span>
+            <span>${escapeHtml(copy.actionRequired.oneOverdue)}</span>
           </header>
           ${decisionRow({
             title: copy.actionRequired.exceptionTitle,
             meta: copy.actionRequired.exceptionMeta,
             history: copy.actionRequired.exceptionHistory,
-            state: "Overdue",
+            state: copy.actionRequired.overdueState,
             tone: "danger",
             action: copy.actions.openTask,
             href: "#/tasks/task_synthetic",
@@ -115,13 +129,13 @@ function renderActionRequired() {
         <section class="decision-group" aria-labelledby="incident-group">
           <header class="decision-group__header">
             <h2 id="incident-group">${escapeHtml(copy.actionRequired.incidentGroup)}</h2>
-            <span>1 item</span>
+            <span>${escapeHtml(copy.actionRequired.oneItem)}</span>
           </header>
           ${decisionRow({
             title: copy.actionRequired.incidentTitle,
             meta: copy.actionRequired.incidentMeta,
             history: copy.actionRequired.incidentHistory,
-            state: "Automation paused",
+            state: copy.actionRequired.pausedState,
             tone: "warning",
             action: copy.actions.inspectIncident,
             href: "#/operations",
@@ -145,7 +159,7 @@ function renderTask() {
   `).join("");
   return `
     <article class="route task-route" aria-labelledby="page-title">
-      <nav class="breadcrumb" aria-label="Breadcrumb">
+      <nav class="breadcrumb" aria-label="${escapeHtml(copy.task.breadcrumbLabel)}">
         <a href="#/work">${escapeHtml(copy.navigation.work)}</a> /
         <span>${escapeHtml(copy.task.project)}</span>
       </nav>
@@ -156,14 +170,14 @@ function renderTask() {
           <p class="lede">${escapeHtml(copy.task.summary)}</p>
           <div class="task-meta">
             <span class="status-badge status-badge--success">${escapeHtml(copy.task.state)}</span>
-            <span>${escapeHtml(copy.task.priority)} priority</span>
+            <span>${escapeHtml(copy.task.priorityLabel)}</span>
             <span>${escapeHtml(copy.task.owner)}</span>
             <span>${escapeHtml(copy.task.updated)}</span>
           </div>
         </div>
         ${referenceChip()}
       </header>
-      <div class="tabs" role="tablist" aria-label="Task workspace">
+      <div class="tabs" role="tablist" aria-label="${escapeHtml(copy.task.workspaceLabel)}">
         ${tabs}
       </div>
       <div id="task-panel" class="brief-grid" role="tabpanel" aria-label="${escapeHtml(copy.task.brief)}">
@@ -201,10 +215,10 @@ function renderCandidate() {
       </header>
       <section class="integrity-banner" aria-label="${escapeHtml(copy.candidate.integrity)}">
         <div class="integrity-banner__title"><span aria-hidden="true">✓</span>${escapeHtml(copy.candidate.integrity)}</div>
-        <div class="integrity-banner__item"><small>Manifest</small>${escapeHtml(copy.candidate.digest)}</div>
-        <div class="integrity-banner__item"><small>Integration</small>${escapeHtml(copy.candidate.integration)}</div>
-        <div class="integrity-banner__item"><small>Source</small>${escapeHtml(copy.candidate.source)}</div>
-        <div class="integrity-banner__item"><small>Preview</small>${escapeHtml(copy.candidate.preview)}</div>
+        <div class="integrity-banner__item"><small>${escapeHtml(copy.candidate.manifestLabel)}</small>${escapeHtml(copy.candidate.digest)}</div>
+        <div class="integrity-banner__item"><small>${escapeHtml(copy.candidate.integrationLabel)}</small>${escapeHtml(copy.candidate.integration)}</div>
+        <div class="integrity-banner__item"><small>${escapeHtml(copy.candidate.sourceLabel)}</small>${escapeHtml(copy.candidate.source)}</div>
+        <div class="integrity-banner__item"><small>${escapeHtml(copy.candidate.previewLabel)}</small>${escapeHtml(copy.candidate.preview)}</div>
       </section>
       <section class="panel qa-plan">
         <h2>${escapeHtml(copy.candidate.testPlan)}</h2>
@@ -214,15 +228,15 @@ function renderCandidate() {
           <li>${escapeHtml(copy.candidate.stepThree)}</li>
         </ol>
       </section>
-      <aside class="qa-side" aria-label="Candidate evidence and decision scope">
+      <aside class="qa-side" aria-label="${escapeHtml(copy.candidate.sideLabel)}">
         <section class="panel">
-          <h2>Decision scope</h2>
+          <h2>${escapeHtml(copy.candidate.decisionScopeTitle)}</h2>
           <div class="key-value"><small>${escapeHtml(copy.candidate.affected)}</small><span>${escapeHtml(copy.candidate.affectedValue)}</span></div>
           <div class="key-value"><small>${escapeHtml(copy.candidate.evidence)}</small><span>${escapeHtml(copy.candidate.evidenceValue)}</span></div>
           <div class="key-value"><small>${escapeHtml(copy.candidate.risk)}</small><span>${escapeHtml(copy.candidate.riskValue)}</span></div>
         </section>
         <section class="panel decision-card">
-          <h2>Owner decision</h2>
+          <h2>${escapeHtml(copy.candidate.ownerDecisionTitle)}</h2>
           <p>${escapeHtml(copy.candidate.decisionNote)}</p>
           <button class="button button--disabled" type="button" disabled>${escapeHtml(copy.candidate.decisionUnavailable)}</button>
         </section>
@@ -231,35 +245,35 @@ function renderCandidate() {
   `;
 }
 
-function renderPlaceholder(routeName, heading, description) {
+function renderPlaceholder(routeCopy, heading) {
   return `
     <section class="route" aria-labelledby="page-title">
       <header class="page-header">
         <div class="page-header__copy">
-          <p class="eyebrow">${escapeHtml(routeName)}</p>
+          <p class="eyebrow">${escapeHtml(routeCopy.eyebrow)}</p>
           <h1 id="page-title" tabindex="-1">${escapeHtml(heading)}</h1>
-          <p class="lede">${escapeHtml(description)}</p>
+          <p class="lede">${escapeHtml(routeCopy.description)}</p>
         </div>
         ${referenceChip()}
       </header>
       <section class="panel">
-        <h2>Design contract only</h2>
-        <p>This route is mapped in the owner-first contract. Its runtime controls are unavailable in this visual reference.</p>
+        <h2>${escapeHtml(copy.placeholders.contractTitle)}</h2>
+        <p>${escapeHtml(copy.placeholders.contractBody)}</p>
       </section>
     </section>
   `;
 }
 
 function routeState() {
-  const hash = window.location.hash.replace(/^#/, "") || "/";
+  const hash = window.location.hash.replace(/^#/, "") || "/portfolio";
   if (hash.startsWith("/tasks/")) return { key: "work", content: renderTask };
   if (hash.startsWith("/qa/candidates/")) return { key: "qa", content: renderCandidate };
-  if (hash === "/action-required") return { key: "action", content: renderActionRequired };
-  if (hash === "/work") return { key: "work", content: () => renderPlaceholder("Owner workspace", copy.navigation.work, "A bounded lifecycle list replaces the global feed.") };
-  if (hash === "/qa") return { key: "qa", content: () => renderPlaceholder("Immutable candidates", copy.navigation.qaRelease, "Complete candidates and release history appear here.") };
-  if (hash === "/operations") return { key: "operations", content: () => renderPlaceholder("Operator surface", copy.navigation.operations, "Workers, queues, leases, circuits, incidents, logs, and storage health live here.") };
-  if (hash === "/policies") return { key: "policies", content: () => renderPlaceholder("Enforced rules", copy.navigation.policies, "Lifecycle, role, quality-gate, model-budget, and notification policies live here.") };
-  return { key: "portfolio", content: () => renderPlaceholder("Owner overview", copy.navigation.portfolio, "Project health, current work, risks, and the next owner action.") };
+  if (hash === "/actions") return { key: "actions", content: renderActionRequired };
+  if (hash === "/work") return { key: "work", content: () => renderPlaceholder(copy.placeholders.work, copy.navigation.work) };
+  if (hash === "/qa") return { key: "qa", content: () => renderPlaceholder(copy.placeholders.qa, copy.navigation.qaRelease) };
+  if (hash === "/operations") return { key: "operations", content: () => renderPlaceholder(copy.placeholders.operations, copy.navigation.operations) };
+  if (hash === "/policies") return { key: "policies", content: () => renderPlaceholder(copy.placeholders.policies, copy.navigation.policies) };
+  return { key: "portfolio", content: () => renderPlaceholder(copy.placeholders.portfolio, copy.navigation.portfolio) };
 }
 
 function render({ moveFocus = false } = {}) {

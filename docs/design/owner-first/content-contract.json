@@ -2,8 +2,22 @@
   "meta": {
     "name": "StudioOps owner-first product copy",
     "locale": "en-US",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "fixturePolicy": "synthetic-only"
+  },
+  "shell": {
+    "documentTitle": "StudioOps owner-first design reference",
+    "skipLink": "Skip to main content",
+    "brandHomeLabel": "StudioOps Portfolio",
+    "logoAlt": "StudioOps",
+    "connectionStatus": "Local · current",
+    "openNavigation": "Open navigation menu",
+    "primaryNavigationLabel": "Primary",
+    "mobileNavigationLabel": "Primary mobile",
+    "actionCount": "4",
+    "actionCountLabel": "4 actions require attention",
+    "referenceNote": "Visual-only · no API calls",
+    "moreNavigationUnavailable": "More navigation is unavailable in this visual reference"
   },
   "brand": {
     "productName": "StudioOps",
@@ -14,9 +28,12 @@
     "portfolio": "Portfolio",
     "work": "Work",
     "qaRelease": "QA & Release",
-    "actionRequired": "Action Required",
+    "qaShort": "QA",
+    "actions": "Action Required",
+    "actionsShort": "Actions",
     "operations": "Operations",
-    "policies": "Policies"
+    "policies": "Policies",
+    "more": "More"
   },
   "actions": {
     "openTask": "Open task",
@@ -25,6 +42,7 @@
     "acknowledge": "Acknowledge",
     "inspectIncident": "Inspect incident",
     "openMenu": "More actions",
+    "openMenuFor": "More actions for {title}",
     "back": "Back"
   },
   "actionRequired": {
@@ -35,6 +53,8 @@
     "releaseGroup": "Release approvals",
     "exceptionGroup": "Engineering exceptions",
     "incidentGroup": "Incidents",
+    "oneItem": "1 item",
+    "oneOverdue": "1 overdue",
     "qaTitle": "Verify the Meridian onboarding candidate",
     "releaseTitle": "Approve Northstar Atlas release 0.8.0",
     "exceptionTitle": "Choose a dependency exception for Lumen Desk",
@@ -46,7 +66,11 @@
     "qaHistory": "Acknowledged by Owner at 09:24",
     "releaseHistory": "Unacknowledged",
     "exceptionHistory": "Acknowledged by Owner at 08:41",
-    "incidentHistory": "Unacknowledged"
+    "incidentHistory": "Unacknowledged",
+    "readyState": "Ready to test",
+    "authorityState": "Authority required",
+    "overdueState": "Overdue",
+    "pausedState": "Automation paused"
   },
   "task": {
     "project": "Meridian Desk",
@@ -54,9 +78,11 @@
     "title": "Clarify the first-run workspace setup",
     "summary": "Replace the ambiguous setup handoff with a short, reversible owner flow.",
     "state": "Lead approved",
-    "priority": "High",
+    "priorityLabel": "High priority",
     "owner": "QA assembly",
     "updated": "Updated 18 minutes ago",
+    "breadcrumbLabel": "Breadcrumb",
+    "workspaceLabel": "Task workspace",
     "brief": "Brief",
     "activity": "Activity",
     "reviews": "Reviews",
@@ -77,6 +103,10 @@
     "title": "Meridian onboarding · QA candidate",
     "summary": "A frozen local candidate is ready for an owner decision.",
     "integrity": "Candidate integrity verified",
+    "manifestLabel": "Manifest",
+    "integrationLabel": "Integration",
+    "sourceLabel": "Source",
+    "previewLabel": "Preview",
     "digest": "sha256:7f3c…a912",
     "integration": "Integration 7ab31f2",
     "source": "Source 5c82ad1",
@@ -91,17 +121,51 @@
     "evidenceValue": "3 screenshots · 1 keyboard trace · 1 check report",
     "risk": "Known limitation",
     "riskValue": "Screen-reader smoke evidence is VoiceOver on macOS only.",
+    "sideLabel": "Candidate evidence and decision scope",
+    "decisionScopeTitle": "Decision scope",
+    "ownerDecisionTitle": "Owner decision",
     "decisionNote": "Approval applies only to integration commit 7ab31f2.",
     "decisionUnavailable": "Decision controls are unavailable in this design reference."
+  },
+  "placeholders": {
+    "contractTitle": "Design contract only",
+    "contractBody": "This route is mapped in the owner-first contract. Its runtime controls are unavailable in this visual reference.",
+    "portfolio": {
+      "eyebrow": "Owner overview",
+      "description": "Project health, current work, risks, and the next owner action."
+    },
+    "work": {
+      "eyebrow": "Owner workspace",
+      "description": "A bounded lifecycle list replaces the global feed."
+    },
+    "qa": {
+      "eyebrow": "Immutable candidates",
+      "description": "Complete candidates and release history appear here."
+    },
+    "operations": {
+      "eyebrow": "Operator surface",
+      "description": "Workers, queues, leases, circuits, incidents, logs, and storage health live here."
+    },
+    "policies": {
+      "eyebrow": "Enforced rules",
+      "description": "Lifecycle, role, quality-gate, model-budget, and notification policies live here."
+    }
   },
   "states": {
     "loading": "Loading current workspace…",
     "empty": "Nothing needs your attention.",
+    "notFound": "StudioOps could not find this local record.",
     "error": "StudioOps could not load this view.",
     "offline": "You are offline. Showing the last local snapshot.",
     "stale": "This snapshot may be out of date.",
     "permission": "You do not have permission to make this decision.",
+    "partialTelemetry": "Some operational telemetry is unavailable.",
+    "driftBlocked": "The immutable subject changed. Refresh before deciding.",
+    "databaseBusy": "The local database is busy. StudioOps will retry safely.",
+    "validationConflict": "This action conflicts with newer local state.",
+    "pending": "StudioOps is recording this action…",
+    "success": "The action was recorded.",
+    "retry": "StudioOps could not complete the action. Try again.",
     "degraded": "Live worker status is delayed. Decisions remain unavailable."
   }
 }
-

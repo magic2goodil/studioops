@@ -10,14 +10,6 @@ const repositoryRoot = path.resolve(testDirectory, "../../..");
 const designDirectory = path.join(repositoryRoot, "docs/design/owner-first");
 const assetDirectory = path.join(repositoryRoot, "plugins/studioops/assets");
 
-async function bytes(relativePath) {
-  return readFile(path.join(repositoryRoot, relativePath));
-}
-
-async function text(relativePath) {
-  return readFile(path.join(repositoryRoot, relativePath), "utf8");
-}
-
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -40,11 +32,8 @@ function csvRows(source) {
   });
 }
 
-function leafStrings(value) {
-  if (typeof value === "string") return [value];
-  if (Array.isArray(value)) return value.flatMap(leafStrings);
-  if (value && typeof value === "object") return Object.values(value).flatMap(leafStrings);
-  return [];
+function valueAtPath(value, keyPath) {
+  return keyPath.split(".").reduce((current, key) => current?.[key], value);
 }
 
 test("canonical brand asset identity and placement cannot drift", async () => {
@@ -59,12 +48,11 @@ test("canonical brand asset identity and placement cannot drift", async () => {
   assert.doesNotMatch(prototype, /studioops-icon\.png|studioops-composer-icon\.png/);
 });
 
-test("product copy is byte-bound to one checksum-protected source", async () => {
+test("every visible or accessible string is byte-bound to one checksum-protected source", async () => {
   const contractBytes = await readFile(path.join(designDirectory, "content-contract.json"));
   const checksumLine = await readFile(path.join(designDirectory, "content-contract.sha256"), "utf8");
   const expected = checksumLine.trim().split(/\s+/)[0];
   assert.equal(sha256(contractBytes), expected);
-  assert.equal(expected, "4d7586403c27ec666f3a1edc14ce44f36987d64bd31e16c2d765d4ce768e21e9");
 
   const contract = JSON.parse(contractBytes);
   const prototype = await readFile(path.join(designDirectory, "prototype.html"), "utf8");
@@ -72,12 +60,29 @@ test("product copy is byte-bound to one checksum-protected source", async () => 
   assert.match(script, /const COPY_SOURCE = "\.\/content-contract\.json"/);
   assert.match(script, /element\.textContent = copyValue\(element\.dataset\.copy\)/);
 
-  for (const value of leafStrings(contract).filter((entry) => entry.length >= 24)) {
+  const copyAttributes = [
+    ...prototype.matchAll(/data-copy(?:-aria-label|-alt)?="([^"]+)"/g),
+  ].map((match) => match[1]);
+  assert.ok(copyAttributes.length > 20);
+  for (const keyPath of copyAttributes) {
     assert.equal(
-      prototype.includes(value) || script.includes(value),
-      false,
-      `Long-form product copy must not be duplicated outside the checksum source: ${value}`,
+      typeof valueAtPath(contract, keyPath),
+      "string",
+      `Static copy path must resolve to a canonical string: ${keyPath}`,
     );
+  }
+
+  for (const match of prototype.matchAll(/>([^<]+)</g)) {
+    const visibleText = match[1].trim();
+    if (!visibleText) continue;
+    assert.match(visibleText, /^[◫≡✓!⌁◇•]+$/u, `Unsourced HTML copy: ${visibleText}`);
+  }
+  assert.doesNotMatch(prototype, /\s(?:aria-label|alt)="[^"]+\S"/);
+  for (const match of script.matchAll(/`([\s\S]*?)`/g)) {
+    const template = match[1];
+    if (!template.includes("<")) continue;
+    assert.doesNotMatch(template, />\s*(?:[A-Za-z]|\d+\s+[A-Za-z])[^<]*</);
+    assert.doesNotMatch(template, /aria-label="[A-Za-z]/);
   }
 });
 
@@ -87,8 +92,11 @@ test("route-first prototype excludes the global-feed-before-route defect", async
 
   assert.match(prototype, /<main id="main" tabindex="-1"><\/main>/);
   assert.doesNotMatch(prototype, /Run Automation Tick|New Task|Recovery checklist|inaccessible_github_remote/);
+  assert.match(prototype, /href="#\/portfolio"/);
+  assert.match(prototype, /href="#\/actions"/);
+  assert.doesNotMatch(`${prototype}\n${script}`, /action-required/);
   assert.ok(
-    script.indexOf('hash.startsWith("/tasks/")') < script.indexOf('hash === "/action-required"'),
+    script.indexOf('hash.startsWith("/tasks/")') < script.indexOf('hash === "/actions"'),
     "Direct task dispatch must be resolved independently of Action Required.",
   );
   assert.match(script, /<article class="route task-route" aria-labelledby="page-title">/);
@@ -121,7 +129,7 @@ test("route and element inventory is complete at its required boundaries", async
   const rows = csvRows(await readFile(path.join(designDirectory, "element-inventory.csv"), "utf8"));
   const routes = new Set(rows.map((row) => row.route));
   for (const route of [
-    "/",
+    "/portfolio",
     "/work",
     "/tasks/:id",
     "/tasks/:id?tab=brief",
@@ -129,7 +137,7 @@ test("route and element inventory is complete at its required boundaries", async
     "/qa/candidates/:id",
     "/releases",
     "/releases/:id",
-    "/action-required",
+    "/actions",
     "/operations",
     "/policies",
   ]) {
@@ -150,6 +158,18 @@ test("route and element inventory is complete at its required boundaries", async
     ]) {
       assert.ok(row[field], `${row.element_id} is missing ${field}`);
     }
+  }
+  const dataContracts = rows.map((row) => row.data_source).join("\n");
+  assert.doesNotMatch(
+    dataContracts,
+    /\/api\/state|\/api\/inbox|\/api\/tasks\/:id\/detail|\/api\/qa\/review-list/,
+  );
+  for (const row of rows.filter((entry) => entry.data_kind === "dynamic")) {
+    assert.match(
+      row.data_source,
+      /\/api\/ui\/v1|schemaVersion|stateVersion|audited mutation/,
+      `${row.element_id} must consume an approved bounded projection or its envelope`,
+    );
   }
 
   const allStates = rows.map((row) => row.states.toLowerCase()).join(";");
@@ -179,23 +199,92 @@ test("component inventory covers the complete reusable surface and interaction s
     assert.ok(row.interaction_states, `${row.component} has no interaction states`);
     assert.ok(row.responsive_contract, `${row.component} has no responsive contract`);
     assert.ok(row.accessibility_contract, `${row.component} has no accessibility contract`);
+    assert.match(
+      row.data_contract,
+      /\/api\/ui\/v1|envelope|canonical|checksum|route configuration|stateVersion|projection error/,
+      `${row.component} must define its projection or static canonical source`,
+    );
+  }
+});
+
+test("approved UI projections are versioned, bounded, capability-aware, and fresh", async () => {
+  const contract = await readFile(
+    path.join(designDirectory, "OWNER_FIRST_DESIGN_CONTRACT.md"),
+    "utf8",
+  );
+  for (const requirement of [
+    "/api/ui/v1/portfolio",
+    "/api/ui/v1/work",
+    "/api/ui/v1/tasks/:id/summary",
+    "/api/ui/v1/qa/candidates/:id",
+    "/api/ui/v1/actions",
+    '"schemaVersion": "1"',
+    '"generatedAt"',
+    '"stateVersion"',
+    '"data"',
+    '"page"',
+    '"capabilities"',
+    "default to 50 rows",
+    "limit above 100",
+    "25 cards independently",
+    "opaque server encoding of the stable `(updated_at, id)`",
+    "Legacy `/api/state`, `/api/inbox`, `/api/tasks/:id/detail`, and",
+    "non-authoritative for owner UI",
+  ]) {
+    assert.ok(contract.includes(requirement), `Missing approved read-model contract: ${requirement}`);
   }
 });
 
 test("exact type, color, spacing, radius, elevation, z-index, and motion values are recorded", async () => {
   const tokens = JSON.parse(await readFile(path.join(designDirectory, "design-tokens.json")));
+  const css = await readFile(path.join(designDirectory, "owner-first.css"), "utf8");
   for (const category of ["color", "type", "space", "radius", "elevation", "zIndex", "motion"]) {
     assert.ok(tokens[category], `Missing token category: ${category}`);
   }
-  assert.equal(tokens.color.brand.value, "#6427E7");
-  assert.equal(tokens.color.focus.value, "#00A3C4");
-  assert.equal(tokens.type.size.body.value, "1rem");
-  assert.equal(tokens.space["4"].value, "1rem");
-  assert.equal(tokens.radius.large.value, "1rem");
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(tokens.color).map(([key, token]) => [key, token.value])),
+    {
+      canvas: "#0B1020",
+      surface: "#121827",
+      raised: "#182033",
+      border: "#2A344A",
+      text: "#F7F9FC",
+      muted: "#B8C2D6",
+      primary: "#A990FF",
+      focus: "#67E8F9",
+      success: "#57D68D",
+      warning: "#F4B860",
+      danger: "#FF8799",
+    },
+  );
+  assert.deepEqual(
+    Object.values(tokens.type.size).map((token) => token.value),
+    ["0.75rem", "0.875rem", "1rem", "1.25rem", "1.5rem", "2rem"],
+  );
+  assert.deepEqual(
+    Object.values(tokens.space).map((token) => token.value),
+    ["0.25rem", "0.5rem", "0.75rem", "1rem", "1.5rem", "2rem", "3rem"],
+  );
+  assert.deepEqual(
+    Object.values(tokens.radius).map((token) => token.value),
+    ["0.375rem", "0.625rem", "0.875rem", "1.125rem"],
+  );
   assert.match(tokens.elevation.raised.value, /0 8px 24px/);
   assert.equal(tokens.zIndex.dialog.value, 500);
   assert.equal(tokens.motion.durationBase.value, "180ms");
+  assert.equal(tokens.motion.durationSlow.value, "240ms");
   assert.equal(tokens.motion.reducedMotion.value, "0ms");
+  for (const [name, token] of Object.entries(tokens.color)) {
+    assert.match(
+      css,
+      new RegExp(`--color-${name}: ${token.value.toLowerCase()}`),
+      `Prototype CSS must consume the approved ${name} color`,
+    );
+  }
+  assert.doesNotMatch(
+    css,
+    /#f5f6fa|#ffffff|#211d36|#665f78|#6427e7|#00a3c4|Inter,/i,
+  );
 });
 
 test("responsive evidence is exact, synthetic, and immutable", async () => {
@@ -203,9 +292,17 @@ test("responsive evidence is exact, synthetic, and immutable", async () => {
   assert.equal(evidence.fixturePolicy, "synthetic-only");
   assert.equal(evidence.deviceScaleFactor, 1);
   assert.equal(evidence.references.length, 3);
+  assert.equal(
+    evidence.contentContractSha256,
+    sha256(await readFile(path.join(designDirectory, "content-contract.json"))),
+  );
+  assert.equal(
+    evidence.canonicalAssetSha256,
+    sha256(await readFile(path.join(assetDirectory, "studioops-logo.png"))),
+  );
 
   for (const reference of evidence.references) {
-    assert.match(reference.route, /synthetic|action-required/);
+    assert.match(reference.route, /synthetic|actions/);
     const image = await readFile(path.join(testDirectory, reference.file));
     assert.deepEqual(pngDimensions(image), {
       width: reference.width,
@@ -239,4 +336,3 @@ test("zoom, WCAG, QA packet, audit correction, and unavailable-action notes stay
     assert.ok(contract.includes(requirement), `Missing durable design note: ${requirement}`);
   }
 });
-

@@ -23,9 +23,10 @@ Action Required, Operations, or Policies.
    product copy used by the prototype.
 6. [prototype.html](prototype.html) — responsive, non-functional reference
    implementation. Serve the repository root and open:
-   - `docs/design/owner-first/prototype.html#/action-required`
+   - `docs/design/owner-first/prototype.html#/actions`
    - `docs/design/owner-first/prototype.html#/tasks/task_synthetic`
    - `docs/design/owner-first/prototype.html#/qa/candidates/candidate_synthetic`
+   - `docs/design/owner-first/prototype.html#/portfolio`
 
 The canonical brand asset is
 `plugins/studioops/assets/studioops-logo.png`. The prototype references that
@@ -46,4 +47,3 @@ node --test test/visual/owner-first/design-contract.test.js
 The test fails when canonical asset identity, product-copy bytes, routes, task
 tabs, required states, viewport dimensions, or the route-first landmark
 contract drift.
-
