@@ -328,6 +328,8 @@ test("zoom, WCAG, QA packet, audit correction, and unavailable-action notes stay
     "Exact base/source/integration SHAs",
     "Accounts, fixtures, permissions, reset",
     "Acknowledgement and delivery receipts",
+    "Acknowledgement removes",
+    "never resolves",
     "desktop-owner-inbox.png",
     "mobile-owner-inbox.png",
     "mobile-direct-task-route.png",

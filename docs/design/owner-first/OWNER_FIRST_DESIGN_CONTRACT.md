@@ -196,9 +196,9 @@ error enums, branch labels, local paths, prompts, and multiple same-weight
 buttons are prohibited.
 
 Ordering is: blocking incident, overdue release/QA, other overdue items, then
-soonest SLA. Within a tie, oldest created record first. An acknowledged item
-stays visible until resolved; acknowledgement changes presentation, never the
-underlying lifecycle.
+soonest SLA. Within a tie, oldest created record first. Acknowledgement removes
+the handoff from the active queue and records it in history; it never resolves
+the underlying candidate, exception, or incident.
 
 ## 6. Responsive reference layouts
 
