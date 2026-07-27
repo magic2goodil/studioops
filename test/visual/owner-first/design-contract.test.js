@@ -318,6 +318,21 @@ test("zoom, WCAG, QA packet, audit correction, and unavailable-action notes stay
     path.join(designDirectory, "OWNER_FIRST_DESIGN_CONTRACT.md"),
     "utf8",
   );
+  const content = JSON.parse(
+    await readFile(path.join(designDirectory, "content-contract.json"), "utf8"),
+  );
+  for (const historyKey of [
+    "qaHistory",
+    "releaseHistory",
+    "exceptionHistory",
+    "incidentHistory",
+  ]) {
+    assert.equal(
+      content.actionRequired[historyKey],
+      "No acknowledgement recorded",
+      "An active Action Required handoff cannot already be acknowledged.",
+    );
+  }
   for (const requirement of [
     "### 200% zoom",
     "### 400% zoom",

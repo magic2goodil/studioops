@@ -4,14 +4,14 @@
   "deviceScaleFactor": 1,
   "fixturePolicy": "synthetic-only",
   "canonicalAssetSha256": "3ae6318136d074f0613e6b972757022cb8460473e5eda2669ba581c63de57fa6",
-  "contentContractSha256": "db17e67dedeca7b77c94451975dc0e457bd50c5be0406336d3f04d381c2f88bb",
+  "contentContractSha256": "dd177fdc96ddb29b7e65e99718b8c3c0f590c969b273ed3b4671774f8367bb90",
   "references": [
     {
       "file": "390x844-action-required.png",
       "route": "/actions",
       "width": 390,
       "height": 844,
-      "sha256": "289ac3412f9821e825145a7b8a24ebb3bae42a5d10e1d1cfcb649422f2781489",
+      "sha256": "d906e1fc1a5d5ae0a262ccb5a3626f56cc3cd51208978672e340f37af6e09931",
       "annotation": "Compact mobile shell and typed one-action decision rows."
     },
     {

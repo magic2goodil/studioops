@@ -2,7 +2,7 @@
   "meta": {
     "name": "StudioOps owner-first product copy",
     "locale": "en-US",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "fixturePolicy": "synthetic-only"
   },
   "shell": {
@@ -63,10 +63,10 @@
     "releaseMeta": "31 min old · due in 29 min",
     "exceptionMeta": "1 h 12 min old · overdue by 12 min",
     "incidentMeta": "6 min old · due in 24 min",
-    "qaHistory": "Acknowledged by Owner at 09:24",
-    "releaseHistory": "Unacknowledged",
-    "exceptionHistory": "Acknowledged by Owner at 08:41",
-    "incidentHistory": "Unacknowledged",
+    "qaHistory": "No acknowledgement recorded",
+    "releaseHistory": "No acknowledgement recorded",
+    "exceptionHistory": "No acknowledgement recorded",
+    "incidentHistory": "No acknowledgement recorded",
     "readyState": "Ready to test",
     "authorityState": "Authority required",
     "overdueState": "Overdue",
