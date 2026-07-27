@@ -30,6 +30,21 @@ test("lead and security-sensitive work receive xhigh reasoning", () => {
   assert.equal(security.selectionReason, "complex_task");
 });
 
+test("architecture reasoning can be reduced by local execution policy", () => {
+  const policy = resolveExecutionPolicy(
+    { id: "task_4", title: "Review the system architecture" },
+    { type: "start_architecture", role: "systems-architect" },
+    {
+      executionPolicy: {
+        architectReasoningEffort: "high",
+      },
+    },
+  );
+
+  assert.equal(policy.reasoningEffort, "high");
+  assert.equal(policy.selectionReason, "systems_architect_role");
+});
+
 test("execution attempts are scoped to workflow cycle, action, and role", () => {
   assert.equal(
     executionAttemptKey(

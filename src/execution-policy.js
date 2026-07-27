@@ -3,6 +3,7 @@ const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
 export const DEFAULT_EXECUTION_POLICY = Object.freeze({
   model: "gpt-5.6-sol",
   reasoningEffort: "high",
+  architectReasoningEffort: "xhigh",
   leadReasoningEffort: "xhigh",
   complexReasoningEffort: "xhigh",
   maxAttempts: 2,
@@ -43,7 +44,7 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const systemsArchitect = role.includes("architect");
   const complex = COMPLEX_WORK_PATTERN.test(taskText(task));
   const reasoningEffort = normalizedEffort(
-    (systemsArchitect ? "xhigh" : "")
+    (systemsArchitect ? configured.architectReasoningEffort : "")
       || rolePolicy.reasoningEffort
       || (role.includes("lead") ? configured.leadReasoningEffort : "")
       || (complex ? configured.complexReasoningEffort : "")

@@ -151,6 +151,7 @@ async function setup() {
         executionPolicy: {
           model: "gpt-5.6-sol",
           reasoningEffort: "high",
+          architectReasoningEffort: "xhigh",
           leadReasoningEffort: "xhigh",
           complexReasoningEffort: "xhigh",
           maxAttempts: 2,
