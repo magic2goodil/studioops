@@ -4,6 +4,7 @@ import { readState } from "./store.js";
 import { createSupervisorReport } from "./supervisor.js";
 import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
 import { runResilientWorkerLoop } from "./worker-heartbeat.js";
+import { getCodexCreditSnapshot } from "./credit-policy.js";
 
 const DEFAULT_INTERVAL_SECONDS = 10;
 
@@ -64,6 +65,10 @@ function optionsFrom(args, config) {
       ...(config?.defaults?.executionPolicy || {}),
       ...(config?.executionPolicy || {}),
     },
+    creditPolicy: {
+      ...(config?.defaults?.creditPolicy || {}),
+      ...(config?.creditPolicy || {}),
+    },
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     dryRun: Boolean(args["dry-run"] || args.dryRun),
     intervalSeconds,
@@ -82,6 +87,7 @@ async function buildActions(options) {
 async function runOnce(args) {
   const config = await loadConfig();
   const options = optionsFrom(args, config);
+  options.creditSnapshot = await getCodexCreditSnapshot(options.creditPolicy);
   const { state, report } = await buildActions(options);
 
   if (args.plan) {

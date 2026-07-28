@@ -128,6 +128,64 @@ terms. Spark is never selected implicitly: a low-risk builder task must carry
 one of the configured `mechanicalLabels`. An explicit `escalationLabels` match
 selects the configured frontier tier, including `ultra` effort when supported.
 
+## Credit-aware admission
+
+StudioOps can check the authenticated Codex account before creating a model
+run. The controller calls the local Codex App Server
+`account/rateLimits/read` method, caches the sanitized result, and retains only
+quota headroom, reset timing, limit state, and available credit balance fields.
+It does not store account identity or authentication tokens.
+
+```json
+{
+  "defaults": {
+    "creditPolicy": {
+      "enabled": true,
+      "refreshIntervalMs": 300000,
+      "snapshotMaxAgeMs": 900000,
+      "probeTimeoutMs": 20000,
+      "reserveCredits": 5,
+      "failClosedTiers": ["critical", "frontier"],
+      "tierBudgets": {
+        "mechanical": {
+          "estimatedCredits": 2,
+          "minRemainingPercent": 2
+        },
+        "economy": {
+          "estimatedCredits": 8,
+          "minRemainingPercent": 5
+        },
+        "balanced": {
+          "estimatedCredits": 15,
+          "minRemainingPercent": 10
+        },
+        "critical": {
+          "estimatedCredits": 30,
+          "minRemainingPercent": 20
+        },
+        "frontier": {
+          "estimatedCredits": 40,
+          "minRemainingPercent": 35
+        }
+      }
+    }
+  }
+}
+```
+
+The estimates are admission envelopes, not promises of exact spend. Actual
+credit use depends on model, context, cached input, output, reasoning, and
+tools. When Codex exposes a purchased-credit balance, StudioOps requires the
+tier estimate plus the configured reserve. When the account is operating on
+included quota, StudioOps uses remaining quota percentage instead.
+
+The controller never lowers a task below its quality-required tier. A failed
+critical or frontier admission opens one owner-visible task circuit before any
+model launch. Wait for a reset, add credits, or deliberately update the local
+budget, then use the circuit-reset command shown on the task. If the account
+snapshot is unavailable or stale, configured `failClosedTiers` stop while
+lower tiers may continue.
+
 By default, the web UI is only available on the local machine:
 
 ```text

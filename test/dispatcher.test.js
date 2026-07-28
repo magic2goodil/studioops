@@ -360,6 +360,123 @@ test("opening an exhausted circuit does not suppress an owner handoff in the sam
   assert.equal(report.runs[0].actionType, "notify_owner");
 });
 
+test("credit admission blocks a critical run once and opens an owner-visible circuit", async () => {
+  const state = fixtureState();
+  state.tasks.push({
+    id: "task_3",
+    projectId: "project_1",
+    title: "Deploy the production database migration",
+    status: "ready",
+    priority: "critical",
+    acceptanceCriteria: ["Production migration is safe and reversible."],
+  });
+  const action = {
+    id: "task_3:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_3",
+    taskTitle: "Deploy the production database migration",
+    taskStatus: "ready",
+  };
+  const options = {
+    state,
+    executionPolicy: {
+      modelTiers: {
+        economy: { model: "gpt-5.6-luna", reasoningEffort: "medium" },
+        critical: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+      },
+      tierRouting: {
+        defaultTier: "economy",
+        complexTier: "critical",
+      },
+    },
+    creditPolicy: {
+      enabled: true,
+      failClosedTiers: ["critical"],
+      tierBudgets: {
+        critical: { estimatedCredits: 30, minRemainingPercent: 20 },
+      },
+    },
+    creditSnapshot: {
+      status: "available",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 10,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  };
+
+  const report = await dispatchSupervisorActions([action], options);
+
+  assert.equal(report.runs.length, 0);
+  assert.equal(report.skipped[0].reason, "credit_gate:insufficient_quota_headroom");
+  assert.equal(state.tasks[2].status, "blocked");
+  assert.equal(state.tasks[2].automationCircuit.state, "open");
+  assert.equal(state.tasks[2].automationCircuit.reasonCode, "credit_budget_insufficient");
+  assert.equal(state.tasks[2].automationBlocker.modelTier, "critical");
+  assert.ok(state.events.some((event) => event.type === "credit_admission_blocked"));
+  assert.match(state.comments.at(-1).body, /did not downgrade/i);
+
+  const second = await dispatchSupervisorActions([action], options);
+  assert.equal(second.runs.length, 0);
+  assert.equal(second.skipped[0].reason, "task_status_changed:ready->blocked");
+});
+
+test("credit admission allows an affordable ordinary run at its configured quality tier", async () => {
+  const state = fixtureState();
+  state.tasks.push({
+    id: "task_4",
+    projectId: "project_1",
+    title: "Polish event card spacing",
+    status: "ready",
+    priority: "medium",
+    acceptanceCriteria: ["Spacing matches the approved design."],
+  });
+  const report = await dispatchSupervisorActions([{
+    id: "task_4:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_4",
+    taskTitle: "Polish event card spacing",
+    taskStatus: "ready",
+  }], {
+    state,
+    executionPolicy: {
+      modelTiers: {
+        economy: { model: "gpt-5.6-luna", reasoningEffort: "medium" },
+      },
+      tierRouting: {
+        defaultTier: "economy",
+      },
+    },
+    creditPolicy: {
+      enabled: true,
+      tierBudgets: {
+        economy: { estimatedCredits: 8, minRemainingPercent: 5 },
+      },
+    },
+    creditSnapshot: {
+      status: "available",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 80,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  });
+
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.runs[0].modelTier, "economy");
+  assert.equal(report.runs[0].model, "gpt-5.6-luna");
+  assert.equal(report.runs[0].creditAdmission.code, "included_quota_available");
+  assert.equal(report.runs[0].creditAdmission.remainingPercent, 80);
+});
+
 test("open task circuits stop redispatch without blocking owner notifications", () => {
   const state = fixtureState();
   state.tasks[1].automationCircuit = { state: "open" };
