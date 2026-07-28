@@ -174,6 +174,67 @@ test("governed children cannot dispatch before validated parent completion", () 
   )), false);
 });
 
+test("approved child contracts are revalidated before supervisor and dispatch", async () => {
+  const state = fixtureState();
+  state.tasks.push(governedChild());
+  completeArchitectureInState(state, "task_1", {
+    body: [
+      "Use a modular monolith with a durable relational source of truth.",
+      "Bound reads with indexed queries and cursor pagination.",
+      "Keep cache and queue infrastructure out until measured workload requires it.",
+    ].join(" "),
+    taskIds: ["task_2"],
+  });
+  const originalReport = createSupervisorReport(state);
+  const builderAction = originalReport.actions.find((action) => action.taskId === "task_2");
+  assert.equal(builderAction.type, "start_builder");
+
+  state.tasks[1].description = "";
+  const updatedReport = createSupervisorReport(state, { includeWaiting: true });
+  const updatedChildAction = updatedReport.actions.find((action) => action.taskId === "task_2");
+  assert.equal(updatedChildAction.type, "waiting_on_architecture");
+  assert.match(updatedChildAction.reason, /approved architecture graph is no longer valid/i);
+  assert.equal(updatedReport.actions.some((action) => (
+    action.taskId === "task_2" && action.type === "start_builder"
+  )), false);
+
+  const dispatch = await dispatchSupervisorActions([builderAction], { state });
+  assert.equal(dispatch.runs.length, 0);
+  assert.equal(dispatch.skipped[0].reason, "architecture_handoff_invalid");
+});
+
+test("runner revalidates approved child contracts before claiming queued work", async () => {
+  const state = fixtureState();
+  state.tasks.push(governedChild());
+  completeArchitectureInState(state, "task_1", {
+    body: [
+      "Use a modular monolith with a durable relational source of truth.",
+      "Bound reads with indexed queries and cursor pagination.",
+      "Keep cache and queue infrastructure out until measured workload requires it.",
+    ].join(" "),
+    taskIds: ["task_2"],
+  });
+  const supervisor = createSupervisorReport(state);
+  const dispatch = await dispatchSupervisorActions(supervisor.actions, { state });
+  assert.equal(dispatch.runs.length, 1);
+  assert.equal(state.tasks[1].status, "queued");
+
+  state.tasks[1].acceptanceCriteria = [];
+  const claimed = await claimRuns({
+    state,
+    limit: 1,
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "local",
+      originUrl: "",
+    }),
+  });
+  assert.equal(claimed.length, 0);
+  assert.equal(state.runs[0].status, "cancelled");
+  assert.equal(state.runs[0].exitCode, "architecture_handoff_invalid");
+  assert.equal(state.runs[0].startedAt, undefined);
+});
+
 test("architecture completion rejects empty, unlinked, or incomplete child graphs", () => {
   const summary = [
     "Use a modular monolith with a durable relational source of truth.",

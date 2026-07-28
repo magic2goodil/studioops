@@ -49,7 +49,7 @@ Use `docs/REVIEW_PIPELINE.md` for the canonical staged review flow.
 
 Default automated task flow:
 
-1. The dispatcher turns `ready` or `queued` tasks into durable builder runs and moves them to `in_progress`.
+1. The dispatcher turns `ready` or `queued` tasks into durable queued builder runs. The task stays `queued` until the runner claims the run, then moves to `in_progress`.
 2. Builder implements, validates, links branch/PR, comments with changed files and validation, then moves work to `builder_review`.
 3. Automation tick verifies branch/PR intake and routes to the next review lane.
 4. Backend reviewer records `approved`, `skipped`, or `changes_requested`.
@@ -136,7 +136,7 @@ node src/mission-control-cli.js qa-pass task_123 --body "Checked the local QA pr
 node src/mission-control-cli.js qa-fail task_123 --body "Mobile nav still overlaps."
 ```
 
-A scheduled automation stack can call the tick command every few minutes, then let the dispatcher create durable builder, reviewer, and owner handoff runs, the runner execute queued Codex builder/reviewer work, and the notifier alert the human owner when review or failures need attention. The stack should not deploy production or merge PRs.
+The active local automation stack calls the steward, dispatcher, runner, and notifier every 10 seconds by default, with the read-only supervisor reporting every 15 seconds. The dispatcher creates durable builder, reviewer, and owner handoff runs, the runner executes queued Codex work, and the notifier alerts the human owner when review or failures need attention. The stack should not deploy production or merge PRs.
 
 For macOS always-on setup, see [LOCAL_AUTOMATION.md](LOCAL_AUTOMATION.md).
 

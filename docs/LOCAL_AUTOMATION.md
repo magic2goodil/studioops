@@ -5,7 +5,7 @@ StudioOps can run manually from the CLI or continuously through macOS user Launc
 The always-on stack includes:
 
 - `web`: serves the task board and API
-- `steward`: advances workflow state and review routing every few minutes
+- `steward`: advances workflow state and review routing every 10 seconds by default
 - `supervisor`: reports next actions across projects
 - `dispatcher`: creates durable builder, reviewer, and owner-handoff runs
 - `runner`: launches queued builder/reviewer runs with a Codex provider
