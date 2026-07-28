@@ -12,6 +12,7 @@ import {
   pruneRuntimeReleases,
   restoreRuntimeCurrent,
   sourceCheckoutSafetyError,
+  verifyStudioOpsIdentity,
 } from "../src/runtime-install.js";
 import {
   acquireStudioOpsMaintenanceLease,
@@ -51,6 +52,18 @@ const sourceRoot = path.resolve(
   ),
 );
 const sourceBranch = process.env.STUDIOOPS_SOURCE_BRANCH || process.env.MISSION_CONTROL_SOURCE_BRANCH || "main";
+const SERVICE_DISPLAY_NAMES = Object.freeze({
+  "com.codex.mission-control.web": "StudioOps web UI",
+  "com.codex.mission-control.steward": "StudioOps workflow steward",
+  "com.codex.mission-control.supervisor": "StudioOps supervisor",
+  "com.codex.mission-control.dispatcher": "StudioOps dispatcher",
+  "com.codex.mission-control.runner": "StudioOps runner",
+  "com.codex.mission-control.notifier": "StudioOps notifier",
+  "com.codex.mission-control.qa-integration": "StudioOps QA integration",
+  "com.codex.mission-control.promotion": "StudioOps promotion",
+  "com.codex.mission-control.self-update": "StudioOps self-update",
+  "com.codex.mission-control.watchdog": "StudioOps watchdog",
+});
 
 function usage() {
   console.log(`StudioOps LaunchAgent installer
@@ -59,22 +72,30 @@ Usage:
   npm run install-agents
   npm run uninstall-agents
   npm run status-agents
+  node scripts/install-launchagents.js verify [--json]
 
 Optional environment:
   STUDIOOPS_HOME=~/.codex/studioops  Local-only root for all StudioOps operational state
   STUDIOOPS_HOST=0.0.0.0        Bind web UI to the local network
   STUDIOOPS_PORT=4317           Web UI port
+  STUDIOOPS_NODE_PATH=...       Stable Node.js binary for every LaunchAgent
+  STUDIOOPS_NPM_PATH=...        npm binary used for immutable runtime staging
   STUDIOOPS_WORKING_ROOT=...    Persistent config and SQLite state root
   STUDIOOPS_MIGRATE_FROM=...    Legacy working root to migrate after active runs finish
   STUDIOOPS_LEGACY_HOME=...     Legacy operational workspace root; defaults to ~/.mission-control
   STUDIOOPS_RUNTIME_ROOT=...    Immutable installed runtime root
   STUDIOOPS_SOURCE_ROOT=...     Clean main checkout used by self-update
+  STUDIOOPS_SOURCE_BRANCH=main  Self-update source branch
+
+Compatibility environment fallbacks (only when the matching STUDIOOPS variable is unset):
   MISSION_CONTROL_HOST=0.0.0.0   Bind web UI to the local network
   MISSION_CONTROL_PORT=4317      Web UI port
   MISSION_CONTROL_NODE_PATH=...  Stable Node.js binary for every LaunchAgent
+  MISSION_CONTROL_NPM_PATH=...   Legacy alias for STUDIOOPS_NPM_PATH
   MISSION_CONTROL_RUNTIME_ROOT=...  Legacy alias for STUDIOOPS_RUNTIME_ROOT
   MISSION_CONTROL_WORKING_ROOT=... Use a separate source/config/data checkout
   MISSION_CONTROL_SOURCE_ROOT=... Legacy alias for STUDIOOPS_SOURCE_ROOT
+  MISSION_CONTROL_SOURCE_BRANCH=main Legacy alias for STUDIOOPS_SOURCE_BRANCH
 `);
 }
 
@@ -191,6 +212,15 @@ function labelFromTemplate(fileName) {
 
 function targetPathForLabel(label) {
   return path.join(launchAgentDir, `${label}.plist`);
+}
+
+function serviceDisplayName(label) {
+  return SERVICE_DISPLAY_NAMES[label] || "StudioOps service";
+}
+
+function printCompatibilityLabels(labels) {
+  console.log("Compatibility detail (legacy LaunchAgent service ABI):");
+  for (const label of labels) console.log(`- ${serviceDisplayName(label)}: ${label}`);
 }
 
 async function launchctl(args, options = {}) {
@@ -520,12 +550,13 @@ async function install() {
     throw error;
   }
 
-  console.log(`Installed ${installed.length} StudioOps LaunchAgents:`);
-  for (const label of installed) console.log(`- ${label}`);
+  console.log(`Installed ${installed.length} StudioOps services:`);
+  for (const label of installed) console.log(`- ${serviceDisplayName(label)}`);
   console.log(`Logs: ${logDir}`);
   console.log(`Runtime: ${runtimeRoot}`);
   console.log(`Node: ${nodePath}`);
   console.log(`Self-update source: ${sourceRoot}`);
+  if (process.argv.includes("--compatibility")) printCompatibilityLabels(installed);
 }
 
 async function uninstall() {
@@ -537,18 +568,70 @@ async function uninstall() {
     await rm(target, { force: true });
     removed.push(template.label);
   }
-  console.log(`Removed ${removed.length} StudioOps LaunchAgents:`);
-  for (const label of removed) console.log(`- ${label}`);
+  console.log(`Removed ${removed.length} StudioOps services:`);
+  for (const label of removed) console.log(`- ${serviceDisplayName(label)}`);
+  if (process.argv.includes("--compatibility")) printCompatibilityLabels(removed);
 }
 
 async function status() {
   ensureMac();
   const output = await launchctl(["list"]);
   const labels = (await templates()).map((template) => template.label);
+  console.log("StudioOps service status:");
   for (const label of labels) {
     const line = output.split("\n").find((item) => item.includes(label));
-    console.log(line || `-       -       ${label} (not loaded)`);
+    if (!line) {
+      console.log(`- ${serviceDisplayName(label)}: not loaded`);
+      continue;
+    }
+    const [pid = "-", lastExitStatus = "-"] = line.trim().split(/\s+/);
+    const state = pid === "-" ? `loaded, last exit ${lastExitStatus}` : `running, pid ${pid}`;
+    console.log(`- ${serviceDisplayName(label)}: ${state}`);
   }
+  if (process.argv.includes("--compatibility")) printCompatibilityLabels(labels);
+}
+
+function printVerification(report) {
+  console.log(`StudioOps identity verification: ${report.ok ? "PASS" : "FAIL"}`);
+  console.log(`Source origin: ${report.source.origin || "unavailable"}`);
+  console.log(`Source HEAD: ${report.source.head || "unavailable"}`);
+  console.log(`Source clean: ${report.source.clean ? "yes" : "no"}`);
+  console.log(`Runtime target: ${report.runtime.currentTarget || "unavailable"}`);
+  console.log(`Runtime commit: ${report.runtime.commit || "unavailable"}`);
+  console.log(
+    `Provenance: ${report.provenance.valid ? "valid" : report.provenance.present ? "invalid" : "missing"}`,
+  );
+  console.log(
+    `Package: ${report.package.runtime.name || "unavailable"}@${report.package.runtime.version || "unavailable"} (${report.package.valid ? "valid" : "invalid"})`,
+  );
+  console.log(
+    `Plugin: ${report.plugin.runtime.name || "unavailable"}@${report.plugin.runtime.version || "unavailable"} (${report.plugin.valid ? "valid" : "invalid"})`,
+  );
+  console.log(
+    `Payload: ${report.payload.runtime?.digest || "unavailable"} (${report.payload.valid ? "valid" : "invalid"})`,
+  );
+  console.log(`Stale user-facing findings: ${report.staleUserFacingFindings.length}`);
+  for (const finding of report.staleUserFacingFindings) {
+    console.log(`- ${finding.scope}:${finding.path}:${finding.line} ${finding.match}`);
+  }
+  console.log("Compatibility detail (recognized legacy identifiers only):");
+  console.log("- LaunchAgent ABI prefix: com.codex.mission-control");
+  console.log("- Environment fallback prefix: MISSION_CONTROL_");
+  console.log(`- Findings: ${report.compatibility.findings.length}`);
+  for (const finding of report.compatibility.findings) {
+    console.log(`  - ${finding.scope}:${finding.path}:${finding.line} ${finding.identifier}`);
+  }
+  if (report.errors.length) {
+    console.log("Identity errors:");
+    for (const error of report.errors) console.log(`- ${error.code}: ${error.message}`);
+  }
+}
+
+async function verify() {
+  const report = await verifyStudioOpsIdentity({ sourceRoot, runtimeRoot });
+  if (process.argv.includes("--json")) console.log(JSON.stringify(report, null, 2));
+  else printVerification(report);
+  if (!report.ok) process.exitCode = 1;
 }
 
 async function main() {
@@ -560,6 +643,7 @@ async function main() {
   if (command === "install") return install();
   if (command === "uninstall") return uninstall();
   if (command === "status") return status();
+  if (command === "verify") return verify();
   throw new Error(`Unknown command: ${command}`);
 }
 
