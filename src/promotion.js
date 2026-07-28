@@ -40,7 +40,7 @@ const PROMOTION_DEPENDENCY_COMPLETE_STATUSES = new Set([
 function childEnv(options = {}) {
   return {
     ...process.env,
-    PATH: options.path || process.env.MISSION_CONTROL_PROMOTION_PATH || DEFAULT_PROMOTION_PATH,
+    PATH: options.path || process.env.STUDIOOPS_PROMOTION_PATH || process.env.MISSION_CONTROL_PROMOTION_PATH || DEFAULT_PROMOTION_PATH,
     ...(options.env || {}),
   };
 }
@@ -182,7 +182,7 @@ function isGitHubRepoUrl(value) {
 
 function promotionAuthEnabled(projectPlan, input = {}) {
   return booleanOption(
-    input.githubAppAuth ?? process.env.MISSION_CONTROL_PROMOTION_GITHUB_APP_AUTH,
+    input.githubAppAuth ?? process.env.STUDIOOPS_PROMOTION_GITHUB_APP_AUTH ?? process.env.MISSION_CONTROL_PROMOTION_GITHUB_APP_AUTH,
     isGitHubRepoUrl(projectPlan.repoUrl),
   );
 }
@@ -304,9 +304,13 @@ async function branchHead(repoPath, ref, options = {}) {
 }
 
 async function fetchTaskSource(repoPath, task, options = {}) {
-  const localRef = `refs/mission-control/promotions/${safeRefSegment(task.id)}`;
+  const localRef = `refs/studioops/promotions/${safeRefSegment(task.id)}`;
+  const legacyLocalRef = `refs/mission-control/promotions/${safeRefSegment(task.id)}`;
   const branchName = normalizeBranchName(task.branchName);
   const errors = [];
+
+  const legacyHead = await branchHead(repoPath, legacyLocalRef, options);
+  if (legacyHead) return { ok: true, ref: legacyLocalRef, label: "historical scratch ref", fetchOutput: "" };
 
   if (branchName) {
     const branchFormat = await git(repoPath, ["check-ref-format", "--branch", branchName], { allowFailure: true });
@@ -775,9 +779,9 @@ async function promoteProject(projectPlan, options = {}) {
       "--head",
       result.promotionBranch,
       "--title",
-      `QA-approved release candidate: ${projectPlan.projectName || projectPlan.projectKey}`,
+      `StudioOps release candidate: ${projectPlan.projectName || projectPlan.projectKey}`,
       "--body",
-      `## Immutable StudioOps candidate\n\nCandidate: ${projectPlan.candidate.id}\nManifest: ${projectPlan.candidate.manifestDigest}\nIntegration SHA: ${projectPlan.candidate.manifest.integration.sha}\n\n## QA-approved tasks\n\n${taskList}\n\nValidation passed against the exact candidate in StudioOps. Production deployment remains release/tag gated.`,
+      `## Immutable StudioOps candidate\n\nCandidate: ${projectPlan.candidate.id}\nManifest: ${projectPlan.candidate.manifestDigest}\nIntegration SHA: ${projectPlan.candidate.manifest.integration.sha}\n\n## QA-approved tasks\n\n${taskList}\n\nProduct: https://github.com/magic2goodil/studioops\n\nValidation passed against the exact candidate in StudioOps. Production deployment remains release/tag gated.`,
     ], {
       cwd: executionRepoPath,
       env: options.env,
@@ -864,7 +868,7 @@ function commentForTask(projectResult, taskResult) {
   const workspaceLine = workspaceSummary(projectResult);
 
   if (taskResult.status === "pr_ready") {
-    return `QA-approved release-candidate PR is ready for ${projectResult.targetBranch} at ${projectResult.commit}.${projectResult.prUrl ? `\n\nPR: ${projectResult.prUrl}` : ""}${targetLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
+    return `StudioOps release-candidate PR is ready for ${projectResult.targetBranch} at ${projectResult.commit}.${projectResult.prUrl ? `\n\nPR: ${projectResult.prUrl}` : ""}${targetLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}\n\nProduct: https://github.com/magic2goodil/studioops`;
   }
 
   if (taskResult.status === "conflict") {

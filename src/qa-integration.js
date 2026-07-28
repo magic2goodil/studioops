@@ -47,7 +47,7 @@ const DEFAULT_QA_INTEGRATION_PATH = [
 function childEnv(options = {}) {
   return {
     ...process.env,
-    PATH: options.path || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH || DEFAULT_QA_INTEGRATION_PATH,
+    PATH: options.path || process.env.STUDIOOPS_QA_INTEGRATION_PATH || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH || DEFAULT_QA_INTEGRATION_PATH,
     ...(options.env || {}),
   };
 }
@@ -268,7 +268,7 @@ async function createIntegrationPr(repoPath, projectPlan, candidateBranch, commi
     "--title",
     `StudioOps QA integration: ${projectPlan.projectName || projectPlan.projectKey}`,
     "--body",
-    `## Validated StudioOps QA candidate\n\nCandidate commit: ${commit}\nTarget QA branch: ${projectPlan.integrationBranch}\n\n## Included tasks\n\n${taskList}\n\nStudioOps will track this PR but will not bypass required reviews, checks, or branch policy. Production deployment is not authorized by this PR.`,
+    `## Validated StudioOps QA candidate\n\nCandidate commit: ${commit}\nTarget QA branch: ${projectPlan.integrationBranch}\n\n## Included tasks\n\n${taskList}\n\nProduct: https://github.com/magic2goodil/studioops\n\nStudioOps will track this PR but will not bypass required reviews, checks, or branch policy. Production deployment is not authorized by this PR.`,
   ], {
     cwd: repoPath,
     env: options.env,
@@ -410,7 +410,7 @@ function isGitHubRepoUrl(value) {
 
 function qaIntegrationAuthEnabled(projectPlan, input = {}) {
   return booleanOption(
-    input.githubAppAuth ?? process.env.MISSION_CONTROL_QA_GITHUB_APP_AUTH,
+    input.githubAppAuth ?? process.env.STUDIOOPS_QA_GITHUB_APP_AUTH ?? process.env.MISSION_CONTROL_QA_GITHUB_APP_AUTH,
     isGitHubRepoUrl(projectPlan.repoUrl),
   );
 }
@@ -653,9 +653,22 @@ async function resetPreparedIntegrationBranch(repoPath, branchName, preparedHead
 }
 
 async function fetchTaskSource(repoPath, task, options = {}) {
-  const localRef = `refs/mission-control/tasks/${safeRefSegment(task.id)}`;
+  const localRef = `refs/studioops/tasks/${safeRefSegment(task.id)}`;
+  const legacyLocalRef = `refs/mission-control/tasks/${safeRefSegment(task.id)}`;
   const branchName = normalizeBranchName(task.branchName);
   const errors = [];
+
+  const legacyHead = await branchHead(repoPath, legacyLocalRef, options);
+  if (legacyHead) {
+    return {
+      ok: true,
+      ref: legacyLocalRef,
+      sourceRef: "",
+      headSha: legacyHead,
+      label: "historical scratch ref",
+      fetchOutput: "",
+    };
+  }
 
   if (branchName) {
     const branchFormat = await git(repoPath, ["check-ref-format", "--branch", branchName], { allowFailure: true });
@@ -2120,24 +2133,24 @@ function commentForTask(projectResult, taskResult) {
     : "";
 
   if (taskResult.status === "ready") {
-    return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}${previewLine}\n\nValidation passed:\n${validationSummary(projectResult)}${supersededLine}`;
+    return `StudioOps QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}${previewLine}\n\nValidation passed:\n${validationSummary(projectResult)}${supersededLine}`;
   }
 
   if (taskResult.status === "conflict") {
     const files = taskResult.conflicts?.length ? taskResult.conflicts.map((file) => `- ${file}`).join("\n") : "- Git did not report conflicted file names.";
-    return `QA integration blocked: merging ${taskResult.source} into ${projectResult.integrationBranch} produced conflicts. No changes were pushed.${workspaceLine}\n\nConflicts:\n${files}\n\nUpdate the PR branch or resolve the conflict, then rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
+    return `StudioOps QA integration blocked: merging ${taskResult.source} into ${projectResult.integrationBranch} produced conflicts. No changes were pushed.${workspaceLine}\n\nConflicts:\n${files}\n\nUpdate the PR branch or resolve the conflict, then rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
   }
 
   if (taskResult.status === "validation_failed") {
-    return `QA integration validation failed after merging ${taskResult.source} into ${projectResult.integrationBranch}. No changes were pushed.${branchLine}${workspaceLine}\n\nValidation:\n${validationSummary(projectResult)}`;
+    return `StudioOps QA integration validation failed after merging ${taskResult.source} into ${projectResult.integrationBranch}. No changes were pushed.${branchLine}${workspaceLine}\n\nValidation:\n${validationSummary(projectResult)}`;
   }
 
   if (taskResult.status === "validation_missing") {
-    return `QA integration paused after merging ${taskResult.source}: the project has no validationCommands configured, so StudioOps did not push or mark the QA bundle ready.${workspaceLine}\n\nAdd validation commands and rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
+    return `StudioOps QA integration paused after merging ${taskResult.source}: the project has no validationCommands configured, so StudioOps did not push or mark the QA bundle ready.${workspaceLine}\n\nAdd validation commands and rerun \`npm run qa-integrate -- --project ${projectResult.projectKey}\`.`;
   }
 
   if (taskResult.status === "push_failed") {
-    return `QA integration could not update ${projectResult.integrationBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
+    return `StudioOps QA integration could not update ${projectResult.integrationBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (["pr_waiting", "pr_merged", "checks_failed", "changes_requested", "pr_closed"].includes(taskResult.status)) {
@@ -2152,7 +2165,7 @@ function commentForTask(projectResult, taskResult) {
     return `Protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
   }
 
-  return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}${supersededLine}`;
+  return `StudioOps QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}${supersededLine}`;
 }
 
 function stableQaOutput(value, workspacePath) {
