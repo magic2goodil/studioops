@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title></title>
+    <link rel="stylesheet" href="./owner-first.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main" data-copy="shell.skipLink"></a>
+    <div class="app-shell">
+      <header class="app-header">
+        <a class="brand" href="#/portfolio" data-copy-aria-label="shell.brandHomeLabel">
+          <img
+            src="../../../plugins/studioops/assets/studioops-logo.png"
+            width="40"
+            height="40"
+            alt=""
+            data-copy-alt="shell.logoAlt"
+          >
+          <span class="brand__copy">
+            <strong data-copy="brand.productName"></strong>
+            <small data-copy="brand.environment"></small>
+          </span>
+        </a>
+        <div class="header-state">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span data-copy="shell.connectionStatus"></span>
+        </div>
+        <button class="icon-button header-more" type="button" disabled data-copy-aria-label="shell.openNavigation">
+          <span aria-hidden="true">•••</span>
+        </button>
+      </header>
+
+      <aside class="app-rail">
+        <nav class="primary-nav" data-copy-aria-label="shell.primaryNavigationLabel">
+          <a href="#/portfolio" data-nav="portfolio"><span aria-hidden="true">◫</span><span data-copy="navigation.portfolio"></span></a>
+          <a href="#/work" data-nav="work"><span aria-hidden="true">≡</span><span data-copy="navigation.work"></span></a>
+          <a href="#/qa" data-nav="qa"><span aria-hidden="true">✓</span><span data-copy="navigation.qaRelease"></span></a>
+          <a href="#/actions" data-nav="actions"><span aria-hidden="true">!</span><span data-copy="navigation.actions"></span><b data-copy="shell.actionCount" data-copy-aria-label="shell.actionCountLabel"></b></a>
+          <a href="#/operations" data-nav="operations"><span aria-hidden="true">⌁</span><span data-copy="navigation.operations"></span></a>
+          <a href="#/policies" data-nav="policies"><span aria-hidden="true">◇</span><span data-copy="navigation.policies"></span></a>
+        </nav>
+        <div class="rail-note">
+          <span data-copy="brand.referenceBadge"></span>
+          <small data-copy="shell.referenceNote"></small>
+        </div>
+      </aside>
+
+      <main id="main" tabindex="-1"></main>
+
+      <nav class="bottom-nav" data-copy-aria-label="shell.mobileNavigationLabel">
+        <a href="#/portfolio" data-mobile-nav="portfolio"><span aria-hidden="true">◫</span><span data-copy="navigation.portfolio"></span></a>
+        <a href="#/work" data-mobile-nav="work"><span aria-hidden="true">≡</span><span data-copy="navigation.work"></span></a>
+        <a href="#/qa" data-mobile-nav="qa"><span aria-hidden="true">✓</span><span data-copy="navigation.qaShort"></span></a>
+        <a href="#/actions" data-mobile-nav="actions"><span class="bottom-count" aria-hidden="true" data-copy="shell.actionCount"></span><span data-copy="navigation.actionsShort"></span></a>
+        <button type="button" disabled data-copy-aria-label="shell.moreNavigationUnavailable"><span aria-hidden="true">•••</span><span data-copy="navigation.more"></span></button>
+      </nav>
+    </div>
+    <script type="module" src="./owner-first.js"></script>
+  </body>
+</html>
