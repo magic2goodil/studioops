@@ -2332,6 +2332,7 @@ ${functionalDeliveryContract(task)}
 
 Review instructions:
 - Review as a senior engineer in the ${reviewerProfile.domain} lane.
+- Use \`show-task ${task.id}\` (or \`--json\`) only for read-only task inspection. Use \`status ${task.id} --status <canonical-status>\` only for an intentional status mutation; never omit \`--status\`.
 - Lead with concrete findings ordered by severity.
 - Focus especially on:
 ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
