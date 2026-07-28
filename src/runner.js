@@ -19,12 +19,17 @@ import {
 import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
+  applyGitHubRemoteRecoveryProbeResult,
   architectureIsCompleteInState,
+  claimDueGitHubRemoteRecoveryProbes,
+  currentReviewCandidateCycle,
   DATA_DIR,
   findProject,
   findTask,
   mutateState,
   readState,
+  renewGitHubRemoteRecoveryProbeLease,
+  scheduleGitHubRemoteRecoveryProbeInState,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
@@ -46,7 +51,9 @@ const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "preview_blocked", "blocked"]);
 const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
+const ARCHITECTURE_GATED_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_PREFLIGHT_RETRY_DELAY_MS = 250;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
   "/usr/local/bin",
@@ -173,6 +180,12 @@ function staleRunReason(state, run) {
     return "";
   }
 
+  if (
+    ARCHITECTURE_GATED_ACTIONS.has(run.actionType)
+    && task.architectureRequired
+    && !architectureIsCompleteInState(state, task)
+  ) return "architecture_handoff_invalid";
+
   if (["start_builder", "start_builder_fix", "return_to_builder"].includes(run.actionType)) {
     if (!["queued", "in_progress"].includes(task.status)) return `task_status_changed:${task.status || "unknown"}`;
     if (task.assignedAgentRole && task.assignedAgentRole !== run.role) {
@@ -225,8 +238,8 @@ export function resolveProjectWorkflowMode(project = {}, originUrl = "") {
   return parseGitHubRepoUrl(project.repoUrl) || parseGitHubRepoUrl(originUrl) ? "github" : "local";
 }
 
-function preflightFailure(code, message, remediation) {
-  return { ok: false, code, message, remediation };
+function preflightFailure(code, message, remediation, details = {}) {
+  return { ok: false, code, message, remediation, ...details };
 }
 
 function workflowAuthEnv(workflowMode, authContext, baseEnv = process.env) {
@@ -456,10 +469,16 @@ export async function preflightRun(run, input = {}) {
   try {
     await checkRemote({ ...run, workflowMode, project: { ...project, workflowMode } }, authContext, input);
   } catch (error) {
+    const repository = parseGitHubRepoUrl(originUrl);
     return preflightFailure(
       "inaccessible_github_remote",
-      `The GitHub origin is not accessible: ${error?.message || String(error)}`,
+      `The GitHub origin is not accessible: ${redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext))}`,
       "Verify the origin URL, repository access, network connection, and GitHub App installation permissions.",
+      {
+        originUrl,
+        owner: repository?.owner || "",
+        repository: repository?.name || "",
+      },
     );
   } finally {
     await cleanupAuth(authContext);
@@ -799,6 +818,19 @@ function reviewerRecordedOutcome(state, run) {
   });
 }
 
+export function reviewerRunSupersessionReason(run, task) {
+  if (run.group !== "reviewer" || !task) return "";
+  const runCandidateCycle = Number(run.candidateCycle || 0);
+  const taskCandidateCycle = currentReviewCandidateCycle(task);
+  if (
+    runCandidateCycle <= 0
+    || taskCandidateCycle <= runCandidateCycle
+  ) {
+    return "";
+  }
+  return "review_candidate_superseded";
+}
+
 export function successfulHandoffFailure(state, run, task) {
   if (!task) return "task_missing_after_run";
   if (run.group === "architect") {
@@ -812,6 +844,7 @@ export function successfulHandoffFailure(state, run, task) {
     ) return "architecture_task_graph_invalid";
     return "";
   }
+  if (reviewerRunSupersessionReason(run, task)) return "";
   if (run.group === "builder") {
     if (task.status !== "in_progress" && task.status !== "qa_review") return "";
     if (task.branchName && task.prUrl && run.actionType !== "qa_integration_blocked") return "";
@@ -988,6 +1021,7 @@ async function pauseTaskForAutomationConfig(run, reason, notes) {
 
 async function blockQueuedRunForPreflight(state, run, failure, now) {
   const task = findTask(state, run.taskId);
+  const project = findProject(state, run.projectId);
   run.status = "cancelled";
   run.exitCode = failure.code;
   // Configuration preflight is outside the worker retry budget. Clearing the
@@ -1003,15 +1037,32 @@ async function blockQueuedRunForPreflight(state, run, failure, now) {
     task.retryNotBefore = "";
     task.lastAutomationFailure = failure.code;
     task.lastAutomationFailureRunId = run.id;
-    task.automationBlocker = {
-      type: "configuration",
-      reason: failure.code,
-      message: failure.message,
-      remediation: failure.remediation,
-      runId: run.id,
-      resumeStatus,
-      blockedAt: now,
-    };
+    if (failure.code === "inaccessible_github_remote") {
+      const repository = parseGitHubRepoUrl(
+        failure.originUrl || project?.repoUrl || run.preflightOriginUrl || "",
+      );
+      scheduleGitHubRemoteRecoveryProbeInState(state, run, {
+        now,
+        nowMs: Date.parse(now),
+        owner: failure.owner || repository?.owner || "",
+        repository: failure.repository || repository?.name || "",
+        branchName: branchNameForRun(run),
+        prUrl: run.prUrl || task.prUrl || "",
+        resumeStatus,
+        diagnostic: failure.message,
+        remediation: failure.remediation,
+      });
+    } else {
+      task.automationBlocker = {
+        type: "configuration",
+        reason: failure.code,
+        message: failure.message,
+        remediation: failure.remediation,
+        runId: run.id,
+        resumeStatus,
+        blockedAt: now,
+      };
+    }
     task.updatedAt = now;
   }
   const body = `${run.id} was blocked by runner preflight before a worker was claimed: ${failure.code}.\n\n${failure.message}\n\nRemediation: ${failure.remediation}`;
@@ -1034,7 +1085,17 @@ export async function claimRuns(input = {}) {
   for (const candidate of candidates) {
     try {
       const check = input.preflightRun || preflightRun;
-      preflightResults.set(candidate.id, await check(candidate, input));
+      let result = await check(candidate, input);
+      if (result?.code === "inaccessible_github_remote") {
+        const retryDelayMs = Math.max(
+          0,
+          Number(input.preflightRetryDelayMs ?? DEFAULT_PREFLIGHT_RETRY_DELAY_MS),
+        );
+        const delay = input.delay || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+        await delay(retryDelayMs);
+        result = await check(candidate, input);
+      }
+      preflightResults.set(candidate.id, result);
     } catch (error) {
       preflightResults.set(candidate.id, preflightFailure(
         "runner_preflight_failed",
@@ -1136,6 +1197,7 @@ export async function claimRuns(input = {}) {
       run.provider = normalizeProvider(input.provider || run.provider);
       const executionPolicy = resolveExecutionPolicy(findTask(state, run.taskId) || {}, run, input);
       run.model = run.model || executionPolicy.model || input.model;
+      run.modelTier = run.modelTier || executionPolicy.modelTier || "";
       run.modelReasoningEffort = run.modelReasoningEffort || executionPolicy.reasoningEffort || input.modelReasoningEffort;
       run.modelSelectionReason = run.modelSelectionReason || executionPolicy.selectionReason;
       run.attempt = Math.max(1, Number(run.attempt || 1));
@@ -1184,7 +1246,10 @@ export async function claimRuns(input = {}) {
 }
 
 export async function completeRun(runId, input = {}) {
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
@@ -1202,13 +1267,22 @@ export async function completeRun(runId, input = {}) {
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
     if (run.status === "completed") {
-      handoffFailure = successfulHandoffFailure(state, run, task);
-      if (handoffFailure) {
-        run.status = "failed";
-        run.exitCode = handoffFailure;
-        run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
+      const supersessionReason = reviewerRunSupersessionReason(run, task);
+      if (supersessionReason) {
+        run.completionDisposition = "superseded";
+        run.neutralCompletionReason = supersessionReason;
+        run.attemptConsumed = false;
+        const note = "Reviewer run ended after its candidate was superseded; no review outcome was required.";
+        run.notes = run.notes ? `${run.notes}\n\n${note}` : note;
       } else {
-        applySuccessfulHandoff(state, run, task, now);
+        handoffFailure = successfulHandoffFailure(state, run, task);
+        if (handoffFailure) {
+          run.status = "failed";
+          run.exitCode = handoffFailure;
+          run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
+        } else {
+          applySuccessfulHandoff(state, run, task, now);
+        }
       }
     }
 
@@ -1217,8 +1291,11 @@ export async function completeRun(runId, input = {}) {
       failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
     }
 
-    const summary = run.status === "completed"
-      ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
+    const neutralCompletion = run.status === "completed" && run.completionDisposition === "superseded";
+    const summary = neutralCompletion
+      ? `${run.id} completed neutrally because its review candidate was superseded. Output: ${run.outputPath || "(not recorded)"}`
+      : run.status === "completed"
+        ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
       : `${run.id} failed with exit code ${run.exitCode || "unknown"}. Output: ${run.outputPath || "(not recorded)"}`;
     await appendTaskComment(state, run, summary, now);
     if (failureDisposition) {
@@ -1232,7 +1309,7 @@ export async function completeRun(runId, input = {}) {
 
     state.events.push({
       id: nextId(state.events, "event"),
-      type: run.status === "completed" ? "run_completed" : "run_failed",
+      type: neutralCompletion ? "run_superseded" : run.status === "completed" ? "run_completed" : "run_failed",
       projectId: run.projectId,
       taskId: run.taskId,
       message: summary,
@@ -1581,6 +1658,246 @@ export async function runClaimedRun(run, input = {}) {
   return runClaimedRunWithCli(run, input);
 }
 
+async function defaultRecoveryBranchCheck(run, authContext, input = {}) {
+  try {
+    await git(["ls-remote", "--exit-code", "origin", `refs/heads/${run.branchName}`], {
+      cwd: run.project.repoPath,
+      env: githubAppAuthEnv(authContext, process.env),
+      timeout: Number(input.recoveryBranchTimeoutMs || 60_000),
+    });
+    return { exists: true };
+  } catch (error) {
+    if (Number(error?.code) === 2) return { exists: false };
+    return {
+      exists: null,
+      diagnostic: error?.message || String(error),
+    };
+  }
+}
+
+async function defaultRecoveryPrCheck(run, authContext, input = {}) {
+  try {
+    const result = await execFileAsync("gh", [
+      "pr",
+      "view",
+      run.prUrl,
+      "--json",
+      "state,headRefName,url",
+    ], {
+      cwd: run.project.repoPath,
+      env: githubAppAuthEnv(authContext, process.env),
+      timeout: Number(input.recoveryPrTimeoutMs || 30_000),
+      maxBuffer: 1024 * 1024,
+    });
+    return { ok: true, pr: JSON.parse(result.stdout || "{}") };
+  } catch (error) {
+    const diagnostic = `${error?.message || error}\n${error?.stderr || ""}`.trim();
+    if (/not found|no pull requests found|could not resolve to a pullrequest/i.test(diagnostic)) {
+      return { ok: false, missing: true, diagnostic };
+    }
+    return { ok: false, missing: false, diagnostic };
+  }
+}
+
+function recoveryPreflightRepository(preflight = {}) {
+  const repository = parseGitHubRepoUrl(preflight.originUrl);
+  if (repository) {
+    return {
+      owner: repository.owner.toLowerCase(),
+      repository: repository.name.toLowerCase(),
+    };
+  }
+  const owner = String(preflight.owner || "").trim().toLowerCase();
+  const name = String(preflight.repository || "").trim().replace(/\.git$/i, "").toLowerCase();
+  return owner && name ? { owner, repository: name } : null;
+}
+
+function exactRepositoryMatches(probe, repository) {
+  return Boolean(
+    repository
+    && repository.owner === probe.owner
+    && repository.repository === probe.repository,
+  );
+}
+
+export async function performGitHubRemoteRecoveryProbe(claim, input = {}) {
+  const probe = claim.probe;
+  const run = {
+    ...claim.sourceRun,
+    role: probe.role,
+    actionType: probe.actionType,
+    branchName: probe.branchName,
+    prUrl: probe.prUrl,
+    project: claim.project,
+  };
+  const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
+  const cleanupAuth = input.cleanupGitHubAppAuth || cleanupGitHubAppAuth;
+  const checkPreflight = input.preflightRun || preflightRun;
+  const checkBranch = input.verifyRecoveryBranch || defaultRecoveryBranchCheck;
+  const checkPr = input.verifyRecoveryPr || defaultRecoveryPrCheck;
+  let authContext = null;
+
+  try {
+    const preflight = await checkPreflight(run, {
+      ...input,
+      prepareGitHubAppAuth: async (...args) => {
+        authContext = await prepareAuth(...args);
+        return authContext;
+      },
+      cleanupGitHubAppAuth: async () => {},
+    });
+    const preflightRepository = recoveryPreflightRepository(preflight);
+    if (
+      preflightRepository
+      && !exactRepositoryMatches(probe, preflightRepository)
+    ) {
+      return {
+        ok: false,
+        probeable: false,
+        code: "github_remote_recovery_repository_changed",
+        diagnostic: "The current project checkout no longer resolves to the recorded GitHub repository.",
+      };
+    }
+    if (!preflight?.ok) {
+      const diagnostic = redactSecrets(
+        preflight?.message || preflight?.code || "GitHub remote preflight did not verify access.",
+        githubAppAuthSecrets(authContext),
+      );
+      return {
+        ok: false,
+        probeable: preflight?.code === "inaccessible_github_remote",
+        code: preflight?.code || "github_remote_recovery_preflight_failed",
+        diagnostic,
+      };
+    }
+    if (
+      preflight.workflowMode !== "github"
+      || !exactRepositoryMatches(probe, preflightRepository)
+    ) {
+      return {
+        ok: false,
+        probeable: false,
+        code: "github_remote_recovery_repository_changed",
+        diagnostic: "The current project checkout no longer resolves to the recorded GitHub repository.",
+      };
+    }
+
+    const branch = await checkBranch(run, authContext, input);
+    if (branch === false || branch?.exists === false) {
+      return {
+        ok: false,
+        probeable: false,
+        code: "github_remote_recovery_branch_missing",
+        diagnostic: `The recorded remote branch no longer exists: ${probe.branchName}.`,
+      };
+    }
+    if (!branch || (branch !== true && branch.exists !== true)) {
+      return {
+        ok: false,
+        probeable: true,
+        code: "github_remote_recovery_branch_unverified",
+        diagnostic: redactSecrets(
+          branch?.diagnostic || `The recorded remote branch could not be verified: ${probe.branchName}.`,
+          githubAppAuthSecrets(authContext),
+        ),
+      };
+    }
+
+    if (probe.prUrl) {
+      const prResult = await checkPr(run, authContext, input);
+      if (!prResult?.ok) {
+        return {
+          ok: false,
+          probeable: !prResult?.missing,
+          code: prResult?.missing
+            ? "github_remote_recovery_pr_missing"
+            : "github_remote_recovery_pr_unverified",
+          diagnostic: redactSecrets(
+            prResult?.diagnostic || "The recorded pull request could not be verified.",
+            githubAppAuthSecrets(authContext),
+          ),
+        };
+      }
+      const pr = prResult.pr || prResult;
+      if (String(pr.state || "").toUpperCase() !== "OPEN") {
+        return {
+          ok: false,
+          probeable: false,
+          code: "github_remote_recovery_pr_closed",
+          diagnostic: `The recorded pull request is ${String(pr.state || "not open").toLowerCase()}: ${probe.prUrl}.`,
+        };
+      }
+      if (String(pr.headRefName || "") !== probe.branchName) {
+        return {
+          ok: false,
+          probeable: false,
+          code: "github_remote_recovery_pr_head_changed",
+          diagnostic: `The recorded pull request head no longer matches ${probe.branchName}.`,
+        };
+      }
+      if (pr.url && String(pr.url) !== probe.prUrl) {
+        return {
+          ok: false,
+          probeable: false,
+          code: "github_remote_recovery_pr_target_changed",
+          diagnostic: "The pull request lookup no longer matches the recorded pull request target.",
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      code: "github_remote_recovery_verified",
+      diagnostic: `Verified ${probe.owner}/${probe.repository}, branch ${probe.branchName}${probe.prUrl ? ", and its open pull request" : ""}.`,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      probeable: true,
+      code: "github_remote_recovery_unverified",
+      diagnostic: redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext)),
+    };
+  } finally {
+    await cleanupAuth(authContext);
+  }
+}
+
+export async function runGitHubRemoteRecoveryProbes(input = {}) {
+  const leaseMs = Math.max(15_000, Number(input.recoveryProbeLeaseMs || 90_000));
+  const claimProbes = input.claimRecoveryProbes || claimDueGitHubRemoteRecoveryProbes;
+  const renewLease = input.renewRecoveryProbeLease || renewGitHubRemoteRecoveryProbeLease;
+  const applyResult = input.applyRecoveryProbeResult || applyGitHubRemoteRecoveryProbeResult;
+  const claims = await claimProbes({
+    ...input,
+    leaseMs,
+    limit: Math.min(2, Math.max(1, Number(input.recoveryProbeLimit || 2))),
+  });
+  return Promise.all(claims.map(async (claim) => {
+    const renewalIntervalMs = Math.max(5_000, Math.floor(leaseMs / 3));
+    const renewalTimer = input.state ? null : setInterval(() => {
+      renewLease(claim, {
+        ...input,
+        nowMs: Date.now(),
+        leaseMs,
+      }).catch(() => {
+        // A failed renewal makes the final compare-and-set safely lose its lease.
+      });
+    }, renewalIntervalMs);
+    renewalTimer?.unref();
+    try {
+      const result = await (input.performRecoveryProbe || performGitHubRemoteRecoveryProbe)(claim, input);
+      const applied = await applyResult(claim, result, input);
+      return {
+        taskId: claim.taskId,
+        code: result.code,
+        ...applied,
+      };
+    } finally {
+      if (renewalTimer) clearInterval(renewalTimer);
+    }
+  }));
+}
+
 export async function runQueuedRuns(input = {}) {
   const disk = input.disk || await readDiskAvailability({
     ...input,
@@ -1597,7 +1914,7 @@ export async function runQueuedRuns(input = {}) {
       results: [],
     };
   }
-  const state = await readState();
+  const state = input.state || await readState();
   if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
     return {
       generatedAt: new Date().toISOString(),
@@ -1609,13 +1926,20 @@ export async function runQueuedRuns(input = {}) {
       results: [],
     };
   }
-  const recovered = await reconcileStaleRuns(input);
-  const claimed = await claimRuns(input);
-  const results = await Promise.all(claimed.map((run) => runClaimedRun(run, input)));
+  const reconcile = input.reconcileStaleRuns || reconcileStaleRuns;
+  const claim = input.claimRuns || claimRuns;
+  const execute = input.runClaimedRun || runClaimedRun;
+  const recoverGitHub = input.runGitHubRemoteRecoveryProbes || runGitHubRemoteRecoveryProbes;
+  const recovered = await reconcile(input);
+  const claimed = await claim(input);
+  const resultsPromise = Promise.all(claimed.map((run) => execute(run, input)));
+  const recoveryProbesPromise = recoverGitHub(input);
+  const [results, recoveryProbes] = await Promise.all([resultsPromise, recoveryProbesPromise]);
   return {
     generatedAt: new Date().toISOString(),
     disk,
     recovered,
+    recoveryProbes,
     claimed: claimed.map((run) => run.id),
     results,
   };
@@ -1624,7 +1948,7 @@ export async function runQueuedRuns(input = {}) {
 export function formatRunnerReport(report) {
   const lines = [
     `StudioOps runner sweep (${report.generatedAt})`,
-    `Recovered: ${(report.recovered || []).length}  Claimed: ${report.claimed.length}  Finished: ${report.results.length}`,
+    `Recovered: ${(report.recovered || []).length}  GitHub probes: ${(report.recoveryProbes || []).length}  Claimed: ${report.claimed.length}  Finished: ${report.results.length}`,
     "",
   ];
   if (report.paused) {
@@ -1638,6 +1962,10 @@ export function formatRunnerReport(report) {
     lines.push(`[recovered] ${item.runId}: ${item.reason}${item.blocked ? " (retry limit reached)" : ""}`);
   }
   if (report.recovered?.length) lines.push("");
+  for (const item of report.recoveryProbes || []) {
+    lines.push(`[github-probe] ${item.taskId}: ${item.status || item.reason} (${item.code})`);
+  }
+  if (report.recoveryProbes?.length) lines.push("");
   if (!report.claimed.length) {
     lines.push("No queued runs claimed.");
     return lines.join("\n");

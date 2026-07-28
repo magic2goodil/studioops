@@ -12,10 +12,13 @@ import {
   branchReuseSafetyReason,
   claimRuns,
   cloneFallbackSource,
+  performGitHubRemoteRecoveryProbe,
   planRunnableRuns,
   preflightRun,
   prepareRunWorkspace,
   resolveProjectWorkflowMode,
+  runGitHubRemoteRecoveryProbes,
+  runQueuedRuns,
 } from "../src/runner.js";
 
 const execFileAsync = promisify(execFile);
@@ -504,6 +507,336 @@ test("claim preflight blocks configuration failures once without starting or ret
 
   assert.deepEqual(await claimRuns({ state, limit: 1 }), []);
   assert.equal(state.comments.length, 1);
+});
+
+test("an inaccessible GitHub preflight is retried once after an injectable delay", async () => {
+  const state = fixtureState({
+    status: "in_progress",
+    integrationStatus: "",
+    assignedAgentRole: "builder",
+    branchName: "codex/demo-task",
+  }, {
+    actionType: "start_builder",
+    integrationStatus: "",
+    branchName: "codex/demo-task",
+  });
+  let checks = 0;
+  const delays = [];
+
+  const claimed = await claimRuns({
+    state,
+    limit: 1,
+    preflightRetryDelayMs: 17,
+    delay: async (ms) => { delays.push(ms); },
+    preflightRun: async () => {
+      checks += 1;
+      if (checks === 1) {
+        return {
+          ok: false,
+          code: "inaccessible_github_remote",
+          message: "temporary network failure",
+          remediation: "retry",
+          owner: "example",
+          repository: "demo",
+          originUrl: "https://github.com/example/demo.git",
+        };
+      }
+      return {
+        ok: true,
+        workflowMode: "github",
+        originUrl: "https://github.com/example/demo.git",
+      };
+    },
+  });
+
+  assert.equal(checks, 2);
+  assert.deepEqual(delays, [17]);
+  assert.equal(claimed.length, 1);
+  assert.equal(state.runs[0].status, "running");
+  assert.equal(state.tasks[0].automationBlocker, undefined);
+});
+
+test("two inaccessible GitHub preflights cancel before launch and schedule exact recovery", async () => {
+  const state = fixtureState({
+    status: "in_progress",
+    integrationStatus: "",
+    assignedAgentRole: "builder",
+    branchName: "codex/demo-task",
+    automationAttemptEpoch: 4,
+  }, {
+    actionType: "start_builder",
+    integrationStatus: "",
+    branchName: "codex/demo-task",
+    attempt: 1,
+    attemptKey: "task_1:builder:4",
+  });
+  state.projects[0].repoUrl = "https://github.com/Example/Demo.git";
+  const failure = {
+    ok: false,
+    code: "inaccessible_github_remote",
+    message: "The GitHub origin is not accessible: timed out",
+    remediation: "Verify access.",
+    owner: "Example",
+    repository: "Demo",
+    originUrl: state.projects[0].repoUrl,
+  };
+
+  assert.deepEqual(await claimRuns({
+    state,
+    limit: 1,
+    preflightRetryDelayMs: 0,
+    preflightRun: async () => failure,
+  }), []);
+
+  const probe = state.tasks[0].automationBlocker.recoveryProbe;
+  assert.equal(state.runs[0].status, "cancelled");
+  assert.equal(state.runs[0].attemptKey, "");
+  assert.equal(state.runs[0].startedAt, undefined);
+  assert.equal(state.tasks[0].automationAttemptEpoch, 4);
+  assert.deepEqual({
+    sourceRunId: probe.sourceRunId,
+    projectId: probe.projectId,
+    owner: probe.owner,
+    repository: probe.repository,
+    role: probe.role,
+    actionType: probe.actionType,
+    branchName: probe.branchName,
+    prUrl: probe.prUrl,
+    resumeStatus: probe.resumeStatus,
+    probeCount: probe.probeCount,
+  }, {
+    sourceRunId: "run_1",
+    projectId: "project_1",
+    owner: "example",
+    repository: "demo",
+    role: "builder",
+    actionType: "start_builder",
+    branchName: "codex/demo-task",
+    prUrl: "",
+    resumeStatus: "queued",
+    probeCount: 0,
+  });
+  assert.equal(Date.parse(probe.nextProbeAt) - Date.parse(probe.lastProbeAt || state.tasks[0].automationBlocker.blockedAt), 60_000);
+  assert.equal(probe.lastCode, "inaccessible_github_remote");
+  assert.equal(probe.lease, null);
+});
+
+test("periodic GitHub recovery failure then success restores state without a run or attempt mutation", async () => {
+  const initialNow = Date.parse("2026-07-21T12:00:00.000Z");
+  const state = fixtureState({
+    status: "in_progress",
+    integrationStatus: "",
+    assignedAgentRole: "builder",
+    branchName: "codex/demo-task",
+    automationAttemptEpoch: 7,
+  }, {
+    actionType: "start_builder",
+    integrationStatus: "",
+    branchName: "codex/demo-task",
+    attempt: 1,
+  });
+  state.projects[0].repoUrl = "https://github.com/example/demo.git";
+  const failure = {
+    ok: false,
+    code: "inaccessible_github_remote",
+    message: "temporary",
+    remediation: "retry",
+    owner: "example",
+    repository: "demo",
+    originUrl: state.projects[0].repoUrl,
+  };
+  await claimRuns({
+    state,
+    limit: 1,
+    preflightRetryDelayMs: 0,
+    preflightRun: async () => failure,
+  });
+  state.tasks[0].automationBlocker.blockedAt = new Date(initialNow).toISOString();
+  state.tasks[0].automationBlocker.recoveryProbe.nextProbeAt = new Date(initialNow + 60_000).toISOString();
+  const runCount = state.runs.length;
+  const attempt = state.runs[0].attempt;
+
+  const failed = await runGitHubRemoteRecoveryProbes({
+    state,
+    nowMs: initialNow + 60_000,
+    performRecoveryProbe: async () => ({
+      ok: false,
+      probeable: true,
+      code: "inaccessible_github_remote",
+      diagnostic: "still unavailable",
+    }),
+  });
+  assert.equal(failed[0].status, "waiting");
+  assert.equal(state.tasks[0].automationBlocker.recoveryProbe.probeCount, 1);
+  assert.equal(
+    Date.parse(state.tasks[0].automationBlocker.recoveryProbe.nextProbeAt),
+    initialNow + 3 * 60_000,
+  );
+
+  const recovered = await runGitHubRemoteRecoveryProbes({
+    state,
+    nowMs: initialNow + 3 * 60_000,
+    performRecoveryProbe: async () => ({
+      ok: true,
+      code: "github_remote_recovery_verified",
+      diagnostic: "verified",
+    }),
+  });
+  assert.equal(recovered[0].status, "recovered");
+  assert.equal(state.tasks[0].status, "queued");
+  assert.equal(state.tasks[0].automationBlocker, undefined);
+  assert.equal(state.tasks[0].automationAttemptEpoch, 7);
+  assert.equal(state.runs.length, runCount);
+  assert.equal(state.runs[0].attempt, attempt);
+  assert.equal(state.comments.filter((comment) => /restored queued/.test(comment.body)).length, 1);
+  assert.equal(state.events.filter((event) => event.type === "github_remote_recovery_verified").length, 1);
+});
+
+test("recovery probes do not delay ordinary claimed worker launch", async () => {
+  const order = [];
+  let finishProbe;
+  const reportPromise = runQueuedRuns({
+    state: { meta: {} },
+    disk: { pressure: false },
+    reconcileStaleRuns: async () => [],
+    claimRuns: async () => [{ id: "run_ready", taskId: "task_1" }],
+    runClaimedRun: async (run) => {
+      order.push(`run:${run.id}`);
+      return { ...run, status: "completed", exitCode: "" };
+    },
+    runGitHubRemoteRecoveryProbes: async () => {
+      order.push("probe");
+      return new Promise((resolve) => { finishProbe = resolve; });
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["run:run_ready", "probe"]);
+  finishProbe([{ taskId: "task_blocked", status: "waiting", code: "unavailable" }]);
+  const report = await reportPromise;
+  assert.deepEqual(report.claimed, ["run_ready"]);
+  assert.equal(report.results[0].status, "completed");
+  assert.equal(report.recoveryProbes[0].status, "waiting");
+});
+
+test("a completed recovery probe applies without waiting for a slower sibling", async () => {
+  const claims = [
+    { taskId: "task_fast", leaseId: "lease_fast" },
+    { taskId: "task_slow", leaseId: "lease_slow" },
+  ];
+  let releaseSlowProbe;
+  let fastApplied = false;
+  const reportPromise = runGitHubRemoteRecoveryProbes({
+    claimRecoveryProbes: async () => claims,
+    performRecoveryProbe: async (claim) => {
+      if (claim.taskId === "task_fast") {
+        return { ok: true, code: "github_remote_recovery_verified" };
+      }
+      return new Promise((resolve) => { releaseSlowProbe = resolve; });
+    },
+    applyRecoveryProbeResult: async (claim) => {
+      if (claim.taskId === "task_fast") fastApplied = true;
+      return { applied: true, status: "recovered" };
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fastApplied, true);
+  releaseSlowProbe({ ok: false, probeable: true, code: "inaccessible_github_remote" });
+  const results = await reportPromise;
+  assert.deepEqual(results.map((result) => result.taskId), ["task_fast", "task_slow"]);
+});
+
+test("periodic recovery verifies exact repository branch and pull request head", async () => {
+  const claim = {
+    probe: {
+      owner: "example",
+      repository: "demo",
+      role: "backend-reviewer",
+      actionType: "start_review",
+      branchName: "codex/demo-task",
+      prUrl: "https://github.com/example/demo/pull/12",
+    },
+    sourceRun: {
+      id: "run_1",
+      group: "reviewer",
+      role: "backend-reviewer",
+      actionType: "start_review",
+    },
+    project: {
+      repoPath: "/tmp/demo",
+      workflowMode: "github",
+    },
+  };
+  let preparedRole = "";
+  const result = await performGitHubRemoteRecoveryProbe(claim, {
+    prepareGitHubAppAuth: async (run) => {
+      preparedRole = run.role;
+      return { token: "secret-token" };
+    },
+    cleanupGitHubAppAuth: async () => {},
+    preflightRun: async (run, input) => {
+      await input.prepareGitHubAppAuth(run);
+      return {
+        ok: true,
+        workflowMode: "github",
+        originUrl: "git@github.com:example/demo.git",
+      };
+    },
+    verifyRecoveryBranch: async () => ({ exists: true }),
+    verifyRecoveryPr: async () => ({
+      ok: true,
+      pr: { state: "OPEN", headRefName: "codex/demo-task" },
+    }),
+  });
+
+  assert.equal(preparedRole, "backend-reviewer");
+  assert.equal(result.ok, true);
+
+  const missingBranch = await performGitHubRemoteRecoveryProbe(claim, {
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "github",
+      originUrl: "https://github.com/example/demo.git",
+    }),
+    cleanupGitHubAppAuth: async () => {},
+    verifyRecoveryBranch: async () => ({ exists: false }),
+  });
+  assert.equal(missingBranch.probeable, false);
+  assert.equal(missingBranch.code, "github_remote_recovery_branch_missing");
+
+  const closedPr = await performGitHubRemoteRecoveryProbe(claim, {
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "github",
+      originUrl: "https://github.com/example/demo.git",
+    }),
+    cleanupGitHubAppAuth: async () => {},
+    verifyRecoveryBranch: async () => ({ exists: true }),
+    verifyRecoveryPr: async () => ({
+      ok: true,
+      pr: { state: "CLOSED", headRefName: "codex/demo-task" },
+    }),
+  });
+  assert.equal(closedPr.probeable, false);
+  assert.equal(closedPr.code, "github_remote_recovery_pr_closed");
+
+  const changedInaccessibleOrigin = await performGitHubRemoteRecoveryProbe(claim, {
+    preflightRun: async () => ({
+      ok: false,
+      code: "inaccessible_github_remote",
+      message: "The changed origin is inaccessible.",
+      originUrl: "https://github.com/example/different-repository.git",
+      owner: "example",
+      repository: "different-repository",
+    }),
+    cleanupGitHubAppAuth: async () => {},
+  });
+  assert.equal(changedInaccessibleOrigin.probeable, false);
+  assert.equal(
+    changedInaccessibleOrigin.code,
+    "github_remote_recovery_repository_changed",
+  );
 });
 
 test("dead or overlong running jobs are identified for automatic recovery", () => {

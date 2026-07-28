@@ -13,6 +13,7 @@ import {
   recordQaDecision,
   recordReview,
   readState,
+  readStateReadOnly,
   resetAutomationCircuit,
   resumeOperatorAutomation,
   setOperatorPause,
@@ -35,6 +36,7 @@ import {
   writeConfig,
 } from "./config.js";
 import { backupStateDatabase } from "./state-database.js";
+import { getCodexCreditSnapshot } from "./credit-policy.js";
 import {
   defaultStudioOpsCredentialsRoot,
   defaultStudioOpsGitLockRoot,
@@ -151,11 +153,64 @@ async function setup() {
         executionPolicy: {
           model: "gpt-5.6-sol",
           reasoningEffort: "high",
+          architectReasoningEffort: "xhigh",
           leadReasoningEffort: "xhigh",
           complexReasoningEffort: "xhigh",
+          mechanicalLabels: ["spark-ok"],
+          escalationLabels: ["ultra-review"],
+          modelTiers: {
+            mechanical: {
+              model: "gpt-5.3-codex-spark",
+              reasoningEffort: "high",
+            },
+            economy: {
+              model: "gpt-5.6-luna",
+              reasoningEffort: "medium",
+            },
+            balanced: {
+              model: "gpt-5.6-terra",
+              reasoningEffort: "high",
+            },
+            critical: {
+              model: "gpt-5.6-sol",
+              reasoningEffort: "high",
+            },
+            frontier: {
+              model: "gpt-5.6-sol",
+              reasoningEffort: "ultra",
+            },
+          },
+          tierRouting: {
+            defaultTier: "economy",
+            mechanicalTier: "mechanical",
+            architectTier: "critical",
+            leadTier: "critical",
+            complexTier: "critical",
+            escalationTier: "frontier",
+          },
+          roles: {
+            "backend-reviewer": { tier: "balanced" },
+            "frontend-reviewer": { tier: "balanced" },
+            "accessibility-reviewer": { tier: "balanced" },
+          },
           maxAttempts: 2,
           retryBackoffMs: 30000,
           staleRunMs: 7200000,
+        },
+        creditPolicy: {
+          enabled: false,
+          refreshIntervalMs: 300000,
+          snapshotMaxAgeMs: 900000,
+          probeTimeoutMs: 20000,
+          reserveCredits: 5,
+          failClosedTiers: ["critical", "frontier"],
+          tierBudgets: {
+            mechanical: { estimatedCredits: 2, minRemainingPercent: 2 },
+            economy: { estimatedCredits: 8, minRemainingPercent: 5 },
+            balanced: { estimatedCredits: 15, minRemainingPercent: 10 },
+            critical: { estimatedCredits: 30, minRemainingPercent: 20 },
+            frontier: { estimatedCredits: 40, minRemainingPercent: 35 },
+          },
         },
         supervisor: {
           intervalSeconds: 15,
@@ -368,11 +423,12 @@ Commands:
   import-config                 Register projects from StudioOps configuration
   projects                      List projects
   tasks                         List tasks, optionally --project key and --status value
+  show-task TASK_ID             Read-only inspection of one task and its current review subject
   add-project --key --name      Add a project
   update-project PROJECT        Update project settings and Trust Leads policy
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
-  status TASK_ID --status       Update task status
+  status TASK_ID --status       Mutate task status (requires one canonical non-empty status)
   comment TASK_ID --body        Add a builder/reviewer comment
   architecture-complete TASK   Record the architecture decision and implementation task graph
   review TASK_ID --stage        Record approved, skipped, or changes_requested
@@ -407,6 +463,7 @@ Task fields:
   --architecture-required       Route this task through systems architecture before builders
   --architecture-approved       Stage a --parent child for atomic approval when parent architecture completes
   --lane                        Work lane: backend, frontend, design, devops, product
+  --labels                      Task policy labels, comma or newline separated
   --work-area                   Expected file/work areas, comma or newline separated
   --branch                      Associated feature branch
   --pr-url                      Associated pull request URL
@@ -540,6 +597,31 @@ Automation:
     return;
   }
 
+  if (command === "show-task") {
+    const taskId = args._[1];
+    if (!taskId) throw new Error("Usage: show-task TASK_ID [--json] (read-only task inspection)");
+    const state = await readStateReadOnly();
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (!task) throw new Error(`Unknown task: ${taskId}`);
+    const project = state.projects.find((item) => item.id === task.projectId);
+    const inspection = {
+      id: task.id,
+      title: task.title,
+      project: project?.key || task.projectId,
+      status: task.status,
+      assignedRole: task.assignedAgentRole || "",
+      reviewCycle: task.reviewCycle || 0,
+      reviewSubjectSha: task.reviewSubjectSha || "",
+      reviewSubjectCycle: task.reviewSubjectCycle || 0,
+      branchName: task.branchName || "",
+      prUrl: task.prUrl || "",
+      updatedAt: task.updatedAt || "",
+    };
+    if (args.json) console.log(JSON.stringify(inspection, null, 2));
+    else printTable([inspection], ["id", "project", "status", "assignedRole", "reviewCycle", "reviewSubjectSha", "branchName", "prUrl", "updatedAt"]);
+    return;
+  }
+
   if (command === "runs") {
     const state = await readState();
     const projectFilter = args.project
@@ -661,6 +743,7 @@ Automation:
       type: args.type,
       area: args.area,
       lane: args.lane,
+      labels: args.labels || args.label,
       workAreas: args["work-area"] || args["work-areas"],
       parentTaskId: args.parent || args["parent-task-id"] || args.epic,
       dependsOnTaskIds: args["depends-on"] || args.dependencies,
@@ -700,6 +783,8 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
     if (Object.prototype.hasOwnProperty.call(args, "type")) patch.type = args.type;
     if (Object.prototype.hasOwnProperty.call(args, "lane")) patch.lane = args.lane;
+    if (Object.prototype.hasOwnProperty.call(args, "labels")) patch.labels = args.labels;
+    if (Object.prototype.hasOwnProperty.call(args, "label")) patch.labels = args.label;
     if (Object.prototype.hasOwnProperty.call(args, "work-area")) patch.workAreas = args["work-area"];
     if (Object.prototype.hasOwnProperty.call(args, "work-areas")) patch.workAreas = args["work-areas"];
     if (Object.prototype.hasOwnProperty.call(args, "priority")) patch.priority = args.priority;
@@ -729,6 +814,9 @@ Automation:
 
   if (command === "status") {
     const taskId = args._[1];
+    if (!taskId || !Object.prototype.hasOwnProperty.call(args, "status") || typeof args.status !== "string" || !args.status.trim()) {
+      throw new Error("Usage: status TASK_ID --status CANONICAL_STATUS (status is a mutation; use show-task TASK_ID for read-only inspection)");
+    }
     const task = await updateTask(taskId, { status: args.status });
     console.log(`${task.id} -> ${task.status}`);
     return;
@@ -829,7 +917,12 @@ Automation:
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
       },
+      creditPolicy: {
+        ...(config?.defaults?.creditPolicy || {}),
+        ...(config?.creditPolicy || {}),
+      },
     };
+    options.creditSnapshot = await getCodexCreditSnapshot(options.creditPolicy);
     if (args.plan) {
       const plan = planDispatches(state, supervisor.actions, options);
       const report = {

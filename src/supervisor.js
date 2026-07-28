@@ -1,7 +1,12 @@
 import {
   architectureIsCompleteInState,
+  currentReviewCandidateCycle,
+  earliestIncompleteRequiredReviewStage,
+  latestCurrentReviewForStage,
   reviewPolicyForProject,
+  reviewMatchesCurrentCandidate,
   reviewStagesForProject,
+  VALID_STATUSES,
 } from "./store.js";
 import {
   branchWebUrl,
@@ -37,7 +42,7 @@ function promptCommand(task, role) {
 
 function reviewCommand(task, stage) {
   const subject = task.reviewSubjectSha || "<full-head-sha>";
-  const cycle = Number(task.reviewCycle || 0) || "<candidate-cycle>";
+  const cycle = currentReviewCandidateCycle(task) || "<candidate-cycle>";
   return `node src/mission-control-cli.js review ${task.id} --stage ${stage.key} --subject-sha ${subject} --candidate-cycle ${cycle} --outcome approved --body "Reviewed ${stage.label || stage.key}."`;
 }
 
@@ -53,14 +58,6 @@ function incompleteDependencies(state, task) {
 
 function currentReviewCycle(task) {
   return Number(task.reviewCycle || 0);
-}
-
-function latestReviewForStage(state, task, stage) {
-  return (state.reviews || [])
-    .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
-    .filter((review) => review.stageKey === stage.key || review.status === stage.status || review.role === stage.role)
-    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
 }
 
 function isLeadReviewStage(stage) {
@@ -81,14 +78,14 @@ function reviewCycleAtLimit(project, task) {
 function changeRequestedReviewsForCycle(state, task) {
   return (state.reviews || [])
     .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
+    .filter((review) => reviewMatchesCurrentCandidate(task, review))
     .filter((review) => review.outcome === "changes_requested");
 }
 
 function leadReviewCompleteForCycle(state, task, project) {
   const leadStage = leadReviewStageForProject(project);
   if (!leadStage) return false;
-  const latest = latestReviewForStage(state, task, leadStage);
+  const latest = latestCurrentReviewForStage(state, task, leadStage);
   return latest && REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
 }
 
@@ -105,7 +102,7 @@ function nextOpenReviewStage(state, project, task) {
     return leadReviewStageForProject(project);
   }
   return reviewStagesForProject(project).find((stage) => {
-    const latest = latestReviewForStage(state, task, stage);
+    const latest = latestCurrentReviewForStage(state, task, stage);
     return !latest || !REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
   }) || null;
 }
@@ -126,6 +123,21 @@ function projectSummary(state, project) {
     taskCount: tasks.length,
     statuses: statusCounts(tasks),
   };
+}
+
+export function workflowIntegrityFaults(state) {
+  return (state.tasks || [])
+    .filter((task) => {
+      const status = typeof task.status === "string" ? task.status.trim() : "";
+      return task.status !== status || !status || !VALID_STATUSES.has(status);
+    })
+    .map((task) => ({
+      taskId: task.id,
+      taskTitle: task.title || "Untitled task",
+      observedStatus: task.status ?? null,
+      fault: "invalid_task_status",
+      reason: `Task has no canonical workflow status. Repair with: status ${task.id} --status <canonical-status>. Existing review evidence and subject SHA are preserved by an explicit status repair.`,
+    }));
 }
 
 function actionBase(state, task, type, role, reason, options = {}) {
@@ -154,6 +166,8 @@ function actionBase(state, task, type, role, reason, options = {}) {
     integrationPrUrl: task.integrationPrUrl || "",
     integrationCheckState: task.integrationCheckState || null,
     integrationBlocker: task.integrationBlocker || "",
+    reviewSubjectSha: task.reviewSubjectSha || "",
+    candidateCycle: currentReviewCandidateCycle(task),
     promptCommand: role && role !== "owner" && !String(role).includes("integration-worker") ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     integrationCommand: options.integrationCommand || "",
@@ -228,7 +242,9 @@ function taskActions(state, task, options = {}) {
       "waiting_on_architecture",
       "",
       architectureParent
-        ? `Waiting for parent ${architectureParent.id} to record the durable architecture decision and governed task graph.`
+        ? architectureParent.architectureStatus === "completed"
+          ? `Parent ${architectureParent.id}'s approved architecture graph is no longer valid. Repair the governed child contract or record a new architecture decision before dispatch.`
+          : `Waiting for parent ${architectureParent.id} to record the durable architecture decision and governed task graph.`
         : `Waiting for missing architecture parent ${task.architectureParentTaskId} to be repaired.`,
       options,
     )];
@@ -252,6 +268,40 @@ function taskActions(state, task, options = {}) {
 
   if (task.type === "epic" || hasChildren) return [];
 
+  const stages = reviewStagesForProject(project);
+  const currentStage = stageForStatus(project, task.status);
+  const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+  const currentStageIndex = stages.indexOf(currentStage);
+  const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
+  const laterReviewStatuses = new Set([
+    "qa_review",
+    "user_review",
+    "approved_for_main",
+    "promotion_blocked",
+    "approved",
+  ]);
+  if (
+    task.reviewSubjectSha
+    && earliestRequiredStage
+    && (
+      (currentStage && currentStageIndex > earliestRequiredIndex)
+      || (!currentStage && laterReviewStatuses.has(task.status))
+    )
+  ) {
+    return [actionBase(
+      state,
+      task,
+      "start_review",
+      earliestRequiredStage.role,
+      `${earliestRequiredStage.label || earliestRequiredStage.key} lacks approval for candidate cycle ${currentReviewCandidateCycle(task)} at ${task.reviewSubjectSha}; later review and owner/QA handoff are blocked.`,
+      {
+        ...options,
+        stage: earliestRequiredStage,
+        nextStatus: earliestRequiredStage.status,
+      },
+    )];
+  }
+
   if (BUILDABLE_STATUSES.has(task.status)) {
     if (missingDependencies.length) {
       return [actionBase(
@@ -272,6 +322,25 @@ function taskActions(state, task, options = {}) {
   if (task.status === "blocked") {
     if (task.automationBlocker) {
       const blocker = task.automationBlocker;
+      const recoveryProbe = blocker.recoveryProbe;
+      if (
+        blocker.type === "configuration"
+        && blocker.reason === "inaccessible_github_remote"
+        && recoveryProbe?.nextProbeAt
+      ) {
+        const target = recoveryProbe.prUrl || recoveryProbe.branchName || "(missing target)";
+        return [actionBase(
+          state,
+          task,
+          "waiting_for_github_remote_recovery",
+          "",
+          `Automatic GitHub recovery probe ${Number(recoveryProbe.probeCount || 0) + 1} is due at ${recoveryProbe.nextProbeAt}. Role: ${recoveryProbe.role}; repository: ${recoveryProbe.owner}/${recoveryProbe.repository}; target: ${target}; latest diagnostic: ${recoveryProbe.lastDiagnostic || blocker.message || "GitHub remote unavailable"}.`,
+          {
+            ...options,
+            nextStatus: recoveryProbe.resumeStatus || blocker.resumeStatus || "queued",
+          },
+        )];
+      }
       if (["execution", "transient"].includes(blocker.type)) {
         return [actionBase(
           state,
@@ -338,9 +407,8 @@ function taskActions(state, task, options = {}) {
     })];
   }
 
-  const currentStage = stageForStatus(project, task.status);
   if (currentStage) {
-    const latest = latestReviewForStage(state, task, currentStage);
+    const latest = latestCurrentReviewForStage(state, task, currentStage);
     if (!latest) {
       return [actionBase(state, task, "continue_review", currentStage.role, `${currentStage.label || currentStage.key} has not recorded an outcome yet.`, {
         ...options,
@@ -470,12 +538,14 @@ function sortActions(actions) {
 }
 
 export function createSupervisorReport(state, options = {}) {
+  const integrityFaults = workflowIntegrityFaults(state);
   const allActions = sortActions((state.tasks || []).flatMap((task) => taskActions(state, task, options)));
   const passiveActionTypes = new Set([
     "waiting_on_architecture",
     "waiting_on_dependency",
     "waiting_for_retry",
     "waiting_on_qa_integration_handoff",
+    "waiting_for_github_remote_recovery",
     "blocked",
     "release_candidate_ready",
   ]);
@@ -496,7 +566,9 @@ export function createSupervisorReport(state, options = {}) {
         counts[action.type] = (counts[action.type] || 0) + 1;
         return counts;
       }, {}),
+      integrityFaults: integrityFaults.length,
     },
+    integrityFaults,
     actions,
   };
 }
@@ -504,9 +576,14 @@ export function createSupervisorReport(state, options = {}) {
 export function formatSupervisorReport(report) {
   const lines = [
     `StudioOps supervisor sweep (${report.generatedAt})`,
-    `Projects: ${report.totals.projects}  Tasks: ${report.totals.tasks}  Actions: ${report.totals.actions}  Waiting: ${report.totals.waiting}`,
+    `Projects: ${report.totals.projects}  Tasks: ${report.totals.tasks}  Actions: ${report.totals.actions}  Waiting: ${report.totals.waiting}  Integrity faults: ${report.totals.integrityFaults || 0}`,
     "",
   ];
+
+  for (const fault of report.integrityFaults || []) {
+    lines.push(`[integrity] ${fault.taskId} ${fault.fault}: ${fault.reason}`);
+  }
+  if ((report.integrityFaults || []).length) lines.push("");
 
   if (!report.actions.length) {
     lines.push("No actionable work found.");
