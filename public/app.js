@@ -2,7 +2,14 @@ const state = {
   projects: [],
   tasks: [],
   qaBundles: [],
-  ownerInbox: { count: 0, items: [], operatorPause: null },
+  ownerInbox: {
+    count: 0,
+    totalCount: 0,
+    counts: { decisions: 0, operations: 0, legacy: 0 },
+    groups: [],
+    items: [],
+    operatorPause: null,
+  },
   selectedProjectId: "",
   selectedTaskId: "",
   routeTaskId: "",
@@ -26,9 +33,12 @@ const configStatus = document.querySelector("#configStatus");
 const productPlan = document.querySelector("#productPlan");
 const attentionButton = document.querySelector("#attentionButton");
 const attentionCount = document.querySelector("#attentionCount");
+const operationsButton = document.querySelector("#operationsButton");
+const operationsCount = document.querySelector("#operationsCount");
 const systemStatus = document.querySelector("#systemStatus");
 const ownerInbox = document.querySelector("#ownerInbox");
 const ownerInboxCount = document.querySelector("#ownerInboxCount");
+const ownerInboxSummary = document.querySelector("#ownerInboxSummary");
 const ownerInboxList = document.querySelector("#ownerInboxList");
 const detailPanel = document.querySelector(".detail-panel");
 const detailHeading = document.querySelector(".detail-panel .panel-header h2");
@@ -62,8 +72,10 @@ function escapeHtml(value) {
 }
 
 function safeHttpUrl(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return "";
   try {
-    const url = new URL(String(value || ""), window.location.origin);
+    const url = new URL(candidate, window.location.origin);
     return ["http:", "https:"].includes(url.protocol) ? url.href : "";
   } catch {
     return "";
@@ -310,11 +322,19 @@ function attachmentList(attachments) {
 }
 
 async function loadState() {
+  renderInboxLoading();
   const data = await api("/api/state");
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
   state.qaBundles = data.qaBundles || [];
-  state.ownerInbox = data.ownerInbox || { count: 0, items: [], operatorPause: null };
+  state.ownerInbox = data.ownerInbox || {
+    count: 0,
+    totalCount: 0,
+    counts: { decisions: 0, operations: 0, legacy: 0 },
+    groups: [],
+    items: [],
+    operatorPause: null,
+  };
   state.productAccess = data.productAccess || null;
   if (productPlan && state.productAccess) {
     productPlan.textContent = `${state.productAccess.planName} · ${state.productAccess.connectedToCloud ? "cloud" : "local"}`;
@@ -386,20 +406,42 @@ function notificationStatusText(notification) {
   return "Desktop notification pending";
 }
 
+function plural(count, singular, pluralLabel = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : pluralLabel}`;
+}
+
+function formatAge(ageMs) {
+  if (!Number.isFinite(ageMs)) return "age unavailable";
+  if (ageMs < 60_000) return "just now";
+  if (ageMs < 60 * 60_000) return `${Math.floor(ageMs / 60_000)}m old`;
+  if (ageMs < 24 * 60 * 60_000) return `${Math.floor(ageMs / (60 * 60_000))}h old`;
+  if (ageMs < 14 * 24 * 60 * 60_000) return `${Math.floor(ageMs / (24 * 60 * 60_000))}d old`;
+  return `${Math.floor(ageMs / (7 * 24 * 60 * 60_000))}w old`;
+}
+
+function inboxAge(item) {
+  const updatedAt = String(item.updatedAt || "");
+  const ageMs = item.ageMs === null || item.ageMs === undefined ? Number.NaN : Number(item.ageMs);
+  const label = formatAge(ageMs);
+  return updatedAt
+    ? `<time datetime="${escapeHtml(updatedAt)}" title="${escapeHtml(new Date(updatedAt).toLocaleString())}">${escapeHtml(label)}</time>`
+    : `<span>${escapeHtml(label)}</span>`;
+}
+
 function inboxChecklist(item) {
   const checklist = Array.isArray(item.checklist) ? item.checklist : [];
   const label = item.checklistLabel || "Handoff checklist";
   if (!checklist.length) {
     return `
-      <div class="owner-inbox-checklist">
+      <div class="owner-inbox-checklist empty">
         <strong>${escapeHtml(label)}</strong>
         <p>No acceptance criteria were recorded for this handoff.</p>
       </div>
     `;
   }
   return `
-    <div class="owner-inbox-checklist">
-      <strong>${escapeHtml(label)}</strong>
+    <details class="owner-inbox-checklist">
+      <summary>${escapeHtml(label)} · ${plural(checklist.length, "item")}</summary>
       <ul>
         ${checklist.map((entry) => {
     const text = typeof entry === "string" ? entry : entry.text;
@@ -407,7 +449,7 @@ function inboxChecklist(item) {
     return `<li>${taskId ? `<span>${escapeHtml(taskId)}</span>` : ""}${escapeHtml(text)}</li>`;
   }).join("")}
       </ul>
-    </div>
+    </details>
   `;
 }
 
@@ -445,25 +487,68 @@ function inboxTaskLinks(item) {
   `;
 }
 
-function renderOwnerInbox() {
-  const inbox = state.ownerInbox || { count: 0, items: [] };
-  const items = inbox.items || [];
-  ownerInbox.hidden = items.length === 0;
-  attentionButton.hidden = items.length === 0;
-  attentionCount.textContent = String(items.length);
-  attentionButton.setAttribute("aria-label", `Action required: ${items.length} item${items.length === 1 ? "" : "s"}`);
-  ownerInboxCount.textContent = `${items.length} item${items.length === 1 ? "" : "s"}`;
-  ownerInboxList.innerHTML = items.map((item) => {
-    const previewUrl = safeHttpUrl(item.previewUrl);
-    const prUrl = safeHttpUrl(item.prUrl);
+function inboxPrimaryAction(item) {
+  const action = item.primaryAction || {};
+  const href = safeHttpUrl(action.href);
+  if (action.type === "task" && action.taskId) {
     return `
+      <button type="button" class="primary-action" data-inbox-task-id="${escapeHtml(action.taskId)}">
+        ${escapeHtml(action.label || "Open task")}
+      </button>
+    `;
+  }
+  if (action.type === "command" && action.value) {
+    return `
+      <button type="button" class="primary-action" data-copy-inbox-value="${escapeHtml(action.value)}">
+        ${escapeHtml(action.label || "Copy command")}
+      </button>
+    `;
+  }
+  if (href) {
+    const external = action.type === "pr" ? ` target="_blank" rel="noreferrer"` : "";
+    return `<a class="primary-action" href="${escapeHtml(href)}"${external}>${escapeHtml(action.label || "Open")}</a>`;
+  }
+  return `<span class="primary-action unavailable" aria-disabled="true">Primary action unavailable</span>`;
+}
+
+function inboxSecondaryActions(item) {
+  if (item.group === "operations") return "";
+  const primaryHref = safeHttpUrl(item.primaryAction?.href);
+  const prUrl = safeHttpUrl(item.prUrl);
+  const links = [];
+  if (prUrl && prUrl !== primaryHref) {
+    links.push(`<a href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open pull request</a>`);
+  }
+  if (item.integrationBranch) links.push(`<span>${escapeHtml(item.integrationBranch)}</span>`);
+  return links.join("");
+}
+
+function inboxItemMarkup(item) {
+  const identity = item.taskId || item.bundleId || "project";
+  const showTaskLinks = item.tasks?.length
+    || (item.taskId && item.primaryAction?.type !== "task");
+  const diagnostic = item.diagnostic
+    ? `<span class="inbox-label diagnostic">${escapeHtml(item.diagnosticLabel || "Non-production diagnostic")}</span>`
+    : "";
+  const stale = item.stale ? `<span class="inbox-label stale">Stale record</span>` : "";
+  return `
     <article class="owner-inbox-item ${escapeHtml(item.severity || "action")}">
       <div class="owner-inbox-item-heading">
         <div>
-          <span>${escapeHtml(item.projectKey || item.projectName || "project")} · ${escapeHtml(item.taskId || item.bundleId || "")}</span>
+          <span class="inbox-item-meta">
+            <strong>${escapeHtml(item.projectKey || item.projectName || "project")}</strong>
+            <span aria-hidden="true">·</span>
+            <span>${escapeHtml(identity)}</span>
+            <span aria-hidden="true">·</span>
+            ${inboxAge(item)}
+          </span>
           <h3>${escapeHtml(item.title)}</h3>
         </div>
-        <span class="inbox-status">${escapeHtml(String(item.status || "").replaceAll("_", " "))}</span>
+        <div class="inbox-labels">
+          ${diagnostic}
+          ${stale}
+          <span class="inbox-status">${escapeHtml(String(item.status || "").replaceAll("_", " "))}</span>
+        </div>
       </div>
       <p>${escapeHtml(item.nextAction || "")}</p>
       ${item.blocker ? `
@@ -474,15 +559,114 @@ function renderOwnerInbox() {
       ` : ""}
       ${inboxChecklist(item)}
       <div class="owner-inbox-actions">
-        ${previewUrl ? `<a class="primary-action" href="${escapeHtml(previewUrl)}">Open local QA</a>` : ""}
-        ${prUrl ? `<a href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open pull request</a>` : ""}
-        ${item.integrationBranch ? `<span>${escapeHtml(item.integrationBranch)}</span>` : ""}
+        ${inboxPrimaryAction(item)}
+        ${inboxSecondaryActions(item)}
       </div>
-      <div class="owner-inbox-tasks">${inboxTaskLinks(item)}</div>
+      ${showTaskLinks ? `<div class="owner-inbox-tasks" aria-label="Tasks in this handoff">${inboxTaskLinks(item)}</div>` : ""}
       <small class="notification-delivery ${escapeHtml(item.notification?.status || "pending")}">${escapeHtml(notificationStatusText(item.notification))}</small>
     </article>
   `;
-  }).join("");
+}
+
+function inboxGroups(inbox) {
+  if (Array.isArray(inbox.groups) && inbox.groups.length) return inbox.groups;
+  const definitions = {
+    decisions: ["Owner decisions", "Validated QA, release approvals, and explicit owner exceptions."],
+    operations: ["Operations", "Automation recovery that does not require code or product approval."],
+    legacy: ["Legacy records", "Historical records that are not current QA handoffs."],
+  };
+  return Object.entries(definitions).map(([id, [label, description]]) => {
+    const items = (inbox.items || []).filter((item) => (item.group || "decisions") === id);
+    return { id, label, description, count: items.length, oldestAt: "", items };
+  });
+}
+
+function inboxGroupMarkup(group) {
+  const items = Array.isArray(group.items) ? group.items : [];
+  const count = Number(group.count ?? items.length);
+  const ages = items
+    .map((item) => (item.ageMs === null || item.ageMs === undefined ? Number.NaN : Number(item.ageMs)))
+    .filter(Number.isFinite);
+  const oldestAge = ages.length
+    ? formatAge(Math.max(...ages))
+    : "No records";
+  const open = group.id !== "legacy" ? " open" : "";
+  return `
+    <details id="inbox-group-${escapeHtml(group.id)}" class="owner-inbox-group ${escapeHtml(group.id)}"${open}>
+      <summary>
+        <span class="inbox-group-count">
+          <span aria-hidden="true">${escapeHtml(count)}</span>
+          <span class="visually-hidden">${plural(count, "record")} in this group.</span>
+        </span>
+        <span class="inbox-group-copy">
+          <strong>${escapeHtml(group.label || group.id)}</strong>
+          <span>${escapeHtml(group.description || "")}</span>
+        </span>
+        <span class="inbox-group-age">${escapeHtml(oldestAge === "No records" ? oldestAge : `Oldest ${oldestAge}`)}</span>
+      </summary>
+      <div class="inbox-group-items">
+        ${items.length ? items.map(inboxItemMarkup).join("") : `
+          <div class="inbox-state empty">
+            <strong>No ${escapeHtml(String(group.label || group.id).toLowerCase())}</strong>
+            <span>This group will update on refresh when a matching record exists.</span>
+          </div>
+        `}
+      </div>
+    </details>
+  `;
+}
+
+function renderInboxLoading() {
+  ownerInbox.hidden = false;
+  ownerInbox.setAttribute("aria-busy", "true");
+  attentionButton.disabled = true;
+  attentionCount.textContent = "…";
+  operationsButton.hidden = true;
+  ownerInboxCount.textContent = "Loading…";
+  ownerInboxSummary.textContent = "Loading current decisions and operational records…";
+  ownerInboxList.innerHTML = `
+    <div class="inbox-state" role="status">
+      <strong>Loading owner inbox</strong>
+      <span>Classifying decision, operations, and legacy records without changing task state.</span>
+    </div>
+  `;
+}
+
+function renderInboxError(error) {
+  ownerInbox.hidden = false;
+  ownerInbox.setAttribute("aria-busy", "false");
+  attentionButton.disabled = true;
+  attentionCount.textContent = "!";
+  operationsButton.hidden = true;
+  ownerInboxCount.textContent = "Unavailable";
+  ownerInboxSummary.textContent = "The latest inbox state could not be loaded.";
+  ownerInboxList.innerHTML = `
+    <div class="inbox-state error" role="alert">
+      <strong>Owner inbox failed to load</strong>
+      <span>${escapeHtml(error?.message || "Request failed.")}</span>
+      <button type="button" data-retry-inbox>Retry</button>
+    </div>
+  `;
+}
+
+function renderOwnerInbox() {
+  const inbox = state.ownerInbox || {};
+  const groups = inboxGroups(inbox);
+  const counts = Object.fromEntries(groups.map((group) => [group.id, Number(group.count || 0)]));
+  const decisionCount = counts.decisions || 0;
+  const operationCount = counts.operations || 0;
+  const legacyCount = counts.legacy || 0;
+  ownerInbox.hidden = false;
+  ownerInbox.setAttribute("aria-busy", "false");
+  attentionButton.disabled = false;
+  attentionCount.textContent = String(decisionCount);
+  attentionButton.setAttribute("aria-label", plural(decisionCount, "owner decision"));
+  operationsButton.hidden = operationCount === 0;
+  operationsCount.textContent = String(operationCount);
+  operationsButton.setAttribute("aria-label", plural(operationCount, "operational record"));
+  ownerInboxCount.textContent = plural(decisionCount, "decision");
+  ownerInboxSummary.textContent = `${plural(decisionCount, "owner decision")} · ${plural(operationCount, "operation")} · ${plural(legacyCount, "legacy record")}`;
+  ownerInboxList.innerHTML = groups.map(inboxGroupMarkup).join("");
 }
 
 function renderProjectSettings() {
@@ -908,6 +1092,7 @@ async function renderDetail() {
       <button type="button" data-status="backend_review">Backend Review</button>
       <button type="button" data-status="frontend_review">Frontend Review</button>
       <button type="button" data-status="accessibility_review">Accessibility Review</button>
+      <button type="button" data-status="regression_review">Regression Review</button>
       <button type="button" data-status="lead_review">Lead Review</button>
       <button type="button" data-status="qa_review">QA Review</button>
       <button type="button" data-status="approved_for_main">Approved For Main</button>
@@ -1208,12 +1393,42 @@ newTaskButton.addEventListener("click", () => {
 });
 
 refreshButton.addEventListener("click", () => {
-  loadState().catch((error) => alert(error.message));
+  loadState().catch(renderInboxError);
 });
 
-attentionButton.addEventListener("click", () => {
-  ownerInbox.scrollIntoView({ behavior: "smooth", block: "start" });
-});
+function focusInboxGroup(groupId) {
+  const group = document.querySelector(`#inbox-group-${groupId}`);
+  const scrollBehavior = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ? "auto"
+    : "smooth";
+  if (group) {
+    group.open = true;
+    group.scrollIntoView({ behavior: scrollBehavior, block: "start" });
+    group.querySelector("summary")?.focus({ preventScroll: true });
+    return;
+  }
+  ownerInbox.scrollIntoView({ behavior: scrollBehavior, block: "start" });
+  document.querySelector("#ownerInboxTitle")?.focus({ preventScroll: true });
+}
+
+async function copyInboxValue(value) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const fallback = document.createElement("textarea");
+  fallback.value = value;
+  fallback.setAttribute("readonly", "");
+  fallback.className = "clipboard-fallback";
+  document.body.append(fallback);
+  fallback.select();
+  const copied = document.execCommand("copy");
+  fallback.remove();
+  if (!copied) throw new Error("Clipboard access is unavailable.");
+}
+
+attentionButton.addEventListener("click", () => focusInboxGroup("decisions"));
+operationsButton.addEventListener("click", () => focusInboxGroup("operations"));
 
 systemStatus.addEventListener("click", async (event) => {
   if (!event.target.closest("[data-resume-automation]")) return;
@@ -1227,12 +1442,31 @@ systemStatus.addEventListener("click", async (event) => {
   await loadState();
 });
 
-ownerInbox.addEventListener("click", (event) => {
+ownerInbox.addEventListener("click", async (event) => {
+  const retryButton = event.target.closest("[data-retry-inbox]");
+  if (retryButton) {
+    loadState().catch(renderInboxError);
+    return;
+  }
+  const copyButton = event.target.closest("[data-copy-inbox-value]");
+  if (copyButton) {
+    const originalLabel = copyButton.textContent;
+    try {
+      await copyInboxValue(copyButton.dataset.copyInboxValue);
+      copyButton.textContent = "Copied";
+      window.setTimeout(() => {
+        copyButton.textContent = originalLabel;
+      }, 1600);
+    } catch (error) {
+      copyButton.textContent = error.message;
+    }
+    return;
+  }
   const taskButton = event.target.closest("[data-inbox-task-id]");
   if (!taskButton) return;
   state.selectedTaskId = taskButton.dataset.inboxTaskId;
   window.history.pushState(null, "", taskPath(state.selectedTaskId));
-  loadState().catch((error) => alert(error.message));
+  loadState().catch(renderInboxError);
 });
 
 automationButton.addEventListener("click", async () => {
@@ -1284,6 +1518,4 @@ statusFilter.addEventListener("change", () => {
   render();
 });
 
-loadState().catch((error) => {
-  document.body.innerHTML = `<main class="panel"><h1>StudioOps failed to load</h1><p>${escapeHtml(error.message)}</p></main>`;
-});
+loadState().catch(renderInboxError);

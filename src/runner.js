@@ -22,6 +22,7 @@ import {
   applyGitHubRemoteRecoveryProbeResult,
   architectureIsCompleteInState,
   claimDueGitHubRemoteRecoveryProbes,
+  currentReviewCandidateCycle,
   DATA_DIR,
   findProject,
   findTask,
@@ -50,6 +51,7 @@ const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "preview_blocked", "blocked"]);
 const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
+const ARCHITECTURE_GATED_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_PREFLIGHT_RETRY_DELAY_MS = 250;
 const DEFAULT_RUNNER_PATH = [
@@ -177,6 +179,12 @@ function staleRunReason(state, run) {
     }
     return "";
   }
+
+  if (
+    ARCHITECTURE_GATED_ACTIONS.has(run.actionType)
+    && task.architectureRequired
+    && !architectureIsCompleteInState(state, task)
+  ) return "architecture_handoff_invalid";
 
   if (["start_builder", "start_builder_fix", "return_to_builder"].includes(run.actionType)) {
     if (!["queued", "in_progress"].includes(task.status)) return `task_status_changed:${task.status || "unknown"}`;
@@ -810,6 +818,19 @@ function reviewerRecordedOutcome(state, run) {
   });
 }
 
+export function reviewerRunSupersessionReason(run, task) {
+  if (run.group !== "reviewer" || !task) return "";
+  const runCandidateCycle = Number(run.candidateCycle || 0);
+  const taskCandidateCycle = currentReviewCandidateCycle(task);
+  if (
+    runCandidateCycle <= 0
+    || taskCandidateCycle <= runCandidateCycle
+  ) {
+    return "";
+  }
+  return "review_candidate_superseded";
+}
+
 export function successfulHandoffFailure(state, run, task) {
   if (!task) return "task_missing_after_run";
   if (run.group === "architect") {
@@ -823,6 +844,7 @@ export function successfulHandoffFailure(state, run, task) {
     ) return "architecture_task_graph_invalid";
     return "";
   }
+  if (reviewerRunSupersessionReason(run, task)) return "";
   if (run.group === "builder") {
     if (task.status !== "in_progress" && task.status !== "qa_review") return "";
     if (task.branchName && task.prUrl && run.actionType !== "qa_integration_blocked") return "";
@@ -1175,6 +1197,7 @@ export async function claimRuns(input = {}) {
       run.provider = normalizeProvider(input.provider || run.provider);
       const executionPolicy = resolveExecutionPolicy(findTask(state, run.taskId) || {}, run, input);
       run.model = run.model || executionPolicy.model || input.model;
+      run.modelTier = run.modelTier || executionPolicy.modelTier || "";
       run.modelReasoningEffort = run.modelReasoningEffort || executionPolicy.reasoningEffort || input.modelReasoningEffort;
       run.modelSelectionReason = run.modelSelectionReason || executionPolicy.selectionReason;
       run.attempt = Math.max(1, Number(run.attempt || 1));
@@ -1223,7 +1246,10 @@ export async function claimRuns(input = {}) {
 }
 
 export async function completeRun(runId, input = {}) {
-  return mutateState(async (state) => {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
@@ -1241,13 +1267,22 @@ export async function completeRun(runId, input = {}) {
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
     if (run.status === "completed") {
-      handoffFailure = successfulHandoffFailure(state, run, task);
-      if (handoffFailure) {
-        run.status = "failed";
-        run.exitCode = handoffFailure;
-        run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
+      const supersessionReason = reviewerRunSupersessionReason(run, task);
+      if (supersessionReason) {
+        run.completionDisposition = "superseded";
+        run.neutralCompletionReason = supersessionReason;
+        run.attemptConsumed = false;
+        const note = "Reviewer run ended after its candidate was superseded; no review outcome was required.";
+        run.notes = run.notes ? `${run.notes}\n\n${note}` : note;
       } else {
-        applySuccessfulHandoff(state, run, task, now);
+        handoffFailure = successfulHandoffFailure(state, run, task);
+        if (handoffFailure) {
+          run.status = "failed";
+          run.exitCode = handoffFailure;
+          run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
+        } else {
+          applySuccessfulHandoff(state, run, task, now);
+        }
       }
     }
 
@@ -1256,8 +1291,11 @@ export async function completeRun(runId, input = {}) {
       failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
     }
 
-    const summary = run.status === "completed"
-      ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
+    const neutralCompletion = run.status === "completed" && run.completionDisposition === "superseded";
+    const summary = neutralCompletion
+      ? `${run.id} completed neutrally because its review candidate was superseded. Output: ${run.outputPath || "(not recorded)"}`
+      : run.status === "completed"
+        ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
       : `${run.id} failed with exit code ${run.exitCode || "unknown"}. Output: ${run.outputPath || "(not recorded)"}`;
     await appendTaskComment(state, run, summary, now);
     if (failureDisposition) {
@@ -1271,7 +1309,7 @@ export async function completeRun(runId, input = {}) {
 
     state.events.push({
       id: nextId(state.events, "event"),
-      type: run.status === "completed" ? "run_completed" : "run_failed",
+      type: neutralCompletion ? "run_superseded" : run.status === "completed" ? "run_completed" : "run_failed",
       projectId: run.projectId,
       taskId: run.taskId,
       message: summary,
