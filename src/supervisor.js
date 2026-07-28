@@ -6,6 +6,7 @@ import {
   reviewPolicyForProject,
   reviewMatchesCurrentCandidate,
   reviewStagesForProject,
+  VALID_STATUSES,
 } from "./store.js";
 import {
   branchWebUrl,
@@ -122,6 +123,21 @@ function projectSummary(state, project) {
     taskCount: tasks.length,
     statuses: statusCounts(tasks),
   };
+}
+
+export function workflowIntegrityFaults(state) {
+  return (state.tasks || [])
+    .filter((task) => {
+      const status = typeof task.status === "string" ? task.status.trim() : "";
+      return !status || !VALID_STATUSES.has(status);
+    })
+    .map((task) => ({
+      taskId: task.id,
+      taskTitle: task.title || "Untitled task",
+      observedStatus: task.status ?? null,
+      fault: "invalid_task_status",
+      reason: `Task has no canonical workflow status. Repair with: status ${task.id} --status <canonical-status>. Existing review evidence and subject SHA are preserved by an explicit status repair.`,
+    }));
 }
 
 function actionBase(state, task, type, role, reason, options = {}) {
@@ -445,6 +461,7 @@ function sortActions(actions) {
 }
 
 export function createSupervisorReport(state, options = {}) {
+  const integrityFaults = workflowIntegrityFaults(state);
   const allActions = sortActions((state.tasks || []).flatMap((task) => taskActions(state, task, options)));
   const passiveActionTypes = new Set([
     "waiting_on_architecture",
@@ -470,7 +487,9 @@ export function createSupervisorReport(state, options = {}) {
         counts[action.type] = (counts[action.type] || 0) + 1;
         return counts;
       }, {}),
+      integrityFaults: integrityFaults.length,
     },
+    integrityFaults,
     actions,
   };
 }
@@ -478,9 +497,14 @@ export function createSupervisorReport(state, options = {}) {
 export function formatSupervisorReport(report) {
   const lines = [
     `StudioOps supervisor sweep (${report.generatedAt})`,
-    `Projects: ${report.totals.projects}  Tasks: ${report.totals.tasks}  Actions: ${report.totals.actions}  Waiting: ${report.totals.waiting}`,
+    `Projects: ${report.totals.projects}  Tasks: ${report.totals.tasks}  Actions: ${report.totals.actions}  Waiting: ${report.totals.waiting}  Integrity faults: ${report.totals.integrityFaults || 0}`,
     "",
   ];
+
+  for (const fault of report.integrityFaults || []) {
+    lines.push(`[integrity] ${fault.taskId} ${fault.fault}: ${fault.reason}`);
+  }
+  if ((report.integrityFaults || []).length) lines.push("");
 
   if (!report.actions.length) {
     lines.push("No actionable work found.");

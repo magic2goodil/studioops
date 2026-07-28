@@ -422,11 +422,12 @@ Commands:
   import-config                 Register projects from StudioOps configuration
   projects                      List projects
   tasks                         List tasks, optionally --project key and --status value
+  show-task TASK_ID             Read-only inspection of one task and its current review subject
   add-project --key --name      Add a project
   update-project PROJECT        Update project settings and Trust Leads policy
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
-  status TASK_ID --status       Update task status
+  status TASK_ID --status       Mutate task status (requires one canonical non-empty status)
   comment TASK_ID --body        Add a builder/reviewer comment
   architecture-complete TASK   Record the architecture decision and implementation task graph
   review TASK_ID --stage        Record approved, skipped, or changes_requested
@@ -592,6 +593,31 @@ Automation:
         title: task.title,
       };
     }), ["id", "project", "status", "owner", "cycle", "type", "priority", "parent", "title"]);
+    return;
+  }
+
+  if (command === "show-task") {
+    const taskId = args._[1];
+    if (!taskId) throw new Error("Usage: show-task TASK_ID [--json] (read-only task inspection)");
+    const state = await readState();
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (!task) throw new Error(`Unknown task: ${taskId}`);
+    const project = state.projects.find((item) => item.id === task.projectId);
+    const inspection = {
+      id: task.id,
+      title: task.title,
+      project: project?.key || task.projectId,
+      status: task.status,
+      assignedRole: task.assignedAgentRole || "",
+      reviewCycle: task.reviewCycle || 0,
+      reviewSubjectSha: task.reviewSubjectSha || "",
+      reviewSubjectCycle: task.reviewSubjectCycle || 0,
+      branchName: task.branchName || "",
+      prUrl: task.prUrl || "",
+      updatedAt: task.updatedAt || "",
+    };
+    if (args.json) console.log(JSON.stringify(inspection, null, 2));
+    else printTable([inspection], ["id", "project", "status", "assignedRole", "reviewCycle", "reviewSubjectSha", "branchName", "prUrl", "updatedAt"]);
     return;
   }
 
@@ -787,6 +813,9 @@ Automation:
 
   if (command === "status") {
     const taskId = args._[1];
+    if (!taskId || !Object.prototype.hasOwnProperty.call(args, "status") || typeof args.status !== "string" || !args.status.trim()) {
+      throw new Error("Usage: status TASK_ID --status CANONICAL_STATUS (status is a mutation; use show-task TASK_ID for read-only inspection)");
+    }
     const task = await updateTask(taskId, { status: args.status });
     console.log(`${task.id} -> ${task.status}`);
     return;

@@ -598,8 +598,12 @@ export async function updateTask(taskId, patch) {
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
-    if (patch.status && !VALID_STATUSES.has(patch.status)) {
-      throw new Error(`Invalid status: ${patch.status}`);
+    if (Object.prototype.hasOwnProperty.call(patch, "status")) {
+      const normalizedStatus = typeof patch.status === "string" ? patch.status.trim() : "";
+      if (!normalizedStatus || !VALID_STATUSES.has(normalizedStatus)) {
+        throw new Error(`Invalid status: ${patch.status ?? "(missing)"}`);
+      }
+      patch = { ...patch, status: normalizedStatus };
     }
     const architectureCompletionFields = [
       "architectureStatus",
@@ -2406,6 +2410,7 @@ Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
 Builder instructions:
+- Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Use 'status ${task.id} --status <canonical-status>' only for an intentional status mutation; never omit '--status'.
 - Create or switch to the feature branch.
 - For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
 - For UI tasks, implement and verify mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.

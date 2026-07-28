@@ -18,6 +18,13 @@ const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
 const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
+const VALID_TASK_STATUSES = new Set([
+  "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
+  "ready", "queued", "in_progress", "blocked", "builder_review", "backend_review",
+  "frontend_review", "accessibility_review", "regression_review", "lead_review", "qa_review",
+  "approved_for_main", "promotion_blocked", "needs_changes", "user_review", "approved",
+  "merged", "deployed", "done", "closed", "legacy_untrusted",
+]);
 const DATA_DIR = missionControlDataDir();
 export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
@@ -595,7 +602,17 @@ function assertFullCandidateHistoryPreserved(db, candidates) {
   for (const candidate of candidates || []) assertCandidateEnvelope(candidate);
 }
 
-function writeMutationToOpenDatabase(db, state, snapshot) {
+function assertValidTaskStatuses(state) {
+  for (const task of state.tasks || []) {
+    const status = typeof task.status === "string" ? task.status.trim() : "";
+    if (!VALID_TASK_STATUSES.has(status)) {
+      throw new Error(`Task ${task.id} has invalid workflow status: ${task.status || "(missing)"}. Repair it with an explicit canonical status before writing other fields.`);
+    }
+  }
+}
+
+function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
+  if (options.validateTaskStatuses !== false) assertValidTaskStatuses(state);
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -679,7 +696,7 @@ async function runStateIntegrityMigration(db) {
     state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
     recordOperationalArchiveMetadata(state, archived, now, backupPath);
     state.meta.updatedAt = now;
-    writeMutationToOpenDatabase(db, state, snapshot);
+    writeMutationToOpenDatabase(db, state, snapshot, { validateTaskStatuses: false });
     db.exec("COMMIT");
     integrityMigrated = true;
   } catch (error) {
@@ -780,6 +797,7 @@ export async function writeDatabaseState(state) {
   try {
     assertMaintenanceWriteAllowed(readStateFromOpenDatabase(db));
     reconcileStateIntegrity(state);
+    assertValidTaskStatuses(state);
     const archived = compactOperationalHistory(state);
     if (archivedItemCount(archived)) {
       const now = new Date().toISOString();
