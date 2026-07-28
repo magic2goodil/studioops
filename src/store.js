@@ -1,5 +1,11 @@
 import path from "node:path";
 import {
+  assertCandidateEnvelope,
+  invalidateCandidate,
+  normalizeGitSha,
+} from "./candidate-manifest.js";
+import { verifyCandidateRepositoryState } from "./candidate-repository.js";
+import {
   branchWebUrl,
   integrationBranchName,
   integrationBranchSafetyError,
@@ -14,6 +20,7 @@ import {
   ensureStateDatabase,
   mutateDatabaseState,
   readDatabaseState,
+  readDatabaseStateReadOnly,
   writeDatabaseState,
 } from "./state-database.js";
 
@@ -33,6 +40,7 @@ const VALID_STATUSES = new Set([
   "backend_review",
   "frontend_review",
   "accessibility_review",
+  "regression_review",
   "lead_review",
   "qa_review",
   "approved_for_main",
@@ -145,6 +153,10 @@ export async function readState() {
   return readDatabaseState();
 }
 
+export async function readStateReadOnly() {
+  return readDatabaseStateReadOnly();
+}
+
 export async function writeState(state) {
   const now = new Date().toISOString();
   state.meta = state.meta || {};
@@ -153,8 +165,8 @@ export async function writeState(state) {
   await writeDatabaseState(state);
 }
 
-export async function mutateState(mutator) {
-  return mutateDatabaseState(mutator);
+export async function mutateState(mutator, options = {}) {
+  return mutateDatabaseState(mutator, options);
 }
 
 function nextId(items, prefix) {
@@ -233,7 +245,7 @@ function standardReference(item) {
   return path.join(process.cwd(), value);
 }
 
-function normalizeReviewPipeline(value) {
+export function normalizeReviewPipeline(value) {
   if (!Array.isArray(value)) return [];
   const stages = value
     .map((stage) => ({
@@ -245,6 +257,32 @@ function normalizeReviewPipeline(value) {
       description: String(stage.description || "").trim(),
     }))
     .filter((stage) => stage.key && stage.role);
+  if (!stages.length) return [];
+  const leadIndex = stages.findIndex(isLeadReviewStage);
+  if (leadIndex === -1) {
+    stages.push({ ...DEFAULT_REVIEW_PIPELINE.find((stage) => stage.key === "lead") });
+  } else {
+    stages[leadIndex] = {
+      ...stages[leadIndex],
+      required: true,
+    };
+  }
+  for (const stage of stages) {
+    if (!stage.status || !VALID_STATUSES.has(stage.status)) {
+      throw new Error(`Invalid review status for ${stage.key}: ${stage.status || "(missing)"}`);
+    }
+    if (stage.status === "qa_review") {
+      throw new Error(
+        `Review stage ${stage.key} cannot use qa_review; that status is reserved for human local QA. Use regression_review for automated regression review.`,
+      );
+    }
+  }
+  const duplicateStatus = stages.find((stage, index) => (
+    stages.findIndex((candidate) => candidate.status === stage.status) !== index
+  ));
+  if (duplicateStatus) {
+    throw new Error(`Review status must be unique within a pipeline: ${duplicateStatus.status}`);
+  }
   return reviewStagesWithDefaultAccessibility(stages);
 }
 
@@ -291,13 +329,14 @@ export function architectureIsCompleteInState(state, task = {}) {
   if (["completed", "not_required"].includes(task.architectureStatus)) return true;
   if (task.architectureStatus !== "inherited") return false;
   const parent = findTask(state, task.architectureParentTaskId);
-  return Boolean(
-    parent
-    && parent.projectId === task.projectId
-    && parent.architectureStatus === "completed"
-    && task.parentTaskId === parent.id
-    && (parent.architectureDecisionTaskIds || []).includes(task.id),
-  );
+  if (
+    !parent
+    || parent.projectId !== task.projectId
+    || parent.architectureStatus !== "completed"
+    || task.parentTaskId !== parent.id
+    || !(parent.architectureDecisionTaskIds || []).includes(task.id)
+  ) return false;
+  return completedArchitectureGraphIsValid(state, parent);
 }
 
 function statusWithArchitectureGate(input, requestedStatus) {
@@ -516,6 +555,7 @@ export async function addTask(input) {
       type: String(input.type || "feature").trim(),
       area: String(input.area || "").trim(),
       lane: String(input.lane || "").trim(),
+      labels: normalizeList(input.labels || input.label),
       workAreas: normalizeList(input.workAreas || input.workArea || input["work-area"]),
       parentTaskId,
       dependsOnTaskIds,
@@ -539,6 +579,8 @@ export async function addTask(input) {
       assignedThreadId: String(input.assignedThreadId || "").trim(),
       reviewerThreadId: String(input.reviewerThreadId || "").trim(),
       reviewCycle: 0,
+      reviewSubjectSha: "",
+      reviewSubjectCycle: 0,
       createdAt: now,
       updatedAt: now,
     };
@@ -556,13 +598,24 @@ export async function addTask(input) {
 }
 
 export async function updateTask(taskId, patch) {
+  const ownsValidStatus = Object.prototype.hasOwnProperty.call(patch, "status")
+    && typeof patch.status === "string"
+    && patch.status.trim()
+    && VALID_STATUSES.has(patch.status.trim());
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
-    if (patch.status && !VALID_STATUSES.has(patch.status)) {
-      throw new Error(`Invalid status: ${patch.status}`);
+    const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
+    const previousNormalizedStatus = typeof task.status === "string" ? task.status.trim() : "";
+    const repairingLegacyStatus = ownsValidStatus && !VALID_STATUSES.has(previousNormalizedStatus);
+    if (Object.prototype.hasOwnProperty.call(patch, "status")) {
+      const normalizedStatus = typeof patch.status === "string" ? patch.status.trim() : "";
+      if (!normalizedStatus || !VALID_STATUSES.has(normalizedStatus)) {
+        throw new Error(`Invalid status: ${patch.status ?? "(missing)"}`);
+      }
+      patch = { ...patch, status: normalizedStatus };
     }
     const architectureCompletionFields = [
       "architectureStatus",
@@ -636,6 +689,9 @@ export async function updateTask(taskId, patch) {
     if (Object.prototype.hasOwnProperty.call(patch, "acceptanceCriteria")) {
       task.acceptanceCriteria = normalizeList(patch.acceptanceCriteria);
     }
+    if (Object.prototype.hasOwnProperty.call(patch, "labels")) {
+      task.labels = normalizeList(patch.labels);
+    }
     if (Object.prototype.hasOwnProperty.call(patch, "dependsOnTaskIds")) {
       task.dependsOnTaskIds = normalizeList(patch.dependsOnTaskIds);
     }
@@ -660,8 +716,40 @@ export async function updateTask(taskId, patch) {
     ) {
       task.status = "architecture_pending";
     }
-    if (patch.status === "builder_review" && previousStatus !== "builder_review") {
+    // A status repair restores an invalid legacy record to the workflow; it must
+    // not be treated as a new builder submission, which would discard the
+    // review subject and cycle that make existing approvals auditable.
+    const startedBuilderReviewCycle = !repairingLegacyStatus
+      && patch.status === "builder_review"
+      && previousStatus !== "builder_review";
+    if (startedBuilderReviewCycle) {
       task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+      task.reviewSubjectSha = "";
+      task.reviewSubjectCycle = Math.max(
+        Number(task.reviewSubjectCycle || 0) + 1,
+        task.reviewCycle,
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "subjectSha")) {
+      const subjectSha = normalizeGitSha(patch.subjectSha, "review subject SHA");
+      task.reviewSubjectSha = subjectSha;
+      if (!task.reviewSubjectCycle) {
+        task.reviewSubjectCycle = Number(task.reviewCycle || 0);
+      }
+      if (
+        !startedBuilderReviewCycle
+        && previousReviewSubjectSha
+        && previousReviewSubjectSha !== subjectSha
+      ) {
+        restartReviewsForSubjectChange(
+          state,
+          task,
+          project,
+          previousReviewSubjectSha,
+          subjectSha,
+          new Date().toISOString(),
+        );
+      }
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
@@ -679,8 +767,29 @@ export async function updateTask(taskId, patch) {
       message: `Task updated: ${task.title}`,
       createdAt: task.updatedAt,
     });
+    if (repairingLegacyStatus) {
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "workflow_integrity_repaired",
+        projectId: task.projectId,
+        taskId: task.id,
+        message: `Task workflow status repaired from ${previousNormalizedStatus || "(missing)"} to ${task.status}; review evidence was preserved.`,
+        createdAt: task.updatedAt,
+      });
+    }
     return task;
-  });
+  }, ownsValidStatus ? { repairTaskId: taskId } : {});
+}
+
+function missingArchitectureChildContractFields(child) {
+  const missing = [];
+  if (!String(child.description || "").trim()) missing.push("architecture constraints/description");
+  if (!String(child.userStory || "").trim()) missing.push("user story");
+  if (!String(child.expectedOutcome || "").trim()) missing.push("expected outcome");
+  if (!(child.acceptanceCriteria || []).length) missing.push("acceptance criteria");
+  if (!String(child.lane || "").trim()) missing.push("work lane");
+  if (!(child.workAreas || []).length) missing.push("work areas");
+  return missing;
 }
 
 function assertArchitectureChildContract(parent, child) {
@@ -695,13 +804,7 @@ function assertArchitectureChildContract(parent, child) {
   if (!["idea", "architecture_pending"].includes(child.status)) {
     throw new Error(`Architecture child ${child.id} is already beyond the pre-builder architecture gate.`);
   }
-  const missing = [];
-  if (!String(child.description || "").trim()) missing.push("architecture constraints/description");
-  if (!String(child.userStory || "").trim()) missing.push("user story");
-  if (!String(child.expectedOutcome || "").trim()) missing.push("expected outcome");
-  if (!(child.acceptanceCriteria || []).length) missing.push("acceptance criteria");
-  if (!String(child.lane || "").trim()) missing.push("work lane");
-  if (!(child.workAreas || []).length) missing.push("work areas");
+  const missing = missingArchitectureChildContractFields(child);
   if (missing.length) {
     throw new Error(`Architecture child ${child.id} is missing required task contract fields: ${missing.join(", ")}.`);
   }
@@ -739,6 +842,38 @@ function assertArchitectureDependencyGraph(state, parent, childTasks) {
     visited.add(taskId);
   }
   for (const child of childTasks) visit(child.id);
+}
+
+function completedArchitectureGraphIsValid(state, parent) {
+  const decisionTaskIds = parent.architectureDecisionTaskIds || [];
+  if (!decisionTaskIds.length || new Set(decisionTaskIds).size !== decisionTaskIds.length) return false;
+  const childTasks = decisionTaskIds.map((id) => findTask(state, id));
+  if (childTasks.some((child) => (
+    !child
+    || child.projectId !== parent.projectId
+    || child.parentTaskId !== parent.id
+    || child.architectureParentTaskId !== parent.id
+    || !child.architectureRequired
+    || child.architectureStatus !== "inherited"
+    || missingArchitectureChildContractFields(child).length
+  ))) return false;
+
+  const governedChildIds = (state.tasks || [])
+    .filter((child) => child.architectureParentTaskId === parent.id)
+    .map((child) => child.id)
+    .sort();
+  const recordedChildIds = [...decisionTaskIds].sort();
+  if (
+    governedChildIds.length !== recordedChildIds.length
+    || governedChildIds.some((id, index) => id !== recordedChildIds[index])
+  ) return false;
+
+  try {
+    assertArchitectureDependencyGraph(state, parent, childTasks);
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 export function completeArchitectureInState(state, taskId, input = {}) {
@@ -819,14 +954,20 @@ export async function completeArchitecture(taskId, input = {}) {
   return mutateState(async (state) => completeArchitectureInState(state, taskId, input));
 }
 
-function recordQaDecisionInState(state, task, input = {}) {
-  if (!task) throw new Error("Unknown task for QA decision.");
-  const project = findProject(state, task.projectId);
-  if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
-  const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
-  if (!["passed", "failed"].includes(outcome)) {
-    throw new Error("QA decision outcome must be passed or failed.");
-  }
+function qaDecisionSubject(candidate, input = {}) {
+  assertCandidateEnvelope(candidate);
+  const candidateId = String(input.candidateId || "").trim();
+  const manifestDigest = String(input.manifestDigest || "").trim();
+  const integrationSha = normalizeGitSha(input.integrationSha, "QA integration SHA");
+  if (candidateId !== candidate.id) throw new Error("QA decision candidate ID does not match.");
+  if (manifestDigest !== candidate.manifestDigest) throw new Error("QA decision manifest digest does not match.");
+  if (integrationSha !== candidate.manifest.integration.sha) throw new Error("QA decision integration SHA does not match.");
+  if (candidate.invalidation || candidate.status === "invalidated") throw new Error("Invalidated candidate cannot receive a QA decision.");
+  if (candidate.status !== "frozen") throw new Error(`Candidate must be frozen for QA. Current status: ${candidate.status}`);
+  return { candidateId, manifestDigest, integrationSha };
+}
+
+function applyTaskQaOutcome(state, task, project, outcome, input, now) {
   if (!["qa_review", "approved_for_main"].includes(task.status)) {
     throw new Error(`Task must be in qa_review before QA can be marked passed or failed. Current status: ${task.status}`);
   }
@@ -834,11 +975,14 @@ function recordQaDecisionInState(state, task, input = {}) {
     throw new Error(`Task QA integration is not ready yet: ${task.integrationStatus}`);
   }
 
-  const now = new Date().toISOString();
   const author = String(input.author || "Owner QA").trim();
   const notes = String(input.notes || input.body || "").trim();
   task.qaDecision = {
     outcome,
+    candidateId: input.candidateId,
+    manifestDigest: input.manifestDigest,
+    integrationSha: input.integrationSha,
+    repositoryVerifiedAt: input.repositoryVerifiedAt || "",
     author,
     notes,
     decidedAt: now,
@@ -868,7 +1012,7 @@ function recordQaDecisionInState(state, task, input = {}) {
       message: `${task.title} passed local QA and is approved for main promotion.`,
       createdAt: now,
     });
-    return { task, outcome };
+    return task;
   }
 
   setTaskWorkflowState(state, task, {
@@ -893,52 +1037,133 @@ function recordQaDecisionInState(state, task, input = {}) {
     message: `${task.title} failed local QA and was returned for changes.`,
     createdAt: now,
   });
-  return { task, outcome };
+  return task;
+}
+
+function recordCandidateQaDecisionInState(state, candidate, input = {}) {
+  const subject = qaDecisionSubject(candidate, input);
+  const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
+  if (!["passed", "failed"].includes(outcome)) throw new Error("QA decision outcome must be passed or failed.");
+  const sourceTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
+  const selectedTaskIds = normalizeList(input.taskIds || input.tasks).sort();
+  if (selectedTaskIds.length && JSON.stringify(selectedTaskIds) !== JSON.stringify(sourceTaskIds)) {
+    throw new Error("Candidate QA decisions are atomic and must include every manifest task.");
+  }
+  const project = findProject(state, candidate.projectId);
+  if (!project) throw new Error(`Candidate has missing project: ${candidate.projectId}`);
+  const now = new Date().toISOString();
+  const tasks = sourceTaskIds.map((taskId) => {
+    const task = state.tasks.find((item) => (
+      item.id === taskId
+      && item.projectId === candidate.projectId
+      && item.candidateId === candidate.id
+    ));
+    if (!task) throw new Error(`Candidate task ${taskId} is missing or linked to another candidate.`);
+    return task;
+  });
+  const applied = tasks.map((task) => applyTaskQaOutcome(state, task, project, outcome, {
+    ...input,
+    ...subject,
+  }, now));
+  candidate.status = outcome === "passed" ? "qa_passed" : "qa_failed";
+  candidate.qaDecision = {
+    outcome,
+    ...subject,
+    taskIds: sourceTaskIds,
+    repositoryVerifiedAt: input.repositoryVerifiedAt || "",
+    author: String(input.author || "Owner QA").trim(),
+    notes: String(input.notes || input.body || "").trim(),
+    decidedAt: now,
+  };
+  candidate.updatedAt = now;
+  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  if (bundle) {
+    bundle.status = outcome;
+    bundle.qaDecision = candidate.qaDecision;
+    bundle.updatedAt = now;
+  }
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: `candidate_qa_${outcome}`,
+    projectId: candidate.projectId,
+    message: `${candidate.id}: ${applied.length} task(s) marked ${outcome} at ${subject.integrationSha}.`,
+    createdAt: now,
+  });
+  return { candidate, bundle, decisions: applied.map((task) => ({ task, outcome })) };
+}
+
+async function verifyCandidateForQaInState(state, candidate) {
+  const project = findProject(state, candidate.projectId);
+  if (!project) throw new Error(`Candidate has missing project: ${candidate.projectId}`);
+  const verification = await verifyCandidateRepositoryState(project, candidate);
+  if (verification.ok) return { ok: true, verification };
+  if (verification.status !== "drift") {
+    return {
+      ok: false,
+      error: `Candidate integrity could not be verified: ${verification.reason}`,
+    };
+  }
+  invalidateCandidate(candidate, verification);
+  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  if (bundle) {
+    bundle.status = "invalidated";
+    bundle.updatedAt = candidate.updatedAt;
+  }
+  state.events.push({
+      id: nextId(state.events, "event"),
+      type: "candidate_invalidated",
+      projectId: candidate.projectId,
+      message: `${candidate.id}: ${verification.reason}`,
+      createdAt: candidate.updatedAt,
+    });
+  return {
+    ok: false,
+    error: `Candidate integrity verification failed: ${verification.reason}`,
+  };
 }
 
 export async function recordQaDecision(taskId, input = {}) {
-  return mutateState(async (state) => {
+  const operation = await mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
-    return recordQaDecisionInState(state, task, input);
+    const candidate = (state.candidates || []).find((item) => item.id === task.candidateId);
+    if (!candidate) throw new Error(`Task ${taskId} has no immutable candidate.`);
+    const verified = await verifyCandidateForQaInState(state, candidate);
+    if (!verified.ok) return verified;
+    if (candidate.manifest.sources.length !== 1) {
+      throw new Error("Use the candidate or QA bundle decision endpoint for a multi-task candidate.");
+    }
+    return {
+      ok: true,
+      result: recordCandidateQaDecisionInState(state, candidate, {
+        ...input,
+        repositoryVerifiedAt: verified.verification.verifiedAt,
+      }),
+    };
   });
+  if (!operation.ok) throw new Error(operation.error);
+  return operation.result;
 }
 
 export async function recordQaBundleDecision(bundleId, input = {}) {
-  return mutateState(async (state) => {
+  const operation = await mutateState(async (state) => {
     const bundle = (state.qaBundles || []).find((item) => item.id === bundleId);
     if (!bundle) throw new Error(`Unknown QA bundle: ${bundleId}`);
-    const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
-    if (!["passed", "failed"].includes(outcome)) throw new Error("QA bundle outcome must be passed or failed.");
-    const taskIds = normalizeList(input.taskIds || input.tasks);
-    const selectedIds = taskIds.length ? new Set(taskIds) : new Set((bundle.tasks || []).map((task) => task.id));
-    const decisions = [];
-    for (const taskId of selectedIds) {
-      const task = state.tasks.find((item) => item.id === taskId && item.qaBundleId === bundle.id);
-      if (!task) throw new Error(`Task ${taskId} is not part of QA bundle ${bundle.id}.`);
-      decisions.push(recordQaDecisionInState(state, task, input));
-    }
-    const now = new Date().toISOString();
-    const bundleTaskIds = new Set((bundle.tasks || []).map((task) => task.id));
-    const remaining = state.tasks.filter((task) => bundleTaskIds.has(task.id) && task.status === "qa_review");
-    bundle.status = remaining.length ? "partially_reviewed" : outcome;
-    bundle.updatedAt = now;
-    bundle.qaDecision = {
-      outcome,
-      taskIds: [...selectedIds],
-      author: String(input.author || "Owner QA").trim(),
-      notes: String(input.notes || input.body || "").trim(),
-      decidedAt: now,
+    if (!bundle.candidateId) throw new Error(`QA bundle ${bundleId} is legacy and has no immutable candidate.`);
+    const candidate = (state.candidates || []).find((item) => item.id === bundle.candidateId);
+    if (!candidate || candidate.qaBundleId !== bundle.id) throw new Error(`QA bundle ${bundleId} has an invalid candidate link.`);
+    const verified = await verifyCandidateForQaInState(state, candidate);
+    if (!verified.ok) return verified;
+    return {
+      ok: true,
+      result: recordCandidateQaDecisionInState(state, candidate, {
+        ...input,
+        repositoryVerifiedAt: verified.verification.verifiedAt,
+      }),
     };
-    state.events.push({
-      id: nextId(state.events, "event"),
-      type: `qa_bundle_${bundle.status}`,
-      projectId: bundle.projectId,
-      message: `${bundle.id}: ${decisions.length} task(s) marked ${outcome}.`,
-      createdAt: now,
-    });
-    return { bundle, decisions };
   });
+  if (!operation.ok) throw new Error(operation.error);
+  return operation.result;
 }
 
 export async function addComment(taskId, body, author = "user") {
@@ -980,12 +1205,40 @@ export async function recordReview(taskId, input = {}) {
     if (!VALID_REVIEW_OUTCOMES.has(outcome)) {
       throw new Error(`Invalid review outcome: ${outcome}`);
     }
+    if (isLeadReviewStage(stage) && outcome === "skipped") {
+      throw new Error("Primary lead review cannot be skipped.");
+    }
+    const candidateCycle = Number(input.candidateCycle || input.cycle);
+    const currentCycle = currentReviewCycle(task);
+    const currentCandidateCycle = currentReviewCandidateCycle(task);
+    if (!Number.isSafeInteger(candidateCycle) || candidateCycle < 1) {
+      throw new Error("Review candidate cycle is required.");
+    }
+    if (candidateCycle !== currentCandidateCycle) {
+      throw new Error(`Review candidate cycle ${candidateCycle} does not match current cycle candidate ${currentCandidateCycle}.`);
+    }
+    const subjectSha = normalizeGitSha(input.subjectSha || input.sha, "review subject SHA");
+    if (task.reviewSubjectSha && task.reviewSubjectSha !== subjectSha) {
+      throw new Error(`Review subject SHA does not match the current cycle subject ${task.reviewSubjectSha}.`);
+    }
+    task.reviewSubjectSha = subjectSha;
+    task.reviewSubjectCycle = candidateCycle;
+    const stageIndex = stages.indexOf(stage);
+    const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+    const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
+    if (earliestRequiredStage && stageIndex > earliestRequiredIndex) {
+      throw new Error(
+        `${earliestRequiredStage.label || earliestRequiredStage.key} must approve candidate cycle ${candidateCycle} at ${subjectSha} before ${stage.label || stage.key} can continue.`,
+      );
+    }
     const now = new Date().toISOString();
     const review = {
       id: nextId(state.reviews, "review"),
       taskId,
       projectId: task.projectId,
       cycle: currentReviewCycle(task),
+      candidateCycle,
+      subjectSha,
       stageKey: stage.key,
       status: stage.status,
       role: stage.role,
@@ -1452,12 +1705,83 @@ function currentReviewCycle(task) {
   return Number(task.reviewCycle || 0);
 }
 
-function latestReviewForStage(state, task, stage) {
+export function currentReviewCandidateCycle(task) {
+  return Number(task.reviewSubjectCycle || task.reviewCycle || 0);
+}
+
+export function reviewMatchesCurrentCandidate(task, review) {
+  const reviewCycle = currentReviewCycle(task);
+  if (Number(review?.cycle || 0) !== reviewCycle) return false;
+  if (!task.reviewSubjectSha) {
+    return !review?.candidateCycle || Number(review.candidateCycle) === currentReviewCandidateCycle(task);
+  }
+  return (
+    currentReviewCandidateCycle(task) > 0
+    && review?.subjectSha === task.reviewSubjectSha
+    && Number(review?.candidateCycle || 0) === currentReviewCandidateCycle(task)
+  );
+}
+
+export function latestCurrentReviewForStage(state, task, stage) {
   return (state.reviews || [])
     .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
-    .filter((review) => review.stageKey === stage.key || review.status === stage.status || review.role === stage.role)
+    .filter((review) => reviewMatchesCurrentCandidate(task, review))
+    .filter((review) => (
+      review.stageKey
+        ? review.stageKey === stage.key
+        : Boolean(review.status) && review.status === stage.status
+    ))
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
+}
+
+export function earliestIncompleteRequiredReviewStage(state, project, task) {
+  return reviewStagesForProject(project)
+    .filter((stage) => stage.required !== false)
+    .find((stage) => {
+      const review = latestCurrentReviewForStage(state, task, stage);
+      return !review || !REVIEW_COMPLETE_OUTCOMES.has(review.outcome);
+    }) || null;
+}
+
+export function candidateReviewEvidenceForTask(state, task) {
+  const project = findProject(state, task.projectId);
+  if (!project) return { ok: false, error: `Task has missing project: ${task.projectId}` };
+  const candidateCycle = currentReviewCandidateCycle(task);
+  if (!currentReviewCycle(task) || !candidateCycle || !task.reviewSubjectSha) {
+    return { ok: false, error: "Task has no exact review subject for its current candidate cycle." };
+  }
+  const requiredStages = reviewStagesForProject(project).filter((stage) => stage.required !== false);
+  const reviews = [];
+  for (const stage of requiredStages) {
+    const review = latestCurrentReviewForStage(state, task, stage);
+    if (!review || !REVIEW_COMPLETE_OUTCOMES.has(review.outcome)) {
+      return { ok: false, error: `Required ${stage.label || stage.key} is not complete for the current subject SHA.` };
+    }
+    if (isLeadReviewStage(stage) && review.outcome !== "approved") {
+      return { ok: false, error: "Primary lead review must be approved for the current subject SHA." };
+    }
+    if (
+      review.subjectSha !== task.reviewSubjectSha
+      || Number(review.candidateCycle) !== candidateCycle
+    ) {
+      return { ok: false, error: `Required ${stage.label || stage.key} is bound to stale candidate evidence.` };
+    }
+    reviews.push({
+      id: review.id,
+      stageKey: review.stageKey,
+      role: review.role,
+      outcome: review.outcome,
+      subjectSha: review.subjectSha,
+      candidateCycle: review.candidateCycle,
+      reviewedAt: review.createdAt,
+    });
+  }
+  return {
+    ok: true,
+    subjectSha: task.reviewSubjectSha,
+    candidateCycle,
+    reviews,
+  };
 }
 
 function isLeadReviewStage(stage) {
@@ -1478,15 +1802,15 @@ function reviewCycleAtLimit(project, task) {
 function changeRequestedReviewsForCycle(state, task) {
   return (state.reviews || [])
     .filter((review) => review.taskId === task.id)
-    .filter((review) => Number(review.cycle || 0) === currentReviewCycle(task))
+    .filter((review) => reviewMatchesCurrentCandidate(task, review))
     .filter((review) => review.outcome === "changes_requested");
 }
 
 function leadReviewCompleteForCycle(state, task, project) {
   const leadStage = leadReviewStageForProject(project);
   if (!leadStage) return false;
-  const latestReview = latestReviewForStage(state, task, leadStage);
-  return latestReview && REVIEW_COMPLETE_OUTCOMES.has(latestReview.outcome);
+  const latestReview = latestCurrentReviewForStage(state, task, leadStage);
+  return latestReview?.outcome === "approved";
 }
 
 function shouldEscalateChangesToLead(project, task, stage) {
@@ -1531,6 +1855,11 @@ function setTaskWorkflowState(state, task, patch, now) {
   }
   if (patch.status === "builder_review" && previousStatus !== "builder_review") {
     task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+    task.reviewSubjectSha = "";
+    task.reviewSubjectCycle = Math.max(
+      Number(task.reviewSubjectCycle || 0) + 1,
+      task.reviewCycle,
+    );
   }
   task.updatedAt = now;
   state.events.push({
@@ -1539,6 +1868,71 @@ function setTaskWorkflowState(state, task, patch, now) {
     projectId: task.projectId,
     taskId: task.id,
     message: `Task moved to ${task.status}: ${task.title}`,
+    createdAt: now,
+  });
+}
+
+function restartReviewsForSubjectChange(state, task, project, previousSha, subjectSha, now) {
+  task.reviewSubjectCycle = Math.max(
+    currentReviewCandidateCycle(task),
+    currentReviewCycle(task),
+  ) + 1;
+  for (const candidate of state.candidates || []) {
+    if (
+      candidate.invalidation
+      || !(candidate.manifest?.sources || []).some((source) => source.taskId === task.id)
+    ) {
+      continue;
+    }
+    invalidateCandidate(candidate, {
+      reason: `Task ${task.id} review subject changed after candidate assembly.`,
+      expected: previousSha,
+      observed: subjectSha,
+      invalidatedAt: now,
+    });
+    const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+    if (bundle) {
+      bundle.status = "invalidated";
+      bundle.updatedAt = now;
+    }
+  }
+  task.candidateId = "";
+  task.qaBundleId = "";
+  task.integrationStatus = "";
+  task.qaDecision = null;
+  task.promotionStatus = "";
+  const firstRequiredStage = reviewStagesForProject(project)
+    .find((stage) => stage.required !== false);
+  if (firstRequiredStage) {
+    setTaskWorkflowState(state, task, {
+      status: firstRequiredStage.status,
+      assignedAgentRole: firstRequiredStage.role,
+      reviewerThreadId: "",
+    }, now);
+  }
+  for (const run of state.runs || []) {
+    if (
+      run.taskId === task.id
+      && run.group === "reviewer"
+      && run.status === "queued"
+    ) {
+      run.status = "cancelled";
+      run.notes = `Cancelled before start because the review subject changed from ${previousSha} to ${subjectSha}.`;
+      run.updatedAt = now;
+    }
+  }
+  addAutomationComment(
+    state,
+    task,
+    `Review subject changed from ${previousSha} to ${subjectSha}. Prior candidate-cycle approvals are stale, so StudioOps restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.`,
+    now,
+  );
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "review_subject_changed",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title}: review subject changed and required reviews restarted`,
     createdAt: now,
   });
 }
@@ -1565,13 +1959,12 @@ function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLa
 }
 
 function moveTaskToQaReview(state, task, project, now, author, body, actions, actionLabel = "ready for QA review") {
-  const policy = reviewPolicyForProject(project);
   const integrationBranch = integrationBranchName(project);
   const integrationBranchUrl = branchWebUrl(project, integrationBranch);
-  if (task.status !== "qa_review" || task.assignedAgentRole !== (policy.qaReviewerRole || "qa-reviewer")) {
+  if (task.status !== "qa_review" || task.assignedAgentRole !== "owner") {
     setTaskWorkflowState(state, task, {
       status: "qa_review",
-      assignedAgentRole: policy.qaReviewerRole || "qa-reviewer",
+      assignedAgentRole: "owner",
       reviewerThreadId: "",
       integrationStatus: task.integrationStatus || "pending",
       integrationBranch,
@@ -1581,7 +1974,7 @@ function moveTaskToQaReview(state, task, project, now, author, body, actions, ac
   addAutomationComment(
     state,
     task,
-    `${body} Lead-approved work can be merged into ${integrationBranch} for local QA.${integrationBranchUrl ? `\n\nIntegration branch: ${integrationBranchUrl}` : ""}`,
+    `${body} Lead-approved work is eligible for immutable candidate assembly and local QA. ${integrationBranch} remains a policy namespace; each QA candidate receives a unique branch.${integrationBranchUrl ? `\n\nQA branch namespace: ${integrationBranchUrl}` : ""}`,
     now,
     author,
   );
@@ -1735,7 +2128,7 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
 
   const currentStage = findReviewStage(stages, task.status);
   if (currentStage) {
-    const latestReview = latestReviewForStage(state, task, currentStage);
+    const latestReview = latestCurrentReviewForStage(state, task, currentStage);
     if (!latestReview) {
       if (task.assignedAgentRole !== currentStage.role) {
         setTaskWorkflowState(state, task, {
@@ -1775,7 +2168,7 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
   }
 
   for (const stage of stages) {
-    const latestReview = latestReviewForStage(state, task, stage);
+    const latestReview = latestCurrentReviewForStage(state, task, stage);
     if (latestReview?.outcome === "changes_requested" && project && shouldEscalateChangesToLead(project, task, stage)) {
       return routeChangesRequestedInState(state, task, project, stage, now, author, actions);
     }
@@ -1948,18 +2341,21 @@ export function generatePrompt(state, taskId, role = "builder") {
   }
 
   if (role !== "builder") {
-    const reviewerProfile = reviewerProfileForRole(role);
+    const reviewerStage = reviewStages.find((stage) => stage.role === role) || null;
+    const reviewerProfile = reviewerProfileForRole(role, reviewerStage);
     return `You are the ${reviewerProfile.label} for StudioOps task ${task.id}.
 
 Project: ${project.name}
 Repository path: ${project.repoPath || "(not recorded)"}
 Feature branch: ${task.branchName || "(not recorded)"}
 PR: ${task.prUrl || "(not recorded)"}
+Review subject SHA: ${task.reviewSubjectSha || "(not recorded)"}
 Task type: ${task.type || "task"}
 Work lane: ${task.lane || task.area || "(inferred by StudioOps)"}
 Work areas:
 ${(task.workAreas || []).map((item) => `- ${item}`).join("\n") || "- Not explicitly scoped."}
 Review cycle: ${currentReviewCycle(task)}
+Candidate cycle: ${currentReviewCandidateCycle(task)}
 Parent epic/task: ${parent ? `${parent.id}: ${parent.title}` : "(none)"}
 
 Task:
@@ -2000,6 +2396,7 @@ ${functionalDeliveryContract(task)}
 
 Review instructions:
 - Review as a senior engineer in the ${reviewerProfile.domain} lane.
+- Use \`show-task ${task.id}\` (or \`--json\`) only for read-only task inspection. Use \`status ${task.id} --status <canonical-status>\` only for an intentional status mutation; never omit \`--status\`.
 - Lead with concrete findings ordered by severity.
 - Focus especially on:
 ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
@@ -2014,11 +2411,12 @@ ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
 - Confirm the task has branch/PR context and builder notes when implementation work was done.
 - Confirm whether this PR has one primary task or intentionally covers multiple tasks. If it covers multiple tasks, verify each linked task has clear complete/partial scope notes.
 - If you find small deterministic issues and the project policy allows reviewer fixes, fix them directly on the PR branch, run relevant validation, comment with exactly what changed, then continue the review.
+- If a reviewer fix changes the source SHA, update the task's review subject to the new full SHA. StudioOps will preserve the builder review cycle, advance the candidate cycle, invalidate prior-candidate approvals, and restart at the earliest required review lane. Do not record a later-lane approval until automation routes the new candidate back to that lane.
 - Use \`changes_requested\` only for material, risky, ambiguous, security/privacy-sensitive, or product-shaping problems that should not be quietly fixed inside review.
 - Do not create an endless builder-review loop. If this is review cycle ${reviewPolicy.maxBuilderReviewCycles} or later, routine bounce-backs are exhausted.
 - At or beyond the review-cycle limit, non-lead reviewers should record \`changes_requested\` only for material unresolved issues; StudioOps will route the task to lead review for the final decision.
 - At or beyond the review-cycle limit, the lead reviewer should make the final call: fix and approve, approve with residual risk documented, or hand the task to the human owner if it is unsafe or genuinely blocked. Do not send it back for another routine builder pass.
-- Record the result with \`studioops review ${task.id} --stage ${reviewerProfile.stageHint} --outcome approved|skipped|changes_requested --body "..."\`
+- Record the result with \`studioops review ${task.id} --stage ${reviewerProfile.stageHint} --subject-sha ${task.reviewSubjectSha || "<full-head-sha>"} --candidate-cycle ${currentReviewCandidateCycle(task) || "<candidate-cycle>"} --outcome approved|skipped|changes_requested --body "..."\`
 - Use \`changes_requested\` for material issues and include concrete findings.
 - Use \`skipped\` only when this review lane truly has no relevant surface.
 - Use \`approved\` when this lane is complete, with validation reviewed and residual risk summarized.
@@ -2077,6 +2475,7 @@ Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
 Builder instructions:
+- Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Use 'status ${task.id} --status <canonical-status>' only for an intentional status mutation; never omit '--status'.
 - Create or switch to the feature branch.
 - For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
 - For UI tasks, implement and verify mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.
@@ -2091,17 +2490,18 @@ Builder instructions:
 - Commit and push only if the user/project workflow asks for that.
 - Link the feature branch and pull request on the task when available.
 - Add a task comment with changed files, validation results, known gaps, PR link, and next review step.
-- Move the task to \`builder_review\` only after the branch, PR, validation notes, and builder comment are present.
+- Move the task to \`builder_review\` only after the branch, PR, exact full head SHA, validation notes, and builder comment are present. Include the SHA as \`--subject-sha\` when updating the task.
 `;
 }
 
-function reviewerProfileForRole(role) {
+function reviewerProfileForRole(role, stage = null) {
   const normalized = String(role || "reviewer").toLowerCase().replaceAll("_", "-");
+  const stageHint = String(stage?.key || "").trim();
   if (normalized.includes("backend")) {
     return {
       label: "backend reviewer",
       domain: "backend/data/security",
-      stageHint: "backend",
+      stageHint: stageHint || "backend",
       focus: [
         "API contracts and error handling",
         "data model ownership, migrations, indexes, pagination, and query shape",
@@ -2114,7 +2514,7 @@ function reviewerProfileForRole(role) {
     return {
       label: "frontend reviewer",
       domain: "frontend/product UI",
-      stageHint: "frontend",
+      stageHint: stageHint || "frontend",
       focus: [
         "mockup fidelity, visual hierarchy, spacing, typography, and interaction quality",
         "mobile, tablet, desktop, direct URL refresh, and no horizontal overflow",
@@ -2127,7 +2527,7 @@ function reviewerProfileForRole(role) {
     return {
       label: "accessibility expert reviewer",
       domain: "accessibility/a11y product UI",
-      stageHint: "accessibility",
+      stageHint: stageHint || "accessibility",
       focus: [
         "WCAG-oriented color contrast, readable typography, non-color-only states, and zoom-safe text",
         "visible focus states, keyboard reachability, logical tab order, skip/escape behavior, and no keyboard traps",
@@ -2137,10 +2537,27 @@ function reviewerProfileForRole(role) {
       ],
     };
   }
+  if (
+    normalized.includes("regression")
+    || normalized === "qa-reviewer"
+    || stage?.status === "regression_review"
+  ) {
+    return {
+      label: stage?.label ? `${stage.label} reviewer` : "regression QA reviewer",
+      domain: "release regression/QA",
+      stageHint: stageHint || "regression",
+      focus: [
+        "the exact candidate commit and every mandatory journey in the project regression standard",
+        "missing, skipped, stale, fixture-only, or otherwise non-production-shaped regression evidence",
+        "repeatability, test isolation, realistic state transitions, and clear failure diagnostics",
+        "release and rollback risk without merging or deploying production",
+      ],
+    };
+  }
   return {
     label: "primary team lead reviewer",
     domain: "product/architecture/release",
-    stageHint: "lead",
+    stageHint: stageHint || "lead",
     focus: [
       "acceptance criteria, product intent, scope control, and user-facing risk",
       "whether backend, frontend, and accessibility reviews are complete or explicitly waived",

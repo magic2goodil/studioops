@@ -1,6 +1,16 @@
-import { findProject, findTask, generatePrompt, mutateState } from "./store.js";
+import {
+  architectureIsCompleteInState,
+  currentReviewCandidateCycle,
+  earliestIncompleteRequiredReviewStage,
+  findProject,
+  findTask,
+  generatePrompt,
+  mutateState,
+  reviewStagesForProject,
+} from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
+import { assessCreditAdmission } from "./credit-policy.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_architecture",
@@ -17,6 +27,14 @@ const DISPATCHABLE_ACTIONS = new Set([
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
 const FINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const ARCHITECTURE_GATED_ACTIONS = new Set([
+  "start_builder",
+  "start_builder_fix",
+  "return_to_builder",
+  "unblock_task",
+]);
+const REVIEW_ACTIONS = new Set(["start_review", "continue_review"]);
+const REVIEW_HANDOFF_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_bundle_ready"]);
 
 const DEFAULTS = {
   provider: "prompt-outbox",
@@ -84,10 +102,12 @@ function taskStatusFor(action) {
 
 function dispatchKeyFor(task, action) {
   const cycle = Number(task.reviewCycle || 0);
+  const candidateCycle = currentReviewCandidateCycle(task);
+  const subjectSha = task.reviewSubjectSha || "no-subject";
   const status = ["notify_owner", "notify_qa_review", "qa_bundle_ready", "qa_integration_blocked"].includes(action.type)
     ? action.type
     : String(action.nextStatus || task.status || "");
-  return `${task.id}:${cycle}:${action.type}:${action.role || "system"}:${status}`;
+  return `${task.id}:${cycle}:${candidateCycle}:${subjectSha}:${action.type}:${action.role || "system"}:${status}`;
 }
 
 function activeRunMatches(run, action, task) {
@@ -97,10 +117,21 @@ function activeRunMatches(run, action, task) {
   }
   if (!ACTIVE_RUN_STATUSES.has(run.status)) return false;
   if (run.role !== action.role) return false;
+  if (
+    run.group === "reviewer"
+    && task.reviewSubjectSha
+    && (
+      run.reviewSubjectSha !== task.reviewSubjectSha
+      || Number(run.candidateCycle || 0) !== currentReviewCandidateCycle(task)
+    )
+  ) {
+    return false;
+  }
   return run.group === runGroupFor(action);
 }
 
 export function executionAttemptWasConsumed(run = {}) {
+  if (run.attemptConsumed === false) return false;
   if (run.status === "cancelled") return Boolean(run.startedAt);
   return ["running", "completed", "failed"].includes(run.status);
 }
@@ -172,6 +203,11 @@ function findLaneConflict(state, selected, action, task) {
 function dispatchSafetyReason(state, task, action, options) {
   const group = runGroupFor(action);
   if (group === "owner") return "";
+  if (
+    ARCHITECTURE_GATED_ACTIONS.has(action.type)
+    && task.architectureRequired
+    && !architectureIsCompleteInState(state, task)
+  ) return "architecture_handoff_invalid";
   if (state.meta?.operatorPause?.active && !options.ignoreOperatorPause) {
     return "operator_pause";
   }
@@ -179,9 +215,144 @@ function dispatchSafetyReason(state, task, action, options) {
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";
   if (task.automationCircuit?.state === "open") return "task_circuit_open";
   const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const creditAdmission = assessCreditAdmission(
+    options.creditSnapshot,
+    executionPolicy,
+    options.creditPolicy,
+  );
+  if (!creditAdmission.allowed) return `credit_gate:${creditAdmission.code}`;
   const attemptKey = executionAttemptKey(task, action);
   const attemptCount = executionAttemptCount(state, attemptKey);
   if (attemptCount >= executionPolicy.maxAttempts) return "attempt_budget_exhausted";
+  return "";
+}
+
+function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
+  const openedTaskIds = new Set();
+  for (const item of skipped || []) {
+    if (!String(item.reason || "").startsWith("credit_gate:") || openedTaskIds.has(item.taskId)) continue;
+    const task = findTask(state, item.taskId);
+    const action = skippedAction(actions, item);
+    if (!task || !action || task.automationCircuit?.state === "open") continue;
+    const executionPolicy = resolveExecutionPolicy(task, action, options);
+    const admission = assessCreditAdmission(
+      options.creditSnapshot,
+      executionPolicy,
+      options.creditPolicy,
+    );
+    const resumeStatus = task.status;
+    task.status = "blocked";
+    task.assignedAgentRole = "owner";
+    task.retryNotBefore = "";
+    task.lastAutomationFailure = admission.code;
+    task.automationBlocker = {
+      type: "circuit",
+      reason: admission.code,
+      actionType: action.type,
+      modelTier: admission.tier,
+      estimatedCredits: admission.estimatedCredits,
+      minRemainingPercent: admission.minRemainingPercent,
+      resumeStatus,
+      blockedAt: now,
+      retryAt: "",
+    };
+    task.automationCircuit = {
+      state: "open",
+      scope: "task",
+      reasonCode: "credit_budget_insufficient",
+      normalizedReason: `StudioOps did not start ${action.type} because the ${admission.tier} quality tier failed credit admission (${admission.code}).`,
+      failureFingerprint: `${task.id}:${action.type}:${admission.tier}:${admission.code}`,
+      attemptsConsumed: 0,
+      maxAttempts: 0,
+      openedAt: now,
+      nextCheapProbe: "Check current Codex usage limits without launching a model run.",
+      resumeAction: `studioops circuit-reset --task ${task.id} --reason credits_verified`,
+      remediation: "Wait for quota reset, add credits, or update the configured budget after review; then reset this task circuit.",
+    };
+    task.updatedAt = now;
+    const remaining = Number.isFinite(admission.remainingPercent)
+      ? `${admission.remainingPercent}%`
+      : "unknown";
+    state.comments.push({
+      id: nextId(state.comments, "comment"),
+      taskId: task.id,
+      author: "StudioOps Credit Controller",
+      body: `Run suppressed before model launch. Required tier: ${admission.tier}. Admission result: ${admission.code}. Estimated run budget: ${admission.estimatedCredits} credits. Remaining quota headroom: ${remaining}. StudioOps did not downgrade the task. Verify credits or quota, then run \`${task.automationCircuit.resumeAction}\`.`,
+      createdAt: now,
+    });
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "credit_admission_blocked",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title}: ${admission.tier} tier blocked by ${admission.code}`,
+      createdAt: now,
+    });
+    openedTaskIds.add(task.id);
+  }
+  return openedTaskIds;
+}
+
+function resolveReviewTargetStage(stages, task, action) {
+  const targetStatus = String(
+    action.nextStatus
+    || action.taskStatus
+    || task.status
+    || "",
+  );
+  if (targetStatus) {
+    const statusStage = stages.find((stage) => stage.status === targetStatus) || null;
+    if (statusStage) {
+      if (action.role && statusStage.role !== action.role) {
+        return { stage: null, reason: "review_stage_role_mismatch" };
+      }
+      return { stage: statusStage, reason: "" };
+    }
+    if (action.nextStatus) {
+      return { stage: null, reason: "review_stage_unknown" };
+    }
+  }
+
+  const roleStages = stages.filter((stage) => stage.role === action.role);
+  if (roleStages.length > 1) {
+    return { stage: null, reason: "review_stage_ambiguous" };
+  }
+  return {
+    stage: roleStages[0] || null,
+    reason: roleStages.length ? "" : "review_stage_unknown",
+  };
+}
+
+function reviewDispatchSafetyReason(state, task, action) {
+  if (!task.reviewSubjectSha && !REVIEW_ACTIONS.has(action.type)) return "";
+  if (action.reviewSubjectSha && action.reviewSubjectSha !== task.reviewSubjectSha) {
+    return "review_subject_changed";
+  }
+  if (
+    action.candidateCycle
+    && Number(action.candidateCycle) !== currentReviewCandidateCycle(task)
+  ) {
+    return "review_candidate_cycle_changed";
+  }
+  const project = findProject(state, task.projectId);
+  if (!project) return "missing_project";
+  const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+  if (REVIEW_HANDOFF_ACTIONS.has(action.type)) {
+    return earliestRequiredStage
+      ? `earlier_review_incomplete:${earliestRequiredStage.key}`
+      : "";
+  }
+  if (!REVIEW_ACTIONS.has(action.type)) return "";
+  const stages = reviewStagesForProject(project);
+  const target = resolveReviewTargetStage(stages, task, action);
+  if (target.reason) return target.reason;
+  const targetStage = target.stage;
+  if (
+    earliestRequiredStage
+    && stages.indexOf(targetStage) > stages.indexOf(earliestRequiredStage)
+  ) {
+    return `earlier_review_incomplete:${earliestRequiredStage.key}`;
+  }
   return "";
 }
 
@@ -352,6 +523,11 @@ function makeRun(state, task, action, options, now) {
   const threadId = action.threadId || (group === "reviewer" ? task.reviewerThreadId : task.assignedThreadId) || "";
   const profile = laneProfile(task, action);
   const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const creditAdmission = assessCreditAdmission(
+    options.creditSnapshot,
+    executionPolicy,
+    options.creditPolicy,
+  );
   const attemptKey = executionAttemptKey(task, action);
   const attempt = executionAttemptCount(state, attemptKey) + 1;
   return {
@@ -368,8 +544,19 @@ function makeRun(state, task, action, options, now) {
     fileScope: profile.fileScope,
     provider: task.preferredRunnerProvider || options.provider || DEFAULTS.provider,
     model: executionPolicy.model,
+    modelTier: executionPolicy.modelTier,
     modelReasoningEffort: executionPolicy.reasoningEffort,
     modelSelectionReason: executionPolicy.selectionReason,
+    creditAdmission: {
+      code: creditAdmission.code,
+      tier: creditAdmission.tier,
+      estimatedCredits: creditAdmission.estimatedCredits,
+      minRemainingPercent: creditAdmission.minRemainingPercent,
+      remainingPercent: Number.isFinite(creditAdmission.remainingPercent)
+        ? creditAdmission.remainingPercent
+        : null,
+      snapshotStatus: creditAdmission.snapshotStatus,
+    },
     attemptKey,
     attempt,
     maxAttempts: executionPolicy.maxAttempts,
@@ -385,6 +572,8 @@ function makeRun(state, task, action, options, now) {
     integrationBranch: action.integrationBranch || "",
     integrationBranchUrl: action.integrationBranchUrl || "",
     integrationStatus: action.integrationStatus || "",
+    reviewSubjectSha: task.reviewSubjectSha || "",
+    candidateCycle: currentReviewCandidateCycle(task),
     threadId,
     notes: "",
     createdAt: now,
@@ -419,6 +608,15 @@ export function planDispatches(state, actions, input = {}) {
     }
     if (hasExistingDispatch(state, action, task)) {
       skipped.push({ action, reason: "already_dispatched" });
+      continue;
+    }
+    if (action.taskStatus && task.status !== action.taskStatus) {
+      skipped.push({ action, reason: `task_status_changed:${action.taskStatus}->${task.status}` });
+      continue;
+    }
+    const reviewSafetyReason = reviewDispatchSafetyReason(state, task, action);
+    if (reviewSafetyReason) {
+      skipped.push({ action, reason: reviewSafetyReason });
       continue;
     }
     const safetyReason = dispatchSafetyReason(state, task, action, options);
@@ -492,6 +690,14 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       options,
       now,
     );
+    const creditBlockedTaskIds = openCreditAdmissionCircuits(
+      state,
+      actions,
+      plan.skipped,
+      options,
+      now,
+    );
+    for (const taskId of creditBlockedTaskIds) openedTaskIds.add(taskId);
     const selected = plan.selected.filter((item) => (
       !openedTaskIds.has(item.taskId) || item.group === "owner"
     ));

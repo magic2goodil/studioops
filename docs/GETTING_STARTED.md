@@ -37,7 +37,7 @@ npm install
 npm run check
 ```
 
-`npm run check` performs syntax checks and runs the automated test suite. Resolve failures before connecting StudioOps to a real project.
+`npm run check` performs syntax checks and runs the automated test suite inside a temporary, isolated StudioOps control plane. Resolve failures before connecting StudioOps to a real project. See [TESTING.md](TESTING.md) for the isolation contract.
 
 ## 3. Create Local Configuration
 

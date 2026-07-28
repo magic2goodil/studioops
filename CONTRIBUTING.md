@@ -26,6 +26,7 @@ npm run dev
 ```
 
 Use Node.js `22.5` or newer. Keep local configuration and runtime state out of Git.
+Tests run through the hermetic launcher documented in [docs/TESTING.md](docs/TESTING.md); do not invoke `node --test` directly.
 
 ## Change Expectations
 
