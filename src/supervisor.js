@@ -317,6 +317,25 @@ function taskActions(state, task, options = {}) {
   if (task.status === "blocked") {
     if (task.automationBlocker) {
       const blocker = task.automationBlocker;
+      const recoveryProbe = blocker.recoveryProbe;
+      if (
+        blocker.type === "configuration"
+        && blocker.reason === "inaccessible_github_remote"
+        && recoveryProbe?.nextProbeAt
+      ) {
+        const target = recoveryProbe.prUrl || recoveryProbe.branchName || "(missing target)";
+        return [actionBase(
+          state,
+          task,
+          "waiting_for_github_remote_recovery",
+          "",
+          `Automatic GitHub recovery probe ${Number(recoveryProbe.probeCount || 0) + 1} is due at ${recoveryProbe.nextProbeAt}. Role: ${recoveryProbe.role}; repository: ${recoveryProbe.owner}/${recoveryProbe.repository}; target: ${target}; latest diagnostic: ${recoveryProbe.lastDiagnostic || blocker.message || "GitHub remote unavailable"}.`,
+          {
+            ...options,
+            nextStatus: recoveryProbe.resumeStatus || blocker.resumeStatus || "queued",
+          },
+        )];
+      }
       if (["execution", "transient"].includes(blocker.type)) {
         return [actionBase(
           state,
@@ -469,6 +488,7 @@ export function createSupervisorReport(state, options = {}) {
     "waiting_on_architecture",
     "waiting_on_dependency",
     "waiting_for_retry",
+    "waiting_for_github_remote_recovery",
     "blocked",
     "release_candidate_ready",
   ]);
