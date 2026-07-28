@@ -160,8 +160,8 @@ export async function writeState(state) {
   await writeDatabaseState(state);
 }
 
-export async function mutateState(mutator) {
-  return mutateDatabaseState(mutator);
+export async function mutateState(mutator, options = {}) {
+  return mutateDatabaseState(mutator, options);
 }
 
 function nextId(items, prefix) {
@@ -592,12 +592,18 @@ export async function addTask(input) {
 }
 
 export async function updateTask(taskId, patch) {
+  const ownsValidStatus = Object.prototype.hasOwnProperty.call(patch, "status")
+    && typeof patch.status === "string"
+    && patch.status.trim()
+    && VALID_STATUSES.has(patch.status.trim());
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
+    const previousNormalizedStatus = typeof task.status === "string" ? task.status.trim() : "";
+    const repairingLegacyStatus = ownsValidStatus && !VALID_STATUSES.has(previousNormalizedStatus);
     if (Object.prototype.hasOwnProperty.call(patch, "status")) {
       const normalizedStatus = typeof patch.status === "string" ? patch.status.trim() : "";
       if (!normalizedStatus || !VALID_STATUSES.has(normalizedStatus)) {
@@ -750,8 +756,18 @@ export async function updateTask(taskId, patch) {
       message: `Task updated: ${task.title}`,
       createdAt: task.updatedAt,
     });
+    if (repairingLegacyStatus) {
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "workflow_integrity_repaired",
+        projectId: task.projectId,
+        taskId: task.id,
+        message: `Task workflow status repaired from ${previousNormalizedStatus || "(missing)"} to ${task.status}; review evidence was preserved.`,
+        createdAt: task.updatedAt,
+      });
+    }
     return task;
-  });
+  }, ownsValidStatus ? { repairTaskId: taskId } : {});
 }
 
 function assertArchitectureChildContract(parent, child) {

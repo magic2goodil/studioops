@@ -140,6 +140,41 @@ test("noncanonical whitespace statuses are integrity faults and cannot be rewrit
   }
 });
 
+test("explicit repair atomically fixes one invalid task while preserving another invalid record and evidence", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-status-repair-"));
+  try {
+    const state = invalidStatusState();
+    state.tasks.push({
+      id: "task_2",
+      projectId: "project_1",
+      title: "Second legacy task",
+      status: "not-a-status",
+      assignedAgentRole: "frontend-reviewer",
+      reviewCycle: 3,
+      reviewSubjectSha: "b".repeat(40),
+      reviewSubjectCycle: 3,
+    });
+    await writeLegacyState(root, state);
+    const env = await environmentForTestControlRoot(root);
+    await execFileAsync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `import { updateTask } from ${JSON.stringify(path.resolve("src/store.js"))}; await updateTask("task_1", { status: "backend_review" });`,
+    ], { cwd: root, env });
+
+    const persisted = await readPersistedState(root, env);
+    assert.equal(persisted.tasks.find((task) => task.id === "task_1").status, "backend_review");
+    assert.equal(persisted.tasks.find((task) => task.id === "task_2").status, "not-a-status");
+    assert.equal(persisted.tasks.find((task) => task.id === "task_1").reviewSubjectSha, "a".repeat(40));
+    assert.equal(persisted.events.filter((event) => event.type === "workflow_integrity_repaired").length, 1);
+    const report = createSupervisorReport(persisted);
+    assert.deepEqual(report.integrityFaults.map((fault) => fault.taskId), ["task_2"]);
+    assert.equal(report.actions.find((action) => action.taskId === "task_1")?.nextStatus, "frontend_review");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a recovered current-candidate backend approval routes to the next required lane", () => {
   const state = invalidStatusState();
   state.tasks[0].status = "backend_review";

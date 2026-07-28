@@ -605,14 +605,39 @@ function assertFullCandidateHistoryPreserved(db, candidates) {
 function assertValidTaskStatuses(state) {
   for (const task of state.tasks || []) {
     const status = typeof task.status === "string" ? task.status.trim() : "";
-    if (task.status !== status || !VALID_TASK_STATUSES.has(status)) {
-      throw new Error(`Task ${task.id} has invalid workflow status: ${task.status || "(missing)"}. Repair it with an explicit canonical status before writing other fields.`);
-    }
+    if (task.status === status && VALID_TASK_STATUSES.has(status)) continue;
+    throw new Error(`Task ${task.id} has invalid workflow status: ${task.status || "(missing)"}. Repair it with an explicit canonical status before writing other fields.`);
   }
 }
 
 function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
-  if (options.validateTaskStatuses !== false) assertValidTaskStatuses(state);
+  if (options.validateTaskStatuses !== false) {
+    if (options.repairTaskId) {
+      const repairTaskId = String(options.repairTaskId);
+      const target = (state.tasks || []).find((task) => task.id === repairTaskId);
+      const previousPayload = snapshot.tables.tasks.get(repairTaskId)?.payload;
+      const previousTask = previousPayload ? JSON.parse(previousPayload) : null;
+      const previousStatus = typeof previousTask?.status === "string" ? previousTask.status.trim() : "";
+      const currentStatus = typeof target?.status === "string" ? target.status.trim() : "";
+      if (!target || !previousTask || (previousStatus && VALID_TASK_STATUSES.has(previousStatus))) {
+        assertValidTaskStatuses(state);
+      } else if (!VALID_TASK_STATUSES.has(currentStatus)) {
+        throw new Error(`Task ${repairTaskId} repair must transition an existing invalid workflow status to a canonical status.`);
+      } else {
+        for (const task of state.tasks || []) {
+          if (task.id === repairTaskId) continue;
+          const status = typeof task.status === "string" ? task.status.trim() : "";
+          if (task.status === status && VALID_TASK_STATUSES.has(status)) continue;
+          const priorPayload = snapshot.tables.tasks.get(task.id)?.payload;
+          if (!priorPayload || priorPayload !== JSON.stringify(task)) {
+            throw new Error(`Task ${task.id} has invalid workflow status and cannot be changed during repair of ${repairTaskId}.`);
+          }
+        }
+      }
+    } else {
+      assertValidTaskStatuses(state);
+    }
+  }
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -814,7 +839,7 @@ export async function writeDatabaseState(state) {
   }
 }
 
-export async function mutateDatabaseState(mutator) {
+export async function mutateDatabaseState(mutator, options = {}) {
   const db = await ensureStateDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -833,7 +858,7 @@ export async function mutateDatabaseState(mutator) {
     }
     state.meta.updatedAt = new Date().toISOString();
     state.meta.storageBackend = "sqlite";
-    writeMutationToOpenDatabase(db, state, snapshot);
+    writeMutationToOpenDatabase(db, state, snapshot, options);
     db.exec("COMMIT");
     await secureStoragePaths();
     return result;
