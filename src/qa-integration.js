@@ -125,6 +125,223 @@ function prNumberFromUrl(value) {
   return match ? match[1] : "";
 }
 
+function protectedBranchPushRejected(result) {
+  const output = String(result?.output || "").toLowerCase();
+  return [
+    "gh006: protected branch update failed",
+    "gh013: repository rule violations found",
+    "protected branch hook declined",
+    "changes must be made through a pull request",
+    "must be made through a pull request",
+    "cannot push to protected branch",
+    "protected branch",
+  ].some((pattern) => output.includes(pattern));
+}
+
+function integrationCandidateBranchName(projectPlan, commit) {
+  const configured = normalizeBranchName(
+    qaIntegrationConfig(projectPlan).protectedBranchCandidatePrefix
+      || qaIntegrationConfig(projectPlan).candidateBranchPrefix
+      || "studioops/qa-candidate",
+  ).replace(/\/+$/, "");
+  const projectSegment = workspaceSegment(projectPlan.projectKey || projectPlan.projectId);
+  return `${configured}/${projectSegment}-${String(commit || "").slice(0, 12)}`;
+}
+
+function parseJsonOutput(result, label) {
+  try {
+    return JSON.parse(String(result.output || "").trim() || "null");
+  } catch {
+    throw new Error(`${label} returned invalid JSON: ${truncateOutput(result.output)}`);
+  }
+}
+
+function integrationPrCheckState(pr) {
+  const checks = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const failedConclusions = new Set([
+    "ACTION_REQUIRED",
+    "CANCELLED",
+    "ERROR",
+    "FAILURE",
+    "STALE",
+    "STARTUP_FAILURE",
+    "TIMED_OUT",
+  ]);
+  const failed = checks.filter((check) => failedConclusions.has(String(check.conclusion || check.state || "").toUpperCase()));
+  const pending = checks.filter((check) => {
+    const conclusion = String(check.conclusion || check.state || "").toUpperCase();
+    const status = String(check.status || "").toUpperCase();
+    return !failedConclusions.has(conclusion)
+      && (["", "EXPECTED", "PENDING"].includes(conclusion) || (status && status !== "COMPLETED"));
+  });
+  const state = failed.length ? "failed" : pending.length || !checks.length ? "pending" : "passed";
+  return {
+    state,
+    total: checks.length,
+    passed: checks.length - failed.length - pending.length,
+    pending: pending.length,
+    failed: failed.length,
+    checks: checks.map((check) => ({
+      name: check.name || check.context || check.workflowName || "unnamed check",
+      status: check.status || "",
+      conclusion: check.conclusion || check.state || "",
+      detailsUrl: check.detailsUrl || check.targetUrl || "",
+    })),
+  };
+}
+
+function integrationPrBlocker(pr, checkState) {
+  const state = String(pr?.state || "").toUpperCase();
+  const reviewDecision = String(pr?.reviewDecision || "").toUpperCase();
+  if (state === "MERGED") return "";
+  if (state === "CLOSED") return "The integration PR was closed without merging. Reopen it or authorize a new validated candidate.";
+  if (checkState.state === "failed") {
+    return `${checkState.failed} reported integration check(s) failed. Inspect the PR checks, update the source PR, and rerun QA integration after review.`;
+  }
+  if (reviewDecision === "CHANGES_REQUESTED") {
+    return "The integration PR has requested changes. Resolve the review findings without bypassing the protected-branch policy.";
+  }
+  if (reviewDecision === "REVIEW_REQUIRED") {
+    return "The integration PR is waiting for its required human review.";
+  }
+  if (checkState.state === "pending") {
+    return checkState.total
+      ? `${checkState.pending} integration check(s) are still pending.`
+      : "The integration PR is waiting for the repository to report required checks.";
+  }
+  return "All reported checks passed; the protected branch still requires the pull request to be merged by an authorized human.";
+}
+
+function integrationPrStatus(pr, checkState) {
+  const state = String(pr?.state || "").toUpperCase();
+  const reviewDecision = String(pr?.reviewDecision || "").toUpperCase();
+  if (state === "MERGED") return "merged";
+  if (state === "CLOSED") return "pr_closed";
+  if (checkState.state === "failed") return "checks_failed";
+  if (reviewDecision === "CHANGES_REQUESTED") return "changes_requested";
+  return "pr_waiting";
+}
+
+async function findIntegrationPr(repoPath, projectPlan, candidateBranch, options = {}) {
+  const result = await runCommand("gh", [
+    "pr",
+    "list",
+    "--base",
+    projectPlan.integrationBranch,
+    "--head",
+    candidateBranch,
+    "--state",
+    "all",
+    "--limit",
+    "10",
+    "--json",
+    "number,url,state,headRefName,headRefOid,baseRefName,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit",
+  ], {
+    cwd: repoPath,
+    env: options.env,
+    secrets: options.secrets,
+    timeoutMs: 60_000,
+    allowFailure: true,
+  });
+  if (!result.ok) {
+    throw new Error(`Could not inspect the integration pull request: ${truncateOutput(result.output)}`);
+  }
+  const prs = parseJsonOutput(result, "gh pr list");
+  if (!Array.isArray(prs)) throw new Error("gh pr list did not return a pull request list.");
+  return prs.sort((a, b) => {
+    const rank = (pr) => ({ OPEN: 0, MERGED: 1, CLOSED: 2 }[String(pr.state || "").toUpperCase()] ?? 3);
+    return rank(a) - rank(b) || Number(b.number || 0) - Number(a.number || 0);
+  })[0] || null;
+}
+
+async function createIntegrationPr(repoPath, projectPlan, candidateBranch, commit, options = {}) {
+  const taskList = projectPlan.tasks
+    .map((task) => `- ${task.id}: ${task.title}${task.prUrl ? ` (${task.prUrl})` : ""} at ${task.expectedHeadSha}`)
+    .join("\n");
+  const result = await runCommand("gh", [
+    "pr",
+    "create",
+    "--base",
+    projectPlan.integrationBranch,
+    "--head",
+    candidateBranch,
+    "--title",
+    `StudioOps QA integration: ${projectPlan.projectName || projectPlan.projectKey}`,
+    "--body",
+    `## Validated StudioOps QA candidate\n\nCandidate commit: ${commit}\nTarget QA branch: ${projectPlan.integrationBranch}\n\n## Included tasks\n\n${taskList}\n\nStudioOps will track this PR but will not bypass required reviews, checks, or branch policy. Production deployment is not authorized by this PR.`,
+  ], {
+    cwd: repoPath,
+    env: options.env,
+    secrets: options.secrets,
+    timeoutMs: 60_000,
+    allowFailure: true,
+  });
+  if (!result.ok) {
+    throw new Error(`Candidate branch was pushed, but its integration pull request could not be created: ${truncateOutput(result.output)}`);
+  }
+}
+
+async function ensureIntegrationPr(repoPath, projectPlan, candidateBranch, commit, options = {}) {
+  let pr = await findIntegrationPr(repoPath, projectPlan, candidateBranch, options);
+  if (!pr) {
+    await createIntegrationPr(repoPath, projectPlan, candidateBranch, commit, options);
+    pr = await findIntegrationPr(repoPath, projectPlan, candidateBranch, options);
+  }
+  if (!pr) throw new Error("The integration pull request could not be found after creation.");
+  const checkState = integrationPrCheckState(pr);
+  return {
+    ...pr,
+    checkState,
+    blocker: integrationPrBlocker(pr, checkState),
+    workflowStatus: integrationPrStatus(pr, checkState),
+  };
+}
+
+async function closeIntegrationPr(repoPath, projectPlan, pr, reason, options = {}) {
+  const prNumber = Number(pr?.number || 0);
+  if (!Number.isSafeInteger(prNumber) || prNumber < 1) {
+    return {
+      ok: false,
+      output: "The obsolete integration PR has no valid number, so StudioOps could not close it safely.",
+    };
+  }
+  const close = await runCommand("gh", [
+    "pr",
+    "close",
+    String(prNumber),
+    "--comment",
+    reason,
+  ], {
+    cwd: repoPath,
+    env: options.env,
+    secrets: options.secrets,
+    timeoutMs: 60_000,
+    allowFailure: true,
+  });
+  if (!close.ok) {
+    return {
+      ok: false,
+      output: `Could not close obsolete integration PR ${pr.url || `#${prNumber}`}: ${truncateOutput(close.output)}`,
+    };
+  }
+  const verified = await findIntegrationPr(repoPath, projectPlan, pr.headRefName, options);
+  if (
+    !verified
+    || Number(verified.number || 0) !== prNumber
+    || String(verified.state || "").toUpperCase() !== "CLOSED"
+  ) {
+    return {
+      ok: false,
+      output: `Integration PR ${pr.url || `#${prNumber}`} did not report CLOSED after the supersession request. StudioOps will not publish a competing candidate.`,
+    };
+  }
+  return {
+    ok: true,
+    pr: verified,
+    output: truncateOutput(close.output),
+  };
+}
+
 function sourceLabel(task) {
   return task.prUrl || task.branchName || "unlinked PR";
 }
@@ -357,6 +574,32 @@ async function remoteBranchExists(repoPath, branchName, options = {}) {
   if (fetchResult.ok) return true;
   const result = await git(repoPath, ["rev-parse", "--verify", `refs/remotes/origin/${branchName}`], { allowFailure: true });
   return result.ok;
+}
+
+async function remoteRefHead(repoPath, ref, options = {}) {
+  const result = await git(repoPath, ["ls-remote", "origin", ref], { ...options, allowFailure: true });
+  if (!result.ok) return { ok: false, head: "", output: truncateOutput(result.output) };
+  const line = String(result.output || "").split("\n").find(Boolean) || "";
+  return {
+    ok: true,
+    head: line.trim().split(/\s+/)[0] || "",
+    output: "",
+  };
+}
+
+async function remoteTaskHead(repoPath, task, options = {}) {
+  const branchName = normalizeBranchName(task.branchName);
+  if (branchName) return remoteRefHead(repoPath, `refs/heads/${branchName}`, options);
+  const prNumber = prNumberFromUrl(task.prUrl);
+  if (prNumber) return remoteRefHead(repoPath, `refs/pull/${prNumber}/head`, options);
+  return { ok: false, head: "", output: "Task has no branch or GitHub PR ref." };
+}
+
+function taskSourceRef(task) {
+  const branchName = normalizeBranchName(task.branchName);
+  if (branchName) return `refs/heads/${branchName}`;
+  const prNumber = prNumberFromUrl(task.prUrl);
+  return prNumber ? `refs/pull/${prNumber}/head` : "";
 }
 
 async function prepareIntegrationBranch(repoPath, project, branchName, options = {}) {
@@ -1032,6 +1275,15 @@ export function planQaIntegrations(state, input = {}) {
             candidateCycle: reviewEvidence.candidateCycle || 0,
             reviews: reviewEvidence.reviews || [],
             reviewEvidenceError: reviewEvidence.ok ? "" : reviewEvidence.error,
+            integrationCandidateBranch: task.integrationCandidateBranch || "",
+            integrationCandidateCommit: task.integrationCandidateCommit || "",
+            integrationPrUrl: task.integrationPrUrl || "",
+            integrationPrNumber: task.integrationPrNumber || 0,
+            integrationCheckState: task.integrationCheckState || null,
+            integrationBlocker: task.integrationBlocker || "",
+            integrationValidation: task.integrationValidation || null,
+            integrationSourceHeadSha: task.integrationSourceHeadSha || "",
+            integrationSourceCandidateCycle: Number(task.integrationSourceCandidateCycle || 0),
           };
         }),
       };
@@ -1074,6 +1326,10 @@ function allTaskResults(tasks, status, output) {
     title: task.title,
     status,
     source: sourceLabel(task),
+    sourceRef: taskSourceRef(task),
+    headSha: task.expectedHeadSha || "",
+    candidateCycle: task.candidateCycle || 0,
+    reviews: task.reviews || [],
     output: truncateOutput(output),
   }));
 }
@@ -1086,21 +1342,280 @@ function appendOutput(existing, addition) {
   return truncateOutput(`${current}\n${next}`);
 }
 
+function pendingProtectedHandoff(projectPlan) {
+  if (!projectPlan.tasks.length) return null;
+  const handoffTasks = projectPlan.tasks.filter((task) => (
+    task.integrationCandidateBranch
+    && task.integrationCandidateCommit
+    && task.integrationPrUrl
+  ));
+  if (!handoffTasks.length) return null;
+  const handoffKeys = new Set(handoffTasks.map((task) => (
+    `${task.integrationCandidateBranch}\n${task.integrationCandidateCommit}\n${task.integrationPrUrl}`
+  )));
+  if (handoffKeys.size !== 1) {
+    return {
+      error: "Multiple unresolved protected-branch integration handoffs exist for this project. Resolve or invalidate them before assembling another QA candidate.",
+      tasks: projectPlan.tasks,
+      deferredTasks: [],
+    };
+  }
+  const first = handoffTasks[0];
+  return {
+    branch: first.integrationCandidateBranch,
+    commit: first.integrationCandidateCommit,
+    prUrl: first.integrationPrUrl,
+    tasks: handoffTasks,
+    deferredTasks: projectPlan.tasks.filter((task) => !handoffTasks.includes(task)),
+  };
+}
+
+async function verifyMergedIntegrationTarget(repoPath, projectPlan, pr, options = {}) {
+  const mergeCommit = String(pr?.mergeCommit?.oid || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(mergeCommit)) {
+    return {
+      ok: false,
+      blocker: "The integration PR is marked merged, but GitHub did not report a full merge commit SHA. StudioOps cannot attest the protected target.",
+    };
+  }
+  const targetBranch = normalizeBranchName(projectPlan.integrationBranch);
+  const fetch = await git(
+    repoPath,
+    ["fetch", "origin", `refs/heads/${targetBranch}:refs/remotes/origin/${targetBranch}`],
+    { ...options, allowFailure: true },
+  );
+  if (!fetch.ok) {
+    return {
+      ok: false,
+      blocker: `The integration PR is merged, but StudioOps could not fetch protected target ${targetBranch}: ${truncateOutput(fetch.output)}`,
+    };
+  }
+  const targetCommit = await branchHead(repoPath, `refs/remotes/origin/${targetBranch}`, options);
+  const mergeCommitExists = await git(
+    repoPath,
+    ["cat-file", "-e", `${mergeCommit}^{commit}`],
+    { ...options, allowFailure: true },
+  );
+  const mergeIsReachable = mergeCommitExists.ok
+    ? await git(
+        repoPath,
+        ["merge-base", "--is-ancestor", mergeCommit, targetCommit],
+        { ...options, allowFailure: true },
+      )
+    : { ok: false };
+  if (!targetCommit || !mergeIsReachable.ok) {
+    return {
+      ok: false,
+      blocker: `Merged integration commit ${mergeCommit} is not reachable from protected target ${targetBranch} at ${targetCommit || "missing"}. StudioOps will not reconstruct or repush the candidate.`,
+    };
+  }
+  return {
+    ok: true,
+    mergeCommit,
+    targetCommit,
+  };
+}
+
+async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, options = {}) {
+  for (const task of projectPlan.tasks) {
+    const source = await remoteTaskHead(repoPath, task, options);
+    if (!source.ok) {
+      return {
+        status: "candidate_drift",
+        blocker: `Could not verify the reviewed source for ${task.id}: ${source.output}`,
+      };
+    }
+    if (source.head !== task.expectedHeadSha) {
+      return {
+        status: "candidate_drift",
+        blocker: `Reviewed source drift for ${task.id}: expected ${task.expectedHeadSha}, observed ${source.head || "missing"}. A new review is required before rebuilding the QA candidate.`,
+      };
+    }
+  }
+
+  const pr = await findIntegrationPr(repoPath, projectPlan, handoff.branch, options);
+  if (!pr) {
+    return {
+      status: "candidate_drift",
+      blocker: `The recorded integration PR ${handoff.prUrl} could not be found for candidate branch ${handoff.branch}.`,
+    };
+  }
+  const checkState = integrationPrCheckState(pr);
+  const inspectedPr = {
+    ...pr,
+    checkState,
+    blocker: integrationPrBlocker(pr, checkState),
+    workflowStatus: integrationPrStatus(pr, checkState),
+  };
+  const recordedPrNumber = Number(prNumberFromUrl(handoff.prUrl) || 0);
+  if (
+    (recordedPrNumber && recordedPrNumber !== Number(inspectedPr.number || 0))
+    || (inspectedPr.url && inspectedPr.url !== handoff.prUrl)
+  ) {
+    return {
+      status: "candidate_drift",
+      blocker: `Recorded integration PR ${handoff.prUrl} does not match the candidate branch PR ${inspectedPr.url || `#${inspectedPr.number || "unknown"}`}.`,
+      pr: inspectedPr,
+    };
+  }
+  if (inspectedPr.headRefOid !== handoff.commit) {
+    return {
+      status: "candidate_drift",
+      blocker: `Integration PR head drift: expected ${handoff.commit}, observed ${inspectedPr.headRefOid || "missing"}. StudioOps will not overwrite the PR branch.`,
+      pr: inspectedPr,
+    };
+  }
+
+  const remoteCandidate = await remoteRefHead(repoPath, `refs/heads/${handoff.branch}`, options);
+  if (!remoteCandidate.ok) {
+    return {
+      status: "candidate_drift",
+      blocker: `Could not inspect candidate branch ${handoff.branch}: ${remoteCandidate.output}`,
+      pr: inspectedPr,
+    };
+  }
+  if (remoteCandidate.head && remoteCandidate.head !== handoff.commit) {
+    return {
+      status: "candidate_drift",
+      blocker: `Candidate branch drift: expected ${handoff.commit}, observed ${remoteCandidate.head}. StudioOps will not overwrite the changed remote head.`,
+      pr: inspectedPr,
+    };
+  }
+  if (inspectedPr.workflowStatus !== "merged" && !remoteCandidate.head) {
+    return {
+      status: "candidate_drift",
+      blocker: `Open integration PR candidate branch ${handoff.branch} is missing. StudioOps will not recreate it without rebuilding and review.`,
+      pr: inspectedPr,
+    };
+  }
+  const changedSources = projectPlan.tasks.filter((task) => (
+    task.integrationSourceHeadSha
+    && task.expectedHeadSha
+    && task.integrationSourceHeadSha !== task.expectedHeadSha
+  ));
+  const missingSourceSnapshots = projectPlan.tasks.filter((task) => !task.integrationSourceHeadSha);
+  if (inspectedPr.workflowStatus !== "merged" && changedSources.length) {
+    if (missingSourceSnapshots.length) {
+      return {
+        status: "candidate_drift",
+        blocker: `Newly reviewed source evidence is available, but the previous handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not replace the open PR without auditable evidence.`,
+        pr: inspectedPr,
+      };
+    }
+    const changedSummary = changedSources
+      .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
+      .join(", ");
+    const reason = `StudioOps is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
+    const closed = String(inspectedPr.state || "").toUpperCase() === "CLOSED"
+      ? { ok: true, pr: inspectedPr, output: "" }
+      : await closeIntegrationPr(repoPath, projectPlan, inspectedPr, reason, options);
+    if (!closed.ok) {
+      return {
+        status: "candidate_supersession_failed",
+        blocker: `${closed.output} No replacement candidate was published.`,
+        pr: inspectedPr,
+      };
+    }
+    const cleanup = remoteCandidate.head
+      ? await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+          ...options,
+          allowFailure: true,
+        })
+      : { ok: true, output: "" };
+    return {
+      status: "superseded",
+      blocker: "",
+      pr: {
+        ...inspectedPr,
+        state: "CLOSED",
+      },
+      supersededHandoff: {
+        candidateBranch: handoff.branch,
+        candidateCommit: handoff.commit,
+        prUrl: handoff.prUrl,
+        prNumber: Number(inspectedPr.number || 0),
+        prState: "CLOSED",
+        workflowStatus: inspectedPr.workflowStatus,
+        checkState: inspectedPr.checkState,
+        reviewDecision: inspectedPr.reviewDecision || "",
+        blocker: inspectedPr.blocker || "",
+        taskIds: projectPlan.tasks.map((task) => task.id),
+        sources: projectPlan.tasks.map((task) => ({
+          taskId: task.id,
+          headSha: task.integrationSourceHeadSha,
+          candidateCycle: task.integrationSourceCandidateCycle || 0,
+          replacementHeadSha: task.expectedHeadSha,
+          replacementCandidateCycle: task.candidateCycle || 0,
+        })),
+        reason,
+        cleanup: cleanup.ok
+          ? remoteCandidate.head
+            ? `Removed superseded integration-candidate branch ${handoff.branch}.`
+            : `Superseded integration-candidate branch ${handoff.branch} was already removed.`
+          : `Cleanup warning: superseded integration-candidate branch ${handoff.branch} could not be removed: ${truncateOutput(cleanup.output)}`,
+      },
+    };
+  }
+  if (inspectedPr.workflowStatus !== "merged") {
+    return {
+      status: inspectedPr.workflowStatus,
+      blocker: inspectedPr.blocker,
+      pr: inspectedPr,
+    };
+  }
+
+  const target = await verifyMergedIntegrationTarget(repoPath, projectPlan, inspectedPr, options);
+  if (!target.ok) {
+    return {
+      status: "candidate_drift",
+      blocker: target.blocker,
+      pr: inspectedPr,
+    };
+  }
+  const cleanup = remoteCandidate.head
+    ? await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+        ...options,
+        allowFailure: true,
+      })
+    : { ok: true, output: "" };
+  return {
+    status: "merged",
+    blocker: "",
+    pr: inspectedPr,
+    mergeCommit: target.mergeCommit,
+    targetCommit: target.targetCommit,
+    cleanup: cleanup.ok
+      ? remoteCandidate.head
+        ? `Removed merged integration-candidate branch ${handoff.branch}.`
+        : `Merged integration-candidate branch ${handoff.branch} was already removed.`
+      : `Cleanup warning: merged integration-candidate branch ${handoff.branch} could not be removed: ${truncateOutput(cleanup.output)}`,
+  };
+}
+
 async function integrateProject(projectPlan, options = {}) {
-  const assemblingCandidate = projectPlan.tasks.length > 0;
-  const candidateId = assemblingCandidate ? `candidate_${randomUUID()}` : "";
-  const candidateBranch = assemblingCandidate
-    ? `qa/candidate-${workspaceSegment(projectPlan.projectKey || projectPlan.projectId)}-${candidateId.slice(-12)}`
-    : projectPlan.integrationBranch;
   const candidatePlan = {
     ...projectPlan,
-    integrationBranch: candidateBranch,
-    candidateBranch: assemblingCandidate ? candidateBranch : "",
-    integrationBranchUrl: branchWebUrl({
-      repoUrl: projectPlan.repoUrl,
-      reviewPolicy: { integrationBranch: candidateBranch },
-    }, candidateBranch),
+    tasks: [...projectPlan.tasks],
+    integrationBranch: projectPlan.integrationBranch,
+    candidateBranch: "",
+    integrationBranchUrl: projectPlan.integrationBranchUrl,
   };
+  const requestedTasks = [...candidatePlan.tasks];
+  const requestedAssembly = candidatePlan.assembly;
+  const pendingHandoff = pendingProtectedHandoff(candidatePlan);
+  if (pendingHandoff?.tasks?.length && !pendingHandoff.error) {
+    const includedTaskIds = pendingHandoff.tasks.map((task) => task.id).sort();
+    candidatePlan.tasks = pendingHandoff.tasks;
+    candidatePlan.assembly = {
+      mode: "atomic",
+      requestedTaskIds: includedTaskIds,
+      includedTaskIds,
+      excludedTaskIds: [],
+    };
+    candidatePlan.deferredTaskIds = pendingHandoff.deferredTasks.map((task) => task.id).sort();
+  }
+  const assemblingCandidate = candidatePlan.tasks.length > 0;
+  const candidateId = assemblingCandidate ? `candidate_${randomUUID()}` : "";
   const project = {
     id: candidatePlan.projectId,
     key: candidatePlan.projectKey,
@@ -1126,19 +1641,37 @@ async function integrateProject(projectPlan, options = {}) {
     localQaPreview: null,
     baseSha: "",
     candidate: null,
+    protectedBranchFallback: false,
+    integrationCandidateBranch: "",
+    integrationCandidateCommit: "",
+    integrationPr: null,
+    integrationCheckState: null,
+    integrationBlocker: "",
+    integrationCandidateCleanup: "",
+    integrationMergeCommit: "",
+    supersededHandoff: null,
+    deferredTaskIds: candidatePlan.deferredTaskIds || [],
   };
   const shouldSyncDefaultBranch = syncDefaultBranchEnabled(candidatePlan);
   const shouldSyncLocalPreview = localQaPreviewConfig(candidatePlan).enabled;
 
-  if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && !shouldSyncLocalPreview) {
+  if (!candidatePlan.tasks.length && !shouldSyncDefaultBranch && !shouldSyncLocalPreview) {
     result.status = "no_tasks";
+    return result;
+  }
+
+  if (pendingHandoff?.error) {
+    result.status = "blocked";
+    result.output = pendingHandoff.error;
+    result.integrationBlocker = pendingHandoff.error;
+    result.tasks = allTaskResults(candidatePlan.tasks, "blocked", pendingHandoff.error);
     return result;
   }
 
   if (!path.isAbsolute(repoPath)) {
     result.status = "blocked";
     result.output = "Project repoPath must be an absolute local path before QA integration can run.";
-    result.tasks = projectPlan.tasks.map((task) => ({
+    result.tasks = candidatePlan.tasks.map((task) => ({
       taskId: task.id,
       title: task.title,
       status: "blocked",
@@ -1148,7 +1681,45 @@ async function integrateProject(projectPlan, options = {}) {
     return result;
   }
 
-  if (!projectPlan.tasks.length && !shouldSyncDefaultBranch && shouldSyncLocalPreview) {
+  let mergedHandoff = null;
+  if (pendingHandoff) {
+    const gitOptions = { env: options.env, secrets: options.secrets };
+    const inspected = await inspectPendingProtectedHandoff(repoPath, candidatePlan, pendingHandoff, gitOptions);
+    if (inspected.status === "superseded") {
+      candidatePlan.tasks = requestedTasks;
+      candidatePlan.assembly = requestedAssembly;
+      candidatePlan.deferredTaskIds = [];
+      result.assembly = requestedAssembly;
+      result.deferredTaskIds = [];
+      result.supersededHandoff = inspected.supersededHandoff;
+      result.output = [
+        `Superseded protected QA handoff ${pendingHandoff.prUrl} at ${pendingHandoff.commit}.`,
+        inspected.supersededHandoff.cleanup,
+      ].filter(Boolean).join("\n");
+    } else {
+      result.protectedBranchFallback = true;
+      result.integrationCandidateBranch = pendingHandoff.branch;
+      result.integrationCandidateCommit = pendingHandoff.commit;
+      result.commit = pendingHandoff.commit;
+      result.integrationPr = inspected.pr || {
+        url: pendingHandoff.prUrl,
+        number: candidatePlan.tasks[0].integrationPrNumber || 0,
+      };
+      result.integrationCheckState = inspected.pr?.checkState || candidatePlan.tasks[0].integrationCheckState || null;
+      result.integrationBlocker = inspected.blocker || "";
+      result.integrationCandidateCleanup = inspected.cleanup || "";
+      result.integrationMergeCommit = inspected.mergeCommit || "";
+    }
+    if (!["merged", "superseded"].includes(inspected.status)) {
+      result.status = inspected.status;
+      result.output = inspected.blocker;
+      result.tasks = allTaskResults(candidatePlan.tasks, inspected.status, inspected.blocker);
+      return result;
+    }
+    if (inspected.status === "merged") mergedHandoff = inspected;
+  }
+
+  if (!candidatePlan.tasks.length && !shouldSyncDefaultBranch && shouldSyncLocalPreview) {
     result.localQaPreview = await syncLocalQaPreview(candidatePlan, options);
     result.status = localPreviewFailed(result.localQaPreview)
       ? "preview_blocked"
@@ -1169,30 +1740,72 @@ async function integrateProject(projectPlan, options = {}) {
 
     const gitOptions = { env: options.env, secrets: options.secrets };
     const prepared = await prepareIntegrationBranch(executionRepoPath, project, candidatePlan.integrationBranch, gitOptions);
-    result.output = prepared;
+    result.output = appendOutput(result.output, prepared);
     const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     preparedHead = preparedCommit.output.trim();
-    result.baseSha = preparedHead;
+    const defaultBranchHead = await remoteRefHead(
+      executionRepoPath,
+      `refs/heads/${normalizeBranchName(candidatePlan.defaultBranch || "main")}`,
+      gitOptions,
+    );
+    if (!defaultBranchHead.ok || !defaultBranchHead.head) {
+      throw new Error(`Could not resolve the exact default-branch base for the QA candidate: ${defaultBranchHead.output || "remote ref is missing"}`);
+    }
+    result.baseSha = defaultBranchHead.head;
 
     let branchChanged = false;
-    if (shouldSyncDefaultBranch) {
+    if (!mergedHandoff && shouldSyncDefaultBranch) {
       result.defaultBranchSync = await mergeDefaultBranchIntoIntegration(executionRepoPath, candidatePlan, gitOptions);
       if (!result.defaultBranchSync.ok) {
         result.status = result.defaultBranchSync.status || "blocked";
         result.output = result.defaultBranchSync.output;
         result.tasks = result.tasks.length
           ? result.tasks
-          : allTaskResults(projectPlan.tasks, result.status, result.output);
+          : allTaskResults(candidatePlan.tasks, result.status, result.output);
         return result;
       }
       branchChanged = Boolean(result.defaultBranchSync.changed);
     }
 
     const mergedTasks = [];
-    for (const task of projectPlan.tasks) {
-      const taskResult = await mergeTaskSource(executionRepoPath, task, gitOptions);
-      result.tasks.push(taskResult);
-      if (taskResult.status === "merged") mergedTasks.push(taskResult);
+    if (mergedHandoff) {
+      const mergeIsReachable = await git(
+        executionRepoPath,
+        ["merge-base", "--is-ancestor", mergedHandoff.mergeCommit, preparedHead],
+        { ...gitOptions, allowFailure: true },
+      );
+      if (!mergeIsReachable.ok) {
+        result.status = "candidate_drift";
+        result.integrationBlocker = `Protected target ${candidatePlan.integrationBranch} moved to ${preparedHead}, which no longer contains merged integration commit ${mergedHandoff.mergeCommit}.`;
+        result.output = result.integrationBlocker;
+        result.tasks = allTaskResults(candidatePlan.tasks, result.status, result.output);
+        return result;
+      }
+      for (const task of candidatePlan.tasks) {
+        const taskResult = {
+          taskId: task.id,
+          title: task.title,
+          status: "merged",
+          source: sourceLabel(task),
+          sourceRef: taskSourceRef(task),
+          headSha: task.expectedHeadSha,
+          candidateCycle: task.candidateCycle,
+          reviews: task.reviews,
+          output: `Verified merged integration PR ${result.integrationPr?.url || ""} on protected target ${candidatePlan.integrationBranch} at ${preparedHead}.`,
+        };
+        result.tasks.push(taskResult);
+        mergedTasks.push(taskResult);
+      }
+      result.output = appendOutput(
+        result.output,
+        `Verified merged integration commit ${mergedHandoff.mergeCommit} on protected target ${candidatePlan.integrationBranch} at ${preparedHead}. Source commits were not merged or pushed again.`,
+      );
+    } else {
+      for (const task of candidatePlan.tasks) {
+        const taskResult = await mergeTaskSource(executionRepoPath, task, gitOptions);
+        result.tasks.push(taskResult);
+        if (taskResult.status === "merged") mergedTasks.push(taskResult);
+      }
     }
 
     const failedTaskMerge = result.tasks.find((task) => task.status !== "merged");
@@ -1204,7 +1817,7 @@ async function integrateProject(projectPlan, options = {}) {
 
     if (!mergedTasks.length && !branchChanged) {
       result.status = result.tasks.some((task) => task.status === "conflict") ? "conflict" : "blocked";
-      if (!projectPlan.tasks.length) {
+      if (!candidatePlan.tasks.length) {
         result.status = "no_changes";
         result.output = result.defaultBranchSync?.output || "No QA integration changes were needed.";
         if (shouldSyncLocalPreview) {
@@ -1218,7 +1831,7 @@ async function integrateProject(projectPlan, options = {}) {
       return result;
     }
 
-    const validationCommands = normalizeList(projectPlan.validationCommands);
+    const validationCommands = normalizeList(candidatePlan.validationCommands);
     if (!validationCommands.length) {
       result.status = "validation_missing";
       result.output = "No project validationCommands are configured. The QA integration branch was not pushed or marked ready.";
@@ -1238,18 +1851,95 @@ async function integrateProject(projectPlan, options = {}) {
     const commit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     result.commit = commit.output.trim();
 
-    const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${candidatePlan.integrationBranch}`], { ...gitOptions, allowFailure: true });
-    if (!push.ok) {
-      result.status = "push_failed";
-      result.output = `Non-force push to ${candidatePlan.integrationBranch} failed. The remote branch may have changed; rebuild a new candidate.\n${truncateOutput(push.output)}`;
-      for (const task of mergedTasks) task.status = "push_failed";
-      return result;
-    }
+    if (mergedHandoff) {
+      result.status = "ready";
+      result.output = appendOutput(result.output, result.integrationCandidateCleanup);
+      pushed = true;
+      for (const task of mergedTasks) task.status = "ready";
+    } else {
+      const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${candidatePlan.integrationBranch}`], { ...gitOptions, allowFailure: true });
+      if (!push.ok) {
+        if (assemblingCandidate && protectedBranchPushRejected(push)) {
+          const integrationCandidateBranch = integrationCandidateBranchName(candidatePlan, result.commit);
+          const remoteCandidate = await remoteRefHead(
+            executionRepoPath,
+            `refs/heads/${integrationCandidateBranch}`,
+            gitOptions,
+          );
+          if (!remoteCandidate.ok) {
+            result.status = "candidate_publish_failed";
+            result.output = `Protected branch ${candidatePlan.integrationBranch} requires a pull request, but StudioOps could not inspect candidate branch ${integrationCandidateBranch}: ${remoteCandidate.output}`;
+            for (const task of mergedTasks) task.status = result.status;
+            return result;
+          }
+          if (remoteCandidate.head && remoteCandidate.head !== result.commit) {
+            result.status = "candidate_drift";
+            result.integrationCandidateBranch = integrationCandidateBranch;
+            result.integrationCandidateCommit = result.commit;
+            result.integrationBlocker = `Candidate branch ${integrationCandidateBranch} changed remotely: expected ${result.commit}, observed ${remoteCandidate.head}. StudioOps will not overwrite it.`;
+            result.output = result.integrationBlocker;
+            for (const task of mergedTasks) task.status = result.status;
+            return result;
+          }
+          if (!remoteCandidate.head) {
+            const candidatePush = await git(
+              executionRepoPath,
+              ["push", "origin", `HEAD:refs/heads/${integrationCandidateBranch}`],
+              { ...gitOptions, allowFailure: true },
+            );
+            if (!candidatePush.ok) {
+              result.status = "candidate_publish_failed";
+              result.output = `Protected branch ${candidatePlan.integrationBranch} requires a pull request, and the non-force candidate push to ${integrationCandidateBranch} failed.\n${truncateOutput(candidatePush.output)}`;
+              for (const task of mergedTasks) task.status = result.status;
+              return result;
+            }
+          }
 
-    result.status = "ready";
-    result.output = truncateOutput(push.output || `Pushed ${candidatePlan.integrationBranch}.`);
-    pushed = true;
-    for (const task of mergedTasks) task.status = "ready";
+          pushed = true;
+          result.protectedBranchFallback = true;
+          result.integrationCandidateBranch = integrationCandidateBranch;
+          result.integrationCandidateCommit = result.commit;
+          const pr = await ensureIntegrationPr(
+            executionRepoPath,
+            candidatePlan,
+            integrationCandidateBranch,
+            result.commit,
+            gitOptions,
+          );
+          result.integrationPr = pr;
+          result.integrationCheckState = pr.checkState;
+          result.integrationBlocker = pr.blocker || (
+            pr.workflowStatus === "merged"
+              ? "The integration PR merged; rerun QA integration to verify the protected target and local preview."
+              : ""
+          );
+          result.status = pr.workflowStatus === "merged" ? "pr_merged" : pr.workflowStatus;
+          result.output = [
+            result.output,
+            `Protected branch ${candidatePlan.integrationBranch} rejected the direct non-force push; no force push was attempted.`,
+            `Published exact candidate ${result.commit} to ${integrationCandidateBranch}.`,
+            `Integration PR: ${pr.url}`,
+            result.integrationBlocker,
+          ].filter(Boolean).join("\n");
+          for (const task of mergedTasks) task.status = result.status;
+          return result;
+        }
+        result.status = "push_failed";
+        result.output = `Non-force push to ${candidatePlan.integrationBranch} failed. The remote branch may have changed; rebuild a new candidate.\n${truncateOutput(push.output)}`;
+        for (const task of mergedTasks) task.status = "push_failed";
+        return result;
+      }
+      result.status = "ready";
+      result.output = appendOutput(
+        result.output,
+        appendOutput(
+          truncateOutput(push.output || `Pushed ${candidatePlan.integrationBranch}.`),
+          result.integrationCandidateCleanup,
+        ),
+      );
+      pushed = true;
+      for (const task of mergedTasks) task.status = "ready";
+    }
     if (shouldSyncLocalPreview) {
       result.localQaPreview = await syncLocalQaPreview(candidatePlan, options);
       result.output = appendOutput(result.output, result.localQaPreview.output);
@@ -1341,7 +2031,16 @@ async function integrateProject(projectPlan, options = {}) {
   } catch (error) {
     result.status = "blocked";
     result.output = truncateOutput(error.message);
-    result.tasks = result.tasks.length ? result.tasks : allTaskResults(projectPlan.tasks, "blocked", error.message);
+    if (result.tasks.length) {
+      for (const task of result.tasks) {
+        if (task.status === "merged") {
+          task.status = "blocked";
+          task.output = result.output;
+        }
+      }
+    } else {
+      result.tasks = allTaskResults(candidatePlan.tasks, "blocked", error.message);
+    }
     return result;
   } finally {
     if (preparedHead && !pushed && executionRepoPath) {
@@ -1416,9 +2115,12 @@ function commentForTask(projectResult, taskResult) {
     : `\n\nIntegration branch: ${projectResult.integrationBranch}`;
   const workspaceLine = workspaceSummary(projectResult);
   const previewLine = localPreviewSummary(projectResult);
+  const supersededLine = projectResult.supersededHandoff
+    ? `\n\nSuperseded handoff: ${projectResult.supersededHandoff.prUrl} at ${projectResult.supersededHandoff.candidateCommit}. ${projectResult.supersededHandoff.cleanup}`
+    : "";
 
   if (taskResult.status === "ready") {
-    return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}${previewLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
+    return `QA integration branch ready: merged ${taskResult.source} into ${projectResult.integrationBranch} at ${projectResult.commit}.${branchLine}${workspaceLine}${previewLine}\n\nValidation passed:\n${validationSummary(projectResult)}${supersededLine}`;
   }
 
   if (taskResult.status === "conflict") {
@@ -1438,7 +2140,19 @@ function commentForTask(projectResult, taskResult) {
     return `QA integration could not update ${projectResult.integrationBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
-  return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}`;
+  if (["pr_waiting", "pr_merged", "checks_failed", "changes_requested", "pr_closed"].includes(taskResult.status)) {
+    const checkState = projectResult.integrationCheckState;
+    const checks = checkState
+      ? `\n\nChecks: ${checkState.state} (${checkState.passed} passed, ${checkState.pending} pending, ${checkState.failed} failed)`
+      : "";
+    return `Protected QA branch handoff for ${taskResult.source}: ${projectResult.integrationCandidateCommit} is published on ${projectResult.integrationCandidateBranch}.${projectResult.integrationPr?.url ? `\n\nPR: ${projectResult.integrationPr.url}` : ""}${branchLine}${checks}\n\n${projectResult.integrationBlocker || projectResult.output}${supersededLine}`;
+  }
+
+  if (["candidate_drift", "candidate_publish_failed", "candidate_supersession_failed"].includes(taskResult.status)) {
+    return `Protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
+  }
+
+  return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}${supersededLine}`;
 }
 
 function stableQaOutput(value, workspacePath) {
@@ -1464,6 +2178,20 @@ export function qaResultFingerprint(projectResult, taskResult) {
     projectStatus: projectResult.status || "",
     integrationBranch: projectResult.integrationBranch || "",
     commit: projectResult.commit || "",
+    integrationCandidateBranch: projectResult.integrationCandidateBranch || "",
+    integrationCandidateCommit: projectResult.integrationCandidateCommit || "",
+    integrationMergeCommit: projectResult.integrationMergeCommit || "",
+    deferredTaskIds: projectResult.deferredTaskIds || [],
+    integrationPr: projectResult.integrationPr ? {
+      url: projectResult.integrationPr.url || "",
+      number: projectResult.integrationPr.number || 0,
+      state: projectResult.integrationPr.state || "",
+      headRefOid: projectResult.integrationPr.headRefOid || "",
+      mergeStateStatus: projectResult.integrationPr.mergeStateStatus || "",
+      reviewDecision: projectResult.integrationPr.reviewDecision || "",
+    } : null,
+    integrationCheckState: projectResult.integrationCheckState || null,
+    integrationBlocker: projectResult.integrationBlocker || "",
     projectOutput: ready ? "" : stableQaOutput(projectResult.output, workspacePath),
     localPreview: projectResult.localQaPreview ? {
       status: ready ? "ready" : projectResult.localQaPreview.status || "",
@@ -1481,14 +2209,49 @@ export function qaResultFingerprint(projectResult, taskResult) {
 }
 
 function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
+  const remediationStatuses = new Set([
+    "checks_failed",
+    "changes_requested",
+    "candidate_drift",
+    "candidate_publish_failed",
+    "candidate_supersession_failed",
+  ]);
+  const integrationStatus = remediationStatuses.has(taskResult.status)
+    ? "blocked"
+    : taskResult.status;
   const integrationRetryNotBefore = taskResult.status === "ready"
     ? ""
     : new Date(Date.parse(now) + DEFAULT_QA_RETRY_DELAY_MS).toISOString();
+  const protectedHandoff = Boolean(
+    projectResult.protectedBranchFallback
+    || projectResult.integrationCandidateBranch
+    || projectResult.integrationPr,
+  );
+  const assignedAgentRole = taskResult.status === "ready"
+    ? "owner"
+    : ["pr_waiting", "pr_merged"].includes(taskResult.status)
+      ? "qa-integration-worker"
+      : taskResult.status === "pr_closed"
+        ? "owner"
+        : "builder";
   return {
-    integrationStatus: taskResult.status,
+    integrationStatus,
     integrationBranch: projectResult.integrationBranch,
     integrationBranchUrl: projectResult.integrationBranchUrl,
-    integrationCommit: taskResult.status === "ready" ? projectResult.commit : "",
+    integrationCommit: taskResult.status === "ready" || protectedHandoff ? projectResult.commit : "",
+    integrationCandidateBranch: projectResult.integrationCandidateBranch || "",
+    integrationCandidateCommit: projectResult.integrationCandidateCommit || "",
+    integrationPrUrl: projectResult.integrationPr?.url || "",
+    integrationPrNumber: Number(projectResult.integrationPr?.number || 0),
+    integrationPrState: projectResult.integrationPr?.state || "",
+    integrationPrHeadSha: projectResult.integrationPr?.headRefOid || "",
+    integrationPrMergeState: projectResult.integrationPr?.mergeStateStatus || "",
+    integrationPrReviewDecision: projectResult.integrationPr?.reviewDecision || "",
+    integrationMergeCommit: projectResult.integrationMergeCommit || "",
+    integrationCheckState: projectResult.integrationCheckState || null,
+    integrationBlocker: projectResult.integrationBlocker || "",
+    integrationSourceHeadSha: protectedHandoff ? taskResult.headSha || "" : "",
+    integrationSourceCandidateCycle: protectedHandoff ? Number(taskResult.candidateCycle || 0) : 0,
     integrationSource: taskResult.source || "",
     integrationWorkspacePath: projectResult.workspacePath || "",
     integrationWorkspaceStrategy: projectResult.workspaceStrategy || "",
@@ -1501,7 +2264,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
       status: projectResult.status,
       commands: projectResult.validation || [],
     },
-    assignedAgentRole: taskResult.status === "ready" ? "owner" : "builder",
+    assignedAgentRole,
     reviewerThreadId: "",
   };
 }
@@ -1517,6 +2280,30 @@ async function recordProjectResult(projectResult) {
     for (const taskResult of projectResult.tasks || []) {
       const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
       if (!task) continue;
+      const supersededHandoff = projectResult.supersededHandoff;
+      if (supersededHandoff?.taskIds?.includes(task.id)) {
+        task.integrationHandoffHistory = Array.isArray(task.integrationHandoffHistory)
+          ? task.integrationHandoffHistory
+          : [];
+        const alreadyRecorded = task.integrationHandoffHistory.some((item) => (
+          item.candidateCommit === supersededHandoff.candidateCommit
+          && item.prUrl === supersededHandoff.prUrl
+        ));
+        if (!alreadyRecorded) {
+          task.integrationHandoffHistory.push({
+            ...supersededHandoff,
+            supersededAt: now,
+          });
+          state.events.push({
+            id: nextId(state.events, "event"),
+            type: "qa_integration_handoff_superseded",
+            projectId: task.projectId,
+            taskId: task.id,
+            message: `${task.title}: superseded QA integration handoff ${supersededHandoff.prUrl}`,
+            createdAt: now,
+          });
+        }
+      }
       const reportFingerprint = qaResultFingerprint(projectResult, taskResult);
       const reportChanged = task.integrationReportFingerprint !== reportFingerprint;
       Object.assign(task, taskPatchForResult(projectResult, taskResult, now, reportFingerprint));
