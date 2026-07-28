@@ -48,6 +48,15 @@ async function writeLegacyState(root, state) {
   await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(state)}\n`);
 }
 
+async function readPersistedState(root, env) {
+  const result = await execFileAsync(process.execPath, [
+    "--input-type=module",
+    "-e",
+    `import { readState } from ${JSON.stringify(path.resolve("src/store.js"))}; console.log(JSON.stringify(await readState()));`,
+  ], { cwd: root, env });
+  return JSON.parse(result.stdout);
+}
+
 test("status without a value and show-task leave the task unchanged", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-status-cli-"));
   try {
@@ -62,8 +71,18 @@ test("status without a value and show-task leave the task unchanged", async () =
     const inspection = await execFileAsync(process.execPath, [cliPath, "show-task", "task_1", "--json"], { cwd: root, env });
     assert.match(inspection.stdout, /"reviewSubjectSha":/);
 
-    const state = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8")).tasks[0];
-    assert.deepEqual(state, before);
+    const legacyTask = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8")).tasks[0];
+    assert.deepEqual(legacyTask, before);
+    const persisted = await readPersistedState(root, env);
+    assert.deepEqual({
+      task: persisted.tasks[0],
+      comments: persisted.comments,
+      events: persisted.events,
+    }, {
+      task: before,
+      comments: [],
+      events: [],
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -96,6 +115,29 @@ test("supervisor reports invalid legacy status as a repairable integrity fault",
   assert.equal(report.totals.integrityFaults, 1);
   assert.equal(report.integrityFaults[0].taskId, "task_1");
   assert.match(report.integrityFaults[0].reason, /status task_1 --status/);
+});
+
+test("noncanonical whitespace statuses are integrity faults and cannot be rewritten", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-status-boundary-"));
+  try {
+    const state = invalidStatusState();
+    state.tasks[0].status = " backend_review ";
+    await writeLegacyState(root, state);
+    const env = await environmentForTestControlRoot(root);
+
+    const report = createSupervisorReport(state);
+    assert.equal(report.totals.integrityFaults, 1);
+    await assert.rejects(
+      execFileAsync(process.execPath, [
+        "--input-type=module",
+        "-e",
+        `import { readState, writeState } from ${JSON.stringify(path.resolve("src/store.js"))}; const state = await readState(); await writeState(state);`,
+      ], { cwd: root, env }),
+      /invalid workflow status/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("a recovered current-candidate backend approval routes to the next required lane", () => {

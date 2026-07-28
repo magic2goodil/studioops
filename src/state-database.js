@@ -605,7 +605,7 @@ function assertFullCandidateHistoryPreserved(db, candidates) {
 function assertValidTaskStatuses(state) {
   for (const task of state.tasks || []) {
     const status = typeof task.status === "string" ? task.status.trim() : "";
-    if (!VALID_TASK_STATUSES.has(status)) {
+    if (task.status !== status || !VALID_TASK_STATUSES.has(status)) {
       throw new Error(`Task ${task.id} has invalid workflow status: ${task.status || "(missing)"}. Repair it with an explicit canonical status before writing other fields.`);
     }
   }

@@ -129,7 +129,7 @@ export function workflowIntegrityFaults(state) {
   return (state.tasks || [])
     .filter((task) => {
       const status = typeof task.status === "string" ? task.status.trim() : "";
-      return !status || !VALID_STATUSES.has(status);
+      return task.status !== status || !status || !VALID_STATUSES.has(status);
     })
     .map((task) => ({
       taskId: task.id,
