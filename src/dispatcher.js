@@ -9,6 +9,7 @@ import {
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
+import { assessCreditAdmission } from "./credit-policy.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_architecture",
@@ -202,10 +203,82 @@ function dispatchSafetyReason(state, task, action, options) {
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";
   if (task.automationCircuit?.state === "open") return "task_circuit_open";
   const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const creditAdmission = assessCreditAdmission(
+    options.creditSnapshot,
+    executionPolicy,
+    options.creditPolicy,
+  );
+  if (!creditAdmission.allowed) return `credit_gate:${creditAdmission.code}`;
   const attemptKey = executionAttemptKey(task, action);
   const attemptCount = executionAttemptCount(state, attemptKey);
   if (attemptCount >= executionPolicy.maxAttempts) return "attempt_budget_exhausted";
   return "";
+}
+
+function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
+  const openedTaskIds = new Set();
+  for (const item of skipped || []) {
+    if (!String(item.reason || "").startsWith("credit_gate:") || openedTaskIds.has(item.taskId)) continue;
+    const task = findTask(state, item.taskId);
+    const action = skippedAction(actions, item);
+    if (!task || !action || task.automationCircuit?.state === "open") continue;
+    const executionPolicy = resolveExecutionPolicy(task, action, options);
+    const admission = assessCreditAdmission(
+      options.creditSnapshot,
+      executionPolicy,
+      options.creditPolicy,
+    );
+    const resumeStatus = task.status;
+    task.status = "blocked";
+    task.assignedAgentRole = "owner";
+    task.retryNotBefore = "";
+    task.lastAutomationFailure = admission.code;
+    task.automationBlocker = {
+      type: "circuit",
+      reason: admission.code,
+      actionType: action.type,
+      modelTier: admission.tier,
+      estimatedCredits: admission.estimatedCredits,
+      minRemainingPercent: admission.minRemainingPercent,
+      resumeStatus,
+      blockedAt: now,
+      retryAt: "",
+    };
+    task.automationCircuit = {
+      state: "open",
+      scope: "task",
+      reasonCode: "credit_budget_insufficient",
+      normalizedReason: `StudioOps did not start ${action.type} because the ${admission.tier} quality tier failed credit admission (${admission.code}).`,
+      failureFingerprint: `${task.id}:${action.type}:${admission.tier}:${admission.code}`,
+      attemptsConsumed: 0,
+      maxAttempts: 0,
+      openedAt: now,
+      nextCheapProbe: "Check current Codex usage limits without launching a model run.",
+      resumeAction: `studioops circuit-reset --task ${task.id} --reason credits_verified`,
+      remediation: "Wait for quota reset, add credits, or update the configured budget after review; then reset this task circuit.",
+    };
+    task.updatedAt = now;
+    const remaining = Number.isFinite(admission.remainingPercent)
+      ? `${admission.remainingPercent}%`
+      : "unknown";
+    state.comments.push({
+      id: nextId(state.comments, "comment"),
+      taskId: task.id,
+      author: "StudioOps Credit Controller",
+      body: `Run suppressed before model launch. Required tier: ${admission.tier}. Admission result: ${admission.code}. Estimated run budget: ${admission.estimatedCredits} credits. Remaining quota headroom: ${remaining}. StudioOps did not downgrade the task. Verify credits or quota, then run \`${task.automationCircuit.resumeAction}\`.`,
+      createdAt: now,
+    });
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "credit_admission_blocked",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title}: ${admission.tier} tier blocked by ${admission.code}`,
+      createdAt: now,
+    });
+    openedTaskIds.add(task.id);
+  }
+  return openedTaskIds;
 }
 
 function resolveReviewTargetStage(stages, task, action) {
@@ -438,6 +511,11 @@ function makeRun(state, task, action, options, now) {
   const threadId = action.threadId || (group === "reviewer" ? task.reviewerThreadId : task.assignedThreadId) || "";
   const profile = laneProfile(task, action);
   const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const creditAdmission = assessCreditAdmission(
+    options.creditSnapshot,
+    executionPolicy,
+    options.creditPolicy,
+  );
   const attemptKey = executionAttemptKey(task, action);
   const attempt = executionAttemptCount(state, attemptKey) + 1;
   return {
@@ -457,6 +535,16 @@ function makeRun(state, task, action, options, now) {
     modelTier: executionPolicy.modelTier,
     modelReasoningEffort: executionPolicy.reasoningEffort,
     modelSelectionReason: executionPolicy.selectionReason,
+    creditAdmission: {
+      code: creditAdmission.code,
+      tier: creditAdmission.tier,
+      estimatedCredits: creditAdmission.estimatedCredits,
+      minRemainingPercent: creditAdmission.minRemainingPercent,
+      remainingPercent: Number.isFinite(creditAdmission.remainingPercent)
+        ? creditAdmission.remainingPercent
+        : null,
+      snapshotStatus: creditAdmission.snapshotStatus,
+    },
     attemptKey,
     attempt,
     maxAttempts: executionPolicy.maxAttempts,
@@ -590,6 +678,14 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       options,
       now,
     );
+    const creditBlockedTaskIds = openCreditAdmissionCircuits(
+      state,
+      actions,
+      plan.skipped,
+      options,
+      now,
+    );
+    for (const taskId of creditBlockedTaskIds) openedTaskIds.add(taskId);
     const selected = plan.selected.filter((item) => (
       !openedTaskIds.has(item.taskId) || item.group === "owner"
     ));

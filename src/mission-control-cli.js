@@ -35,6 +35,7 @@ import {
   writeConfig,
 } from "./config.js";
 import { backupStateDatabase } from "./state-database.js";
+import { getCodexCreditSnapshot } from "./credit-policy.js";
 import {
   defaultStudioOpsCredentialsRoot,
   defaultStudioOpsGitLockRoot,
@@ -194,6 +195,21 @@ async function setup() {
           maxAttempts: 2,
           retryBackoffMs: 30000,
           staleRunMs: 7200000,
+        },
+        creditPolicy: {
+          enabled: false,
+          refreshIntervalMs: 300000,
+          snapshotMaxAgeMs: 900000,
+          probeTimeoutMs: 20000,
+          reserveCredits: 5,
+          failClosedTiers: ["critical", "frontier"],
+          tierBudgets: {
+            mechanical: { estimatedCredits: 2, minRemainingPercent: 2 },
+            economy: { estimatedCredits: 8, minRemainingPercent: 5 },
+            balanced: { estimatedCredits: 15, minRemainingPercent: 10 },
+            critical: { estimatedCredits: 30, minRemainingPercent: 20 },
+            frontier: { estimatedCredits: 40, minRemainingPercent: 35 },
+          },
         },
         supervisor: {
           intervalSeconds: 15,
@@ -871,7 +887,12 @@ Automation:
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
       },
+      creditPolicy: {
+        ...(config?.defaults?.creditPolicy || {}),
+        ...(config?.creditPolicy || {}),
+      },
     };
+    options.creditSnapshot = await getCodexCreditSnapshot(options.creditPolicy);
     if (args.plan) {
       const plan = planDispatches(state, supervisor.actions, options);
       const report = {
