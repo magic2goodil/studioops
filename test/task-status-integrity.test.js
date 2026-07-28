@@ -166,10 +166,33 @@ test("explicit repair atomically fixes one invalid task while preserving another
     assert.equal(persisted.tasks.find((task) => task.id === "task_1").status, "backend_review");
     assert.equal(persisted.tasks.find((task) => task.id === "task_2").status, "not-a-status");
     assert.equal(persisted.tasks.find((task) => task.id === "task_1").reviewSubjectSha, "a".repeat(40));
+    assert.equal(persisted.tasks.find((task) => task.id === "task_1").reviewCycle, 2);
+    assert.equal(persisted.tasks.find((task) => task.id === "task_1").reviewSubjectCycle, 2);
     assert.equal(persisted.events.filter((event) => event.type === "workflow_integrity_repaired").length, 1);
     const report = createSupervisorReport(persisted);
     assert.deepEqual(report.integrityFaults.map((fault) => fault.taskId), ["task_2"]);
     assert.equal(report.actions.find((action) => action.taskId === "task_1")?.nextStatus, "frontend_review");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a builder-review status repair preserves the current review subject and cycle", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-builder-review-repair-"));
+  try {
+    await writeLegacyState(root, invalidStatusState());
+    const env = await environmentForTestControlRoot(root);
+    await execFileAsync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `import { updateTask } from ${JSON.stringify(path.resolve("src/store.js"))}; await updateTask("task_1", { status: "builder_review" });`,
+    ], { cwd: root, env });
+
+    const task = (await readPersistedState(root, env)).tasks[0];
+    assert.equal(task.status, "builder_review");
+    assert.equal(task.reviewCycle, 2);
+    assert.equal(task.reviewSubjectCycle, 2);
+    assert.equal(task.reviewSubjectSha, "a".repeat(40));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

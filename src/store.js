@@ -710,7 +710,12 @@ export async function updateTask(taskId, patch) {
     ) {
       task.status = "architecture_pending";
     }
-    const startedBuilderReviewCycle = patch.status === "builder_review" && previousStatus !== "builder_review";
+    // A status repair restores an invalid legacy record to the workflow; it must
+    // not be treated as a new builder submission, which would discard the
+    // review subject and cycle that make existing approvals auditable.
+    const startedBuilderReviewCycle = !repairingLegacyStatus
+      && patch.status === "builder_review"
+      && previousStatus !== "builder_review";
     if (startedBuilderReviewCycle) {
       task.reviewCycle = Number(task.reviewCycle || 0) + 1;
       task.reviewSubjectSha = "";
