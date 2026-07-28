@@ -9,6 +9,7 @@ const TABLES = {
   events: "events",
   runs: "runs",
   qaBundles: "qa_bundles",
+  candidates: "candidates",
 };
 
 export function readPersistedState(root) {
@@ -26,4 +27,3 @@ export function readPersistedState(root) {
     db.close();
   }
 }
-

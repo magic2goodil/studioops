@@ -1,17 +1,30 @@
 import { backup, DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { assertCandidateEnvelope } from "./candidate-manifest.js";
 import { fileExists } from "./config.js";
-import { missionControlDataDir, missionControlRoot } from "./runtime-paths.js";
+import {
+  assertIsolatedTestEnvironment,
+  missionControlDataDir,
+  missionControlRoot,
+} from "./runtime-paths.js";
 
-const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles"];
+const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
-const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles"]);
-const STATE_INTEGRITY_VERSION = 3;
+const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles", "candidates"]);
+const STATE_INTEGRITY_VERSION = 4;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
+const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
+const VALID_TASK_STATUSES = new Set([
+  "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
+  "ready", "queued", "in_progress", "blocked", "builder_review", "backend_review",
+  "frontend_review", "accessibility_review", "regression_review", "lead_review", "qa_review",
+  "approved_for_main", "promotion_blocked", "needs_changes", "user_review", "approved",
+  "merged", "deployed", "done", "closed", "legacy_untrusted",
+]);
 const DATA_DIR = missionControlDataDir();
 export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
@@ -29,6 +42,7 @@ async function secureStoragePaths() {
 
 function openDatabase() {
   if (database) return database;
+  assertIsolatedTestEnvironment();
   database = new DatabaseSync(DATABASE_FILE);
   database.exec("PRAGMA busy_timeout = 10000");
   database.exec("PRAGMA journal_mode = WAL");
@@ -99,6 +113,15 @@ function openDatabase() {
       updated_at TEXT NOT NULL DEFAULT '',
       payload TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS candidates (
+      id TEXT PRIMARY KEY,
+      sequence INTEGER NOT NULL,
+      project_id TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT '',
+      manifest_digest TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS operational_archive (
       entity_type TEXT NOT NULL,
       entity_id TEXT NOT NULL,
@@ -117,6 +140,8 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_runs_status_updated ON runs(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
     CREATE INDEX IF NOT EXISTS idx_qa_bundles_project_status ON qa_bundles(project_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_candidates_project_status ON candidates(project_id, status, updated_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_manifest_digest ON candidates(manifest_digest);
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
   `);
   return database;
@@ -146,6 +171,10 @@ function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
 export function compactOperationalHistory(state, input = {}) {
   const commentLimit = Math.max(1, Number(input.commentLimit || ACTIVE_QA_COMMENTS_PER_TASK));
   const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
+  const staleReviewRunLimit = Math.max(
+    1,
+    Number(input.staleReviewRunLimit || ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH),
+  );
   const qaEventEvidence = new Set((Array.isArray(state.events) ? state.events : [])
     .filter((event) => /^qa_integration_/.test(event.type || ""))
     .map((event) => `${event.taskId || ""}|${event.createdAt || ""}`));
@@ -168,9 +197,35 @@ export function compactOperationalHistory(state, input = {}) {
     (event) => event.taskId || `${event.projectId || "unassigned"}:${event.type || "qa"}`,
     eventLimit,
   );
+  const runs = archiveOldestBeyondLimit(
+    Array.isArray(state.runs) ? state.runs : [],
+    (run) => (
+      run.status === "cancelled"
+      && run.actionType === "continue_review"
+      && (
+        String(run.exitCode || "").startsWith("task_status_changed:")
+        || String(run.notes || "").includes("dispatch-loop incident")
+      )
+    ),
+    (run) => run.dispatchKey || `${run.taskId || "unassigned"}:${run.role || "reviewer"}`,
+    staleReviewRunLimit,
+  );
   state.comments = comments.active;
   state.events = events.active;
-  return { comments: comments.archived, events: events.archived };
+  state.runs = runs.active;
+  return { comments: comments.archived, events: events.archived, runs: runs.archived };
+}
+
+function archivePayload(entityType, item) {
+  if (entityType !== "runs") return item;
+  const {
+    prompt: _prompt,
+    ...auditRecord
+  } = item;
+  return {
+    ...auditRecord,
+    promptOmitted: true,
+  };
 }
 
 function archiveOperationalHistory(db, archived, now) {
@@ -188,7 +243,7 @@ function archiveOperationalHistory(db, archived, now) {
         item.taskId || "",
         item.createdAt || "",
         now,
-        JSON.stringify(item),
+        JSON.stringify(archivePayload(entityType, item)),
       );
     }
   }
@@ -204,10 +259,12 @@ function recordOperationalArchiveMetadata(state, archived, now, backupPath = "")
     migratedAt: previous.migratedAt || now,
     updatedAt: now,
     backupPath: backupPath || previous.backupPath || "",
-    comments: Number(previous.comments || 0) + archived.comments.length,
-    events: Number(previous.events || 0) + archived.events.length,
+    comments: Number(previous.comments || 0) + (archived.comments || []).length,
+    events: Number(previous.events || 0) + (archived.events || []).length,
+    runs: Number(previous.runs || 0) + (archived.runs || []).length,
     activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
     activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
+    activeStaleReviewRunsPerDispatch: ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH,
   };
 }
 
@@ -233,10 +290,45 @@ export function reconcileStateIntegrity(state) {
   state.projects = Array.isArray(state.projects) ? state.projects : [];
   state.tasks = Array.isArray(state.tasks) ? state.tasks : [];
   state.qaBundles = Array.isArray(state.qaBundles) ? state.qaBundles : [];
+  state.candidates = Array.isArray(state.candidates) ? state.candidates : [];
 
   const projectIds = new Set(state.projects.map((project) => project.id));
   const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
   const bundlesById = new Map(state.qaBundles.map((bundle) => [bundle.id, bundle]));
+  const candidatesById = new Map(state.candidates.map((candidate) => [candidate.id, candidate]));
+
+  for (const candidate of state.candidates) {
+    try {
+      assertCandidateEnvelope(candidate);
+    } catch (error) {
+      candidate.status = "invalidated";
+      candidate.integrityError = error.message;
+    }
+  }
+
+  for (const task of state.tasks) {
+    const candidate = candidatesById.get(task.candidateId);
+    const decision = candidate?.qaDecision;
+    const hasTrustedApproval = Boolean(
+      candidate
+      && !candidate.integrityError
+      && ["qa_passed", "release_candidate_ready"].includes(candidate.status)
+      && decision?.outcome === "passed"
+      && decision.candidateId === candidate.id
+      && decision.manifestDigest === candidate.manifestDigest
+      && decision.integrationSha === candidate.manifest?.integration?.sha
+      && candidate.manifest?.sources?.some((source) => source.taskId === task.id),
+    );
+    if (task.qaDecision?.outcome === "passed" && !hasTrustedApproval) {
+      task.legacyQaDecisionUntrusted = true;
+    }
+    if (task.status === "approved_for_main" && !hasTrustedApproval) {
+      task.legacyStatus = task.legacyStatus || task.status;
+      task.status = "legacy_untrusted";
+      task.promotionStatus = "";
+      task.integrityBlocker = "Legacy task-level QA approval is not bound to an immutable candidate.";
+    }
+  }
 
   for (const task of state.tasks) {
     if (!task.qaBundleId) continue;
@@ -246,6 +338,16 @@ export function reconcileStateIntegrity(state) {
 
   for (const bundle of state.qaBundles) {
     if (!projectIds.has(bundle.projectId)) bundle.status = "blocked";
+    if (bundle.candidateId) {
+      const candidate = candidatesById.get(bundle.candidateId);
+      if (!candidate || candidate.projectId !== bundle.projectId || candidate.qaBundleId !== bundle.id) {
+        bundle.status = "blocked";
+        bundle.candidateIntegrityError = "QA bundle candidate link is invalid.";
+      }
+    } else if (["ready", "passed", "partially_reviewed", "release_candidate_ready"].includes(bundle.status)) {
+      bundle.legacyStatus = bundle.legacyStatus || bundle.status;
+      bundle.status = "legacy_untrusted";
+    }
     const seenTaskIds = new Set();
     bundle.tasks = (Array.isArray(bundle.tasks) ? bundle.tasks : [])
       .map((entry) => tasksById.get(entry?.id))
@@ -396,6 +498,25 @@ function upsertEntity(db, table, item, sequence) {
       .run(item.id, sequence, item.projectId || "", item.taskId || "", item.status || "", item.role || "", item.updatedAt || "", payload);
     return;
   }
+  if (table === "candidates") {
+    db.prepare(`
+      INSERT INTO candidates(id, sequence, project_id, status, manifest_digest, updated_at, payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
+        status = excluded.status, manifest_digest = excluded.manifest_digest,
+        updated_at = excluded.updated_at, payload = excluded.payload
+    `)
+      .run(
+        item.id,
+        sequence,
+        item.projectId || "",
+        item.status || "",
+        item.manifestDigest || "",
+        item.updatedAt || "",
+        payload,
+      );
+    return;
+  }
   db.prepare(`
     INSERT INTO qa_bundles(id, sequence, project_id, status, integration_commit, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
@@ -405,6 +526,7 @@ function upsertEntity(db, table, item, sequence) {
 }
 
 function writeStateToOpenDatabase(db, state) {
+  assertFullCandidateHistoryPreserved(db, state.candidates || []);
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -439,7 +561,83 @@ function mutationSnapshot(state) {
   return snapshot;
 }
 
-function writeMutationToOpenDatabase(db, state, snapshot) {
+function assertAppendOnlyCandidateFields(previousCandidate, candidate) {
+  for (const field of ["invalidation", "qaDecision", "promotion"]) {
+    if (
+      previousCandidate[field]
+      && JSON.stringify(previousCandidate[field]) !== JSON.stringify(candidate[field])
+    ) {
+      throw new Error(`Candidate ${candidate.id} ${field} record is append-only.`);
+    }
+  }
+  if (candidate.invalidation && candidate.status !== "invalidated") {
+    throw new Error(`Candidate ${candidate.id} cannot leave invalidated status.`);
+  }
+}
+
+function assertCandidateTransition(previousCandidate, candidate) {
+  assertCandidateEnvelope(candidate);
+  for (const field of ["id", "projectId", "qaBundleId", "createdAt"]) {
+    if (previousCandidate[field] !== candidate[field]) {
+      throw new Error(`Candidate ${previousCandidate.id} ${field} is immutable.`);
+    }
+  }
+  if (
+    JSON.stringify(previousCandidate.manifest) !== JSON.stringify(candidate.manifest)
+    || previousCandidate.manifestDigest !== candidate.manifestDigest
+  ) {
+    throw new Error(`Candidate ${candidate.id} manifest is immutable.`);
+  }
+  assertAppendOnlyCandidateFields(previousCandidate, candidate);
+}
+
+function assertFullCandidateHistoryPreserved(db, candidates) {
+  const currentById = new Map((candidates || []).map((candidate) => [candidate.id, candidate]));
+  for (const row of db.prepare("SELECT id, payload FROM candidates").all()) {
+    const previousCandidate = parsePayload(row.payload, null);
+    const candidate = currentById.get(row.id);
+    if (!candidate) throw new Error(`Candidate ${row.id} cannot be deleted.`);
+    assertCandidateTransition(previousCandidate, candidate);
+  }
+  for (const candidate of candidates || []) assertCandidateEnvelope(candidate);
+}
+
+function assertValidTaskStatuses(state) {
+  for (const task of state.tasks || []) {
+    const status = typeof task.status === "string" ? task.status.trim() : "";
+    if (task.status === status && VALID_TASK_STATUSES.has(status)) continue;
+    throw new Error(`Task ${task.id} has invalid workflow status: ${task.status || "(missing)"}. Repair it with an explicit canonical status before writing other fields.`);
+  }
+}
+
+function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
+  if (options.validateTaskStatuses !== false) {
+    if (options.repairTaskId) {
+      const repairTaskId = String(options.repairTaskId);
+      const target = (state.tasks || []).find((task) => task.id === repairTaskId);
+      const previousPayload = snapshot.tables.tasks.get(repairTaskId)?.payload;
+      const previousTask = previousPayload ? JSON.parse(previousPayload) : null;
+      const previousStatus = typeof previousTask?.status === "string" ? previousTask.status.trim() : "";
+      const currentStatus = typeof target?.status === "string" ? target.status.trim() : "";
+      if (!target || !previousTask || (previousStatus && VALID_TASK_STATUSES.has(previousStatus))) {
+        assertValidTaskStatuses(state);
+      } else if (!VALID_TASK_STATUSES.has(currentStatus)) {
+        throw new Error(`Task ${repairTaskId} repair must transition an existing invalid workflow status to a canonical status.`);
+      } else {
+        for (const task of state.tasks || []) {
+          if (task.id === repairTaskId) continue;
+          const status = typeof task.status === "string" ? task.status.trim() : "";
+          if (task.status === status && VALID_TASK_STATUSES.has(status)) continue;
+          const priorPayload = snapshot.tables.tasks.get(task.id)?.payload;
+          if (!priorPayload || priorPayload !== JSON.stringify(task)) {
+            throw new Error(`Task ${task.id} has invalid workflow status and cannot be changed during repair of ${repairTaskId}.`);
+          }
+        }
+      }
+    } else {
+      assertValidTaskStatuses(state);
+    }
+  }
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -458,6 +656,13 @@ function writeMutationToOpenDatabase(db, state, snapshot) {
     for (const [sequence, item] of (state[table] || []).entries()) {
       currentIds.add(item.id);
       const prior = previousItems.get(item.id);
+      if (table === "candidates") {
+        assertCandidateEnvelope(item);
+        if (prior) {
+          const previousCandidate = JSON.parse(prior.payload);
+          assertCandidateTransition(previousCandidate, item);
+        }
+      }
       const changed = !prior
         || prior.sequence !== sequence
         || (MUTABLE_ENTITY_TABLES.has(table) && prior.payload !== JSON.stringify(item));
@@ -465,7 +670,10 @@ function writeMutationToOpenDatabase(db, state, snapshot) {
     }
     const tableName = TABLE_NAME[table] || table;
     for (const id of previousItems.keys()) {
-      if (!currentIds.has(id)) db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
+      if (!currentIds.has(id)) {
+        if (table === "candidates") throw new Error(`Candidate ${id} cannot be deleted.`);
+        db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
+      }
     }
   }
 }
@@ -513,7 +721,7 @@ async function runStateIntegrityMigration(db) {
     state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
     recordOperationalArchiveMetadata(state, archived, now, backupPath);
     state.meta.updatedAt = now;
-    writeMutationToOpenDatabase(db, state, snapshot);
+    writeMutationToOpenDatabase(db, state, snapshot, { validateTaskStatuses: false });
     db.exec("COMMIT");
     integrityMigrated = true;
   } catch (error) {
@@ -541,10 +749,21 @@ async function initialState() {
     if (!(await fileExists(candidate))) continue;
     return reconcileStateIntegrity(JSON.parse(await readFile(candidate, "utf8")));
   }
-  return { meta: {}, projects: [], tasks: [], comments: [], reviews: [], events: [], runs: [], qaBundles: [] };
+  return {
+    meta: {},
+    projects: [],
+    tasks: [],
+    comments: [],
+    reviews: [],
+    events: [],
+    runs: [],
+    qaBundles: [],
+    candidates: [],
+  };
 }
 
 export async function ensureStateDatabase() {
+  assertIsolatedTestEnvironment();
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   await secureStoragePaths();
   const db = openDatabase();
@@ -575,6 +794,35 @@ export async function readDatabaseState() {
   return readStateFromOpenDatabase(db);
 }
 
+export async function readDatabaseStateReadOnly() {
+  assertIsolatedTestEnvironment();
+  if (!(await fileExists(DATABASE_FILE))) {
+    throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
+  }
+  let walHasFrames = false;
+  try {
+    walHasFrames = (await stat(`${DATABASE_FILE}-wal`)).size > 0;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const db = new DatabaseSync(
+    walHasFrames
+      ? `file:${DATABASE_FILE}?mode=ro`
+      : `file:${DATABASE_FILE}?mode=ro&immutable=1`,
+    {
+    readOnly: true,
+    uri: true,
+    },
+  );
+  try {
+    const state = readStateFromOpenDatabase(db);
+    if (!state) throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
+    return state;
+  } finally {
+    db.close();
+  }
+}
+
 export function maintenanceWriteBlocker(state, input = {}) {
   const lease = state?.meta?.selfUpdateLease;
   if (!lease || typeof lease !== "object") return null;
@@ -603,6 +851,7 @@ export async function writeDatabaseState(state) {
   try {
     assertMaintenanceWriteAllowed(readStateFromOpenDatabase(db));
     reconcileStateIntegrity(state);
+    assertValidTaskStatuses(state);
     const archived = compactOperationalHistory(state);
     if (archivedItemCount(archived)) {
       const now = new Date().toISOString();
@@ -619,7 +868,7 @@ export async function writeDatabaseState(state) {
   }
 }
 
-export async function mutateDatabaseState(mutator) {
+export async function mutateDatabaseState(mutator, options = {}) {
   const db = await ensureStateDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -638,7 +887,7 @@ export async function mutateDatabaseState(mutator) {
     }
     state.meta.updatedAt = new Date().toISOString();
     state.meta.storageBackend = "sqlite";
-    writeMutationToOpenDatabase(db, state, snapshot);
+    writeMutationToOpenDatabase(db, state, snapshot, options);
     db.exec("COMMIT");
     await secureStoragePaths();
     return result;

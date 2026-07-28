@@ -11,8 +11,6 @@
     <string>__NODE_PATH__</string>
     <string>__MISSION_CONTROL_RUNTIME__/src/mission-control-dispatcher.js</string>
     <string>--watch</string>
-    <string>--interval</string>
-    <string>10</string>
   </array>
 
   <key>WorkingDirectory</key>

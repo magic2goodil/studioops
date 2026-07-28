@@ -30,6 +30,120 @@ test("lead and security-sensitive work receive xhigh reasoning", () => {
   assert.equal(security.selectionReason, "complex_task");
 });
 
+test("architecture reasoning can be reduced by local execution policy", () => {
+  const policy = resolveExecutionPolicy(
+    { id: "task_4", title: "Review the system architecture" },
+    { type: "start_architecture", role: "systems-architect" },
+    {
+      executionPolicy: {
+        architectReasoningEffort: "high",
+      },
+    },
+  );
+
+  assert.equal(policy.reasoningEffort, "high");
+  assert.equal(policy.selectionReason, "systems_architect_role");
+});
+
+test("tiered routing keeps risky work on Sol while using Luna and Terra for routine lanes", () => {
+  const executionPolicy = {
+    modelTiers: {
+      economy: { model: "gpt-5.6-luna", reasoningEffort: "medium" },
+      balanced: { model: "gpt-5.6-terra", reasoningEffort: "high" },
+      critical: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+    },
+    tierRouting: {
+      defaultTier: "economy",
+      architectTier: "critical",
+      leadTier: "critical",
+      complexTier: "critical",
+    },
+    roles: {
+      "frontend-reviewer": {
+        tier: "balanced",
+      },
+    },
+  };
+  const builder = resolveExecutionPolicy(
+    { id: "task_5", title: "Polish event card spacing" },
+    { type: "start_builder", role: "builder" },
+    { executionPolicy },
+  );
+  const reviewer = resolveExecutionPolicy(
+    { id: "task_6", title: "Review event card spacing" },
+    { type: "start_review", role: "frontend-reviewer" },
+    { executionPolicy },
+  );
+  const risky = resolveExecutionPolicy(
+    { id: "task_7", title: "Migrate the customer database schema" },
+    { type: "start_builder", role: "builder" },
+    { executionPolicy },
+  );
+
+  assert.equal(builder.model, "gpt-5.6-luna");
+  assert.equal(builder.modelTier, "economy");
+  assert.equal(builder.reasoningEffort, "medium");
+  assert.equal(reviewer.model, "gpt-5.6-terra");
+  assert.equal(reviewer.modelTier, "balanced");
+  assert.equal(reviewer.reasoningEffort, "high");
+  assert.equal(reviewer.selectionReason, "role_policy");
+  assert.equal(risky.model, "gpt-5.6-sol");
+  assert.equal(risky.reasoningEffort, "high");
+  assert.equal(risky.selectionReason, "complex_task");
+});
+
+test("Spark requires an explicit mechanical label and never overrides risky work", () => {
+  const executionPolicy = {
+    modelTiers: {
+      mechanical: { model: "gpt-5.3-codex-spark", reasoningEffort: "high" },
+      economy: { model: "gpt-5.6-luna", reasoningEffort: "medium" },
+      critical: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+      frontier: { model: "gpt-5.6-sol", reasoningEffort: "ultra" },
+    },
+    tierRouting: {
+      defaultTier: "economy",
+      mechanicalTier: "mechanical",
+      complexTier: "critical",
+      escalationTier: "frontier",
+    },
+    mechanicalLabels: ["spark-ok"],
+    escalationLabels: ["ultra-review"],
+  };
+  const mechanical = resolveExecutionPolicy(
+    { id: "task_8", title: "Format generated documentation", labels: ["spark-ok"] },
+    { type: "start_builder", role: "builder" },
+    { executionPolicy },
+  );
+  const risky = resolveExecutionPolicy(
+    { id: "task_9", title: "Format OAuth migration documentation", labels: ["spark-ok"] },
+    { type: "start_builder", role: "builder" },
+    { executionPolicy },
+  );
+  const reviewer = resolveExecutionPolicy(
+    { id: "task_10", title: "Review generated documentation", labels: ["spark-ok"] },
+    { type: "start_review", role: "frontend-reviewer" },
+    { executionPolicy },
+  );
+  const escalated = resolveExecutionPolicy(
+    { id: "task_11", title: "Investigate a subtle rendering bug", labels: ["ultra-review"] },
+    { type: "start_builder", role: "builder" },
+    { executionPolicy },
+  );
+
+  assert.equal(mechanical.model, "gpt-5.3-codex-spark");
+  assert.equal(mechanical.modelTier, "mechanical");
+  assert.equal(mechanical.reasoningEffort, "high");
+  assert.equal(mechanical.selectionReason, "mechanical_task");
+  assert.equal(risky.model, "gpt-5.6-sol");
+  assert.equal(risky.selectionReason, "complex_task");
+  assert.equal(reviewer.model, "gpt-5.6-luna");
+  assert.equal(reviewer.selectionReason, "default_role");
+  assert.equal(escalated.model, "gpt-5.6-sol");
+  assert.equal(escalated.modelTier, "frontier");
+  assert.equal(escalated.reasoningEffort, "ultra");
+  assert.equal(escalated.selectionReason, "explicit_escalation");
+});
+
 test("execution attempts are scoped to workflow cycle, action, and role", () => {
   assert.equal(
     executionAttemptKey(
@@ -38,4 +152,31 @@ test("execution attempts are scoped to workflow cycle, action, and role", () => 
     ),
     "task_4:2:continue_review:frontend-reviewer",
   );
+});
+
+test("reviewer execution attempts are scoped to exact candidate identity", () => {
+  const oldCandidate = executionAttemptKey(
+    {
+      id: "task_5",
+      reviewCycle: 2,
+      reviewSubjectCycle: 3,
+      reviewSubjectSha: "a".repeat(40),
+    },
+    { type: "continue_review", role: "frontend-reviewer" },
+  );
+  const newCandidate = executionAttemptKey(
+    {
+      id: "task_5",
+      reviewCycle: 2,
+      reviewSubjectCycle: 4,
+      reviewSubjectSha: "b".repeat(40),
+    },
+    { type: "continue_review", role: "frontend-reviewer" },
+  );
+
+  assert.equal(
+    oldCandidate,
+    `task_5:2:candidate-3:sha-${"a".repeat(40)}:continue_review:frontend-reviewer`,
+  );
+  assert.notEqual(oldCandidate, newCandidate);
 });

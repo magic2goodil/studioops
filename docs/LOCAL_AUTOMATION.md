@@ -59,6 +59,133 @@ studioops automation-resume --reason "Backup, integrity, and worker health verif
 
 An operator pause suppresses new builder and reviewer claims while still allowing owner-review notifications to reach the persistent inbox.
 
+## Tiered model routing
+
+StudioOps can route ordinary implementation, specialist review, high-risk work,
+and explicitly mechanical tasks to different Codex models. Model selection is
+recorded on each run so the cost and quality decision remains auditable.
+
+```json
+{
+  "defaults": {
+    "executionPolicy": {
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "medium",
+      "mechanicalLabels": ["spark-ok"],
+      "escalationLabels": ["ultra-review"],
+      "modelTiers": {
+        "mechanical": {
+          "model": "gpt-5.3-codex-spark",
+          "reasoningEffort": "high"
+        },
+        "economy": {
+          "model": "gpt-5.6-luna",
+          "reasoningEffort": "medium"
+        },
+        "balanced": {
+          "model": "gpt-5.6-terra",
+          "reasoningEffort": "high"
+        },
+        "critical": {
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "high"
+        },
+        "frontier": {
+          "model": "gpt-5.6-sol",
+          "reasoningEffort": "ultra"
+        }
+      },
+      "tierRouting": {
+        "defaultTier": "economy",
+        "mechanicalTier": "mechanical",
+        "architectTier": "critical",
+        "leadTier": "critical",
+        "complexTier": "critical",
+        "escalationTier": "frontier"
+      },
+      "roles": {
+        "backend-reviewer": {
+          "tier": "balanced"
+        },
+        "frontend-reviewer": {
+          "tier": "balanced"
+        },
+        "accessibility-reviewer": {
+          "tier": "balanced"
+        }
+      }
+    }
+  }
+}
+```
+
+Tier names are stable policy concepts; model IDs and reasoning effort are
+replaceable local configuration. Architecture, lead, and complex work take
+precedence over cheaper routes.
+Complex work includes security, privacy, consent, authentication, database,
+migration, deployment, release, production, infrastructure, and data-loss
+terms. Spark is never selected implicitly: a low-risk builder task must carry
+one of the configured `mechanicalLabels`. An explicit `escalationLabels` match
+selects the configured frontier tier, including `ultra` effort when supported.
+
+## Credit-aware admission
+
+StudioOps can check the authenticated Codex account before creating a model
+run. The controller calls the local Codex App Server
+`account/rateLimits/read` method, caches the sanitized result, and retains only
+quota headroom, reset timing, limit state, and available credit balance fields.
+It does not store account identity or authentication tokens.
+
+```json
+{
+  "defaults": {
+    "creditPolicy": {
+      "enabled": true,
+      "refreshIntervalMs": 300000,
+      "snapshotMaxAgeMs": 900000,
+      "probeTimeoutMs": 20000,
+      "reserveCredits": 5,
+      "failClosedTiers": ["critical", "frontier"],
+      "tierBudgets": {
+        "mechanical": {
+          "estimatedCredits": 2,
+          "minRemainingPercent": 2
+        },
+        "economy": {
+          "estimatedCredits": 8,
+          "minRemainingPercent": 5
+        },
+        "balanced": {
+          "estimatedCredits": 15,
+          "minRemainingPercent": 10
+        },
+        "critical": {
+          "estimatedCredits": 30,
+          "minRemainingPercent": 20
+        },
+        "frontier": {
+          "estimatedCredits": 40,
+          "minRemainingPercent": 35
+        }
+      }
+    }
+  }
+}
+```
+
+The estimates are admission envelopes, not promises of exact spend. Actual
+credit use depends on model, context, cached input, output, reasoning, and
+tools. When Codex exposes a purchased-credit balance, StudioOps requires the
+tier estimate plus the configured reserve. When the account is operating on
+included quota, StudioOps uses remaining quota percentage instead.
+
+The controller never lowers a task below its quality-required tier. A failed
+critical or frontier admission opens one owner-visible task circuit before any
+model launch. Wait for a reset, add credits, or deliberately update the local
+budget, then use the circuit-reset command shown on the task. If the account
+snapshot is unavailable or stale, configured `failClosedTiers` stop while
+lower tiers may continue.
+
 By default, the web UI is only available on the local machine:
 
 ```text
@@ -173,7 +300,9 @@ Projects can also opt into keeping their QA branch and local preview checkout cu
         "com.example.myapp.local": "~/Library/LaunchAgents/com.example.myapp.local.plist"
       },
       "previewUrl": "http://127.0.0.1:4174/",
-      "healthCheckUrl": "http://127.0.0.1:4174/health"
+      "healthCheckUrl": "http://127.0.0.1:4174/health",
+      "identityHeader": "x-studioops-commit",
+      "identityJsonField": "commitSha"
     }
   }
 }
@@ -192,15 +321,36 @@ studioops update-project myapp \
 
 `syncDefaultBranchIntoIntegration` merges the latest configured default branch into the non-production QA branch before task PR heads are integrated. This is useful after the owner merges a PR to `main`: the QA branch catches up on the next sweep instead of leaving the local preview stale.
 
-`localPreview` fast-forwards a stable local checkout to the QA branch after a successful integration or default-branch sync. It never force-pulls. If `stashDirty` is false, uncommitted preview checkout changes block the sync and are reported. If `stashDirty` is true, StudioOps preserves them in a Git stash before fast-forwarding. Missing preview LaunchAgents are bootstrapped from the configured plist (or the standard `~/Library/LaunchAgents/<label>.plist` path), restarted, and health-checked before the bundle is marked ready.
+`localPreview` fast-forwards a stable local checkout to the exact candidate
+branch after successful integration. The configured static branch remains the
+maintenance/default-sync branch and cannot override a candidate branch. It
+never force-pulls. If `stashDirty` is false, uncommitted preview checkout
+changes block the sync and are reported. If `stashDirty` is true, StudioOps
+preserves them in a Git stash before fast-forwarding. Missing preview
+LaunchAgents are bootstrapped from the configured plist (or the standard
+`~/Library/LaunchAgents/<label>.plist` path) and restarted.
+
+The health endpoint must attest the commit actually served by the running
+preview. Return the full Git SHA in the configured `identityHeader` (default
+`X-StudioOps-Commit`) or JSON `identityJsonField` (default `commitSha`). A plain
+HTTP 200 is insufficient and blocks candidate freeze.
 
 ## Main Promotion
 
 After the owner reviews the local QA preview, mark the task from the UI or CLI:
 
 ```bash
-studioops qa-pass task_123 --body "Checked locally."
-studioops qa-fail task_123 --body "Hero image still covers the full page."
+studioops qa-pass task_123 \
+  --candidate candidate_opaque \
+  --manifest-digest sha256:full-digest \
+  --integration-sha full-git-sha \
+  --body "Checked locally."
+
+studioops qa-fail task_123 \
+  --candidate candidate_opaque \
+  --manifest-digest sha256:full-digest \
+  --integration-sha full-git-sha \
+  --body "Hero image still covers the full page."
 ```
 
 `qa-pass` moves the task to `approved_for_main` and queues it for the promotion worker. `qa-fail` moves it back to `needs_changes` with the owner notes preserved as a task comment.
