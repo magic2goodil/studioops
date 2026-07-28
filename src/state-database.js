@@ -1,6 +1,6 @@
 import { backup, DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
 import { fileExists } from "./config.js";
@@ -18,6 +18,13 @@ const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
 const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
+const VALID_TASK_STATUSES = new Set([
+  "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
+  "ready", "queued", "in_progress", "blocked", "builder_review", "backend_review",
+  "frontend_review", "accessibility_review", "regression_review", "lead_review", "qa_review",
+  "approved_for_main", "promotion_blocked", "needs_changes", "user_review", "approved",
+  "merged", "deployed", "done", "closed", "legacy_untrusted",
+]);
 const DATA_DIR = missionControlDataDir();
 export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
@@ -595,7 +602,42 @@ function assertFullCandidateHistoryPreserved(db, candidates) {
   for (const candidate of candidates || []) assertCandidateEnvelope(candidate);
 }
 
-function writeMutationToOpenDatabase(db, state, snapshot) {
+function assertValidTaskStatuses(state) {
+  for (const task of state.tasks || []) {
+    const status = typeof task.status === "string" ? task.status.trim() : "";
+    if (task.status === status && VALID_TASK_STATUSES.has(status)) continue;
+    throw new Error(`Task ${task.id} has invalid workflow status: ${task.status || "(missing)"}. Repair it with an explicit canonical status before writing other fields.`);
+  }
+}
+
+function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
+  if (options.validateTaskStatuses !== false) {
+    if (options.repairTaskId) {
+      const repairTaskId = String(options.repairTaskId);
+      const target = (state.tasks || []).find((task) => task.id === repairTaskId);
+      const previousPayload = snapshot.tables.tasks.get(repairTaskId)?.payload;
+      const previousTask = previousPayload ? JSON.parse(previousPayload) : null;
+      const previousStatus = typeof previousTask?.status === "string" ? previousTask.status.trim() : "";
+      const currentStatus = typeof target?.status === "string" ? target.status.trim() : "";
+      if (!target || !previousTask || (previousStatus && VALID_TASK_STATUSES.has(previousStatus))) {
+        assertValidTaskStatuses(state);
+      } else if (!VALID_TASK_STATUSES.has(currentStatus)) {
+        throw new Error(`Task ${repairTaskId} repair must transition an existing invalid workflow status to a canonical status.`);
+      } else {
+        for (const task of state.tasks || []) {
+          if (task.id === repairTaskId) continue;
+          const status = typeof task.status === "string" ? task.status.trim() : "";
+          if (task.status === status && VALID_TASK_STATUSES.has(status)) continue;
+          const priorPayload = snapshot.tables.tasks.get(task.id)?.payload;
+          if (!priorPayload || priorPayload !== JSON.stringify(task)) {
+            throw new Error(`Task ${task.id} has invalid workflow status and cannot be changed during repair of ${repairTaskId}.`);
+          }
+        }
+      }
+    } else {
+      assertValidTaskStatuses(state);
+    }
+  }
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -679,7 +721,7 @@ async function runStateIntegrityMigration(db) {
     state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
     recordOperationalArchiveMetadata(state, archived, now, backupPath);
     state.meta.updatedAt = now;
-    writeMutationToOpenDatabase(db, state, snapshot);
+    writeMutationToOpenDatabase(db, state, snapshot, { validateTaskStatuses: false });
     db.exec("COMMIT");
     integrityMigrated = true;
   } catch (error) {
@@ -752,6 +794,35 @@ export async function readDatabaseState() {
   return readStateFromOpenDatabase(db);
 }
 
+export async function readDatabaseStateReadOnly() {
+  assertIsolatedTestEnvironment();
+  if (!(await fileExists(DATABASE_FILE))) {
+    throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
+  }
+  let walHasFrames = false;
+  try {
+    walHasFrames = (await stat(`${DATABASE_FILE}-wal`)).size > 0;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const db = new DatabaseSync(
+    walHasFrames
+      ? `file:${DATABASE_FILE}?mode=ro`
+      : `file:${DATABASE_FILE}?mode=ro&immutable=1`,
+    {
+    readOnly: true,
+    uri: true,
+    },
+  );
+  try {
+    const state = readStateFromOpenDatabase(db);
+    if (!state) throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
+    return state;
+  } finally {
+    db.close();
+  }
+}
+
 export function maintenanceWriteBlocker(state, input = {}) {
   const lease = state?.meta?.selfUpdateLease;
   if (!lease || typeof lease !== "object") return null;
@@ -780,6 +851,7 @@ export async function writeDatabaseState(state) {
   try {
     assertMaintenanceWriteAllowed(readStateFromOpenDatabase(db));
     reconcileStateIntegrity(state);
+    assertValidTaskStatuses(state);
     const archived = compactOperationalHistory(state);
     if (archivedItemCount(archived)) {
       const now = new Date().toISOString();
@@ -796,7 +868,7 @@ export async function writeDatabaseState(state) {
   }
 }
 
-export async function mutateDatabaseState(mutator) {
+export async function mutateDatabaseState(mutator, options = {}) {
   const db = await ensureStateDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -815,7 +887,7 @@ export async function mutateDatabaseState(mutator) {
     }
     state.meta.updatedAt = new Date().toISOString();
     state.meta.storageBackend = "sqlite";
-    writeMutationToOpenDatabase(db, state, snapshot);
+    writeMutationToOpenDatabase(db, state, snapshot, options);
     db.exec("COMMIT");
     await secureStoragePaths();
     return result;

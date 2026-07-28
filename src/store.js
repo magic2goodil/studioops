@@ -20,6 +20,7 @@ import {
   ensureStateDatabase,
   mutateDatabaseState,
   readDatabaseState,
+  readDatabaseStateReadOnly,
   writeDatabaseState,
 } from "./state-database.js";
 
@@ -152,6 +153,10 @@ export async function readState() {
   return readDatabaseState();
 }
 
+export async function readStateReadOnly() {
+  return readDatabaseStateReadOnly();
+}
+
 export async function writeState(state) {
   const now = new Date().toISOString();
   state.meta = state.meta || {};
@@ -160,8 +165,8 @@ export async function writeState(state) {
   await writeDatabaseState(state);
 }
 
-export async function mutateState(mutator) {
-  return mutateDatabaseState(mutator);
+export async function mutateState(mutator, options = {}) {
+  return mutateDatabaseState(mutator, options);
 }
 
 function nextId(items, prefix) {
@@ -592,14 +597,24 @@ export async function addTask(input) {
 }
 
 export async function updateTask(taskId, patch) {
+  const ownsValidStatus = Object.prototype.hasOwnProperty.call(patch, "status")
+    && typeof patch.status === "string"
+    && patch.status.trim()
+    && VALID_STATUSES.has(patch.status.trim());
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
-    if (patch.status && !VALID_STATUSES.has(patch.status)) {
-      throw new Error(`Invalid status: ${patch.status}`);
+    const previousNormalizedStatus = typeof task.status === "string" ? task.status.trim() : "";
+    const repairingLegacyStatus = ownsValidStatus && !VALID_STATUSES.has(previousNormalizedStatus);
+    if (Object.prototype.hasOwnProperty.call(patch, "status")) {
+      const normalizedStatus = typeof patch.status === "string" ? patch.status.trim() : "";
+      if (!normalizedStatus || !VALID_STATUSES.has(normalizedStatus)) {
+        throw new Error(`Invalid status: ${patch.status ?? "(missing)"}`);
+      }
+      patch = { ...patch, status: normalizedStatus };
     }
     const architectureCompletionFields = [
       "architectureStatus",
@@ -700,7 +715,12 @@ export async function updateTask(taskId, patch) {
     ) {
       task.status = "architecture_pending";
     }
-    const startedBuilderReviewCycle = patch.status === "builder_review" && previousStatus !== "builder_review";
+    // A status repair restores an invalid legacy record to the workflow; it must
+    // not be treated as a new builder submission, which would discard the
+    // review subject and cycle that make existing approvals auditable.
+    const startedBuilderReviewCycle = !repairingLegacyStatus
+      && patch.status === "builder_review"
+      && previousStatus !== "builder_review";
     if (startedBuilderReviewCycle) {
       task.reviewCycle = Number(task.reviewCycle || 0) + 1;
       task.reviewSubjectSha = "";
@@ -746,8 +766,18 @@ export async function updateTask(taskId, patch) {
       message: `Task updated: ${task.title}`,
       createdAt: task.updatedAt,
     });
+    if (repairingLegacyStatus) {
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "workflow_integrity_repaired",
+        projectId: task.projectId,
+        taskId: task.id,
+        message: `Task workflow status repaired from ${previousNormalizedStatus || "(missing)"} to ${task.status}; review evidence was preserved.`,
+        createdAt: task.updatedAt,
+      });
+    }
     return task;
-  });
+  }, ownsValidStatus ? { repairTaskId: taskId } : {});
 }
 
 function assertArchitectureChildContract(parent, child) {
@@ -2328,6 +2358,7 @@ ${functionalDeliveryContract(task)}
 
 Review instructions:
 - Review as a senior engineer in the ${reviewerProfile.domain} lane.
+- Use \`show-task ${task.id}\` (or \`--json\`) only for read-only task inspection. Use \`status ${task.id} --status <canonical-status>\` only for an intentional status mutation; never omit \`--status\`.
 - Lead with concrete findings ordered by severity.
 - Focus especially on:
 ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
@@ -2406,6 +2437,7 @@ Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
 Builder instructions:
+- Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Use 'status ${task.id} --status <canonical-status>' only for an intentional status mutation; never omit '--status'.
 - Create or switch to the feature branch.
 - For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
 - For UI tasks, implement and verify mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.

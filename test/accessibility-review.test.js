@@ -141,6 +141,8 @@ test("accessibility reviewer prompt includes the required checklist and breakpoi
   const prompt = generatePrompt(fixtureState(), "task_1", "accessibility-reviewer");
 
   assert.match(prompt, /accessibility expert reviewer/);
+  assert.match(prompt, /show-task task_1.*read-only task inspection/);
+  assert.match(prompt, /status task_1 --status <canonical-status>.*intentional status mutation/);
   assert.match(prompt, /color contrast/);
   assert.match(prompt, /readable typography/);
   assert.match(prompt, /focus-visible states/);
