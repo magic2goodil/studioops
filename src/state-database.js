@@ -1,6 +1,6 @@
 import { backup, DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
 import { fileExists } from "./config.js";
@@ -799,10 +799,21 @@ export async function readDatabaseStateReadOnly() {
   if (!(await fileExists(DATABASE_FILE))) {
     throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
   }
-  const db = new DatabaseSync(`file:${DATABASE_FILE}?mode=ro&immutable=1`, {
+  let walHasFrames = false;
+  try {
+    walHasFrames = (await stat(`${DATABASE_FILE}-wal`)).size > 0;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const db = new DatabaseSync(
+    walHasFrames
+      ? `file:${DATABASE_FILE}?mode=ro`
+      : `file:${DATABASE_FILE}?mode=ro&immutable=1`,
+    {
     readOnly: true,
     uri: true,
-  });
+    },
+  );
   try {
     const state = readStateFromOpenDatabase(db);
     if (!state) throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");

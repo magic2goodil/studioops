@@ -61,7 +61,6 @@ async function databaseFileSnapshot(root) {
   const paths = [
     path.join(root, "data", "mission-control.sqlite3"),
     path.join(root, "data", "mission-control.sqlite3-wal"),
-    path.join(root, "data", "mission-control.sqlite3-shm"),
   ];
   const snapshot = {};
   for (const filePath of paths) {
