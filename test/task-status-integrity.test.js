@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -57,12 +57,36 @@ async function readPersistedState(root, env) {
   return JSON.parse(result.stdout);
 }
 
+async function databaseFileSnapshot(root) {
+  const paths = [
+    path.join(root, "data", "mission-control.sqlite3"),
+    path.join(root, "data", "mission-control.sqlite3-wal"),
+    path.join(root, "data", "mission-control.sqlite3-shm"),
+  ];
+  const snapshot = {};
+  for (const filePath of paths) {
+    try {
+      const metadata = await stat(filePath);
+      snapshot[filePath] = {
+        mtimeMs: metadata.mtimeMs,
+        bytes: (await readFile(filePath)).toString("base64"),
+      };
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      snapshot[filePath] = null;
+    }
+  }
+  return snapshot;
+}
+
 test("status without a value and show-task leave the task unchanged", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-status-cli-"));
   try {
     await writeLegacyState(root, invalidStatusState());
     const env = await environmentForTestControlRoot(root);
     const before = invalidStatusState().tasks[0];
+    await readPersistedState(root, env);
+    const beforeDatabase = await databaseFileSnapshot(root);
 
     await assert.rejects(
       execFileAsync(process.execPath, [cliPath, "status", "task_1"], { cwd: root, env }),
@@ -70,6 +94,7 @@ test("status without a value and show-task leave the task unchanged", async () =
     );
     const inspection = await execFileAsync(process.execPath, [cliPath, "show-task", "task_1", "--json"], { cwd: root, env });
     assert.match(inspection.stdout, /"reviewSubjectSha":/);
+    assert.deepEqual(await databaseFileSnapshot(root), beforeDatabase);
 
     const legacyTask = JSON.parse(await readFile(path.join(root, "data", "mission-control.json"), "utf8")).tasks[0];
     assert.deepEqual(legacyTask, before);
@@ -83,6 +108,20 @@ test("status without a value and show-task leave the task unchanged", async () =
       comments: [],
       events: [],
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("show-task does not initialize a missing database", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-read-only-init-"));
+  try {
+    const env = await environmentForTestControlRoot(root);
+    await assert.rejects(
+      execFileAsync(process.execPath, [cliPath, "show-task", "task_1", "--json"], { cwd: root, env }),
+      /read-only inspection cannot initialize it/,
+    );
+    await assert.rejects(stat(path.join(root, "data", "mission-control.sqlite3")), { code: "ENOENT" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -13,6 +13,7 @@ import {
   recordQaDecision,
   recordReview,
   readState,
+  readStateReadOnly,
   resetAutomationCircuit,
   resumeOperatorAutomation,
   setOperatorPause,
@@ -599,7 +600,7 @@ Automation:
   if (command === "show-task") {
     const taskId = args._[1];
     if (!taskId) throw new Error("Usage: show-task TASK_ID [--json] (read-only task inspection)");
-    const state = await readState();
+    const state = await readStateReadOnly();
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = state.projects.find((item) => item.id === task.projectId);

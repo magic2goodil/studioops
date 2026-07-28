@@ -794,6 +794,24 @@ export async function readDatabaseState() {
   return readStateFromOpenDatabase(db);
 }
 
+export async function readDatabaseStateReadOnly() {
+  assertIsolatedTestEnvironment();
+  if (!(await fileExists(DATABASE_FILE))) {
+    throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
+  }
+  const db = new DatabaseSync(`file:${DATABASE_FILE}?mode=ro&immutable=1`, {
+    readOnly: true,
+    uri: true,
+  });
+  try {
+    const state = readStateFromOpenDatabase(db);
+    if (!state) throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
+    return state;
+  } finally {
+    db.close();
+  }
+}
+
 export function maintenanceWriteBlocker(state, input = {}) {
   const lease = state?.meta?.selfUpdateLease;
   if (!lease || typeof lease !== "object") return null;

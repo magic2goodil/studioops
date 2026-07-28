@@ -20,6 +20,7 @@ import {
   ensureStateDatabase,
   mutateDatabaseState,
   readDatabaseState,
+  readDatabaseStateReadOnly,
   writeDatabaseState,
 } from "./state-database.js";
 
@@ -150,6 +151,10 @@ export async function ensureDataFile() {
 
 export async function readState() {
   return readDatabaseState();
+}
+
+export async function readStateReadOnly() {
+  return readDatabaseStateReadOnly();
 }
 
 export async function writeState(state) {
