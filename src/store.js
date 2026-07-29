@@ -16,6 +16,7 @@ import {
   normalizeOwnerRequestProvenance,
   normalizeSelfPromotionPolicy,
   opaqueOwnerRequestIdIsValid,
+  ownerRequestProvenanceHasEvidence,
   OWNER_REQUEST_PROVENANCE_VERSION,
   projectUsesTrustLeadQa,
   SELF_PROMOTION_PROHIBITED_CAPABILITIES,
@@ -1412,7 +1413,7 @@ export function completeArchitectureInState(state, taskId, input = {}) {
     child.status = "ready";
     if (
       parentCanAuthorizeInheritance
-      && !normalizeOwnerRequestProvenance(child.requestProvenance).kind
+      && !ownerRequestProvenanceHasEvidence(child.requestProvenance)
     ) {
       child.requestProvenance = inheritedOwnerRequestProvenance(task, child, now);
     }

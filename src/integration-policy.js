@@ -134,6 +134,44 @@ export function normalizeOwnerRequestProvenance(value = {}) {
   };
 }
 
+export function ownerRequestProvenanceHasEvidence(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const normalized = normalizeOwnerRequestProvenance(value);
+  if (
+    normalized.kind
+    || normalized.ownerActorId
+    || normalized.requestId
+    || normalized.projectId
+    || normalized.capabilities.length
+    || normalized.inheritedFromTaskId
+    || normalized.inheritanceKind
+    || normalized.inheritedAt
+  ) return true;
+  const knownFields = new Set([
+    "version",
+    "kind",
+    "type",
+    "ownerActorId",
+    "actorId",
+    "requestId",
+    "ownerRequestId",
+    "projectId",
+    "capabilities",
+    "capabilityScope",
+    "scope",
+    "inheritedFromTaskId",
+    "inheritanceKind",
+    "inheritedAt",
+  ]);
+  return Object.entries(value).some(([key, item]) => {
+    if (knownFields.has(key)) return false;
+    if (Array.isArray(item)) return item.length > 0;
+    if (typeof item === "string") return Boolean(item.trim());
+    if (item && typeof item === "object") return Object.keys(item).length > 0;
+    return item !== undefined && item !== null;
+  });
+}
+
 export function opaqueOwnerRequestIdIsValid(value) {
   const id = String(value || "").trim();
   return OPAQUE_ID_PATTERN.test(id) && !SENSITIVE_ID_PATTERN.test(id);
@@ -235,6 +273,7 @@ export function evaluateSelfPromotionEligibility(project = {}, task = {}, contex
       || parent.architectureStatus !== "completed"
       || !(parent.architectureDecisionTaskIds || []).includes(task.id)
       || provenance.inheritanceKind !== "governed_architecture_handoff"
+      || !provenance.inheritedAt
     ) {
       return denied("request_inheritance_invalid");
     }

@@ -332,7 +332,9 @@ test("governed architecture completion durably inherits only eligible same-proje
     requestProvenance: explicitOwnerRequest(),
   });
   state.projects[0] = canonicalStudioOpsProject();
-  state.tasks.push(governedChild());
+  state.tasks.push(governedChild({
+    requestProvenance: normalizeOwnerRequestProvenance(),
+  }));
   completeArchitectureInState(state, "task_1", {
     body: [
       "Keep the local modular monolith and its current SQLite JSON entity payloads.",
@@ -345,11 +347,22 @@ test("governed architecture completion durably inherits only eligible same-proje
   assert.equal(child.requestProvenance.kind, "governed_architecture_inheritance");
   assert.equal(child.requestProvenance.inheritedFromTaskId, "task_1");
   assert.equal(child.requestProvenance.inheritanceKind, "governed_architecture_handoff");
+  assert.ok(child.requestProvenance.inheritedAt);
   assert.equal(
     evaluateSelfPromotionEligibility(state.projects[0], child, { parentTask: state.tasks[0] }).reason,
     "eligible",
   );
   assert.ok(state.events.some((event) => event.type === "owner_request_provenance_inherited"));
+  const missingInheritanceTimestamp = structuredClone(child);
+  missingInheritanceTimestamp.requestProvenance.inheritedAt = "";
+  assert.equal(
+    evaluateSelfPromotionEligibility(
+      state.projects[0],
+      missingInheritanceTimestamp,
+      { parentTask: state.tasks[0] },
+    ).reason,
+    "request_inheritance_invalid",
+  );
 
   const deniedState = fixtureState();
   deniedState.projects[0] = canonicalStudioOpsProject();
@@ -362,6 +375,43 @@ test("governed architecture completion durably inherits only eligible same-proje
     taskIds: ["task_2"],
   });
   assert.equal(deniedState.tasks[1].requestProvenance, undefined);
+
+  const malformedChildProvenance = explicitOwnerRequest({
+    kind: "",
+    ownerActorId: "owner:other-9999",
+    requestId: "request:other-9999",
+    capabilities: ["studioops.local_runtime_restart"],
+  });
+  const malformedChildState = fixtureState({
+    requestProvenance: explicitOwnerRequest(),
+  });
+  malformedChildState.projects[0] = canonicalStudioOpsProject();
+  malformedChildState.tasks.push(governedChild({
+    requestProvenance: malformedChildProvenance,
+  }));
+  completeArchitectureInState(malformedChildState, "task_1", {
+    body: [
+      "Keep the local modular monolith and preserve malformed child request evidence.",
+      "Fail closed instead of replacing pre-existing provenance through the architecture handoff.",
+    ].join(" "),
+    taskIds: ["task_2"],
+  });
+  assert.deepEqual(
+    malformedChildState.tasks[1].requestProvenance,
+    malformedChildProvenance,
+  );
+  assert.equal(
+    evaluateSelfPromotionEligibility(
+      malformedChildState.projects[0],
+      malformedChildState.tasks[1],
+      { parentTask: malformedChildState.tasks[0] },
+    ).reason,
+    "request_provenance_kind_invalid",
+  );
+  assert.equal(
+    malformedChildState.events.some((event) => event.type === "owner_request_provenance_inherited"),
+    false,
+  );
 });
 
 test("architecture is a durable xhigh pre-builder dispatch", async () => {
