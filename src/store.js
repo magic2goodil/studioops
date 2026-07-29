@@ -16,6 +16,7 @@ import {
   normalizeOwnerRequestProvenance,
   normalizeSelfPromotionPolicy,
   opaqueOwnerRequestIdIsValid,
+  OWNER_REQUEST_PROVENANCE_VERSION,
   projectUsesTrustLeadQa,
   SELF_PROMOTION_PROHIBITED_CAPABILITIES,
   STUDIOOPS_SELF_PROMOTION_CAPABILITIES,
@@ -924,6 +925,7 @@ function explicitOwnerRequestProvenance(input = {}, project = {}) {
   const raw = input.requestProvenance || (
     input.ownerActorId || input.ownerRequestId || input.ownerRequestCapabilities
       ? {
+        version: OWNER_REQUEST_PROVENANCE_VERSION,
         ownerActorId: input.ownerActorId,
         requestId: input.ownerRequestId,
         capabilities: input.ownerRequestCapabilities,
@@ -1154,6 +1156,17 @@ export async function updateTask(taskId, patch) {
     ) {
       task.requestProvenance = explicitOwnerRequestProvenance({
         requestProvenance: {
+          ...(
+            !Object.prototype.hasOwnProperty.call(task.requestProvenance || {}, "version")
+            && !Object.prototype.hasOwnProperty.call(patch.requestProvenance || {}, "version")
+            && (
+              Object.prototype.hasOwnProperty.call(patch, "ownerActorId")
+              || Object.prototype.hasOwnProperty.call(patch, "ownerRequestId")
+              || Object.prototype.hasOwnProperty.call(patch, "ownerRequestCapabilities")
+            )
+              ? { version: OWNER_REQUEST_PROVENANCE_VERSION }
+              : {}
+          ),
           ...(task.requestProvenance || {}),
           ...(patch.requestProvenance || {}),
           ...(Object.prototype.hasOwnProperty.call(patch, "ownerActorId")

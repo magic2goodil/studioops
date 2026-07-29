@@ -72,31 +72,65 @@ export function canonicalRepositoryId(value) {
 }
 
 export function normalizeSelfPromotionPolicy(value = {}) {
-  const version = Number(value.version ?? SELF_PROMOTION_POLICY_VERSION);
+  const source = value && typeof value === "object" ? value : {};
+  const hasConfiguredFields = Object.keys(source).length > 0;
+  const version = Number(
+    hasOwnValue(source, "version")
+      ? source.version
+      : hasConfiguredFields
+        ? 0
+        : SELF_PROMOTION_POLICY_VERSION,
+  );
   return {
     version: Number.isInteger(version) ? version : 0,
-    enabled: booleanFlag(value.enabled),
-    productId: String(value.productId || STUDIOOPS_PRODUCT_ID).trim().toLowerCase(),
-    repositoryId: canonicalRepositoryId(value.repositoryId || STUDIOOPS_REPOSITORY_ID),
-    sourceRoot: normalizedAbsolutePath(value.sourceRoot || value.repoPath),
-    targetBranch: String(value.targetBranch || "main").trim(),
+    enabled: booleanFlag(source.enabled),
+    productId: String(
+      hasOwnValue(source, "productId")
+        ? source.productId
+        : hasConfiguredFields
+          ? ""
+          : STUDIOOPS_PRODUCT_ID,
+    ).trim().toLowerCase(),
+    repositoryId: canonicalRepositoryId(
+      hasOwnValue(source, "repositoryId")
+        ? source.repositoryId
+        : hasConfiguredFields
+          ? ""
+          : STUDIOOPS_REPOSITORY_ID,
+    ),
+    sourceRoot: normalizedAbsolutePath(source.sourceRoot || source.repoPath),
+    targetBranch: String(
+      hasOwnValue(source, "targetBranch")
+        ? source.targetBranch
+        : hasConfiguredFields
+          ? ""
+          : "main",
+    ).trim(),
     allowedCapabilities: [...STUDIOOPS_SELF_PROMOTION_CAPABILITIES],
     prohibitedCapabilities: [...SELF_PROMOTION_PROHIBITED_CAPABILITIES],
   };
 }
 
 export function normalizeOwnerRequestProvenance(value = {}) {
-  const version = Number(value.version ?? OWNER_REQUEST_PROVENANCE_VERSION);
+  const source = value && typeof value === "object" ? value : {};
+  const hasConfiguredFields = Object.keys(source).length > 0;
+  const version = Number(
+    hasOwnValue(source, "version")
+      ? source.version
+      : hasConfiguredFields
+        ? 0
+        : OWNER_REQUEST_PROVENANCE_VERSION,
+  );
   return {
     version: Number.isInteger(version) ? version : 0,
-    kind: String(value.kind || value.type || "").trim(),
-    ownerActorId: String(value.ownerActorId || value.actorId || "").trim(),
-    requestId: String(value.requestId || value.ownerRequestId || "").trim(),
-    projectId: String(value.projectId || "").trim(),
-    capabilities: normalizedStringList(value.capabilities || value.capabilityScope || value.scope),
-    inheritedFromTaskId: String(value.inheritedFromTaskId || "").trim(),
-    inheritanceKind: String(value.inheritanceKind || "").trim(),
-    inheritedAt: String(value.inheritedAt || "").trim(),
+    kind: String(source.kind || source.type || "").trim(),
+    ownerActorId: String(source.ownerActorId || source.actorId || "").trim(),
+    requestId: String(source.requestId || source.ownerRequestId || "").trim(),
+    projectId: String(source.projectId || "").trim(),
+    capabilities: normalizedStringList(source.capabilities || source.capabilityScope || source.scope),
+    inheritedFromTaskId: String(source.inheritedFromTaskId || "").trim(),
+    inheritanceKind: String(source.inheritanceKind || "").trim(),
+    inheritedAt: String(source.inheritedAt || "").trim(),
   };
 }
 
@@ -106,19 +140,28 @@ export function opaqueOwnerRequestIdIsValid(value) {
 }
 
 export function evaluateSelfPromotionProjectPolicy(project = {}) {
-  const policy = normalizeSelfPromotionPolicy(project.reviewPolicy?.selfPromotion);
+  const rawPolicy = project.reviewPolicy?.selfPromotion;
+  const policy = normalizeSelfPromotionPolicy(rawPolicy);
   const denied = (reason) => ({ eligible: false, reason, policy });
   if (!policy.enabled) return denied("policy_disabled");
+  if (!rawPolicy || typeof rawPolicy !== "object" || !hasOwnValue(rawPolicy, "version")) {
+    return denied("policy_version_missing");
+  }
   if (policy.version !== SELF_PROMOTION_POLICY_VERSION) return denied("policy_version_unsupported");
+  if (!hasOwnValue(rawPolicy, "productId")) return denied("policy_product_identity_missing");
   if (policy.productId !== STUDIOOPS_PRODUCT_ID) return denied("policy_product_identity_mismatch");
+  if (!hasOwnValue(rawPolicy, "repositoryId")) return denied("policy_repository_identity_missing");
   if (policy.repositoryId !== STUDIOOPS_REPOSITORY_ID) return denied("policy_repository_identity_mismatch");
   if (canonicalRepositoryId(project.repoUrl) !== STUDIOOPS_REPOSITORY_ID) {
     return denied("project_repository_identity_mismatch");
   }
-  if (!policy.sourceRoot) return denied("policy_source_root_missing");
+  if (!hasOwnValue(rawPolicy, "sourceRoot") || !policy.sourceRoot) {
+    return denied("policy_source_root_missing");
+  }
   const projectSourceRoot = normalizedAbsolutePath(project.repoPath);
   if (!projectSourceRoot) return denied("project_source_root_missing");
   if (projectSourceRoot !== policy.sourceRoot) return denied("project_source_root_mismatch");
+  if (!hasOwnValue(rawPolicy, "targetBranch")) return denied("policy_target_branch_missing");
   if (String(policy.targetBranch || "").trim() !== "main") {
     return denied("policy_target_branch_mismatch");
   }
@@ -147,6 +190,7 @@ export function evaluateSelfPromotionEligibility(project = {}, task = {}, contex
     provenance,
   });
   if (!projectEvaluation.eligible) return denied(projectEvaluation.reason);
+  if (!task.projectId || task.projectId !== project.id) return denied("task_project_mismatch");
   if (!task.requestProvenance || typeof task.requestProvenance !== "object") {
     return denied("request_provenance_missing");
   }
@@ -158,6 +202,9 @@ export function evaluateSelfPromotionEligibility(project = {}, task = {}, contex
     && !provenance.capabilities.length
   ) {
     return denied("request_provenance_missing");
+  }
+  if (!hasOwnValue(task.requestProvenance, "version")) {
+    return denied("request_provenance_version_missing");
   }
   if (provenance.version !== OWNER_REQUEST_PROVENANCE_VERSION) {
     return denied("request_provenance_version_unsupported");

@@ -197,7 +197,9 @@ Trust Leads does not allow production deploys. It only changes the handoff from 
 - `sourceRoot` is an absolute path equal to the project's configured local source checkout
 - both the policy target and project default branch are `main`
 
-Each eligible task must also carry versioned `requestProvenance` with opaque owner actor and request IDs, the same durable project ID, and a non-empty closed capability scope. The only capabilities recognized by version 1 are:
+Display normalization may show safe defaults for an absent disabled policy, but those defaults are not authorization evidence. An enabled policy must durably declare its version, product ID, repository ID, source root, and target branch; an unversioned or incomplete legacy payload remains ineligible.
+
+Each eligible task must also carry an explicitly versioned `requestProvenance` with opaque owner actor and request IDs, the same durable project ID as both the task and project, and a non-empty closed capability scope. Display normalization never upgrades an unversioned legacy provenance record. The only capabilities recognized by version 1 are:
 
 - `studioops.source_change`
 - `studioops.main_fast_forward`

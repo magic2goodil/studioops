@@ -157,7 +157,7 @@ node src/mission-control-cli.js add-task \
 
 Only those three local StudioOps capabilities are recognized. Managed-project production release, destructive local state deletion, secret rotation, cloud billing, external notifications, and customer-facing communication remain prohibited. Unknown, missing, legacy, mixed-project, or prohibited scope fails closed. Architecture inheritance is available only through the governed `architecture-complete` handoff from an eligible same-project explicit-owner-request parent.
 
-Inspect the effective decision with `projects --json`, `show-task <id> --json`, the project/task APIs, or a generated worker prompt. These surfaces report a stable denial reason such as `policy_disabled`, `project_repository_identity_mismatch`, `request_provenance_missing`, `request_project_mismatch`, `request_scope_unknown`, or `request_scope_prohibited`.
+Inspect the effective decision with `projects --json`, `show-task <id> --json`, the project/task APIs, or a generated worker prompt. These surfaces report a stable denial reason such as `policy_disabled`, `policy_version_missing`, `project_repository_identity_mismatch`, `task_project_mismatch`, `request_provenance_missing`, `request_provenance_version_missing`, `request_project_mismatch`, `request_scope_unknown`, or `request_scope_prohibited`. Normalized display defaults do not count as durable version or identity evidence.
 
 The bootstrap change that adds this policy is not retroactively authorized by itself. It must complete the existing human owner gate before the exception can be enabled for explicitly authorized future StudioOps tasks.
 

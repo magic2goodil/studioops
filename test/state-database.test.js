@@ -10,6 +10,7 @@ import test from "node:test";
 import { maintenanceWriteBlocker } from "../src/state-database.js";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
+import { evaluateSelfPromotionEligibility } from "../src/integration-policy.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -118,7 +119,10 @@ test("SQLite JSON payloads preserve legacy records and persist normalized explic
           selfPromotion: {
             version: 1,
             enabled: true,
-            sourceRoot: "/tmp/studioops/source"
+            productId: "studioops",
+            repositoryId: "magic2goodil/studioops",
+            sourceRoot: "/tmp/studioops/source",
+            targetBranch: "main"
           }
         }
       });
@@ -151,6 +155,59 @@ test("SQLite JSON payloads preserve legacy records and persist normalized explic
       "studioops.main_fast_forward",
       "studioops.local_runtime_restart",
     ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("raw legacy SQLite authorization payloads remain ineligible without explicit version markers", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-legacy-authorization-"));
+  try {
+    const state = baseState();
+    state.projects[0] = {
+      id: "project_1",
+      key: "studioops",
+      name: "StudioOps",
+      repoPath: "/tmp/studioops/source",
+      repoUrl: "https://github.com/magic2goodil/studioops",
+      defaultBranch: "main",
+      reviewPolicy: {
+        selfPromotion: {
+          enabled: true,
+          sourceRoot: "/tmp/studioops/source",
+        },
+      },
+    };
+    state.tasks[0].requestProvenance = {
+      version: 1,
+      kind: "explicit_owner_request",
+      ownerActorId: "owner:opaque-1234",
+      requestId: "request:opaque-5678",
+      projectId: "project_1",
+      capabilities: ["studioops.source_change"],
+    };
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const persisted = readPersistedState(root);
+    assert.equal(
+      evaluateSelfPromotionEligibility(persisted.projects[0], persisted.tasks[0]).reason,
+      "policy_version_missing",
+    );
+
+    persisted.projects[0].reviewPolicy.selfPromotion = {
+      version: 1,
+      enabled: true,
+      productId: "studioops",
+      repositoryId: "magic2goodil/studioops",
+      sourceRoot: "/tmp/studioops/source",
+      targetBranch: "main",
+    };
+    delete persisted.tasks[0].requestProvenance.version;
+    assert.equal(
+      evaluateSelfPromotionEligibility(persisted.projects[0], persisted.tasks[0]).reason,
+      "request_provenance_version_missing",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

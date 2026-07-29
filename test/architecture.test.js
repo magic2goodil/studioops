@@ -4,6 +4,7 @@ import { dispatchSupervisorActions } from "../src/dispatcher.js";
 import { resolveExecutionPolicy } from "../src/execution-policy.js";
 import { claimRuns, successfulHandoffFailure } from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { projectFromConfig } from "../src/config.js";
 import {
   evaluateSelfPromotionEligibility,
   evaluateSelfPromotionProjectPolicy,
@@ -91,7 +92,10 @@ function canonicalStudioOpsProject(patch = {}) {
       selfPromotion: {
         version: 1,
         enabled: true,
+        productId: "studioops",
+        repositoryId: "magic2goodil/studioops",
         sourceRoot: repoPath,
+        targetBranch: "main",
       },
     },
     ...patch,
@@ -155,6 +159,19 @@ test("StudioOps self-promotion policy is versioned, default-disabled, and canoni
     inheritanceKind: "",
     inheritedAt: "",
   });
+  assert.deepEqual(normalizeSelfPromotionPolicy({
+    enabled: true,
+    sourceRoot: "/tmp/legacy-studioops",
+  }), {
+    version: 0,
+    enabled: true,
+    productId: "",
+    repositoryId: "",
+    sourceRoot: "/tmp/legacy-studioops",
+    targetBranch: "",
+    allowedCapabilities: [...STUDIOOPS_SELF_PROMOTION_CAPABILITIES],
+    prohibitedCapabilities: [...SELF_PROMOTION_PROHIBITED_CAPABILITIES],
+  });
   assert.equal(evaluateSelfPromotionProjectPolicy({
     key: "studioops",
     name: "StudioOps",
@@ -162,6 +179,39 @@ test("StudioOps self-promotion policy is versioned, default-disabled, and canoni
 
   const canonical = canonicalStudioOpsProject();
   assert.equal(evaluateSelfPromotionProjectPolicy(canonical).reason, "eligible");
+  assert.equal(evaluateSelfPromotionProjectPolicy({
+    ...canonical,
+    reviewPolicy: {
+      selfPromotion: {
+        enabled: true,
+        sourceRoot: canonical.repoPath,
+      },
+    },
+  }).reason, "policy_version_missing");
+  const importedLegacyPolicy = projectFromConfig({
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: canonical.repoPath,
+    repoUrl: canonical.repoUrl,
+    defaultBranch: "main",
+    reviewPolicy: {
+      selfPromotion: {
+        enabled: true,
+        sourceRoot: canonical.repoPath,
+      },
+    },
+  });
+  assert.equal(importedLegacyPolicy.reviewPolicy.selfPromotion.version, 0);
+  assert.equal(importedLegacyPolicy.selfPromotionEligibility.reason, "policy_version_unsupported");
+  for (const [field, reason] of [
+    ["productId", "policy_product_identity_missing"],
+    ["repositoryId", "policy_repository_identity_missing"],
+    ["targetBranch", "policy_target_branch_missing"],
+  ]) {
+    const incomplete = structuredClone(canonical);
+    delete incomplete.reviewPolicy.selfPromotion[field];
+    assert.equal(evaluateSelfPromotionProjectPolicy(incomplete).reason, reason, field);
+  }
   assert.equal(evaluateSelfPromotionProjectPolicy({
     ...canonical,
     repoUrl: "https://github.com/example/client",
@@ -203,6 +253,15 @@ test("self-promotion eligibility denies managed projects, spoofed keys, mixed sc
     ...task,
     requestProvenance: explicitOwnerRequest({ projectId: "project_other" }),
   }).reason, "request_project_mismatch");
+  assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
+    ...task,
+    projectId: "project_other",
+  }).reason, "task_project_mismatch");
+  const { version: _legacyVersion, ...unversionedRequest } = explicitOwnerRequest();
+  assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
+    ...task,
+    requestProvenance: unversionedRequest,
+  }).reason, "request_provenance_version_missing");
   assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
     ...task,
     requestProvenance: explicitOwnerRequest({ ownerActorId: "github_pat_not-an-actor" }),

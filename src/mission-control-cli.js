@@ -795,6 +795,9 @@ Automation:
     ) {
       reviewPolicy.selfPromotion = {
         version: SELF_PROMOTION_POLICY_VERSION,
+        productId: STUDIOOPS_PRODUCT_ID,
+        repositoryId: STUDIOOPS_REPOSITORY_ID,
+        targetBranch: "main",
         ...(Object.prototype.hasOwnProperty.call(args, "self-promotion")
           ? { enabled: booleanOption(args["self-promotion"], true) }
           : {}),
