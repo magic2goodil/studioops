@@ -13,10 +13,10 @@ const MAX_NOTIFICATION_ATTEMPTS = 3;
 const NOTIFICATION_RETRY_MS = 5 * 60 * 1000;
 const DEFAULT_STUDIOOPS_BASE_URL = "http://127.0.0.1:4317";
 
-function studioOpsBaseUrl() {
+export function studioOpsBaseUrl(env = process.env) {
   return String(
-    process.env.STUDIOOPS_BASE_URL
-      || process.env.MISSION_CONTROL_BASE_URL
+    env.STUDIOOPS_BASE_URL
+      || env.MISSION_CONTROL_BASE_URL
       || DEFAULT_STUDIOOPS_BASE_URL,
   ).replace(/\/$/, "");
 }
@@ -261,12 +261,13 @@ export async function markNotificationAttempt(itemId, statusPatch, notificationT
 }
 
 export async function sendPendingNotifications(input = {}) {
-  const plan = await planNotifications(input);
+  const plan = input.plan || await planNotifications(input);
+  const sendNotification = input.sendNotification || sendMacNotification;
   const sent = [];
   for (const item of plan.pending) {
     if (input.dryRun) continue;
     try {
-      await sendMacNotification(item.notification);
+      await sendNotification(item.notification);
       sent.push(await markNotificationAttempt(item.id, {
         notificationStatus: "sent",
         notificationChannel: "macos",

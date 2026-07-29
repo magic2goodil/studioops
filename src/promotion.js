@@ -37,10 +37,16 @@ const PROMOTION_DEPENDENCY_COMPLETE_STATUSES = new Set([
   "closed",
 ]);
 
+export function resolvePromotionPath(env = process.env) {
+  return env.STUDIOOPS_PROMOTION_PATH
+    || env.MISSION_CONTROL_PROMOTION_PATH
+    || DEFAULT_PROMOTION_PATH;
+}
+
 function childEnv(options = {}) {
   return {
     ...process.env,
-    PATH: options.path || process.env.STUDIOOPS_PROMOTION_PATH || process.env.MISSION_CONTROL_PROMOTION_PATH || DEFAULT_PROMOTION_PATH,
+    PATH: options.path || resolvePromotionPath(),
     ...(options.env || {}),
   };
 }
@@ -303,14 +309,11 @@ async function branchHead(repoPath, ref, options = {}) {
   return result.ok ? result.output.trim() : "";
 }
 
-async function fetchTaskSource(repoPath, task, options = {}) {
+export async function fetchPromotionTaskSource(repoPath, task, options = {}) {
   const localRef = `refs/studioops/promotions/${safeRefSegment(task.id)}`;
   const legacyLocalRef = `refs/mission-control/promotions/${safeRefSegment(task.id)}`;
   const branchName = normalizeBranchName(task.branchName);
   const errors = [];
-
-  const legacyHead = await branchHead(repoPath, legacyLocalRef, options);
-  if (legacyHead) return { ok: true, ref: legacyLocalRef, label: "historical scratch ref", fetchOutput: "" };
 
   if (branchName) {
     const branchFormat = await git(repoPath, ["check-ref-format", "--branch", branchName], { allowFailure: true });
@@ -334,6 +337,16 @@ async function fetchTaskSource(repoPath, task, options = {}) {
     errors.push(`PR ${prNumber}: ${prFetch.output}`);
   }
 
+  const legacyHead = await branchHead(repoPath, legacyLocalRef, options);
+  if (legacyHead) {
+    return {
+      ok: true,
+      ref: legacyLocalRef,
+      label: "historical scratch ref",
+      fetchOutput: "",
+    };
+  }
+
   return {
     ok: false,
     error: errors.length ? errors.join("\n") : "Task needs a branch name or GitHub PR URL before promotion can fetch a source ref.",
@@ -346,7 +359,7 @@ async function conflictFiles(repoPath) {
 }
 
 async function mergeTaskSource(repoPath, task, options = {}) {
-  const source = await fetchTaskSource(repoPath, task, options);
+  const source = await fetchPromotionTaskSource(repoPath, task, options);
   if (!source.ok) {
     return {
       taskId: task.id,
@@ -861,7 +874,7 @@ function workspaceSummary(result) {
   return `\n\nWorkspace: ${result.workspacePath}${strategy}`;
 }
 
-function commentForTask(projectResult, taskResult) {
+export function promotionCommentForTask(projectResult, taskResult) {
   const targetLine = branchWebUrl(projectResult)
     ? `\n\nTarget branch: ${branchWebUrl(projectResult)}`
     : `\n\nTarget branch: ${projectResult.targetBranch}`;
@@ -873,26 +886,26 @@ function commentForTask(projectResult, taskResult) {
 
   if (taskResult.status === "conflict") {
     const files = taskResult.conflicts?.length ? taskResult.conflicts.map((file) => `- ${file}`).join("\n") : "- Git did not report conflicted file names.";
-    return `Promotion blocked: merging ${taskResult.source} into ${projectResult.targetBranch} produced conflicts. No changes were pushed.${workspaceLine}\n\nConflicts:\n${files}`;
+    return `StudioOps promotion blocked: merging ${taskResult.source} into ${projectResult.targetBranch} produced conflicts. No changes were pushed.${workspaceLine}\n\nConflicts:\n${files}`;
   }
 
   if (taskResult.status === "validation_failed") {
-    return `Promotion validation failed after merging ${taskResult.source} into ${projectResult.targetBranch}. No changes were pushed.${targetLine}${workspaceLine}\n\nValidation:\n${validationSummary(projectResult)}`;
+    return `StudioOps promotion validation failed after merging ${taskResult.source} into ${projectResult.targetBranch}. No changes were pushed.${targetLine}${workspaceLine}\n\nValidation:\n${validationSummary(projectResult)}`;
   }
 
   if (taskResult.status === "push_failed") {
-    return `Promotion could not update ${projectResult.targetBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
+    return `StudioOps promotion could not update ${projectResult.targetBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (taskResult.status === "pr_failed") {
-    return `Release-candidate branch ${projectResult.promotionBranch || ""} was pushed, but its pull request could not be created.${workspaceLine}\n\n${projectResult.output}`;
+    return `StudioOps release-candidate branch ${projectResult.promotionBranch || ""} was pushed, but its pull request could not be created.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (taskResult.status === "dependency_blocked") {
-    return `Promotion waiting: ${taskResult.output}`;
+    return `StudioOps promotion waiting: ${taskResult.output}`;
   }
 
-  return `Promotion skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No promotion was attempted."}${workspaceLine}`;
+  return `StudioOps promotion skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No promotion was attempted."}${workspaceLine}`;
 }
 
 function taskPatchForPromotion(projectResult, taskResult, now) {
@@ -1001,7 +1014,7 @@ async function recordProjectResult(projectResult) {
         id: nextId(state.comments, "comment"),
         taskId: task.id,
         author: "StudioOps Promotion",
-        body: commentForTask(projectResult, taskResult),
+        body: promotionCommentForTask(projectResult, taskResult),
         createdAt: now,
       });
       state.events.push({

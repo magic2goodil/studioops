@@ -44,10 +44,16 @@ const DEFAULT_QA_INTEGRATION_PATH = [
   process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
 ].join(":");
 
+export function resolveQaIntegrationPath(env = process.env) {
+  return env.STUDIOOPS_QA_INTEGRATION_PATH
+    || env.MISSION_CONTROL_QA_INTEGRATION_PATH
+    || DEFAULT_QA_INTEGRATION_PATH;
+}
+
 function childEnv(options = {}) {
   return {
     ...process.env,
-    PATH: options.path || process.env.STUDIOOPS_QA_INTEGRATION_PATH || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH || DEFAULT_QA_INTEGRATION_PATH,
+    PATH: options.path || resolveQaIntegrationPath(),
     ...(options.env || {}),
   };
 }
@@ -652,23 +658,11 @@ async function resetPreparedIntegrationBranch(repoPath, branchName, preparedHead
   return git(repoPath, ["reset", "--keep", preparedHead], { allowFailure: true });
 }
 
-async function fetchTaskSource(repoPath, task, options = {}) {
+export async function fetchQaTaskSource(repoPath, task, options = {}) {
   const localRef = `refs/studioops/tasks/${safeRefSegment(task.id)}`;
   const legacyLocalRef = `refs/mission-control/tasks/${safeRefSegment(task.id)}`;
   const branchName = normalizeBranchName(task.branchName);
   const errors = [];
-
-  const legacyHead = await branchHead(repoPath, legacyLocalRef, options);
-  if (legacyHead) {
-    return {
-      ok: true,
-      ref: legacyLocalRef,
-      sourceRef: "",
-      headSha: legacyHead,
-      label: "historical scratch ref",
-      fetchOutput: "",
-    };
-  }
 
   if (branchName) {
     const branchFormat = await git(repoPath, ["check-ref-format", "--branch", branchName], { allowFailure: true });
@@ -704,6 +698,18 @@ async function fetchTaskSource(repoPath, task, options = {}) {
       };
     }
     errors.push(`PR ${prNumber}: ${prFetch.output}`);
+  }
+
+  const legacyHead = await branchHead(repoPath, legacyLocalRef, options);
+  if (legacyHead) {
+    return {
+      ok: true,
+      ref: legacyLocalRef,
+      sourceRef: "",
+      headSha: legacyHead,
+      label: "historical scratch ref",
+      fetchOutput: "",
+    };
   }
 
   return {
@@ -1077,7 +1083,7 @@ async function mergeTaskSource(repoPath, task, options = {}) {
       output: task.reviewEvidenceError || "Task has no reviewed source SHA.",
     };
   }
-  const source = await fetchTaskSource(repoPath, task, options);
+  const source = await fetchQaTaskSource(repoPath, task, options);
   if (!source.ok) {
     return {
       taskId: task.id,
@@ -2122,7 +2128,7 @@ function localPreviewSummary(result) {
   return lines.join("\n");
 }
 
-function commentForTask(projectResult, taskResult) {
+export function qaIntegrationCommentForTask(projectResult, taskResult) {
   const branchLine = projectResult.integrationBranchUrl
     ? `\n\nIntegration branch: ${projectResult.integrationBranchUrl}`
     : `\n\nIntegration branch: ${projectResult.integrationBranch}`;
@@ -2158,11 +2164,11 @@ function commentForTask(projectResult, taskResult) {
     const checks = checkState
       ? `\n\nChecks: ${checkState.state} (${checkState.passed} passed, ${checkState.pending} pending, ${checkState.failed} failed)`
       : "";
-    return `Protected QA branch handoff for ${taskResult.source}: ${projectResult.integrationCandidateCommit} is published on ${projectResult.integrationCandidateBranch}.${projectResult.integrationPr?.url ? `\n\nPR: ${projectResult.integrationPr.url}` : ""}${branchLine}${checks}\n\n${projectResult.integrationBlocker || projectResult.output}${supersededLine}`;
+    return `StudioOps protected QA branch handoff for ${taskResult.source}: ${projectResult.integrationCandidateCommit} is published on ${projectResult.integrationCandidateBranch}.${projectResult.integrationPr?.url ? `\n\nPR: ${projectResult.integrationPr.url}` : ""}${branchLine}${checks}\n\n${projectResult.integrationBlocker || projectResult.output}${supersededLine}`;
   }
 
   if (["candidate_drift", "candidate_publish_failed", "candidate_supersession_failed"].includes(taskResult.status)) {
-    return `Protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
+    return `StudioOps protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
   }
 
   return `StudioOps QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}${supersededLine}`;
@@ -2328,7 +2334,7 @@ async function recordProjectResult(projectResult) {
           author: "StudioOps QA Integration",
           systemGenerated: true,
           kind: "qa_integration",
-          body: commentForTask(projectResult, taskResult),
+          body: qaIntegrationCommentForTask(projectResult, taskResult),
           createdAt: now,
         });
         state.events.push({

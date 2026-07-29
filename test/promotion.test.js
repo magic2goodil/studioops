@@ -8,7 +8,10 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
-import { planPromotions } from "../src/promotion.js";
+import {
+  fetchPromotionTaskSource,
+  planPromotions,
+} from "../src/promotion.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -153,6 +156,58 @@ test("promotion planning requires a complete candidate-level QA pass, not a stat
   assert.equal(redirected.enabled, false);
   assert.equal(redirected.targetBranch, "main");
   assert.match(redirected.skipReason, /does not match candidate base/);
+});
+
+test("promotion scratch refs prefer current evidence and use legacy refs only as read-only fallback", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-promotion-refs-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  try {
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await configureRepo(repoPath);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "main"]);
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "app.txt"), "current\n", "utf8");
+    await git(repoPath, ["commit", "-am", "current"]);
+    const currentSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "feature/task"]);
+    await git(repoPath, ["checkout", "main"]);
+
+    await git(repoPath, ["update-ref", "refs/mission-control/promotions/task_1", baseSha]);
+    await git(repoPath, ["update-ref", "refs/reviewer/unrelated", baseSha]);
+
+    const current = await fetchPromotionTaskSource(repoPath, {
+      id: "task_1",
+      branchName: "feature/task",
+    });
+    assert.equal(current.ok, true);
+    assert.equal(current.ref, "refs/studioops/promotions/task_1");
+    assert.equal(await git(repoPath, ["rev-parse", current.ref]), currentSha);
+    assert.equal(
+      await git(repoPath, ["rev-parse", "refs/mission-control/promotions/task_1"]),
+      baseSha,
+    );
+    assert.equal(await git(repoPath, ["rev-parse", "refs/reviewer/unrelated"]), baseSha);
+
+    const legacyFallback = await fetchPromotionTaskSource(repoPath, { id: "task_1" });
+    assert.equal(legacyFallback.ok, true);
+    assert.equal(legacyFallback.ref, "refs/mission-control/promotions/task_1");
+    assert.equal(legacyFallback.label, "historical scratch ref");
+    assert.deepEqual(
+      (await git(repoPath, ["for-each-ref", "--format=%(refname)", "refs/mission-control"]))
+        .split("\n")
+        .filter(Boolean),
+      ["refs/mission-control/promotions/task_1"],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 async function writeState(root, state) {
@@ -451,6 +506,7 @@ test("promotion creates a validated release-candidate PR without updating main",
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const fakeBin = path.join(root, "bin");
+  const ghArgsLog = path.join(root, "gh-pr-create.log");
 
   try {
     await git(root, ["init", "--bare", remotePath]);
@@ -473,7 +529,19 @@ test("promotion creates a validated release-candidate PR without updating main",
     await git(repoPath, ["push", "origin", "qa/candidate-demo"]);
     await git(repoPath, ["checkout", "main"]);
     await mkdir(fakeBin, { recursive: true });
-    await writeFile(path.join(fakeBin, "gh"), "#!/bin/sh\necho https://github.com/example/demo/pull/42\n", "utf8");
+    await writeFile(path.join(fakeBin, "gh"), `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--title" ]; then
+    shift
+    printf 'TITLE<<EOF\\n%s\\nEOF\\n' "$1" >> "$STUDIOOPS_GH_ARGS_LOG"
+  elif [ "$1" = "--body" ]; then
+    shift
+    printf 'BODY<<EOF\\n%s\\nEOF\\n' "$1" >> "$STUDIOOPS_GH_ARGS_LOG"
+  fi
+  shift
+done
+echo https://github.com/example/demo/pull/42
+`, "utf8");
     await chmod(path.join(fakeBin, "gh"), 0o755);
 
     const candidate = candidateFixture({
@@ -530,7 +598,10 @@ test("promotion creates a validated release-candidate PR without updating main",
       const report = await runPromotion({
         githubAppAuth: false,
         promotionWorkspaceRoot: ${JSON.stringify(path.join(root, "promotion-workspaces"))},
-        env: { PATH: ${JSON.stringify(`${fakeBin}:/usr/local/bin:/usr/bin:/bin`)} }
+        env: {
+          PATH: ${JSON.stringify(`${fakeBin}:/usr/local/bin:/usr/bin:/bin`)},
+          STUDIOOPS_GH_ARGS_LOG: ${JSON.stringify(ghArgsLog)}
+        }
       });
       console.log(JSON.stringify(report));
     `;
@@ -552,6 +623,19 @@ test("promotion creates a validated release-candidate PR without updating main",
     assert.ok(await git(root, ["--git-dir", remotePath, "rev-parse", `refs/heads/${report.projects[0].promotionBranch}`]));
     await assert.rejects(() => git(root, ["--git-dir", remotePath, "show", "refs/heads/main:feature.txt"]));
     assert.equal(state.events.some((event) => event.type === "release_candidate_ready"), true);
+
+    const ghArgs = await readFile(ghArgsLog, "utf8");
+    const title = ghArgs.match(/TITLE<<EOF\n([\s\S]*?)\nEOF/)?.[1] || "";
+    const body = ghArgs.match(/BODY<<EOF\n([\s\S]*?)\nEOF/)?.[1] || "";
+    assert.match(title, /^StudioOps release candidate:/);
+    assert.match(body, /## Immutable StudioOps candidate/);
+    assert.match(body, new RegExp(`Candidate: ${candidate.id}`));
+    assert.match(body, new RegExp(`Manifest: ${candidate.manifestDigest}`));
+    assert.match(body, new RegExp(`Integration SHA: ${sourceSha}`));
+    assert.match(body, new RegExp(`- task_1: Feature task at ${sourceSha}`));
+    assert.match(body, /Product: https:\/\/github\.com\/magic2goodil\/studioops/);
+    assert.doesNotMatch(body, /Mission Control/);
+    assert.doesNotMatch(body, /magic2goodil\/mission-control/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
