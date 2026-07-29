@@ -12,6 +12,7 @@ import {
   recordQaBundleDecision,
   recordQaDecision,
   recordReview,
+  reviewPolicyForProject,
   resetAutomationCircuit,
   resumeOperatorAutomation,
   setOperatorPause,
@@ -19,7 +20,12 @@ import {
   updateProject,
   updateTask,
 } from "./store.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, projectFromConfig } from "./config.js";
+import {
+  evaluateSelfPromotionEligibility,
+  evaluateSelfPromotionProjectPolicy,
+  normalizeOwnerRequestProvenance,
+} from "./integration-policy.js";
 import { buildOwnerInbox } from "./owner-inbox.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
 
@@ -160,8 +166,22 @@ async function handleApi(req, res, url) {
     const config = await loadConfig();
     sendJson(res, 200, {
       meta: state.meta || {},
-      projects: state.projects || [],
-      tasks: state.tasks || [],
+      projects: (state.projects || []).map((project) => ({
+        ...project,
+        reviewPolicy: reviewPolicyForProject(project),
+        selfPromotionEligibility: evaluateSelfPromotionProjectPolicy(project),
+      })),
+      tasks: (state.tasks || []).map((task) => {
+        const project = state.projects.find((item) => item.id === task.projectId);
+        const parent = state.tasks.find((item) => item.id === task.parentTaskId);
+        return {
+          ...task,
+          requestProvenance: normalizeOwnerRequestProvenance(task.requestProvenance),
+          selfPromotionEligibility: project
+            ? evaluateSelfPromotionEligibility(project, task, { parentTask: parent })
+            : { eligible: false, reason: "task_project_missing" },
+        };
+      }),
       qaBundles: state.qaBundles || [],
       ownerInbox: buildOwnerInbox(state),
       configLoaded: !!config,
@@ -182,7 +202,10 @@ async function handleApi(req, res, url) {
 
   if (req.method === "GET" && url.pathname === "/api/config") {
     const config = await loadConfig();
-    sendJson(res, 200, { configLoaded: !!config, config });
+    const effectiveProjects = (config?.projects || []).map((project) => (
+      projectFromConfig(project, config?.defaults || {})
+    ));
+    sendJson(res, 200, { configLoaded: !!config, config, effectiveProjects });
     return;
   }
 
@@ -192,6 +215,24 @@ async function handleApi(req, res, url) {
   }
 
   const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (projectMatch && req.method === "GET") {
+    const state = await readState();
+    const project = state.projects.find((item) => (
+      item.id === projectMatch[1] || item.key === projectMatch[1]
+    ));
+    if (!project) {
+      sendJson(res, 404, { error: "Project not found." });
+      return;
+    }
+    sendJson(res, 200, {
+      project: {
+        ...project,
+        reviewPolicy: reviewPolicyForProject(project),
+        selfPromotionEligibility: evaluateSelfPromotionProjectPolicy(project),
+      },
+    });
+    return;
+  }
   if (projectMatch && req.method === "PATCH") {
     sendJson(res, 200, { project: await updateProject(projectMatch[1], await readJsonBody(req)) });
     return;

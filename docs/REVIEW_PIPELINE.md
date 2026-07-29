@@ -166,7 +166,15 @@ Projects can override the default with:
   "leadOwnsFinalDecisionAtLimit": true,
   "trustLeadApprovals": false,
   "qaReviewerRole": "qa-reviewer",
-  "integrationBranch": ""
+  "integrationBranch": "",
+  "selfPromotion": {
+    "version": 1,
+    "enabled": false,
+    "productId": "studioops",
+    "repositoryId": "magic2goodil/studioops",
+    "sourceRoot": "/absolute/configured/path/to/.codex/studioops/source",
+    "targetBranch": "main"
+  }
 }
 ```
 
@@ -179,6 +187,31 @@ When `reviewPolicy.trustLeadApprovals` is `true`, StudioOps trusts the primary l
 Use `reviewPolicy.integrationBranch` to name the non-production branch or bundle target that should collect lead-approved work for local testing, for example `qa/event-horizons-web`.
 
 Trust Leads does not allow production deploys. It only changes the handoff from "review every PR" to "review the QA bundle." Production release still requires explicit owner approval and the project's protected deployment workflow.
+
+## StudioOps-Only Self-Promotion Policy
+
+`reviewPolicy.selfPromotion` is a separate, versioned, default-disabled exception. It is not implied by Trust Leads, a project key, a mutable project name, or a task status. The effective policy is eligible only when all of these registered values agree:
+
+- product identity is `studioops`
+- repository identity and the project's Git remote resolve to `magic2goodil/studioops`
+- `sourceRoot` is an absolute path equal to the project's configured local source checkout
+- both the policy target and project default branch are `main`
+
+Display normalization may show safe defaults for an absent disabled policy, but those defaults are not authorization evidence. An enabled policy must durably declare its version, product ID, repository ID, source root, and target branch; an unversioned or incomplete legacy payload remains ineligible.
+
+Each eligible task must also carry an explicitly versioned `requestProvenance` with opaque owner actor and request IDs, the same durable project ID as both the task and project, and a non-empty closed capability scope. Display normalization never upgrades an unversioned legacy provenance record. The only capabilities recognized by version 1 are:
+
+- `studioops.source_change`
+- `studioops.main_fast_forward`
+- `studioops.local_runtime_restart`
+
+The exception always excludes `managed_project.production_release`, `local_state.destructive_delete`, `secrets.rotate`, `cloud.billing`, `external_notifications.send`, and `customer_communication.send`. Missing or legacy provenance, unknown capabilities, mixed-project provenance, forbidden capabilities, identity mismatches, and invalid architecture inheritance fail closed with a stable reason code.
+
+A governed architecture child can inherit the parent's exact request IDs and capability scope only during `architecture-complete`, only from an eligible same-project explicit-owner-request parent, and only when the child has no direct provenance. The child records the parent task, handoff kind, and inheritance timestamp. Builders and reviewers must treat any later scope drift as ineligible.
+
+The `projects --json`, `show-task --json`, project API, task detail API, and generated prompts expose the normalized policy, request provenance, effective eligibility, exact limits, and denial reason.
+
+> Bootstrap rule: the implementation that introduces this policy still follows the normal human owner gate. The standing exception becomes usable only after this code has shipped, the canonical StudioOps project policy is explicitly enabled, and a future task carries valid explicit owner-request provenance.
 
 ## One PR Versus Multiple Tasks
 

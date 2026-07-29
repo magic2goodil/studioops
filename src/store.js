@@ -8,9 +8,19 @@ import {
 import { verifyCandidateRepositoryState } from "./candidate-repository.js";
 import {
   branchWebUrl,
+  evaluateSelfPromotionEligibility,
+  evaluateSelfPromotionProjectPolicy,
+  inheritedOwnerRequestProvenance,
   integrationBranchName,
   integrationBranchSafetyError,
+  normalizeOwnerRequestProvenance,
+  normalizeSelfPromotionPolicy,
+  opaqueOwnerRequestIdIsValid,
+  ownerRequestProvenanceHasEvidence,
+  OWNER_REQUEST_PROVENANCE_VERSION,
   projectUsesTrustLeadQa,
+  SELF_PROMOTION_PROHIBITED_CAPABILITIES,
+  STUDIOOPS_SELF_PROMOTION_CAPABILITIES,
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
 import { missionControlDataDir } from "./runtime-paths.js";
@@ -141,6 +151,7 @@ const DEFAULT_REVIEW_POLICY = {
   trustLeadApprovals: false,
   qaReviewerRole: "qa-reviewer",
   integrationBranch: "",
+  selfPromotion: normalizeSelfPromotionPolicy(),
 };
 
 export {
@@ -745,6 +756,7 @@ function normalizeReviewPolicy(value = {}) {
     trustLeadApprovals: normalizeBoolean(value.trustLeadApprovals ?? value.trustLeads, DEFAULT_REVIEW_POLICY.trustLeadApprovals),
     qaReviewerRole: String(value.qaReviewerRole || DEFAULT_REVIEW_POLICY.qaReviewerRole).trim(),
     integrationBranch: String(value.integrationBranch || value.reviewBranch || "").trim(),
+    selfPromotion: normalizeSelfPromotionPolicy(value.selfPromotion),
   };
 }
 
@@ -867,9 +879,14 @@ export async function updateProject(projectId, patch = {}) {
       };
     }
     if (Object.prototype.hasOwnProperty.call(patch, "reviewPolicy")) {
+      const selfPromotion = {
+        ...(project.reviewPolicy?.selfPromotion || {}),
+        ...(patch.reviewPolicy?.selfPromotion || {}),
+      };
       project.reviewPolicy = normalizeReviewPolicy({
         ...(project.reviewPolicy || {}),
         ...(patch.reviewPolicy || {}),
+        selfPromotion,
       });
       project.trustLeadApprovals = project.reviewPolicy.trustLeadApprovals;
       project.integrationBranch = project.reviewPolicy.integrationBranch;
@@ -903,6 +920,45 @@ function governedArchitectureParent(state, project, parentTaskId, architecturePa
     throw new Error(`Architecture parent ${governedParentId} does not require systems architecture.`);
   }
   return parent;
+}
+
+function explicitOwnerRequestProvenance(input = {}, project = {}) {
+  const raw = input.requestProvenance || (
+    input.ownerActorId || input.ownerRequestId || input.ownerRequestCapabilities
+      ? {
+        version: OWNER_REQUEST_PROVENANCE_VERSION,
+        ownerActorId: input.ownerActorId,
+        requestId: input.ownerRequestId,
+        capabilities: input.ownerRequestCapabilities,
+      }
+      : {}
+  );
+  const normalized = normalizeOwnerRequestProvenance(raw);
+  if (normalized.kind === "governed_architecture_inheritance") {
+    throw new Error("Governed architecture request provenance can only be written by architecture completion.");
+  }
+  const hasExplicitRequest = Boolean(
+    normalized.kind
+    || normalized.ownerActorId
+    || normalized.requestId
+    || normalized.projectId
+    || normalized.capabilities.length
+  );
+  if (!hasExplicitRequest) return normalized;
+  if (
+    !opaqueOwnerRequestIdIsValid(normalized.ownerActorId)
+    || !opaqueOwnerRequestIdIsValid(normalized.requestId)
+  ) {
+    throw new Error("Explicit owner requests require opaque, non-sensitive actor and request identifiers.");
+  }
+  return {
+    ...normalized,
+    kind: normalized.kind || "explicit_owner_request",
+    projectId: normalized.projectId || String(project.id || ""),
+    inheritedFromTaskId: "",
+    inheritanceKind: "",
+    inheritedAt: "",
+  };
 }
 
 export async function addTask(input) {
@@ -961,6 +1017,7 @@ export async function addTask(input) {
       architectureDecisionTaskIds: [],
       architectureCompletedAt: "",
       architectureCompletedBy: "",
+      requestProvenance: explicitOwnerRequestProvenance(input, project),
       privacyNotes: String(input.privacyNotes || "").trim(),
       securityNotes: String(input.securityNotes || "").trim(),
       branchName: String(input.branchName || "").trim(),
@@ -1091,6 +1148,39 @@ export async function updateTask(taskId, patch) {
     validateTaskRelationships(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
     if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
       task.attachments = normalizeAttachments(patch.attachments);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "requestProvenance")
+      || Object.prototype.hasOwnProperty.call(patch, "ownerActorId")
+      || Object.prototype.hasOwnProperty.call(patch, "ownerRequestId")
+      || Object.prototype.hasOwnProperty.call(patch, "ownerRequestCapabilities")
+    ) {
+      task.requestProvenance = explicitOwnerRequestProvenance({
+        requestProvenance: {
+          ...(
+            !Object.prototype.hasOwnProperty.call(task.requestProvenance || {}, "version")
+            && !Object.prototype.hasOwnProperty.call(patch.requestProvenance || {}, "version")
+            && (
+              Object.prototype.hasOwnProperty.call(patch, "ownerActorId")
+              || Object.prototype.hasOwnProperty.call(patch, "ownerRequestId")
+              || Object.prototype.hasOwnProperty.call(patch, "ownerRequestCapabilities")
+            )
+              ? { version: OWNER_REQUEST_PROVENANCE_VERSION }
+              : {}
+          ),
+          ...(task.requestProvenance || {}),
+          ...(patch.requestProvenance || {}),
+          ...(Object.prototype.hasOwnProperty.call(patch, "ownerActorId")
+            ? { ownerActorId: patch.ownerActorId }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(patch, "ownerRequestId")
+            ? { requestId: patch.ownerRequestId }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(patch, "ownerRequestCapabilities")
+            ? { capabilities: patch.ownerRequestCapabilities }
+            : {}),
+        },
+      }, project);
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
@@ -1314,9 +1404,19 @@ export function completeArchitectureInState(state, taskId, input = {}) {
   task.status = "architecture_ready";
   task.updatedAt = now;
 
+  const project = findProject(state, task.projectId);
+  const parentCanAuthorizeInheritance = Boolean(
+    project && evaluateSelfPromotionEligibility(project, task).eligible,
+  );
   for (const child of childTasks) {
     child.architectureStatus = "inherited";
     child.status = "ready";
+    if (
+      parentCanAuthorizeInheritance
+      && !ownerRequestProvenanceHasEvidence(child.requestProvenance)
+    ) {
+      child.requestProvenance = inheritedOwnerRequestProvenance(task, child, now);
+    }
     child.updatedAt = now;
   }
 
@@ -1337,6 +1437,17 @@ export function completeArchitectureInState(state, taskId, input = {}) {
     message: `${task.title}: architecture completed with ${decisionTaskIds.length} implementation task(s)`,
     createdAt: now,
   });
+  for (const child of childTasks) {
+    if (child.requestProvenance?.inheritedFromTaskId !== task.id) continue;
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "owner_request_provenance_inherited",
+      projectId: task.projectId,
+      taskId: child.id,
+      message: `${child.id} inherited explicit owner-request provenance through the governed architecture handoff`,
+      createdAt: now,
+    });
+  }
   return task;
 }
 
@@ -2609,10 +2720,22 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
 }
 
 export function taskWithProject(state, task) {
+  const project = state.projects.find((item) => item.id === task.projectId) || null;
+  const parent = state.tasks.find((item) => item.id === task.parentTaskId) || null;
   return {
     ...task,
-    project: state.projects.find((project) => project.id === task.projectId) || null,
-    parent: state.tasks.find((item) => item.id === task.parentTaskId) || null,
+    requestProvenance: normalizeOwnerRequestProvenance(task.requestProvenance),
+    selfPromotionEligibility: project
+      ? evaluateSelfPromotionEligibility(project, task, { parentTask: parent })
+      : { eligible: false, reason: "task_project_missing" },
+    project: project
+      ? {
+        ...project,
+        reviewPolicy: reviewPolicyForProject(project),
+        selfPromotionEligibility: evaluateSelfPromotionProjectPolicy(project),
+      }
+      : null,
+    parent,
     children: state.tasks.filter((item) => item.parentTaskId === task.id),
     dependencies: state.tasks.filter((item) => (task.dependsOnTaskIds || []).includes(item.id)),
     comments: state.comments.filter((comment) => comment.taskId === task.id),
@@ -2643,6 +2766,22 @@ export function functionalDeliveryContract(task = {}) {
     "- Keep payloads and rendering work bounded. Record performance budgets or query/response evidence for the core path.",
     "- Run the product locally as a coherent vertical slice and add executable validation that proves the core behavior, not only that components render.",
     prototypeNote,
+  ].join("\n");
+}
+
+function selfPromotionPromptPolicy(project, task, parent) {
+  const result = evaluateSelfPromotionEligibility(project, task, { parentTask: parent });
+  const policy = result.policy || normalizeSelfPromotionPolicy();
+  const provenance = result.provenance || normalizeOwnerRequestProvenance(task.requestProvenance);
+  return [
+    `- Exception enabled: ${policy.enabled ? "yes" : "no"}`,
+    `- This task eligible: ${result.eligible ? "yes" : "no"} (${result.reason})`,
+    `- Policy identity: version ${policy.version}; product ${policy.productId}; repository ${policy.repositoryId}; source ${policy.sourceRoot || "(not configured)"}; branch ${policy.targetBranch}`,
+    `- Request provenance: ${provenance.kind || "(missing)"}; actor ${provenance.ownerActorId || "(missing)"}; request ${provenance.requestId || "(missing)"}; project ${provenance.projectId || "(missing)"}`,
+    `- Requested capabilities: ${provenance.capabilities.join(", ") || "(missing)"}`,
+    `- Closed allowed capabilities: ${STUDIOOPS_SELF_PROMOTION_CAPABILITIES.join(", ")}`,
+    `- Always prohibited: ${SELF_PROMOTION_PROHIBITED_CAPABILITIES.join(", ")}`,
+    "- Scope drift, missing evidence, an unknown capability, or any managed-project production action must fail closed and return to the normal owner gate.",
   ].join("\n");
 }
 
@@ -2681,6 +2820,9 @@ ${context.projectContext}
 
 Project standards:
 ${context.standards}
+
+StudioOps self-promotion policy:
+${context.selfPromotionPolicy}
 
 Architecture mandate:
 - Inspect the actual repository and every supplied mockup, screenshot, logo, and reference before proposing work. Inventory canonical assets and name the exact asset builders must use; never redraw or substitute a supplied logo without an explicit product decision.
@@ -2725,6 +2867,7 @@ export function generatePrompt(state, taskId, role = "builder") {
   const standards = (project.standards || []).map((item) => `- ${standardReference(item)}`).join("\n") || "- No project-specific standards recorded.";
   const reviewStages = reviewStagesForProject(project);
   const reviewPolicy = reviewPolicyForProject(project);
+  const selfPromotionPolicyText = selfPromotionPromptPolicy(project, task, parent);
   const reviewPipeline = reviewStages.length
     ? reviewStages
         .map((stage) => `- ${stage.label || stage.key} (${stage.role})${stage.required ? "" : " optional"}: ${stage.description || stage.status || "No description recorded."}`)
@@ -2745,6 +2888,7 @@ export function generatePrompt(state, taskId, role = "builder") {
       criteria,
       projectContext: context,
       standards,
+      selfPromotionPolicy: selfPromotionPolicyText,
     });
   }
 
@@ -2798,6 +2942,9 @@ ${reviewPipeline}
 
 Review loop policy:
 ${reviewPolicyText}
+
+StudioOps self-promotion policy:
+${selfPromotionPolicyText}
 
 Functional delivery contract:
 ${functionalDeliveryContract(task)}
@@ -2854,6 +3001,9 @@ ${safety}
 
 Review loop policy:
 ${reviewPolicyText}
+
+StudioOps self-promotion policy:
+${selfPromotionPolicyText}
 
 Task:
 ${task.title}
