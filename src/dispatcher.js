@@ -1,5 +1,6 @@
 import {
   architectureIsCompleteInState,
+  cycleLimitLeadReviewApplies,
   currentReviewCandidateCycle,
   earliestIncompleteRequiredReviewStage,
   findProject,
@@ -347,9 +348,16 @@ function reviewDispatchSafetyReason(state, task, action) {
   const target = resolveReviewTargetStage(stages, task, action);
   if (target.reason) return target.reason;
   const targetStage = target.stage;
+  const cycleLimitLeadReview = cycleLimitLeadReviewApplies(
+    state,
+    project,
+    task,
+    targetStage,
+  );
   if (
     earliestRequiredStage
     && stages.indexOf(targetStage) > stages.indexOf(earliestRequiredStage)
+    && !cycleLimitLeadReview
   ) {
     return `earlier_review_incomplete:${earliestRequiredStage.key}`;
   }

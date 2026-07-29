@@ -408,6 +408,88 @@ test("dispatcher cannot bypass an earlier stage when review stages share a role"
   );
 });
 
+test("cycle-limit lead review can make the final call without reopening the rejecting lane", () => {
+  const state = fixtureState({
+    status: "lead_review",
+    assignedAgentRole: "lead-reviewer",
+    reviewCycle: 2,
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 2,
+  }, [
+    {
+      id: "review_1",
+      taskId: "task_1",
+      stageKey: "regression",
+      status: "regression_review",
+      role: "qa-reviewer",
+      cycle: 2,
+      candidateCycle: 2,
+      subjectSha: REVIEWER_FIX_SHA,
+      outcome: "changes_requested",
+      createdAt: "2026-07-26T10:00:00.000Z",
+    },
+  ]);
+  state.projects[0].reviewPolicy = {
+    maxBuilderReviewCycles: 2,
+    leadOwnsFinalDecisionAtLimit: true,
+  };
+
+  const report = createSupervisorReport(state);
+  const plan = planDispatches(state, report.actions);
+  const ownerHandoff = planDispatches(state, [{
+    ...report.actions[0],
+    id: "task_1:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    nextStatus: "user_review",
+  }]);
+
+  assert.equal(report.actions.length, 1);
+  assert.equal(report.actions[0].type, "continue_review");
+  assert.equal(report.actions[0].role, "lead-reviewer");
+  assert.equal(report.actions[0].nextStatus, "");
+  assert.equal(plan.selected.length, 1);
+  assert.equal(plan.selected[0].action.role, "lead-reviewer");
+  assert.equal(ownerHandoff.selected.length, 0);
+  assert.equal(ownerHandoff.skipped[0].reason, "earlier_review_incomplete:regression");
+});
+
+test("lead review cannot bypass a rejecting lane before the configured cycle limit", () => {
+  const state = fixtureState({
+    status: "lead_review",
+    assignedAgentRole: "lead-reviewer",
+    reviewCycle: 1,
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 1,
+  }, [
+    {
+      id: "review_1",
+      taskId: "task_1",
+      stageKey: "regression",
+      status: "regression_review",
+      role: "qa-reviewer",
+      cycle: 1,
+      candidateCycle: 1,
+      subjectSha: REVIEWER_FIX_SHA,
+      outcome: "changes_requested",
+      createdAt: "2026-07-26T10:00:00.000Z",
+    },
+  ]);
+  state.projects[0].reviewPolicy = {
+    maxBuilderReviewCycles: 2,
+    leadOwnsFinalDecisionAtLimit: true,
+  };
+
+  const report = createSupervisorReport(state);
+  const plan = planDispatches(state, report.actions);
+
+  assert.equal(report.actions.length, 1);
+  assert.equal(report.actions[0].role, "qa-reviewer");
+  assert.equal(report.actions[0].nextStatus, "regression_review");
+  assert.equal(plan.selected.length, 1);
+  assert.equal(plan.selected[0].action.role, "qa-reviewer");
+});
+
 test("one shared-role approval cannot satisfy multiple required review stages", () => {
   const state = fixtureState({
     status: "regression_review",
