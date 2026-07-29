@@ -1,5 +1,6 @@
 import {
   architectureIsCompleteInState,
+  cycleLimitLeadReviewApplies,
   currentReviewCandidateCycle,
   earliestIncompleteRequiredReviewStage,
   latestCurrentReviewForStage,
@@ -273,6 +274,12 @@ function taskActions(state, task, options = {}) {
   const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
   const currentStageIndex = stages.indexOf(currentStage);
   const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
+  const cycleLimitLeadReview = cycleLimitLeadReviewApplies(
+    state,
+    project,
+    task,
+    currentStage,
+  );
   const laterReviewStatuses = new Set([
     "qa_review",
     "user_review",
@@ -283,6 +290,7 @@ function taskActions(state, task, options = {}) {
   if (
     task.reviewSubjectSha
     && earliestRequiredStage
+    && !cycleLimitLeadReview
     && (
       (currentStage && currentStageIndex > earliestRequiredIndex)
       || (!currentStage && laterReviewStatuses.has(task.status))

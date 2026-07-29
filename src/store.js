@@ -2133,6 +2133,24 @@ export function earliestIncompleteRequiredReviewStage(state, project, task) {
     }) || null;
 }
 
+export function cycleLimitLeadReviewApplies(state, project, task, targetStage) {
+  const policy = reviewPolicyForProject(project);
+  const stages = reviewStagesForProject(project);
+  const leadStage = stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
+  if (
+    !policy.leadOwnsFinalDecisionAtLimit
+    || !leadStage
+    || !targetStage
+    || targetStage.key !== leadStage.key
+    || currentReviewCycle(task) < policy.maxBuilderReviewCycles
+  ) {
+    return false;
+  }
+  return stages
+    .filter((stage) => stage.key !== leadStage.key)
+    .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested");
+}
+
 export function candidateReviewEvidenceForTask(state, task) {
   const project = findProject(state, task.projectId);
   if (!project) return { ok: false, error: `Task has missing project: ${task.projectId}` };
