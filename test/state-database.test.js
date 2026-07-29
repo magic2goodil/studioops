@@ -587,3 +587,188 @@ test("SQLite archives excess machine QA history without compacting human comment
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("SQLite persists, backs up, and reconciles append-only exact-SHA hotfix releases", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-hotfix-release-"));
+  const subjectSha = "a".repeat(40);
+  const assessmentFlags = {
+    mixedScope: false,
+    broadScope: false,
+    binaryOrUninspectable: false,
+    migrationChanges: false,
+    workflowChanges: false,
+    secretMaterial: false,
+    stateDeletion: false,
+    unrelatedFeatureChanges: false,
+  };
+  const project = {
+    id: "project_1",
+    key: "demo",
+    name: "Demo",
+    repoUrl: "https://github.com/example/demo.git",
+    defaultBranch: "main",
+    hotfixPolicy: {
+      enabled: true,
+      maxFiles: 3,
+      maxChangedLines: 30,
+      blockedPaths: ["infra/production"],
+      requireCompleteTextPatches: true,
+    },
+    reviewPipeline: [
+      { key: "lead", role: "lead-reviewer", status: "lead_review", required: true },
+    ],
+  };
+  const task = {
+    id: "task_1",
+    projectId: project.id,
+    title: "Production repair",
+    status: "qa_review",
+    type: "security",
+    labels: ["production-hotfix"],
+    prUrl: "https://github.com/example/demo/pull/7",
+    reviewCycle: 1,
+    reviewSubjectCycle: 1,
+    reviewSubjectSha: subjectSha,
+  };
+  const pullRequest = {
+    number: 7,
+    url: "https://github.com/example/demo/pull/7",
+    repositoryUrl: "https://github.com/example/demo",
+    state: "open",
+    isDraft: false,
+    baseRefName: "main",
+    headRefOid: subjectSha,
+    changedFileCount: 1,
+    filesComplete: true,
+    files: [{
+      path: "src/security-fix.js",
+      additions: 1,
+      deletions: 1,
+      patch: "@@ -1 +1 @@\n-unsafe\n+safe",
+      patchComplete: true,
+    }],
+  };
+
+  try {
+    await writeLegacyState(root, {
+      meta: { source: "legacy" },
+      projects: [project],
+      tasks: [task],
+      comments: [],
+      reviews: [],
+      events: [],
+      runs: [],
+      qaBundles: [],
+      candidates: [],
+    });
+    await runStoreScript(root, `
+      import {
+        authorizeProductionHotfix,
+        claimHotfixReleaseExecution,
+        recordReview,
+        updateHotfixReleaseNotification
+      } from ${JSON.stringify(storeModuleUrl)};
+      await recordReview("task_1", {
+        stage: "lead",
+        outcome: "approved",
+        candidateCycle: 1,
+        subjectSha: ${JSON.stringify(subjectSha)},
+        author: "Lead reviewer",
+        releaseAssessment: {
+          kind: "narrow_production_fix",
+          subjectSha: ${JSON.stringify(subjectSha)},
+          prohibitedChanges: ${JSON.stringify(assessmentFlags)}
+        }
+      });
+      const release = await authorizeProductionHotfix({
+        invocationId: "owner-invocation-1",
+        phrase: "green-light demo hotfix PR #7 for production",
+        owner: { id: "owner_1", provider: "local" },
+        pullRequests: [${JSON.stringify(pullRequest)}],
+        now: "2026-07-29T12:00:00.000Z"
+      });
+      await claimHotfixReleaseExecution(release.id, {
+        executionId: "execution-1",
+        now: "2026-07-29T12:01:00.000Z"
+      });
+      await claimHotfixReleaseExecution(release.id, {
+        executionId: "execution-1",
+        now: "2026-07-29T12:01:30.000Z"
+      });
+      await updateHotfixReleaseNotification(release.id, {
+        state: "pending",
+        code: "owner_notice_pending",
+        now: "2026-07-29T12:02:00.000Z"
+      });
+    `);
+
+    const databasePath = path.join(root, "data", "mission-control.sqlite3");
+    let db = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const row = db.prepare("SELECT * FROM hotfix_releases").get();
+      const record = JSON.parse(row.payload);
+      assert.equal(row.project_id, "project_1");
+      assert.equal(row.status, "executing");
+      assert.equal(row.candidate_sha, subjectSha);
+      assert.equal(record.scopeEvidence.patch, undefined);
+      assert.equal(record.scopeEvidence.paths[0], "src/security-fix.js");
+      assert.equal(record.scopeEvidence.declaredFileCount, 1);
+      assert.equal(record.scopeEvidence.fileListComplete, true);
+      assert.equal(record.reviewEvidence.leadAssessment.kind, "narrow_production_fix");
+      assert.equal(record.execution.id, "execution-1");
+      assert.equal(record.transitions.length, 2);
+      assert.equal(record.notification.state, "pending");
+      assert.equal(record.notification.history.length, 1);
+      const indexes = db.prepare("PRAGMA index_list('hotfix_releases')").all().map((entry) => entry.name);
+      assert.equal(indexes.includes("idx_hotfix_releases_project_status_updated"), true);
+      assert.equal(indexes.includes("idx_hotfix_releases_invocation"), true);
+    } finally {
+      db.close();
+    }
+
+    const backupPath = path.join(root, "backups", "hotfix.sqlite3");
+    await runStoreScript(root, `
+      import { backupStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+      await backupStateDatabase(${JSON.stringify(backupPath)});
+    `);
+    db = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT count(*) count FROM hotfix_releases").get().count, 1);
+    } finally {
+      db.close();
+    }
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => { state.hotfixReleases = []; });
+      `),
+      /cannot be deleted/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => { state.hotfixReleases[0].requestedPhrase = "rewritten"; });
+      `),
+      /requestedPhrase is immutable/,
+    );
+
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.tasks = [];
+      });
+    `);
+    db = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const reconciled = JSON.parse(db.prepare("SELECT payload FROM hotfix_releases").get().payload);
+      assert.equal(reconciled.status, "invalidated");
+      assert.match(reconciled.integrityError, /missing project or task/);
+      assert.equal(reconciled.transitions.at(-1).reasonCode, "integrity_reconciliation_failed");
+    } finally {
+      db.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

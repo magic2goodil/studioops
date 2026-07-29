@@ -10,14 +10,40 @@ import {
   missionControlRoot,
 } from "./runtime-paths.js";
 
-const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates"];
-const TABLE_NAME = { qaBundles: "qa_bundles" };
-const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles", "candidates"]);
-const STATE_INTEGRITY_VERSION = 4;
+const ENTITY_TABLES = [
+  "projects",
+  "tasks",
+  "comments",
+  "reviews",
+  "events",
+  "runs",
+  "qaBundles",
+  "candidates",
+  "hotfixReleases",
+];
+const TABLE_NAME = { qaBundles: "qa_bundles", hotfixReleases: "hotfix_releases" };
+const MUTABLE_ENTITY_TABLES = new Set([
+  "projects",
+  "tasks",
+  "runs",
+  "qaBundles",
+  "candidates",
+  "hotfixReleases",
+]);
+const STATE_INTEGRITY_VERSION = 5;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
 const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
+const ACTIVE_HOTFIX_RELEASE_STATUSES = new Set(["authorized", "executing"]);
+const TERMINAL_HOTFIX_RELEASE_STATUSES = new Set([
+  "rejected",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "expired",
+  "invalidated",
+]);
 const VALID_TASK_STATUSES = new Set([
   "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
   "ready", "queued", "in_progress", "blocked", "builder_review", "backend_review",
@@ -122,6 +148,17 @@ function openDatabase() {
       updated_at TEXT NOT NULL DEFAULT '',
       payload TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS hotfix_releases (
+      id TEXT PRIMARY KEY,
+      sequence INTEGER NOT NULL,
+      project_id TEXT NOT NULL DEFAULT '',
+      task_id TEXT NOT NULL DEFAULT '',
+      pull_request_number INTEGER NOT NULL DEFAULT 0,
+      candidate_sha TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS operational_archive (
       entity_type TEXT NOT NULL,
       entity_id TEXT NOT NULL,
@@ -142,6 +179,12 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_qa_bundles_project_status ON qa_bundles(project_id, status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_candidates_project_status ON candidates(project_id, status, updated_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_manifest_digest ON candidates(manifest_digest);
+    CREATE INDEX IF NOT EXISTS idx_hotfix_releases_project_status_updated
+      ON hotfix_releases(project_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_hotfix_releases_candidate
+      ON hotfix_releases(project_id, pull_request_number, candidate_sha);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_hotfix_releases_invocation
+      ON hotfix_releases(json_extract(payload, '$.invocationId'));
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
   `);
   return database;
@@ -291,11 +334,51 @@ export function reconcileStateIntegrity(state) {
   state.tasks = Array.isArray(state.tasks) ? state.tasks : [];
   state.qaBundles = Array.isArray(state.qaBundles) ? state.qaBundles : [];
   state.candidates = Array.isArray(state.candidates) ? state.candidates : [];
+  state.hotfixReleases = Array.isArray(state.hotfixReleases) ? state.hotfixReleases : [];
 
   const projectIds = new Set(state.projects.map((project) => project.id));
   const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
   const bundlesById = new Map(state.qaBundles.map((bundle) => [bundle.id, bundle]));
   const candidatesById = new Map(state.candidates.map((candidate) => [candidate.id, candidate]));
+
+  const seenInvocations = new Set();
+  const activeCandidates = new Set();
+  for (const record of state.hotfixReleases) {
+    const invocationKey = String(record.invocationId || "");
+    const candidateKey = `${record.projectId || ""}:${record.pullRequestNumber || 0}:${record.candidateSha || ""}`;
+    let integrityError = "";
+    if (!invocationKey || seenInvocations.has(invocationKey)) {
+      integrityError = "Hotfix owner invocation identity is missing or duplicated.";
+    } else if (
+      ACTIVE_HOTFIX_RELEASE_STATUSES.has(record.status)
+      && (!projectIds.has(record.projectId) || !tasksById.has(record.taskId))
+    ) {
+      integrityError = "Active hotfix release has missing project or task evidence.";
+    } else if (ACTIVE_HOTFIX_RELEASE_STATUSES.has(record.status) && activeCandidates.has(candidateKey)) {
+      integrityError = "Exact candidate has more than one active hotfix release.";
+    }
+    seenInvocations.add(invocationKey);
+    if (ACTIVE_HOTFIX_RELEASE_STATUSES.has(record.status)) activeCandidates.add(candidateKey);
+    if (
+      !integrityError
+      || record.status === "invalidated"
+      || TERMINAL_HOTFIX_RELEASE_STATUSES.has(record.status)
+    ) continue;
+    const now = new Date().toISOString();
+    record.integrityError = integrityError;
+    record.transitions = Array.isArray(record.transitions) ? record.transitions : [];
+    record.transitions.push({
+      id: `hotfix_transition_${record.transitions.length + 1}`,
+      from: record.status || "",
+      to: "invalidated",
+      reasonCode: "integrity_reconciliation_failed",
+      actor: { id: "studioops-integrity", provider: "local" },
+      diagnostics: [integrityError],
+      at: now,
+    });
+    record.status = "invalidated";
+    record.updatedAt = now;
+  }
 
   for (const candidate of state.candidates) {
     try {
@@ -517,6 +600,29 @@ function upsertEntity(db, table, item, sequence) {
       );
     return;
   }
+  if (table === "hotfixReleases") {
+    db.prepare(`
+      INSERT INTO hotfix_releases(
+        id, sequence, project_id, task_id, pull_request_number, candidate_sha, status, updated_at, payload
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
+        task_id = excluded.task_id, pull_request_number = excluded.pull_request_number,
+        candidate_sha = excluded.candidate_sha, status = excluded.status,
+        updated_at = excluded.updated_at, payload = excluded.payload
+    `)
+      .run(
+        item.id,
+        sequence,
+        item.projectId || "",
+        item.taskId || "",
+        Number(item.pullRequestNumber || 0),
+        item.candidateSha || "",
+        item.status || "",
+        item.updatedAt || "",
+        payload,
+      );
+    return;
+  }
   db.prepare(`
     INSERT INTO qa_bundles(id, sequence, project_id, status, integration_commit, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
@@ -527,6 +633,7 @@ function upsertEntity(db, table, item, sequence) {
 
 function writeStateToOpenDatabase(db, state) {
   assertFullCandidateHistoryPreserved(db, state.candidates || []);
+  assertFullHotfixReleaseHistoryPreserved(db, state.hotfixReleases || []);
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -602,6 +709,195 @@ function assertFullCandidateHistoryPreserved(db, candidates) {
   for (const candidate of candidates || []) assertCandidateEnvelope(candidate);
 }
 
+function assertHotfixReleaseRecord(record) {
+  if (!record || typeof record !== "object") throw new Error("Hotfix release record must be an object.");
+  if (!/^hotfix_release_[1-9][0-9]*$/.test(String(record.id || ""))) {
+    throw new Error("Hotfix release ID is invalid.");
+  }
+  if (!/^[a-zA-Z0-9_.:-]{1,128}$/.test(String(record.invocationId || ""))) {
+    throw new Error(`Hotfix release ${record.id} has no bounded invocation identity.`);
+  }
+  if (!/^sha256:[0-9a-f]{64}$/.test(String(record.requestFingerprint || ""))) {
+    throw new Error(`Hotfix release ${record.id} has no bounded request fingerprint.`);
+  }
+  if (!["authorized", "executing", ...TERMINAL_HOTFIX_RELEASE_STATUSES].includes(record.status)) {
+    throw new Error(`Hotfix release ${record.id} has invalid status ${record.status || "(missing)"}.`);
+  }
+  if (!Array.isArray(record.transitions) || record.transitions.length < 1) {
+    throw new Error(`Hotfix release ${record.id} has no transition history.`);
+  }
+  let previousStatus = "";
+  const allowedTransitions = {
+    "": new Set(["authorized", "rejected", "invalidated"]),
+    authorized: new Set(["executing", "cancelled", "expired", "invalidated"]),
+    executing: new Set(["succeeded", "failed", "cancelled", "invalidated"]),
+  };
+  for (const [index, transition] of record.transitions.entries()) {
+    if (transition.id !== `hotfix_transition_${index + 1}` || transition.from !== previousStatus) {
+      throw new Error(`Hotfix release ${record.id} transition history is not contiguous.`);
+    }
+    if (!allowedTransitions[previousStatus]?.has(transition.to)) {
+      throw new Error(`Hotfix release ${record.id} has invalid transition ${previousStatus || "(initial)"} -> ${transition.to || "(missing)"}.`);
+    }
+    previousStatus = transition.to;
+  }
+  if (previousStatus !== record.status) {
+    throw new Error(`Hotfix release ${record.id} status does not match transition history.`);
+  }
+  if (String(record.requestedPhrase || "").length > 300) {
+    throw new Error(`Hotfix release ${record.id} requested phrase exceeds the audit bound.`);
+  }
+  if (record.eligibility?.ok) {
+    if (
+      !/^[0-9a-f]{40}$/.test(String(record.candidateSha || ""))
+      || !record.projectId
+      || !record.taskId
+      || !Number.isSafeInteger(Number(record.pullRequestNumber))
+      || Number(record.pullRequestNumber) < 1
+    ) {
+      throw new Error(`Eligible hotfix release ${record.id} lacks exact candidate identity.`);
+    }
+    if (record.status === "rejected") {
+      throw new Error(`Eligible hotfix release ${record.id} cannot have rejected status.`);
+    }
+    if (
+      record.reviewEvidence?.subjectSha !== record.candidateSha
+      || record.scopeEvidence?.fileListComplete !== true
+      || !Number.isSafeInteger(record.scopeEvidence?.declaredFileCount)
+      || record.scopeEvidence.declaredFileCount !== record.scopeEvidence?.fileCount
+      || record.scopeEvidence.fileCount !== record.scopeEvidence?.paths?.length
+    ) {
+      throw new Error(`Eligible hotfix release ${record.id} lacks reconciled review or file-list evidence.`);
+    }
+  } else if (record.transitions[0]?.to !== "rejected" && record.transitions[0]?.to !== "invalidated") {
+    throw new Error(`Ineligible hotfix release ${record.id} cannot enter an active status.`);
+  }
+  if (record.status === "executing" && !String(record.execution?.id || "")) {
+    throw new Error(`Executing hotfix release ${record.id} has no exact execution claim.`);
+  }
+  if (record.transitions.some((transition) => transition.to === "executing") !== Boolean(record.execution)) {
+    throw new Error(`Hotfix release ${record.id} execution evidence does not match transition history.`);
+  }
+  if (record.execution?.id && !/^[a-zA-Z0-9_.:-]{1,128}$/.test(String(record.execution.id))) {
+    throw new Error(`Hotfix release ${record.id} has an invalid execution claim identity.`);
+  }
+  for (const diagnostic of record.eligibility?.diagnostics || []) {
+    if (String(diagnostic).length > 500) {
+      throw new Error(`Hotfix release ${record.id} has an unbounded diagnostic.`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(record.scopeEvidence || {}, "patch")) {
+    throw new Error(`Hotfix release ${record.id} cannot persist source patches.`);
+  }
+  const notificationHistory = record.notification?.history;
+  if (
+    !Array.isArray(notificationHistory)
+    || Number(record.notification?.attempts || 0) !== notificationHistory.length
+    || record.notification?.state !== (notificationHistory.at(-1)?.state || "not_requested")
+  ) {
+    throw new Error(`Hotfix release ${record.id} notification state is not bound to append-only history.`);
+  }
+  for (const entry of [...record.transitions, ...notificationHistory]) {
+    if (
+      String(entry.reasonCode || entry.code || "").length > 100
+      || !Array.isArray(entry.diagnostics || [])
+      || (entry.diagnostics || []).length > 12
+      || (entry.diagnostics || []).some((diagnostic) => String(diagnostic).length > 500)
+    ) {
+      throw new Error(`Hotfix release ${record.id} contains unbounded transition diagnostics.`);
+    }
+  }
+}
+
+function assertHotfixReleaseTransition(previousRecord, record) {
+  assertHotfixReleaseRecord(record);
+  const immutableFields = [
+    "schemaVersion",
+    "id",
+    "invocationId",
+    "requestFingerprint",
+    "requestedPhrase",
+    "normalizedSubject",
+    "projectId",
+    "projectKey",
+    "pullRequestNumber",
+    "taskId",
+    "candidateSha",
+    "owner",
+    "eligibility",
+    "reviewEvidence",
+    "scopeEvidence",
+    "policyEvidence",
+    "createdAt",
+  ];
+  for (const field of immutableFields) {
+    if (JSON.stringify(previousRecord[field]) !== JSON.stringify(record[field])) {
+      throw new Error(`Hotfix release ${record.id} ${field} is immutable.`);
+    }
+  }
+  const priorTransitions = previousRecord.transitions || [];
+  if (
+    record.transitions.length < priorTransitions.length
+    || JSON.stringify(record.transitions.slice(0, priorTransitions.length)) !== JSON.stringify(priorTransitions)
+  ) {
+    throw new Error(`Hotfix release ${record.id} transition history is append-only.`);
+  }
+  if (record.transitions.length > priorTransitions.length + 1) {
+    throw new Error(`Hotfix release ${record.id} may append only one transactional transition at a time.`);
+  }
+  const appendedTransition = record.transitions[priorTransitions.length];
+  if (!appendedTransition && JSON.stringify(previousRecord.execution) !== JSON.stringify(record.execution)) {
+    throw new Error(`Hotfix release ${record.id} execution claim requires a state transition.`);
+  }
+  if (appendedTransition?.to === "executing") {
+    if (
+      !record.execution?.id
+      || record.execution.id !== appendedTransition.executionId
+      || record.execution.claimedAt !== appendedTransition.at
+    ) {
+      throw new Error(`Hotfix release ${record.id} execution claim is not bound to its transition.`);
+    }
+  } else if (
+    previousRecord.execution
+    && JSON.stringify(previousRecord.execution) !== JSON.stringify(record.execution)
+  ) {
+    throw new Error(`Hotfix release ${record.id} execution claim is immutable.`);
+  }
+  const priorNotificationHistory = previousRecord.notification?.history || [];
+  const notificationHistory = record.notification?.history || [];
+  if (
+    notificationHistory.length < priorNotificationHistory.length
+    || JSON.stringify(notificationHistory.slice(0, priorNotificationHistory.length)) !== JSON.stringify(priorNotificationHistory)
+  ) {
+    throw new Error(`Hotfix release ${record.id} notification history is append-only.`);
+  }
+  if (
+    TERMINAL_HOTFIX_RELEASE_STATUSES.has(previousRecord.status)
+    && (() => {
+      const previousComparable = { ...previousRecord };
+      const currentComparable = { ...record };
+      delete previousComparable.notification;
+      delete currentComparable.notification;
+      delete previousComparable.updatedAt;
+      delete currentComparable.updatedAt;
+      return JSON.stringify(previousComparable) !== JSON.stringify(currentComparable);
+    })()
+  ) {
+    throw new Error(`Terminal hotfix release ${record.id} requires a new explicit owner invocation.`);
+  }
+}
+
+function assertFullHotfixReleaseHistoryPreserved(db, records) {
+  const currentById = new Map((records || []).map((record) => [record.id, record]));
+  for (const row of db.prepare("SELECT id, payload FROM hotfix_releases").all()) {
+    const previousRecord = parsePayload(row.payload, null);
+    const record = currentById.get(row.id);
+    if (!record) throw new Error(`Hotfix release ${row.id} cannot be deleted.`);
+    assertHotfixReleaseTransition(previousRecord, record);
+  }
+  for (const record of records || []) assertHotfixReleaseRecord(record);
+}
+
 function assertValidTaskStatuses(state) {
   for (const task of state.tasks || []) {
     const status = typeof task.status === "string" ? task.status.trim() : "";
@@ -663,6 +959,13 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
           assertCandidateTransition(previousCandidate, item);
         }
       }
+      if (table === "hotfixReleases") {
+        assertHotfixReleaseRecord(item);
+        if (prior) {
+          const previousRecord = JSON.parse(prior.payload);
+          assertHotfixReleaseTransition(previousRecord, item);
+        }
+      }
       const changed = !prior
         || prior.sequence !== sequence
         || (MUTABLE_ENTITY_TABLES.has(table) && prior.payload !== JSON.stringify(item));
@@ -672,6 +975,7 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
     for (const id of previousItems.keys()) {
       if (!currentIds.has(id)) {
         if (table === "candidates") throw new Error(`Candidate ${id} cannot be deleted.`);
+        if (table === "hotfixReleases") throw new Error(`Hotfix release ${id} cannot be deleted.`);
         db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
       }
     }
@@ -759,6 +1063,7 @@ async function initialState() {
     runs: [],
     qaBundles: [],
     candidates: [],
+    hotfixReleases: [],
   };
 }
 

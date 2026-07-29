@@ -1,5 +1,5 @@
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   assertCandidateEnvelope,
   invalidateCandidate,
@@ -16,6 +16,15 @@ import {
 import { missionControlDataDir } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode } from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
+import {
+  HOTFIX_PROHIBITED_CHANGE_FLAGS,
+  assertHotfixReleaseTransition,
+  evaluateHotfixEligibility,
+  normalizeLeadHotfixAssessment,
+  parseHotfixAuthorizationPhrase,
+  sanitizeHotfixDiagnostics,
+  sanitizeHotfixOwnerAttribution,
+} from "./hotfix-policy.js";
 import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
@@ -793,6 +802,9 @@ export async function addProject(input) {
       qaIntegration: input.qaIntegration || {},
       localQaPreview: input.localQaPreview || input.qaIntegration?.localPreview || null,
       promotion: input.promotion || {},
+      hotfixPolicy: structuredClone(
+        input.hotfixPolicy || input.productionHotfixPolicy || { enabled: false },
+      ),
       reviewPolicy,
       trustLeadApprovals: reviewPolicy.trustLeadApprovals,
       integrationBranch: reviewPolicy.integrationBranch,
@@ -842,6 +854,14 @@ export async function updateProject(projectId, patch = {}) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, "safetyRules")) {
       project.safetyRules = normalizeList(patch.safetyRules);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "hotfixPolicy")
+      || Object.prototype.hasOwnProperty.call(patch, "productionHotfixPolicy")
+    ) {
+      project.hotfixPolicy = structuredClone(
+        patch.hotfixPolicy || patch.productionHotfixPolicy || { enabled: false },
+      );
     }
     if (Object.prototype.hasOwnProperty.call(patch, "reviewPipeline")) {
       project.reviewPipeline = normalizeReviewPipeline(patch.reviewPipeline);
@@ -1556,6 +1576,263 @@ export async function recordQaBundleDecision(bundleId, input = {}) {
   return operation.result;
 }
 
+function hotfixTransitionId(record) {
+  return `hotfix_transition_${(record.transitions || []).length + 1}`;
+}
+
+function nextHotfixReleaseId(records) {
+  const highest = (records || [])
+    .map((record) => Number(String(record.id || "").match(/^hotfix_release_([1-9][0-9]*)$/)?.[1] || 0))
+    .reduce((maximum, value) => Math.max(maximum, value), 0);
+  return `hotfix_release_${highest + 1}`;
+}
+
+function hotfixRequestFingerprint(value) {
+  return `sha256:${createHash("sha256").update(String(value || ""), "utf8").digest("hex")}`;
+}
+
+function hotfixRequestedPhraseForAudit(value) {
+  if (!parseHotfixAuthorizationPhrase(value)) return "[REDACTED NON-CANONICAL OWNER PHRASE]";
+  return sanitizeHotfixDiagnostics([value], 1, 300)[0] || "";
+}
+
+function hotfixEvent(state, record, transition) {
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: `hotfix_release_${transition.to}`,
+    projectId: record.projectId || "",
+    taskId: record.taskId || "",
+    message: `${record.id}: ${transition.from || "requested"} -> ${transition.to} for exact candidate ${record.candidateSha || "(unresolved)"}.`,
+    createdAt: transition.at,
+  });
+}
+
+function hotfixEvidenceSnapshot(eligibility) {
+  const resolved = eligibility.resolved || eligibility;
+  const parsed = eligibility.parsedAuthorization || null;
+  const project = resolved.project || null;
+  const task = resolved.task || null;
+  const pullRequestNumber = Number(resolved.pullRequestNumber || 0);
+  return {
+    normalizedSubject: parsed
+      ? {
+        kind: parsed.subject.kind,
+        ...(parsed.subject.kind === "pull_request"
+          ? { pullRequestNumber: parsed.subject.pullRequestNumber }
+          : { commitSha: parsed.subject.commitSha }),
+      }
+      : null,
+    projectId: project?.id || "",
+    projectKey: project?.key || parsed?.projectKey || "",
+    pullRequestNumber,
+    taskId: task?.id || "",
+    candidateSha: resolved.candidateSha || "",
+    reviewEvidence: eligibility.reviewEvidence
+      ? {
+        subjectSha: eligibility.reviewEvidence.subjectSha,
+        candidateCycle: eligibility.reviewEvidence.candidateCycle,
+        reviews: (eligibility.reviewEvidence.reviews || []).map((review) => ({
+          id: review.id,
+          stageKey: review.stageKey,
+          role: review.role,
+          outcome: review.outcome,
+          subjectSha: review.subjectSha,
+          candidateCycle: review.candidateCycle,
+          reviewedAt: review.reviewedAt,
+          ...(review.releaseAssessment ? { releaseAssessment: review.releaseAssessment } : {}),
+        })),
+        leadAssessment: eligibility.leadAssessment || null,
+      }
+      : null,
+    scopeEvidence: eligibility.scopeEvidence
+      ? {
+        fileCount: eligibility.scopeEvidence.fileCount,
+        declaredFileCount: eligibility.scopeEvidence.declaredFileCount,
+        fileListComplete: eligibility.scopeEvidence.fileListComplete,
+        changedLines: eligibility.scopeEvidence.changedLines,
+        paths: eligibility.scopeEvidence.paths,
+        prohibitedChanges: eligibility.scopeEvidence.prohibitedChanges,
+      }
+      : null,
+    policyEvidence: eligibility.policy
+      ? {
+        maxFiles: eligibility.policy.maxFiles,
+        maxChangedLines: eligibility.policy.maxChangedLines,
+        blockedPaths: eligibility.policy.blockedPaths,
+        requireCompleteTextPatches: eligibility.policy.requireCompleteTextPatches,
+      }
+      : null,
+  };
+}
+
+export function authorizeProductionHotfixInState(state, input = {}) {
+  state.hotfixReleases = Array.isArray(state.hotfixReleases) ? state.hotfixReleases : [];
+  state.events = Array.isArray(state.events) ? state.events : [];
+  const invocationId = String(input.invocationId || input.requestId || randomUUID()).trim();
+  if (!/^[a-zA-Z0-9_.:-]{1,128}$/.test(invocationId)) {
+    throw new Error("Hotfix owner invocation ID must be a bounded non-sensitive opaque identifier.");
+  }
+  const existing = state.hotfixReleases.find((record) => record.invocationId === invocationId);
+  if (existing) {
+    const requestFingerprint = hotfixRequestFingerprint(input.phrase || input.requestedPhrase);
+    if (requestFingerprint !== existing.requestFingerprint) {
+      throw new Error(`Hotfix owner invocation ${invocationId} cannot be reused for another request.`);
+    }
+    return existing;
+  }
+
+  let eligibility = evaluateHotfixEligibility(state, {
+    ...input,
+    candidateReviewEvidenceForTask,
+  });
+  const initialEvidence = hotfixEvidenceSnapshot(eligibility);
+  if (eligibility.ok) {
+    const active = state.hotfixReleases.find((record) => (
+      ["authorized", "executing"].includes(record.status)
+      && record.projectId === initialEvidence.projectId
+      && record.pullRequestNumber === initialEvidence.pullRequestNumber
+      && record.candidateSha === initialEvidence.candidateSha
+    ));
+    if (active) {
+      eligibility = {
+        ...eligibility,
+        ok: false,
+        code: "active_hotfix_release_exists",
+        diagnostics: [`Exact candidate already has active hotfix release ${active.id}.`],
+      };
+    }
+  }
+
+  const now = String(input.now || new Date().toISOString());
+  const evidence = hotfixEvidenceSnapshot(eligibility);
+  const status = eligibility.ok ? "authorized" : "rejected";
+  const transition = {
+    id: "hotfix_transition_1",
+    from: "",
+    to: status,
+    reasonCode: eligibility.code || (eligibility.ok ? "eligible" : "ineligible"),
+    actor: sanitizeHotfixOwnerAttribution(input.owner),
+    at: now,
+  };
+  const record = {
+    schemaVersion: "studioops.hotfix-release.v1",
+    id: nextHotfixReleaseId(state.hotfixReleases),
+    invocationId,
+    requestFingerprint: hotfixRequestFingerprint(input.phrase || input.requestedPhrase),
+    requestedPhrase: hotfixRequestedPhraseForAudit(input.phrase || input.requestedPhrase),
+    ...evidence,
+    owner: sanitizeHotfixOwnerAttribution(input.owner),
+    status,
+    eligibility: {
+      ok: eligibility.ok,
+      code: eligibility.code || (eligibility.ok ? "eligible" : "ineligible"),
+      diagnostics: sanitizeHotfixDiagnostics(eligibility.diagnostics || []),
+    },
+    execution: null,
+    notification: {
+      state: "not_requested",
+      attempts: 0,
+      updatedAt: now,
+      history: [],
+    },
+    transitions: [transition],
+    createdAt: now,
+    updatedAt: now,
+  };
+  state.hotfixReleases.push(record);
+  hotfixEvent(state, record, transition);
+  return record;
+}
+
+export async function authorizeProductionHotfix(input = {}) {
+  return mutateState((state) => authorizeProductionHotfixInState(state, input));
+}
+
+export const createHotfixReleaseAuthorization = authorizeProductionHotfix;
+export const createHotfixReleaseAuthorizationInState = authorizeProductionHotfixInState;
+
+export function transitionHotfixReleaseInState(state, releaseId, input = {}) {
+  const record = (state.hotfixReleases || []).find((item) => item.id === releaseId);
+  if (!record) throw new Error(`Unknown hotfix release: ${releaseId}`);
+  const nextStatus = String(input.status || input.nextStatus || "").trim();
+  const executionId = String(input.executionId || input.claimId || "").trim();
+  if (record.status === nextStatus && nextStatus === "executing" && record.execution?.id === executionId) {
+    return record;
+  }
+  assertHotfixReleaseTransition(record, nextStatus, executionId);
+  if (nextStatus === "executing" && !executionId) {
+    throw new Error("Hotfix execution claim ID is required.");
+  }
+  if (executionId && !/^[a-zA-Z0-9_.:-]{1,128}$/.test(executionId)) {
+    throw new Error("Hotfix execution claim ID must be a bounded non-sensitive opaque identifier.");
+  }
+  if (
+    record.status === "executing"
+    && record.execution?.id
+    && record.execution.id !== executionId
+  ) {
+    throw new Error(`Hotfix release ${releaseId} is claimed by another execution.`);
+  }
+  const now = String(input.now || new Date().toISOString());
+  const transition = {
+    id: hotfixTransitionId(record),
+    from: record.status,
+    to: nextStatus,
+    reasonCode: String(input.reasonCode || nextStatus).trim().slice(0, 100),
+    actor: sanitizeHotfixOwnerAttribution(input.actor || input.owner || "studioops"),
+    executionId: executionId || record.execution?.id || "",
+    diagnostics: sanitizeHotfixDiagnostics(input.diagnostics || []),
+    at: now,
+  };
+  if (nextStatus === "executing") {
+    record.execution = {
+      id: executionId,
+      claimedAt: now,
+      claimedBy: transition.actor,
+    };
+  }
+  record.status = nextStatus;
+  record.transitions.push(transition);
+  record.updatedAt = now;
+  hotfixEvent(state, record, transition);
+  return record;
+}
+
+export async function transitionHotfixRelease(releaseId, input = {}) {
+  return mutateState((state) => transitionHotfixReleaseInState(state, releaseId, input));
+}
+
+export async function claimHotfixReleaseExecution(releaseId, input = {}) {
+  return transitionHotfixRelease(releaseId, { ...input, status: "executing" });
+}
+
+export function updateHotfixReleaseNotificationInState(state, releaseId, input = {}) {
+  const record = (state.hotfixReleases || []).find((item) => item.id === releaseId);
+  if (!record) throw new Error(`Unknown hotfix release: ${releaseId}`);
+  const notificationState = String(input.state || "").trim();
+  if (!["not_requested", "pending", "sent", "failed"].includes(notificationState)) {
+    throw new Error(`Invalid hotfix notification state: ${notificationState || "(missing)"}.`);
+  }
+  const now = String(input.now || new Date().toISOString());
+  const entry = {
+    state: notificationState,
+    code: String(input.code || notificationState).trim().slice(0, 100),
+    diagnostics: sanitizeHotfixDiagnostics(input.diagnostics || []),
+    at: now,
+  };
+  record.notification = record.notification || { state: "not_requested", attempts: 0, history: [] };
+  record.notification.state = notificationState;
+  record.notification.attempts = Number(record.notification.attempts || 0) + 1;
+  record.notification.updatedAt = now;
+  record.notification.history = [...(record.notification.history || []), entry];
+  record.updatedAt = now;
+  return record;
+}
+
+export async function updateHotfixReleaseNotification(releaseId, input = {}) {
+  return mutateState((state) => updateHotfixReleaseNotificationInState(state, releaseId, input));
+}
+
 export async function addComment(taskId, body, author = "user") {
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
@@ -1637,6 +1914,25 @@ export async function recordReview(taskId, input = {}) {
       body: String(input.body || "").trim(),
       createdAt: now,
     };
+    const releaseAssessmentInput = input.releaseAssessment || input.hotfixAssessment;
+    if (releaseAssessmentInput) {
+      if (!isLeadReviewStage(stage)) {
+        throw new Error("Only primary lead review may record a hotfix release assessment.");
+      }
+      const releaseAssessment = normalizeLeadHotfixAssessment(releaseAssessmentInput, subjectSha);
+      if (releaseAssessment.kind !== "narrow_production_fix") {
+        throw new Error("Lead hotfix release assessment must use kind narrow_production_fix.");
+      }
+      if (releaseAssessment.subjectSha !== subjectSha) {
+        throw new Error("Lead hotfix release assessment must name the exact review subject SHA.");
+      }
+      for (const flag of HOTFIX_PROHIBITED_CHANGE_FLAGS) {
+        if (![true, false].includes(releaseAssessment.prohibitedChanges[flag])) {
+          throw new Error(`Lead hotfix release assessment must explicitly classify ${flag}.`);
+        }
+      }
+      review.releaseAssessment = releaseAssessment;
+    }
     state.reviews.push(review);
     state.comments.push({
       id: nextId(state.comments, "comment"),
@@ -2182,6 +2478,7 @@ export function candidateReviewEvidenceForTask(state, task) {
       subjectSha: review.subjectSha,
       candidateCycle: review.candidateCycle,
       reviewedAt: review.createdAt,
+      ...(review.releaseAssessment ? { releaseAssessment: review.releaseAssessment } : {}),
     });
   }
   return {
