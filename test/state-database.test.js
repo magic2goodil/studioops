@@ -638,11 +638,14 @@ test("SQLite persists, backs up, and reconciles append-only exact-SHA hotfix rel
     isDraft: false,
     baseRefName: "main",
     headRefOid: subjectSha,
+    changedFileCount: 1,
+    filesComplete: true,
     files: [{
       path: "src/security-fix.js",
       additions: 1,
       deletions: 1,
       patch: "@@ -1 +1 @@\n-unsafe\n+safe",
+      patchComplete: true,
     }],
   };
 
@@ -709,6 +712,8 @@ test("SQLite persists, backs up, and reconciles append-only exact-SHA hotfix rel
       assert.equal(row.candidate_sha, subjectSha);
       assert.equal(record.scopeEvidence.patch, undefined);
       assert.equal(record.scopeEvidence.paths[0], "src/security-fix.js");
+      assert.equal(record.scopeEvidence.declaredFileCount, 1);
+      assert.equal(record.scopeEvidence.fileListComplete, true);
       assert.equal(record.reviewEvidence.leadAssessment.kind, "narrow_production_fix");
       assert.equal(record.execution.id, "execution-1");
       assert.equal(record.transitions.length, 2);

@@ -103,6 +103,16 @@ function pullRequestRepository(value) {
   return match ? canonicalRepository(`github.com/${match[1]}`) : "";
 }
 
+function pullRequestUrlIdentity(value) {
+  const url = String(value?.url || value?.prUrl || value?.htmlUrl || "").trim();
+  const match = url.match(/^(?:https:\/\/)?github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)(?:[/?#].*)?$/i);
+  if (!match) return null;
+  return {
+    repository: canonicalRepository(`github.com/${match[1]}`),
+    pullRequestNumber: Number(match[2]),
+  };
+}
+
 function pullRequestHeadSha(value) {
   return String(
     value?.headSha
@@ -119,6 +129,10 @@ function pullRequestBase(value) {
 
 function taskPullRequestNumber(task) {
   return pullRequestNumber({ number: task?.pullRequestNumber, url: task?.prUrl });
+}
+
+function taskPullRequestRepository(task) {
+  return pullRequestUrlIdentity({ url: task?.prUrl })?.repository || "";
 }
 
 function taskHasHotfixMarker(task) {
@@ -166,6 +180,18 @@ export function resolveHotfixCandidate(state, parsedAuthorization, input = {}) {
   }
   const pullRequest = pullRequests[0];
   const prNumber = pullRequestNumber(pullRequest);
+  const prUrlIdentity = pullRequestUrlIdentity(pullRequest);
+  if (
+    !prUrlIdentity
+    || prUrlIdentity.repository !== repository
+    || prUrlIdentity.pullRequestNumber !== prNumber
+  ) {
+    return fail(
+      "inconsistent_pull_request_identity",
+      "The pull request URL, repository, and number do not name one canonical GitHub pull request.",
+      { project },
+    );
+  }
   const candidateSha = pullRequestHeadSha(pullRequest);
   if (!FULL_GIT_SHA.test(candidateSha)) {
     return fail("invalid_pull_request_head", "The pull request does not expose a full 40-hex head SHA.", { project });
@@ -173,9 +199,28 @@ export function resolveHotfixCandidate(state, parsedAuthorization, input = {}) {
   if (subject.kind === "commit" && subject.commitSha !== candidateSha) {
     return fail("stale_commit_mapping", "The requested commit is not the pull request head.", { project });
   }
-  const prState = String(pullRequest.state || "open").trim().toLowerCase();
+  const prState = typeof pullRequest.state === "string"
+    ? pullRequest.state.trim().toLowerCase()
+    : "";
+  if (!prState) {
+    return fail(
+      "incomplete_pull_request_observation",
+      "The pull request observation does not explicitly report state.",
+      { project },
+    );
+  }
   if (prState !== "open") return fail("pull_request_not_open", "The pull request is not open.", { project });
-  if (pullRequest.isDraft === true || pullRequest.draft === true) {
+  const draftObservation = Object.prototype.hasOwnProperty.call(pullRequest, "isDraft")
+    ? pullRequest.isDraft
+    : pullRequest.draft;
+  if (typeof draftObservation !== "boolean") {
+    return fail(
+      "incomplete_pull_request_observation",
+      "The pull request observation does not explicitly report draft state.",
+      { project },
+    );
+  }
+  if (draftObservation) {
     return fail("draft_pull_request", "Draft pull requests cannot use the production hotfix exception.", { project });
   }
   const expectedBase = String(project.defaultBranch || "main").trim();
@@ -185,6 +230,7 @@ export function resolveHotfixCandidate(state, parsedAuthorization, input = {}) {
 
   const tasks = (state?.tasks || []).filter((task) => (
     task.projectId === project.id
+    && taskPullRequestRepository(task) === repository
     && taskPullRequestNumber(task) === prNumber
   ));
   if (tasks.length !== 1) {
@@ -308,6 +354,77 @@ function explicitScopeFlag(input, flag) {
   return input?.[flag] === true;
 }
 
+function observedChangedFileCounts(pullRequest, input, usesInputFiles) {
+  const candidates = usesInputFiles
+    ? [input.changedFileCount, input.totalChangedFiles]
+    : [
+      pullRequest.changedFileCount,
+      typeof pullRequest.changedFiles === "number" ? pullRequest.changedFiles : undefined,
+      pullRequest.changed_files,
+      pullRequest.files?.totalCount,
+    ];
+  return candidates.filter((candidate) => candidate !== undefined && candidate !== null);
+}
+
+function observedFilesComplete(pullRequest, input, usesInputFiles) {
+  const source = usesInputFiles ? input : pullRequest;
+  const explicit = ["filesComplete", "fileListComplete"]
+    .filter((key) => Object.prototype.hasOwnProperty.call(source, key))
+    .map((key) => source[key]);
+  if (explicit.length) {
+    return explicit.every((value) => value === true);
+  }
+  if (usesInputFiles) return false;
+  const pageInfo = pullRequest.files?.pageInfo;
+  return Boolean(
+    pageInfo
+    && pageInfo.hasNextPage === false
+    && pageInfo.hasPreviousPage === false,
+  );
+}
+
+function observedFileList(pullRequest, input, usesInputFiles) {
+  const source = usesInputFiles ? input.files : pullRequest.files;
+  if (Array.isArray(source)) return source;
+  return Array.isArray(source?.nodes) ? source.nodes : null;
+}
+
+export function validatePullRequestFileEvidence(pullRequest, input = {}) {
+  const usesInputFiles = Object.prototype.hasOwnProperty.call(input, "files");
+  const files = observedFileList(pullRequest, input, usesInputFiles);
+  const observedCounts = observedChangedFileCounts(pullRequest, input, usesInputFiles);
+  const countsAreValid = observedCounts.length > 0
+    && observedCounts.every((count) => typeof count === "number" && Number.isSafeInteger(count) && count >= 0)
+    && new Set(observedCounts).size === 1;
+  const declaredFileCount = countsAreValid ? observedCounts[0] : null;
+  const fileListComplete = observedFilesComplete(pullRequest, input, usesInputFiles);
+  if (!files || declaredFileCount === null || !fileListComplete) {
+    return fail(
+      "incomplete_pull_request_files",
+      "Changed-file authorization requires an explicit total count and a complete file-list observation.",
+    );
+  }
+  if (declaredFileCount !== files.length) {
+    return fail(
+      "incomplete_pull_request_files",
+      `Declared changed-file count ${declaredFileCount} does not match the observed list length ${files.length}.`,
+    );
+  }
+  const paths = files.map(filePath);
+  if (paths.some((path) => !path) || new Set(paths).size !== paths.length) {
+    return fail(
+      "incomplete_pull_request_files",
+      "The complete changed-file observation contains a missing or duplicate path.",
+    );
+  }
+  return {
+    ok: true,
+    files,
+    declaredFileCount,
+    fileListComplete: true,
+  };
+}
+
 export function classifyHotfixScope(files, policy, input = {}) {
   const normalizedFiles = Array.isArray(files) ? files : [];
   const flags = Object.fromEntries(HOTFIX_PROHIBITED_CHANGE_FLAGS.map((flag) => [flag, explicitScopeFlag(input, flag)]));
@@ -328,8 +445,8 @@ export function classifyHotfixScope(files, policy, input = {}) {
   for (const file of normalizedFiles) {
     const path = filePath(file);
     paths.push(path);
-    const additions = Number(file?.additions);
-    const deletions = Number(file?.deletions);
+    const additions = file?.additions;
+    const deletions = file?.deletions;
     const patch = file?.patch;
     if (
       !path
@@ -339,6 +456,7 @@ export function classifyHotfixScope(files, policy, input = {}) {
       || deletions < 0
       || typeof patch !== "string"
       || !patch
+      || file?.patchComplete !== true
       || file?.binary === true
       || file?.isBinary === true
       || file?.truncated === true
@@ -458,8 +576,21 @@ export function evaluateHotfixEligibility(state, input = {}) {
     return { ...assessmentResult, parsedAuthorization: parsed, resolved, reviewEvidence };
   }
 
-  const files = input.files || pullRequest.files || pullRequest.changedFiles || [];
-  const scopeEvidence = classifyHotfixScope(files, policyResult.policy, input.scope || input);
+  const fileEvidence = validatePullRequestFileEvidence(pullRequest, input);
+  if (!fileEvidence.ok) {
+    return {
+      ...fileEvidence,
+      parsedAuthorization: parsed,
+      resolved,
+      reviewEvidence,
+      leadAssessment: assessmentResult.assessment,
+    };
+  }
+  const scopeEvidence = {
+    ...classifyHotfixScope(fileEvidence.files, policyResult.policy, input.scope || input),
+    declaredFileCount: fileEvidence.declaredFileCount,
+    fileListComplete: fileEvidence.fileListComplete,
+  };
   if (!scopeEvidence.ok) {
     return fail("prohibited_hotfix_scope", scopeEvidence.diagnostics.join(" "), {
       parsedAuthorization: parsed,

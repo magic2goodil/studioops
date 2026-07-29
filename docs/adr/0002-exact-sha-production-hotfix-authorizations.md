@@ -44,12 +44,16 @@ attempt requires a new explicit owner invocation.
 The project key must resolve uniquely to a project with a canonical GitHub
 repository. The PR or commit must then resolve uniquely to one open, non-draft
 pull request targeting the configured default branch. A commit invocation is
-eligible only when the named commit is the PR head.
+eligible only when the named commit is the PR head. The observation must
+explicitly contain both PR state and a boolean draft state; absence is not
+interpreted as open or non-draft. The observed PR URL, repository metadata, and
+number must all resolve to the same canonical GitHub PR.
 
-The PR must map uniquely to one StudioOps task in that project. The PR head must
+The PR must map uniquely to one StudioOps task in that project, and the task PR
+URL must name the same canonical repository and PR number. The PR head must
 equal the task's current full `reviewSubjectSha`. Missing, duplicate,
-cross-project, mixed-task, draft, wrong-base, closed, and stale mappings are
-ineligible.
+cross-repository, cross-project, mixed-task, draft, wrong-base, closed, and
+stale mappings are ineligible.
 
 ### Review and task evidence
 
@@ -88,9 +92,16 @@ Project policy is disabled by default. Enabling requires an explicit
 `hotfixPolicy` with positive `maxFiles` and `maxChangedLines` bounds, an explicit
 `blockedPaths` array, and `requireCompleteTextPatches: true`.
 
-Classification consumes file path, additions, deletions, status, and the
-complete text patch. Missing paths or counts, unavailable or truncated patches,
-and binary content are uninspectable and fail closed. The classifier rejects:
+Before classification, the PR observation must include an explicit total
+changed-file count and an explicit complete-list attestation. The declared
+count must equal the supplied list length, and paths must be present and unique.
+Caller-supplied file overrides require their own count and completeness
+attestation; completeness from another list cannot be reused.
+
+Classification consumes file path, additions, deletions, status, and a text
+patch carrying `patchComplete: true`. Missing paths or counts, unproven,
+unavailable, or truncated patches, and binary content are uninspectable and
+fail closed. The classifier rejects:
 
 - file or changed-line limits and blocked paths;
 - explicitly mixed scope;
@@ -112,7 +123,8 @@ ID. The record contains:
 - bounded requested phrase and normalized subject;
 - non-sensitive owner ID and provider;
 - project, PR, task, candidate SHA, review cycle, and review IDs;
-- structured lead and scope evidence;
+- structured lead and scope evidence, including reconciled declared/list file
+  counts and completeness;
 - eligibility code and bounded redacted diagnostics;
 - notification state and append-only notification history;
 - append-only status transitions and an exact execution claim.
@@ -152,8 +164,9 @@ logs, customer data, local workspaces, and source patches.
 
 ## Failure Modes
 
-- Missing GitHub observations or incomplete patches reject authorization; no
-  remote lookup or side effect is inferred.
+- Missing GitHub state/draft observations, inconsistent PR identities,
+  incomplete file lists, count mismatches, or unproven patches reject
+  authorization; no remote lookup or side effect is inferred.
 - A later PR head makes the recorded authorization stale; it does not retarget
   the record.
 - Missing or duplicated project/task relationships invalidate active authority.

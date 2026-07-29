@@ -760,6 +760,15 @@ function assertHotfixReleaseRecord(record) {
     if (record.status === "rejected") {
       throw new Error(`Eligible hotfix release ${record.id} cannot have rejected status.`);
     }
+    if (
+      record.reviewEvidence?.subjectSha !== record.candidateSha
+      || record.scopeEvidence?.fileListComplete !== true
+      || !Number.isSafeInteger(record.scopeEvidence?.declaredFileCount)
+      || record.scopeEvidence.declaredFileCount !== record.scopeEvidence?.fileCount
+      || record.scopeEvidence.fileCount !== record.scopeEvidence?.paths?.length
+    ) {
+      throw new Error(`Eligible hotfix release ${record.id} lacks reconciled review or file-list evidence.`);
+    }
   } else if (record.transitions[0]?.to !== "rejected" && record.transitions[0]?.to !== "invalidated") {
     throw new Error(`Ineligible hotfix release ${record.id} cannot enter an active status.`);
   }

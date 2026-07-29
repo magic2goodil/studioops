@@ -32,6 +32,7 @@ function textFile(overrides = {}) {
     additions: 2,
     deletions: 1,
     patch: "@@ -1 +1 @@\n-old\n+fixed\n+tested",
+    patchComplete: true,
     ...overrides,
   };
 }
@@ -102,6 +103,8 @@ function fixture() {
     isDraft: false,
     baseRefName: "main",
     headRefOid: SHA,
+    changedFileCount: 1,
+    filesComplete: true,
     files: [textFile()],
   };
   return {
@@ -198,6 +201,80 @@ test("candidate mapping fails closed for stale SHA, missing lane, duplicate task
   }
 });
 
+test("candidate mapping requires explicit PR state, draft state, and canonical task repository binding", () => {
+  {
+    const data = fixture();
+    delete data.pullRequest.state;
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_observation");
+  }
+  {
+    const data = fixture();
+    delete data.pullRequest.isDraft;
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_observation");
+  }
+  {
+    const data = fixture();
+    data.task.prUrl = "https://github.com/example/other/pull/17";
+    assert.equal(eligibilityFor(data).code, "missing_task_mapping");
+  }
+  {
+    const data = fixture();
+    data.pullRequest.url = "https://github.com/example/other/pull/17";
+    assert.equal(eligibilityFor(data).code, "inconsistent_pull_request_identity");
+  }
+});
+
+test("eligibility requires reconciled complete file-list counts and explicit complete patches", () => {
+  {
+    const data = fixture();
+    data.pullRequest.changedFileCount = 99;
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_files");
+  }
+  {
+    const data = fixture();
+    data.pullRequest.changedFiles = 99;
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_files");
+  }
+  {
+    const data = fixture();
+    delete data.pullRequest.changedFileCount;
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_files");
+  }
+  {
+    const data = fixture();
+    data.pullRequest.changedFileCount = "1";
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_files");
+  }
+  {
+    const data = fixture();
+    delete data.pullRequest.filesComplete;
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_files");
+  }
+  {
+    const data = fixture();
+    data.pullRequest.filesComplete = false;
+    assert.equal(eligibilityFor(data).code, "incomplete_pull_request_files");
+  }
+  {
+    const data = fixture();
+    assert.equal(eligibilityFor(data, { files: [textFile()] }).code, "incomplete_pull_request_files");
+  }
+  {
+    const data = fixture();
+    delete data.pullRequest.files[0].patchComplete;
+    const result = eligibilityFor(data);
+    assert.equal(result.code, "prohibited_hotfix_scope");
+    assert.equal(result.scopeEvidence.prohibitedChanges.binaryOrUninspectable, true);
+  }
+  {
+    const data = fixture();
+    data.pullRequest.files[0].additions = "2";
+    const result = eligibilityFor(data);
+    assert.equal(result.code, "prohibited_hotfix_scope");
+    assert.equal(result.scopeEvidence.prohibitedChanges.binaryOrUninspectable, true);
+  }
+});
+
 test("scope classification rejects broad, binary, unavailable, and every prohibited change class", () => {
   const data = fixture();
   const policy = data.project.hotfixPolicy;
@@ -216,7 +293,12 @@ test("scope classification rejects broad, binary, unavailable, and every prohibi
     unrelatedFeatureChanges: { files: [textFile({ relatedToTask: false })] },
   };
   for (const [flag, change] of Object.entries(cases)) {
-    const result = eligibilityFor(fixture(), { ...change, scope: {} });
+    const result = eligibilityFor(fixture(), {
+      ...change,
+      changedFileCount: change.files.length,
+      filesComplete: true,
+      scope: {},
+    });
     assert.equal(result.ok, false, flag);
     assert.equal(result.scopeEvidence.prohibitedChanges[flag], true, flag);
   }

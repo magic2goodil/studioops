@@ -1647,6 +1647,8 @@ function hotfixEvidenceSnapshot(eligibility) {
     scopeEvidence: eligibility.scopeEvidence
       ? {
         fileCount: eligibility.scopeEvidence.fileCount,
+        declaredFileCount: eligibility.scopeEvidence.declaredFileCount,
+        fileListComplete: eligibility.scopeEvidence.fileListComplete,
         changedLines: eligibility.scopeEvidence.changedLines,
         paths: eligibility.scopeEvidence.paths,
         prohibitedChanges: eligibility.scopeEvidence.prohibitedChanges,
