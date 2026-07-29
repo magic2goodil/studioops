@@ -140,6 +140,27 @@ The active local automation stack calls the steward, dispatcher, runner, and not
 
 For macOS always-on setup, see [LOCAL_AUTOMATION.md](LOCAL_AUTOMATION.md).
 
+## Explicit StudioOps Owner Requests
+
+StudioOps self-promotion is a narrow project-policy exception, not general authority for Codex or managed projects. It is disabled by default. Enabling it requires the canonical `magic2goodil/studioops` repository, an exact configured local StudioOps source checkout, and `main` as both the registered default and policy target branch. A `studioops` project key or name by itself never qualifies.
+
+Future tasks intended for this lane must record non-sensitive opaque provenance at intake:
+
+```bash
+node src/mission-control-cli.js add-task \
+  --project studioops \
+  --title "Requested StudioOps change" \
+  --owner-actor-id "owner:opaque-1234" \
+  --owner-request-id "request:opaque-5678" \
+  --owner-request-capability "studioops.source_change,studioops.main_fast_forward,studioops.local_runtime_restart"
+```
+
+Only those three local StudioOps capabilities are recognized. Managed-project production release, destructive local state deletion, secret rotation, cloud billing, external notifications, and customer-facing communication remain prohibited. Unknown, missing, legacy, mixed-project, or prohibited scope fails closed. Architecture inheritance is available only through the governed `architecture-complete` handoff from an eligible same-project explicit-owner-request parent.
+
+Inspect the effective decision with `projects --json`, `show-task <id> --json`, the project/task APIs, or a generated worker prompt. These surfaces report a stable denial reason such as `policy_disabled`, `project_repository_identity_mismatch`, `request_provenance_missing`, `request_project_mismatch`, `request_scope_unknown`, or `request_scope_prohibited`.
+
+The bootstrap change that adds this policy is not retroactively authorized by itself. It must complete the existing human owner gate before the exception can be enabled for explicitly authorized future StudioOps tasks.
+
 ## Reviewer
 
 Use the generated domain reviewer prompts. The reviewer should:

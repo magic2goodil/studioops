@@ -2,7 +2,12 @@ import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { integrationBranchName, trustLeadApprovalsEnabled } from "./integration-policy.js";
+import {
+  evaluateSelfPromotionProjectPolicy,
+  integrationBranchName,
+  normalizeSelfPromotionPolicy,
+  trustLeadApprovalsEnabled,
+} from "./integration-policy.js";
 import { missionControlConfigRoot } from "./runtime-paths.js";
 
 export const CONFIG_FILE = "studioops.config.md";
@@ -89,6 +94,10 @@ function reviewPolicyFromConfig(rawProject = {}, defaults = {}) {
   const reviewPolicy = {
     ...(defaults.reviewPolicy || {}),
     ...(rawProject.reviewPolicy || {}),
+    selfPromotion: normalizeSelfPromotionPolicy({
+      ...(defaults.reviewPolicy?.selfPromotion || {}),
+      ...(rawProject.reviewPolicy?.selfPromotion || {}),
+    }),
   };
   if (
     !hasOwnValue(rawProject.reviewPolicy, "trustLeadApprovals")
@@ -109,7 +118,7 @@ function reviewPolicyFromConfig(rawProject = {}, defaults = {}) {
 
 export function projectFromConfig(rawProject, defaults = {}) {
   const reviewPolicy = reviewPolicyFromConfig(rawProject, defaults);
-  return {
+  const project = {
     key: rawProject.key,
     name: rawProject.name,
     description: rawProject.description || "",
@@ -134,5 +143,9 @@ export function projectFromConfig(rawProject, defaults = {}) {
     localQaPreview: rawProject.localQaPreview || rawProject.qaIntegration?.localPreview || null,
     trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
     integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),
+  };
+  return {
+    ...project,
+    selfPromotionEligibility: evaluateSelfPromotionProjectPolicy(project),
   };
 }

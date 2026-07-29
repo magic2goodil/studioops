@@ -102,6 +102,60 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
   }
 });
 
+test("SQLite JSON payloads preserve legacy records and persist normalized explicit owner-request provenance", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-request-provenance-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import { addProject, addTask } from ${JSON.stringify(storeModuleUrl)};
+      await addProject({
+        key: "studioops",
+        name: "StudioOps",
+        repoPath: "/tmp/studioops/source",
+        repoUrl: "https://github.com/magic2goodil/studioops",
+        defaultBranch: "main",
+        reviewPolicy: {
+          selfPromotion: {
+            version: 1,
+            enabled: true,
+            sourceRoot: "/tmp/studioops/source"
+          }
+        }
+      });
+      await addTask({
+        project: "studioops",
+        title: "Explicit owner request",
+        status: "ready",
+        ownerActorId: "owner:opaque-1234",
+        ownerRequestId: "request:opaque-5678",
+        ownerRequestCapabilities: [
+          "studioops.source_change",
+          "studioops.main_fast_forward",
+          "studioops.local_runtime_restart"
+        ]
+      });
+    `);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.projects[0].reviewPolicy, undefined);
+    assert.equal(persisted.tasks[0].requestProvenance, undefined);
+
+    const project = persisted.projects.find((item) => item.key === "studioops");
+    const task = persisted.tasks.find((item) => item.title === "Explicit owner request");
+    assert.equal(project.reviewPolicy.selfPromotion.enabled, true);
+    assert.equal(project.reviewPolicy.selfPromotion.repositoryId, "magic2goodil/studioops");
+    assert.equal(task.requestProvenance.kind, "explicit_owner_request");
+    assert.equal(task.requestProvenance.projectId, project.id);
+    assert.deepEqual(task.requestProvenance.capabilities, [
+      "studioops.source_change",
+      "studioops.main_fast_forward",
+      "studioops.local_runtime_restart",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("concurrent worker processes serialize updates without dropping comments", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-concurrency-"));
   try {

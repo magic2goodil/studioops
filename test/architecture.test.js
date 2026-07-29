@@ -5,6 +5,14 @@ import { resolveExecutionPolicy } from "../src/execution-policy.js";
 import { claimRuns, successfulHandoffFailure } from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import {
+  evaluateSelfPromotionEligibility,
+  evaluateSelfPromotionProjectPolicy,
+  normalizeOwnerRequestProvenance,
+  normalizeSelfPromotionPolicy,
+  SELF_PROMOTION_PROHIBITED_CAPABILITIES,
+  STUDIOOPS_SELF_PROMOTION_CAPABILITIES,
+} from "../src/integration-policy.js";
+import {
   completeArchitectureInState,
   functionalDeliveryContract,
   generatePrompt,
@@ -70,6 +78,38 @@ function governedChild(taskPatch = {}) {
   };
 }
 
+function canonicalStudioOpsProject(patch = {}) {
+  const repoPath = "/Users/example/.codex/studioops/source";
+  return {
+    id: "project_1",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath,
+    repoUrl: "https://github.com/magic2goodil/studioops.git",
+    defaultBranch: "main",
+    reviewPolicy: {
+      selfPromotion: {
+        version: 1,
+        enabled: true,
+        sourceRoot: repoPath,
+      },
+    },
+    ...patch,
+  };
+}
+
+function explicitOwnerRequest(patch = {}) {
+  return {
+    version: 1,
+    kind: "explicit_owner_request",
+    ownerActorId: "owner:opaque-1234",
+    requestId: "request:opaque-5678",
+    projectId: "project_1",
+    capabilities: [...STUDIOOPS_SELF_PROMOTION_CAPABILITIES],
+    ...patch,
+  };
+}
+
 test("broad epics and app mockups require architecture unless explicitly waived", () => {
   assert.equal(taskRequiresArchitecture({ type: "epic", title: "New product" }), true);
   assert.equal(taskRequiresArchitecture({
@@ -91,6 +131,135 @@ test("broad epics and app mockups require architecture unless explicitly waived"
     title: "Document an existing decision",
     architectureRequired: false,
   }), false);
+});
+
+test("StudioOps self-promotion policy is versioned, default-disabled, and canonical-identity bound", () => {
+  assert.deepEqual(normalizeSelfPromotionPolicy(), {
+    version: 1,
+    enabled: false,
+    productId: "studioops",
+    repositoryId: "magic2goodil/studioops",
+    sourceRoot: "",
+    targetBranch: "main",
+    allowedCapabilities: [...STUDIOOPS_SELF_PROMOTION_CAPABILITIES],
+    prohibitedCapabilities: [...SELF_PROMOTION_PROHIBITED_CAPABILITIES],
+  });
+  assert.deepEqual(normalizeOwnerRequestProvenance(), {
+    version: 1,
+    kind: "",
+    ownerActorId: "",
+    requestId: "",
+    projectId: "",
+    capabilities: [],
+    inheritedFromTaskId: "",
+    inheritanceKind: "",
+    inheritedAt: "",
+  });
+  assert.equal(evaluateSelfPromotionProjectPolicy({
+    key: "studioops",
+    name: "StudioOps",
+  }).reason, "policy_disabled");
+
+  const canonical = canonicalStudioOpsProject();
+  assert.equal(evaluateSelfPromotionProjectPolicy(canonical).reason, "eligible");
+  assert.equal(evaluateSelfPromotionProjectPolicy({
+    ...canonical,
+    repoUrl: "https://github.com/example/client",
+  }).reason, "project_repository_identity_mismatch");
+  assert.equal(evaluateSelfPromotionProjectPolicy({
+    ...canonical,
+    repoPath: "/tmp/spoofed-studioops",
+  }).reason, "project_source_root_mismatch");
+  assert.equal(evaluateSelfPromotionProjectPolicy({
+    ...canonical,
+    defaultBranch: "release",
+  }).reason, "project_default_branch_mismatch");
+});
+
+test("self-promotion eligibility denies managed projects, spoofed keys, mixed scope, and forbidden capabilities", () => {
+  const task = {
+    id: "task_1",
+    projectId: "project_1",
+    requestProvenance: explicitOwnerRequest(),
+  };
+  assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), task).reason, "eligible");
+
+  for (const [key, name, repoUrl] of [
+    ["dollos", "DollOS", "https://github.com/example/dollos"],
+    ["team-robison", "Team Robison", "https://github.com/example/team-robison"],
+    ["sparkos", "SparkOS", "https://github.com/example/sparkos"],
+    ["client", "Client Site", "https://github.com/example/client-site"],
+    ["studioops", "Spoofed StudioOps", "https://github.com/example/not-studioops"],
+  ]) {
+    const project = canonicalStudioOpsProject({ key, name, repoUrl });
+    assert.equal(
+      evaluateSelfPromotionEligibility(project, task).reason,
+      "project_repository_identity_mismatch",
+      name,
+    );
+  }
+
+  assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
+    ...task,
+    requestProvenance: explicitOwnerRequest({ projectId: "project_other" }),
+  }).reason, "request_project_mismatch");
+  assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
+    ...task,
+    requestProvenance: explicitOwnerRequest({ ownerActorId: "github_pat_not-an-actor" }),
+  }).reason, "request_owner_actor_invalid");
+  assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
+    ...task,
+    requestProvenance: explicitOwnerRequest({ capabilities: ["studioops.unknown"] }),
+  }).reason, "request_scope_unknown");
+  for (const capability of SELF_PROMOTION_PROHIBITED_CAPABILITIES) {
+    assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
+      ...task,
+      requestProvenance: explicitOwnerRequest({
+        capabilities: ["studioops.source_change", capability],
+      }),
+    }).reason, "request_scope_prohibited", capability);
+  }
+  assert.equal(evaluateSelfPromotionEligibility(canonicalStudioOpsProject(), {
+    ...task,
+    requestProvenance: undefined,
+  }).reason, "request_provenance_missing");
+});
+
+test("governed architecture completion durably inherits only eligible same-project owner provenance", () => {
+  const state = fixtureState({
+    requestProvenance: explicitOwnerRequest(),
+  });
+  state.projects[0] = canonicalStudioOpsProject();
+  state.tasks.push(governedChild());
+  completeArchitectureInState(state, "task_1", {
+    body: [
+      "Keep the local modular monolith and its current SQLite JSON entity payloads.",
+      "Bind the exact owner request to governed implementation children without adding services.",
+    ].join(" "),
+    taskIds: ["task_2"],
+  });
+
+  const child = state.tasks[1];
+  assert.equal(child.requestProvenance.kind, "governed_architecture_inheritance");
+  assert.equal(child.requestProvenance.inheritedFromTaskId, "task_1");
+  assert.equal(child.requestProvenance.inheritanceKind, "governed_architecture_handoff");
+  assert.equal(
+    evaluateSelfPromotionEligibility(state.projects[0], child, { parentTask: state.tasks[0] }).reason,
+    "eligible",
+  );
+  assert.ok(state.events.some((event) => event.type === "owner_request_provenance_inherited"));
+
+  const deniedState = fixtureState();
+  deniedState.projects[0] = canonicalStudioOpsProject();
+  deniedState.tasks.push(governedChild());
+  completeArchitectureInState(deniedState, "task_1", {
+    body: [
+      "Keep the local modular monolith and existing persistence boundaries unchanged.",
+      "Stage governed children without inventing authorization that the parent does not carry.",
+    ].join(" "),
+    taskIds: ["task_2"],
+  });
+  assert.equal(deniedState.tasks[1].requestProvenance, undefined);
 });
 
 test("architecture is a durable xhigh pre-builder dispatch", async () => {
@@ -315,6 +484,21 @@ test("architect and functional-delivery prompts reject static mockup replicas", 
   assert.match(contract, /not authorization to deliver a static replica/i);
   assert.match(contract, /Primary controls must execute real behavior/i);
   assert.match(contract, /survive refresh and process restart/i);
+});
+
+test("worker and reviewer prompts expose the effective self-promotion exception and exact limits", () => {
+  const state = fixtureState({
+    requestProvenance: explicitOwnerRequest(),
+  });
+  state.projects[0] = canonicalStudioOpsProject();
+  for (const role of ["systems-architect", "builder", "backend-reviewer", "lead-reviewer"]) {
+    const prompt = generatePrompt(state, "task_1", role);
+    assert.match(prompt, /StudioOps self-promotion policy/);
+    assert.match(prompt, /This task eligible: yes \(eligible\)/);
+    assert.match(prompt, /studioops\.main_fast_forward/);
+    assert.match(prompt, /managed_project\.production_release/);
+    assert.match(prompt, /scope drift.*fail closed/i);
+  }
 });
 
 test("runner rejects an architect exit that did not record a durable handoff", () => {

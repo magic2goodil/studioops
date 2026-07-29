@@ -28,7 +28,17 @@ import { formatNotificationReport, sendPendingNotifications } from "./notifier.j
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
 import { formatPromotionReport, planPromotions, runPromotion } from "./promotion.js";
 import { formatSelfUpdateReport, runSelfUpdate } from "./self-update.js";
-import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
+import {
+  branchWebUrl,
+  evaluateSelfPromotionEligibility,
+  evaluateSelfPromotionProjectPolicy,
+  integrationBranchName,
+  SELF_PROMOTION_POLICY_VERSION,
+  SELF_PROMOTION_PROHIBITED_CAPABILITIES,
+  STUDIOOPS_PRODUCT_ID,
+  STUDIOOPS_REPOSITORY_ID,
+  STUDIOOPS_SELF_PROMOTION_CAPABILITIES,
+} from "./integration-policy.js";
 import {
   expandHome,
   loadConfig,
@@ -281,6 +291,14 @@ async function setup() {
           trustLeadApprovals: false,
           qaReviewerRole: "qa-reviewer",
           integrationBranch: "",
+          selfPromotion: {
+            version: SELF_PROMOTION_POLICY_VERSION,
+            enabled: false,
+            productId: STUDIOOPS_PRODUCT_ID,
+            repositoryId: STUDIOOPS_REPOSITORY_ID,
+            sourceRoot: "",
+            targetBranch: "main",
+          },
         },
         trustLeadApprovals: false,
         integrationBranch: "",
@@ -425,7 +443,7 @@ Commands:
   tasks                         List tasks, optionally --project key and --status value
   show-task TASK_ID             Read-only inspection of one task and its current review subject
   add-project --key --name      Add a project
-  update-project PROJECT        Update project settings and Trust Leads policy
+  update-project PROJECT        Update project review and self-promotion policy
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Mutate task status (requires one canonical non-empty status)
@@ -472,6 +490,12 @@ Task fields:
   --trust-lead-approvals        Alias for --trust-leads
   --no-trust-leads              Disable Trust Leads for a project
   --integration-branch          Non-production branch used for QA integration bundles
+  --self-promotion              Enable the StudioOps-only policy (still default-deny unless identity matches)
+  --no-self-promotion           Disable the StudioOps-only policy
+  --self-promotion-source-root  Exact configured local StudioOps source checkout
+  --owner-actor-id              Opaque ID for the owner who explicitly requested the task
+  --owner-request-id            Opaque ID for the explicit owner request
+  --owner-request-capability    Closed comma/newline-separated StudioOps capability scope
   --subject-sha                 Exact full source SHA submitted for the current review cycle
   --partial-tasks               Explicit subset for an authorized partial QA candidate
   --partial-actor-id            Non-sensitive actor ID authorizing a partial candidate
@@ -519,15 +543,39 @@ Automation:
 
   if (command === "projects") {
     const state = await readState();
-    printTable(state.projects.map((project) => ({
-      id: project.id,
-      key: project.key,
-      name: project.name,
-      workflowMode: project.workflowMode || "auto",
-      repo: project.repoPath || project.repoUrl,
-      trustLeads: project.reviewPolicy?.trustLeadApprovals ? "yes" : "no",
-      integrationBranch: project.reviewPolicy?.integrationBranch || "",
-    })), ["id", "key", "name", "workflowMode", "repo", "trustLeads", "integrationBranch"]);
+    const projects = state.projects.map((project) => {
+      const selfPromotion = evaluateSelfPromotionProjectPolicy(project);
+      return {
+        id: project.id,
+        key: project.key,
+        name: project.name,
+        workflowMode: project.workflowMode || "auto",
+        repo: project.repoPath || project.repoUrl,
+        trustLeads: project.reviewPolicy?.trustLeadApprovals ? "yes" : "no",
+        integrationBranch: project.reviewPolicy?.integrationBranch || "",
+        selfPromotionEnabled: selfPromotion.policy.enabled,
+        selfPromotionEligible: selfPromotion.eligible,
+        selfPromotionReason: selfPromotion.reason,
+        selfPromotionPolicy: selfPromotion.policy,
+        selfPromotionAllowed: STUDIOOPS_SELF_PROMOTION_CAPABILITIES,
+        selfPromotionProhibited: SELF_PROMOTION_PROHIBITED_CAPABILITIES,
+      };
+    });
+    if (args.json) console.log(JSON.stringify(projects, null, 2));
+    else printTable(projects, [
+      "id",
+      "key",
+      "name",
+      "workflowMode",
+      "repo",
+      "trustLeads",
+      "integrationBranch",
+      "selfPromotionEnabled",
+      "selfPromotionEligible",
+      "selfPromotionReason",
+      "selfPromotionAllowed",
+      "selfPromotionProhibited",
+    ]);
     return;
   }
 
@@ -604,6 +652,10 @@ Automation:
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = state.projects.find((item) => item.id === task.projectId);
+    const parent = state.tasks.find((item) => item.id === task.parentTaskId);
+    const selfPromotionEligibility = project
+      ? evaluateSelfPromotionEligibility(project, task, { parentTask: parent })
+      : { eligible: false, reason: "task_project_missing" };
     const inspection = {
       id: task.id,
       title: task.title,
@@ -615,10 +667,28 @@ Automation:
       reviewSubjectCycle: task.reviewSubjectCycle || 0,
       branchName: task.branchName || "",
       prUrl: task.prUrl || "",
+      requestProvenance: selfPromotionEligibility.provenance,
+      selfPromotionEligibility,
       updatedAt: task.updatedAt || "",
     };
     if (args.json) console.log(JSON.stringify(inspection, null, 2));
-    else printTable([inspection], ["id", "project", "status", "assignedRole", "reviewCycle", "reviewSubjectSha", "branchName", "prUrl", "updatedAt"]);
+    else printTable([{
+      ...inspection,
+      selfPromotionEligible: selfPromotionEligibility.eligible,
+      selfPromotionReason: selfPromotionEligibility.reason,
+    }], [
+      "id",
+      "project",
+      "status",
+      "assignedRole",
+      "reviewCycle",
+      "reviewSubjectSha",
+      "branchName",
+      "prUrl",
+      "selfPromotionEligible",
+      "selfPromotionReason",
+      "updatedAt",
+    ]);
     return;
   }
 
@@ -665,6 +735,9 @@ Automation:
       ? false
       : args["trust-lead-approvals"] || args.trustLeadApprovals || args["trust-leads"];
     const integrationBranch = args["integration-branch"] || args.integrationBranch || "";
+    const selfPromotionEnabled = args["no-self-promotion"]
+      ? false
+      : booleanOption(args["self-promotion"], false);
     const project = await addProject({
       key: args.key,
       name: args.name,
@@ -680,6 +753,14 @@ Automation:
       reviewPolicy: {
         trustLeadApprovals,
         integrationBranch,
+        selfPromotion: {
+          version: SELF_PROMOTION_POLICY_VERSION,
+          enabled: selfPromotionEnabled,
+          productId: STUDIOOPS_PRODUCT_ID,
+          repositoryId: STUDIOOPS_REPOSITORY_ID,
+          sourceRoot: expandHome(args["self-promotion-source-root"] || ""),
+          targetBranch: "main",
+        },
       },
       trustLeadApprovals,
       integrationBranch,
@@ -707,6 +788,24 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "no-trust-leads")) reviewPolicy.trustLeadApprovals = false;
     if (Object.prototype.hasOwnProperty.call(args, "qa-reviewer-role")) reviewPolicy.qaReviewerRole = args["qa-reviewer-role"];
     if (Object.prototype.hasOwnProperty.call(args, "integration-branch")) reviewPolicy.integrationBranch = args["integration-branch"];
+    if (
+      Object.prototype.hasOwnProperty.call(args, "self-promotion")
+      || Object.prototype.hasOwnProperty.call(args, "no-self-promotion")
+      || Object.prototype.hasOwnProperty.call(args, "self-promotion-source-root")
+    ) {
+      reviewPolicy.selfPromotion = {
+        version: SELF_PROMOTION_POLICY_VERSION,
+        ...(Object.prototype.hasOwnProperty.call(args, "self-promotion")
+          ? { enabled: booleanOption(args["self-promotion"], true) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(args, "no-self-promotion")
+          ? { enabled: false }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(args, "self-promotion-source-root")
+          ? { sourceRoot: expandHome(args["self-promotion-source-root"] || "") }
+          : {}),
+      };
+    }
     if (Object.keys(reviewPolicy).length) patch.reviewPolicy = reviewPolicy;
     if (
       Object.prototype.hasOwnProperty.call(args, "local-qa-preview")
@@ -761,6 +860,9 @@ Automation:
         ? { architectureApproved: booleanOption(args["architecture-approved"], true) }
         : {}),
       architectureParentTaskId: args["architecture-parent"] || "",
+      ownerActorId: args["owner-actor-id"],
+      ownerRequestId: args["owner-request-id"],
+      ownerRequestCapabilities: args["owner-request-capability"] || args["owner-request-capabilities"],
       privacyNotes: args.privacy,
       securityNotes: args.security,
       branchName: args.branch || args["branch-name"],
@@ -806,6 +908,18 @@ Automation:
     }
     if (Object.prototype.hasOwnProperty.call(args, "architecture-parent")) {
       patch.architectureParentTaskId = args["architecture-parent"];
+    }
+    if (Object.prototype.hasOwnProperty.call(args, "owner-actor-id")) {
+      patch.ownerActorId = args["owner-actor-id"];
+    }
+    if (Object.prototype.hasOwnProperty.call(args, "owner-request-id")) {
+      patch.ownerRequestId = args["owner-request-id"];
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(args, "owner-request-capability")
+      || Object.prototype.hasOwnProperty.call(args, "owner-request-capabilities")
+    ) {
+      patch.ownerRequestCapabilities = args["owner-request-capability"] || args["owner-request-capabilities"];
     }
     const task = await updateTask(taskId, patch);
     console.log(`Updated ${task.id}: ${task.title}`);
