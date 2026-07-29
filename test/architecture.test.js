@@ -188,21 +188,64 @@ test("StudioOps self-promotion policy is versioned, default-disabled, and canoni
       },
     },
   }).reason, "policy_version_missing");
-  const importedLegacyPolicy = projectFromConfig({
+  const importedLegacyPolicy = projectFromConfig(
+    {
+      key: "studioops",
+      name: "StudioOps",
+      repoPath: canonical.repoPath,
+      repoUrl: canonical.repoUrl,
+      defaultBranch: "main",
+      reviewPolicy: {
+        selfPromotion: {
+          enabled: true,
+          sourceRoot: canonical.repoPath,
+        },
+      },
+    },
+    {
+      reviewPolicy: {
+        trustLeadApprovals: false,
+        selfPromotion: {
+          version: 1,
+          enabled: false,
+          productId: "studioops",
+          repositoryId: "magic2goodil/studioops",
+          sourceRoot: "",
+          targetBranch: "main",
+        },
+      },
+    },
+  );
+  assert.deepEqual(importedLegacyPolicy.reviewPolicy.selfPromotion, {
+    version: 0,
+    enabled: true,
+    productId: "",
+    repositoryId: "",
+    sourceRoot: canonical.repoPath,
+    targetBranch: "",
+    allowedCapabilities: [...STUDIOOPS_SELF_PROMOTION_CAPABILITIES],
+    prohibitedCapabilities: [...SELF_PROMOTION_PROHIBITED_CAPABILITIES],
+  });
+  assert.equal(importedLegacyPolicy.selfPromotionEligibility.reason, "policy_version_unsupported");
+  const inheritedDefaultPolicy = projectFromConfig({
     key: "studioops",
     name: "StudioOps",
     repoPath: canonical.repoPath,
     repoUrl: canonical.repoUrl,
     defaultBranch: "main",
+  }, {
     reviewPolicy: {
       selfPromotion: {
-        enabled: true,
+        version: 1,
+        enabled: false,
+        productId: "studioops",
+        repositoryId: "magic2goodil/studioops",
         sourceRoot: canonical.repoPath,
+        targetBranch: "main",
       },
     },
   });
-  assert.equal(importedLegacyPolicy.reviewPolicy.selfPromotion.version, 0);
-  assert.equal(importedLegacyPolicy.selfPromotionEligibility.reason, "policy_version_unsupported");
+  assert.equal(inheritedDefaultPolicy.selfPromotionEligibility.reason, "policy_disabled");
   for (const [field, reason] of [
     ["productId", "policy_product_identity_missing"],
     ["repositoryId", "policy_repository_identity_missing"],

@@ -91,13 +91,13 @@ function hasOwnValue(item, key) {
 }
 
 function reviewPolicyFromConfig(rawProject = {}, defaults = {}) {
+  const selfPromotion = hasOwnValue(rawProject.reviewPolicy, "selfPromotion")
+    ? rawProject.reviewPolicy.selfPromotion
+    : defaults.reviewPolicy?.selfPromotion;
   const reviewPolicy = {
     ...(defaults.reviewPolicy || {}),
     ...(rawProject.reviewPolicy || {}),
-    selfPromotion: normalizeSelfPromotionPolicy({
-      ...(defaults.reviewPolicy?.selfPromotion || {}),
-      ...(rawProject.reviewPolicy?.selfPromotion || {}),
-    }),
+    selfPromotion: normalizeSelfPromotionPolicy(selfPromotion),
   };
   if (
     !hasOwnValue(rawProject.reviewPolicy, "trustLeadApprovals")
