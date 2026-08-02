@@ -6,7 +6,11 @@ import path from "node:path";
 import test from "node:test";
 import {
   cleanupGitHubAppAuth,
+  formatGitHubAppAuthForLog,
+  formatGitHubAppAuthForPrompt,
+  githubAppAuthSecrets,
   prepareGitHubAppAuth,
+  redactSecrets,
 } from "../src/github-app-auth.js";
 
 function privateKeyPem() {
@@ -114,6 +118,119 @@ test("default GitHub App credentials remain an intentional fallback when no role
     assert.equal(auth.app.key, "default");
     assert.equal(auth.role, "backend-reviewer");
     assert.equal(calls.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanupGitHubAppAuth(auth);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QA integration mints an exact repository-scoped token without exposing credentials", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+  const token = "ghs_qa_installation_token_secret";
+  let tokenRequest = null;
+  let auth = null;
+
+  try {
+    await writeApp(root, "builder", { role: "builder", name: "Builder fallback" });
+    globalThis.fetch = async (url, options = {}) => {
+      if (String(url).endsWith("/repos/example/repo/installation")) {
+        return {
+          ok: true,
+          text: async () => JSON.stringify({ id: 24680 }),
+        };
+      }
+      if (String(url).endsWith("/app/installations/24680/access_tokens")) {
+        tokenRequest = JSON.parse(options.body);
+        return {
+          ok: true,
+          text: async () => JSON.stringify({
+            token,
+            expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          }),
+        };
+      }
+      throw new Error(`Unexpected GitHub API call: ${url}`);
+    };
+
+    auth = await prepareGitHubAppAuth(runFixture("qa-integration-worker"), {
+      githubAppCredentialsDir: root,
+      githubAppDefaultRole: "builder",
+      githubAppRuntimeDir: path.join(root, "runtime"),
+    });
+
+    assert.equal(auth.role, "qa-integration-worker");
+    assert.equal(auth.app.key, "builder");
+    assert.deepEqual(tokenRequest, {
+      repositories: ["repo"],
+      permissions: {
+        checks: "read",
+        contents: "write",
+        issues: "write",
+        pull_requests: "write",
+        statuses: "read",
+      },
+    });
+
+    const diagnostics = `${formatGitHubAppAuthForLog(auth)}\n${formatGitHubAppAuthForPrompt(auth)}`;
+    assert.equal(diagnostics.includes(auth.token), false);
+    assert.equal(diagnostics.includes(auth.jwt), false);
+    const safeError = redactSecrets(
+      `simulated failure ${auth.token} ${auth.jwt}`,
+      githubAppAuthSecrets(auth),
+    );
+    assert.equal(safeError.includes(auth.token), false);
+    assert.equal(safeError.includes(auth.jwt), false);
+    assert.match(safeError, /REDACTED_GITHUB_APP_TOKEN/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanupGitHubAppAuth(auth);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("builder token permissions do not expand with the QA profile", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+  let tokenRequest = null;
+  let auth = null;
+
+  try {
+    await writeApp(root, "builder", { role: "builder" });
+    globalThis.fetch = async (url, options = {}) => {
+      if (String(url).endsWith("/repos/example/repo/installation")) {
+        return {
+          ok: true,
+          text: async () => JSON.stringify({ id: 13579 }),
+        };
+      }
+      if (String(url).endsWith("/app/installations/13579/access_tokens")) {
+        tokenRequest = JSON.parse(options.body);
+        return {
+          ok: true,
+          text: async () => JSON.stringify({
+            token: "ghs_builder_installation_token",
+            expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          }),
+        };
+      }
+      throw new Error(`Unexpected GitHub API call: ${url}`);
+    };
+
+    auth = await prepareGitHubAppAuth(runFixture("builder"), {
+      githubAppCredentialsDir: root,
+      githubAppRuntimeDir: path.join(root, "runtime"),
+    });
+
+    assert.deepEqual(tokenRequest, {
+      repositories: ["repo"],
+      permissions: {
+        contents: "write",
+        issues: "write",
+        pull_requests: "write",
+      },
+    });
   } finally {
     globalThis.fetch = originalFetch;
     await cleanupGitHubAppAuth(auth);

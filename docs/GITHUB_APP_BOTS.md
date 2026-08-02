@@ -46,6 +46,7 @@ This creates manifests for:
 - `MC Accessibility Reviewer`
 - `MC Lead Reviewer`
 - `MC Promotion Worker`
+- `MC QA Integration Worker`
 
 Separate role apps create clearer GitHub audit trails, but they also mean more app registrations, installations, private keys, and installation tokens to rotate and monitor.
 
@@ -57,7 +58,37 @@ The manifest requests:
 - `pull_requests: write` for PR creation and review activity
 - `issues: write` for PR comments and labels
 - `checks: read` and `actions: read` for CI/status inspection
+- `statuses: read` for legacy commit-status contexts in protected-branch rollups
 - `metadata: read`, required by GitHub Apps
+
+The manifest is the permission ceiling shared by the setup flow; each minted installation token is narrower. Builder tokens retain only `contents: write`, `issues: write`, and `pull_requests: write`. Reviewer profiles retain their existing permissions. The `qa-integration-worker` profile requests those same three writes, which are required to publish immutable candidate branches and PRs, plus only `checks: read` and `statuses: read` for protected-PR inspection. When QA uses the builder App as its configured identity fallback, it still mints the QA-specific token; ordinary builder tokens do not gain check or status access.
+
+### Updating Existing Apps For Protected-PR Inspection
+
+Apps created before the QA check-inspection profile must be updated by an App owner before StudioOps can read `statusCheckRollup`:
+
+1. Open the GitHub App settings page for the dedicated QA App, builder fallback App, or shared default App used by QA integration.
+2. Under **Repository permissions**, set **Checks** to **Read-only** and **Commit statuses** to **Read-only**, then save the change.
+3. Approve the requested permission update for the App installation and install or re-approve the App on each repository where QA integration runs.
+4. Start a new QA integration invocation. Tokens minted before approval do not acquire the new grants; a newly minted installation token is required.
+
+Do not paste or print the token while validating. After the App owner explicitly approves the change, an operator can probe the protected candidate PR with the normal issued token:
+
+```bash
+gh pr view 107 \
+  --repo magic2goodil/DollOS-Discord-Bot \
+  --json state,reviewDecision,statusCheckRollup
+```
+
+Then retry the existing QA task through the normal non-force Git path:
+
+```bash
+npm run qa-integrate -- --project dollos --task task_224 --force
+```
+
+Here `--force` bypasses only the StudioOps retry cooldown. QA integration still must not force-push, merge the PR, bypass required checks or reviews, change another candidate's source SHA, or deploy production.
+
+If GitHub reports `Resource not accessible by integration`, StudioOps fails closed and returns the missing `checks: read` and `statuses: read` grants, the approval/install step, the fresh-token requirement, and the bounded retry command without echoing credentials or repository listings. Revoking either permission later also fails closed. Old installation tokens expire naturally. To roll back, first disable the QA integration worker, then revert the App permissions; existing candidate branches and PRs remain immutable evidence and are not rewritten or merged by rollback.
 
 Webhooks are not requested by default. StudioOps can add webhook handling later if we use a public endpoint or tunnel and want GitHub to actively push events into the local task board.
 
@@ -154,6 +185,7 @@ With `npm run setup-github-role-apps`, StudioOps looks for these directories:
 - `accessibility-reviewer`
 - `lead-reviewer`
 - `promotion-worker`
+- `qa-integration-worker`
 
 You can override the mapping in `studioops.config.md`:
 
@@ -167,7 +199,8 @@ You can override the mapping in `studioops.config.md`:
     "frontend-reviewer": "frontend-reviewer",
     "accessibility-reviewer": "accessibility-reviewer",
     "lead-reviewer": "lead-reviewer",
-    "promotion-worker": "promotion-worker"
+    "promotion-worker": "promotion-worker",
+    "qa-integration-worker": "qa-integration-worker"
   }
 }
 ```

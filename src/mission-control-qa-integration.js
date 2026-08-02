@@ -107,7 +107,9 @@ same integration commit. It does not merge to production, deploy, or force-push.
 
 For GitHub repositories, the worker uses short-lived GitHub App installation
 tokens by default. If no dedicated qa-integration-worker app exists, it falls
-back to the builder app identity.
+back to the builder app identity while retaining a QA-only token profile with
+checks:read and statuses:read. Existing Apps require owner approval of those
+two read grants and a freshly minted token before protected-PR inspection.
 `);
     return;
   }
