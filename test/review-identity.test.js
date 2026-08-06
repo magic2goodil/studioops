@@ -8,9 +8,106 @@ import {
   recordReview,
   updateTask,
 } from "../src/store.js";
+import { completeRun } from "../src/runner.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const REVIEWER_FIX_SHA = "b".repeat(40);
+
+test("cycle-limit backend rejection can be finalized by lead rejection for the exact candidate", async () => {
+  const project = await addProject({
+    key: "cycle-limit-lead-rejection",
+    name: "Cycle-limit lead rejection",
+    repoPath: "/tmp/cycle-limit-lead-rejection",
+    reviewPipeline: [
+      {
+        key: "backend",
+        label: "Backend Review",
+        role: "backend-reviewer",
+        status: "backend_review",
+        required: true,
+      },
+      {
+        key: "lead",
+        label: "Primary Lead Review",
+        role: "lead-reviewer",
+        status: "lead_review",
+        required: true,
+      },
+    ],
+    reviewPolicy: {
+      maxBuilderReviewCycles: 2,
+      leadOwnsFinalDecisionAtLimit: true,
+    },
+  });
+  const task = await addTask({
+    project: project.id,
+    title: "Cycle-limit review decision",
+    status: "in_progress",
+    type: "bug",
+  });
+  await updateTask(task.id, {
+    status: "builder_review",
+    branchName: "codex/cycle-limit-lead-rejection",
+    prUrl: "https://github.com/example/cycle-limit-lead-rejection/pull/1",
+    subjectSha: SUBJECT_SHA,
+  });
+  await updateTask(task.id, { status: "needs_changes" });
+  await updateTask(task.id, {
+    status: "builder_review",
+    branchName: "codex/cycle-limit-lead-rejection",
+    prUrl: "https://github.com/example/cycle-limit-lead-rejection/pull/1",
+    subjectSha: SUBJECT_SHA,
+  });
+
+  await recordReview(task.id, {
+    stage: "backend",
+    outcome: "changes_requested",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 2,
+  });
+  await assert.rejects(
+    recordReview(task.id, {
+      stage: "lead",
+      outcome: "approved",
+      subjectSha: SUBJECT_SHA,
+      candidateCycle: 2,
+    }),
+    /Backend Review must approve candidate cycle 2/,
+  );
+  await recordReview(task.id, {
+    stage: "lead",
+    outcome: "changes_requested",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 2,
+  });
+
+  let state = await readState();
+  const updated = state.tasks.find((item) => item.id === task.id);
+  const leadReview = state.reviews.find((review) => review.taskId === task.id && review.stageKey === "lead");
+  assert.equal(updated.status, "user_review");
+  assert.equal(updated.assignedAgentRole, "owner");
+  assert.equal(leadReview.candidateCycle, 2);
+  assert.equal(leadReview.subjectSha, SUBJECT_SHA);
+
+  state.runs.push({
+    id: "run_cycle_limit_lead",
+    taskId: task.id,
+    projectId: project.id,
+    group: "reviewer",
+    role: "lead-reviewer",
+    actionType: "continue_review",
+    status: "running",
+    candidateCycle: 2,
+    reviewSubjectSha: SUBJECT_SHA,
+    startedAt: new Date(Date.now() - 1_000).toISOString(),
+  });
+  const completed = await completeRun("run_cycle_limit_lead", {
+    state,
+    status: "completed",
+  });
+  assert.equal(completed.status, "completed");
+  assert.doesNotMatch(completed.notes, /review_outcome_missing/);
+});
 
 test("task labels persist through intake and updates for auditable tier routing", async () => {
   const project = await addProject({ key: "tier-routing", name: "Tier Routing" });

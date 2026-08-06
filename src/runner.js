@@ -811,8 +811,12 @@ function restoreTaskStatusForRun(run, task) {
 
 function reviewerRecordedOutcome(state, run) {
   const startedAt = Date.parse(run.startedAt || "");
+  const runCandidateCycle = Number(run.candidateCycle || 0);
+  const runSubjectSha = String(run.reviewSubjectSha || "");
   return (state.reviews || []).some((review) => {
     if (review.taskId !== run.taskId || review.role !== run.role) return false;
+    if (runCandidateCycle > 0 && Number(review.candidateCycle || 0) !== runCandidateCycle) return false;
+    if (runSubjectSha && review.subjectSha !== runSubjectSha) return false;
     const createdAt = Date.parse(review.createdAt || "");
     return !Number.isFinite(startedAt) || (Number.isFinite(createdAt) && createdAt >= startedAt - 1_000);
   });
