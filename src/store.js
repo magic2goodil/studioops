@@ -2144,6 +2144,8 @@ export function cycleLimitLeadReviewApplies(state, project, task, targetStage) {
     || !leadStage
     || !targetStage
     || targetStage.key !== leadStage.key
+    || task.status !== leadStage.status
+    || task.assignedAgentRole !== leadStage.role
     || currentReviewCycle(task) < policy.maxBuilderReviewCycles
   ) {
     return false;

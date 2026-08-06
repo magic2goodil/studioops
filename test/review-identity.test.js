@@ -65,6 +65,27 @@ test("cycle-limit backend rejection can be finalized by lead rejection for the e
     subjectSha: SUBJECT_SHA,
     candidateCycle: 2,
   });
+  let state = await readState();
+  let routed = state.tasks.find((item) => item.id === task.id);
+  assert.equal(routed.status, "lead_review");
+  assert.equal(routed.assignedAgentRole, "lead-reviewer");
+  await updateTask(task.id, {
+    status: "backend_review",
+    assignedAgentRole: "backend-reviewer",
+  });
+  await assert.rejects(
+    recordReview(task.id, {
+      stage: "lead",
+      outcome: "changes_requested",
+      subjectSha: SUBJECT_SHA,
+      candidateCycle: 2,
+    }),
+    /Backend Review must approve candidate cycle 2/,
+  );
+  await updateTask(task.id, {
+    status: "lead_review",
+    assignedAgentRole: "lead-reviewer",
+  });
   await assert.rejects(
     recordReview(task.id, {
       stage: "lead",
@@ -81,7 +102,7 @@ test("cycle-limit backend rejection can be finalized by lead rejection for the e
     candidateCycle: 2,
   });
 
-  let state = await readState();
+  state = await readState();
   const updated = state.tasks.find((item) => item.id === task.id);
   const leadReview = state.reviews.find((review) => review.taskId === task.id && review.stageKey === "lead");
   assert.equal(updated.status, "user_review");
