@@ -130,6 +130,32 @@ test("cycle-limit backend rejection can be finalized by lead rejection for the e
   assert.doesNotMatch(completed.notes, /review_outcome_missing/);
 });
 
+test("cycle-limit lead rejection remains blocked when only an optional lane rejected", async () => {
+  const project = await addProject({
+    key: "optional-lane-lead-rejection",
+    name: "Optional lane lead rejection",
+    repoPath: "/tmp/optional-lane-lead-rejection",
+    reviewPipeline: [
+      { key: "backend", label: "Backend Review", role: "backend-reviewer", status: "backend_review", required: true },
+      { key: "advisory", label: "Advisory Review", role: "advisory-reviewer", status: "advisory_review", required: false },
+      { key: "frontend", label: "Frontend Review", role: "frontend-reviewer", status: "frontend_review", required: true },
+      { key: "lead", label: "Primary Lead Review", role: "lead-reviewer", status: "lead_review", required: true },
+    ],
+    reviewPolicy: { maxBuilderReviewCycles: 2, leadOwnsFinalDecisionAtLimit: true },
+  });
+  const task = await addTask({ project: project.id, title: "Optional lane cannot unlock lead", status: "in_progress", type: "bug" });
+  await updateTask(task.id, { status: "builder_review", branchName: "codex/optional-lane-lead-rejection", prUrl: "https://github.com/example/optional-lane-lead-rejection/pull/1", subjectSha: SUBJECT_SHA });
+  await updateTask(task.id, { status: "needs_changes" });
+  await updateTask(task.id, { status: "builder_review", branchName: "codex/optional-lane-lead-rejection", prUrl: "https://github.com/example/optional-lane-lead-rejection/pull/1", subjectSha: SUBJECT_SHA });
+  await recordReview(task.id, { stage: "backend", outcome: "approved", subjectSha: SUBJECT_SHA, candidateCycle: 2 });
+  await recordReview(task.id, { stage: "advisory", outcome: "changes_requested", subjectSha: SUBJECT_SHA, candidateCycle: 2 });
+
+  await assert.rejects(
+    recordReview(task.id, { stage: "lead", outcome: "changes_requested", subjectSha: SUBJECT_SHA, candidateCycle: 2 }),
+    /Frontend Review must approve candidate cycle 2/,
+  );
+});
+
 test("task labels persist through intake and updates for auditable tier routing", async () => {
   const project = await addProject({ key: "tier-routing", name: "Tier Routing" });
   const task = await addTask({

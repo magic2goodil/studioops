@@ -2151,7 +2151,7 @@ export function cycleLimitLeadReviewApplies(state, project, task, targetStage) {
     return false;
   }
   return stages
-    .filter((stage) => stage.key !== leadStage.key)
+    .filter((stage) => stage.key !== leadStage.key && stage.required !== false)
     .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested");
 }
 
