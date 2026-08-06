@@ -137,7 +137,7 @@ test("cycle-limit lead rejection remains blocked when only an optional lane reje
     repoPath: "/tmp/optional-lane-lead-rejection",
     reviewPipeline: [
       { key: "backend", label: "Backend Review", role: "backend-reviewer", status: "backend_review", required: true },
-      { key: "advisory", label: "Advisory Review", role: "advisory-reviewer", status: "advisory_review", required: false },
+      { key: "advisory", label: "Advisory Review", role: "advisory-reviewer", status: "regression_review", required: false },
       { key: "frontend", label: "Frontend Review", role: "frontend-reviewer", status: "frontend_review", required: true },
       { key: "lead", label: "Primary Lead Review", role: "lead-reviewer", status: "lead_review", required: true },
     ],
