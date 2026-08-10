@@ -76,6 +76,7 @@ test("local runner handoff requires the immutable full subject SHA", () => {
 
   assert.equal(successfulHandoffFailure(state, run, state.tasks[0]), "");
   state.tasks[0].reviewSubjectSha = SUBJECT_SHA.slice(0, 12);
+  state.tasks[0].prUrl = "https://example.test/pull/1";
   assert.equal(successfulHandoffFailure(state, run, state.tasks[0]), "builder_handoff_missing");
 });
 

@@ -851,7 +851,10 @@ export function successfulHandoffFailure(state, run, task) {
     const localReviewSubjectReady = run.workflowMode === "local"
       && task.branchName
       && taskHasExactReviewSubject(task);
-    if ((task.branchName && task.prUrl || localReviewSubjectReady) && run.actionType !== "qa_integration_blocked") return "";
+    const reviewEvidenceReady = run.workflowMode === "local"
+      ? localReviewSubjectReady
+      : task.branchName && task.prUrl;
+    if (reviewEvidenceReady && run.actionType !== "qa_integration_blocked") return "";
     if (run.actionType === "qa_integration_blocked" && !BLOCKED_QA_INTEGRATION_STATUSES.has(task.integrationStatus)) return "";
     return "builder_handoff_missing";
   }
@@ -867,8 +870,9 @@ function applySuccessfulHandoff(state, run, task, now) {
   if (
     run.group === "builder"
     && task.status === "in_progress"
-    && task.branchName
-    && (task.prUrl || (run.workflowMode === "local" && taskHasExactReviewSubject(task)))
+    && (run.workflowMode === "local"
+      ? task.branchName && taskHasExactReviewSubject(task)
+      : task.branchName && task.prUrl)
   ) {
     task.status = "builder_review";
     task.assignedAgentRole = "";
