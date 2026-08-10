@@ -791,7 +791,7 @@ Automation rules:
 - If blocked, add a StudioOps comment explaining the blocker and set the task to an appropriate blocked/needs_changes state.
 - The runner will mark this run completed or failed based on your process exit code.
 ${run.workflowMode === "local"
-    ? "- Local mode forbids pushes and pull requests; leave the local branch and validation evidence recorded on the task."
+    ? "- Local mode forbids pushes and pull requests; leave the local branch, exact full subject SHA, validation evidence, and builder comment recorded on the task."
     : "- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. StudioOps verifies this handoff after the process exits."}
 
 Original prompt:
@@ -847,7 +847,8 @@ export function successfulHandoffFailure(state, run, task) {
   if (reviewerRunSupersessionReason(run, task)) return "";
   if (run.group === "builder") {
     if (task.status !== "in_progress" && task.status !== "qa_review") return "";
-    if (task.branchName && task.prUrl && run.actionType !== "qa_integration_blocked") return "";
+    const localReviewSubjectReady = run.workflowMode === "local" && task.branchName && task.reviewSubjectSha;
+    if ((task.branchName && task.prUrl || localReviewSubjectReady) && run.actionType !== "qa_integration_blocked") return "";
     if (run.actionType === "qa_integration_blocked" && !BLOCKED_QA_INTEGRATION_STATUSES.has(task.integrationStatus)) return "";
     return "builder_handoff_missing";
   }
@@ -864,7 +865,7 @@ function applySuccessfulHandoff(state, run, task, now) {
     run.group === "builder"
     && task.status === "in_progress"
     && task.branchName
-    && task.prUrl
+    && (task.prUrl || (run.workflowMode === "local" && task.reviewSubjectSha))
   ) {
     task.status = "builder_review";
     task.assignedAgentRole = "";

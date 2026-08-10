@@ -7,6 +7,7 @@ import {
   reviewPolicyForProject,
   reviewMatchesCurrentCandidate,
   reviewStagesForProject,
+  projectUsesLocalWorkflow,
   VALID_STATUSES,
 } from "./store.js";
 import {
@@ -398,8 +399,14 @@ function taskActions(state, task, options = {}) {
   }
 
   if (task.status === "builder_review") {
-    if (!task.branchName || !task.prUrl) {
-      return [actionBase(state, task, "return_to_builder", "builder", "Builder review intake is incomplete: branch and PR URL are required before reviewer routing.", {
+    const localWorkflow = projectUsesLocalWorkflow(project);
+    const missingReviewEvidence = !task.branchName
+      || (localWorkflow ? !task.reviewSubjectSha : !task.prUrl);
+    if (missingReviewEvidence) {
+      const evidence = localWorkflow
+        ? "branch and exact full subject SHA"
+        : "branch and PR URL";
+      return [actionBase(state, task, "return_to_builder", "builder", `Builder review intake is incomplete: ${evidence} are required before reviewer routing.`, {
         ...options,
         nextStatus: "needs_changes",
       })];

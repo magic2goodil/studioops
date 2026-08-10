@@ -99,6 +99,10 @@ const GITHUB_REMOTE_RECOVERY_DELAYS_MS = [
 const VALID_DELIVERY_MODES = new Set(["functional", "prototype", "visual-only"]);
 const ARCHITECTURE_TASK_PATTERN = /\b(app|application|platform|product|system|dashboard|portal|website|web app|mobile|native|mockup|redesign)\b/i;
 
+export function projectUsesLocalWorkflow(project = {}) {
+  return normalizeProjectWorkflowMode(project.workflowMode || "auto") === "local";
+}
+
 const DEFAULT_REVIEW_PIPELINE = [
   {
     key: "backend",
@@ -2521,14 +2525,20 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   const stages = reviewStagesForProject(project);
   if (task.status === "builder_review") {
     if (!task.reviewCycle) task.reviewCycle = 1;
-    if (!task.branchName || !task.prUrl) {
+    const localWorkflow = projectUsesLocalWorkflow(project);
+    const missingReviewEvidence = !task.branchName
+      || (localWorkflow ? !task.reviewSubjectSha : !task.prUrl);
+    if (missingReviewEvidence) {
       setTaskWorkflowState(state, task, {
         status: "needs_changes",
         assignedAgentRole: "builder",
         reviewerThreadId: "",
       }, now);
-      addAutomationComment(state, task, "Builder review failed intake: task needs both a feature branch and PR URL before reviewers can start.", now, author);
-      actions.push(`${task.id}: missing branch or PR, returned to builder`);
+      const evidence = localWorkflow
+        ? "a feature branch and exact full subject SHA"
+        : "a feature branch and PR URL";
+      addAutomationComment(state, task, `Builder review failed intake: task needs ${evidence} before reviewers can start.`, now, author);
+      actions.push(`${task.id}: missing ${localWorkflow ? "branch or subject SHA" : "branch or PR"}, returned to builder`);
       return actions;
     }
     return routeToNextReviewStage(state, task, stages, now, author, actions);
@@ -2898,7 +2908,7 @@ Builder instructions:
 - Commit and push only if the user/project workflow asks for that.
 - Link the feature branch and pull request on the task when available.
 - Add a task comment with changed files, validation results, known gaps, PR link, and next review step.
-- Move the task to \`builder_review\` only after the branch, PR, exact full head SHA, validation notes, and builder comment are present. Include the SHA as \`--subject-sha\` when updating the task.
+- Move the task to \`builder_review\` only after the branch, exact full head SHA, validation notes, and builder comment are present. GitHub workflows also require the PR URL; local workflows must leave the PR URL empty. Include the SHA as \`--subject-sha\` when updating the task.
 `;
 }
 
