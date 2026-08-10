@@ -30,6 +30,7 @@ import {
   readState,
   renewGitHubRemoteRecoveryProbeLease,
   scheduleGitHubRemoteRecoveryProbeInState,
+  taskHasExactReviewSubject,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
@@ -847,7 +848,9 @@ export function successfulHandoffFailure(state, run, task) {
   if (reviewerRunSupersessionReason(run, task)) return "";
   if (run.group === "builder") {
     if (task.status !== "in_progress" && task.status !== "qa_review") return "";
-    const localReviewSubjectReady = run.workflowMode === "local" && task.branchName && task.reviewSubjectSha;
+    const localReviewSubjectReady = run.workflowMode === "local"
+      && task.branchName
+      && taskHasExactReviewSubject(task);
     if ((task.branchName && task.prUrl || localReviewSubjectReady) && run.actionType !== "qa_integration_blocked") return "";
     if (run.actionType === "qa_integration_blocked" && !BLOCKED_QA_INTEGRATION_STATUSES.has(task.integrationStatus)) return "";
     return "builder_handoff_missing";
@@ -865,7 +868,7 @@ function applySuccessfulHandoff(state, run, task, now) {
     run.group === "builder"
     && task.status === "in_progress"
     && task.branchName
-    && (task.prUrl || (run.workflowMode === "local" && task.reviewSubjectSha))
+    && (task.prUrl || (run.workflowMode === "local" && taskHasExactReviewSubject(task)))
   ) {
     task.status = "builder_review";
     task.assignedAgentRole = "";

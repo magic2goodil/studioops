@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { successfulHandoffFailure } from "../src/runner.js";
-import { createSupervisorReport } from "../src/supervisor.js";
+import { createSupervisorReport, formatSupervisorReport } from "../src/supervisor.js";
 import { automationTick } from "../src/store.js";
 
 const SUBJECT_SHA = "a".repeat(40);
@@ -48,6 +48,12 @@ test("local builder review routes without a PR and dispatches the reviewer lane"
   assert.equal(report.actions[0].type, "start_review");
   assert.equal(report.actions[0].role, "backend-reviewer");
   assert.equal(report.actions[0].prUrl, "");
+  assert.equal(report.actions[0].reviewSubjectSha, SUBJECT_SHA);
+
+  const ownerStatus = formatSupervisorReport(report);
+  assert.match(ownerStatus, new RegExp(`Branch: codex/demo-local`));
+  assert.match(ownerStatus, new RegExp(`Review subject SHA: ${SUBJECT_SHA}`));
+  assert.doesNotMatch(ownerStatus, /PR:/);
 
   await automationTick({ state });
   assert.equal(state.tasks[0].status, "backend_review");
@@ -69,6 +75,18 @@ test("local runner handoff requires the immutable full subject SHA", () => {
   const run = { id: "run_1", group: "builder", workflowMode: "local" };
 
   assert.equal(successfulHandoffFailure(state, run, state.tasks[0]), "");
-  state.tasks[0].reviewSubjectSha = "";
+  state.tasks[0].reviewSubjectSha = SUBJECT_SHA.slice(0, 12);
   assert.equal(successfulHandoffFailure(state, run, state.tasks[0]), "builder_handoff_missing");
+});
+
+test("local automation rejects a malformed review subject SHA", async () => {
+  const state = fixtureState({}, { reviewSubjectSha: SUBJECT_SHA.slice(0, 12) });
+  const report = createSupervisorReport(state);
+
+  assert.equal(report.actions[0].type, "return_to_builder");
+  assert.match(report.actions[0].reason, /exact full subject SHA/);
+
+  await automationTick({ state });
+  assert.equal(state.tasks[0].status, "needs_changes");
+  assert.match(state.comments[0].body, /exact full subject SHA/);
 });

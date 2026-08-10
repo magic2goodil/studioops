@@ -103,6 +103,15 @@ export function projectUsesLocalWorkflow(project = {}) {
   return normalizeProjectWorkflowMode(project.workflowMode || "auto") === "local";
 }
 
+export function taskHasExactReviewSubject(task = {}) {
+  try {
+    normalizeGitSha(task.reviewSubjectSha, "review subject SHA");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const DEFAULT_REVIEW_PIPELINE = [
   {
     key: "backend",
@@ -2527,7 +2536,7 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
     if (!task.reviewCycle) task.reviewCycle = 1;
     const localWorkflow = projectUsesLocalWorkflow(project);
     const missingReviewEvidence = !task.branchName
-      || (localWorkflow ? !task.reviewSubjectSha : !task.prUrl);
+      || (localWorkflow ? !taskHasExactReviewSubject(task) : !task.prUrl);
     if (missingReviewEvidence) {
       setTaskWorkflowState(state, task, {
         status: "needs_changes",

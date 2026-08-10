@@ -8,6 +8,7 @@ import {
   reviewMatchesCurrentCandidate,
   reviewStagesForProject,
   projectUsesLocalWorkflow,
+  taskHasExactReviewSubject,
   VALID_STATUSES,
 } from "./store.js";
 import {
@@ -401,7 +402,7 @@ function taskActions(state, task, options = {}) {
   if (task.status === "builder_review") {
     const localWorkflow = projectUsesLocalWorkflow(project);
     const missingReviewEvidence = !task.branchName
-      || (localWorkflow ? !task.reviewSubjectSha : !task.prUrl);
+      || (localWorkflow ? !taskHasExactReviewSubject(task) : !task.prUrl);
     if (missingReviewEvidence) {
       const evidence = localWorkflow
         ? "branch and exact full subject SHA"
@@ -613,6 +614,7 @@ export function formatSupervisorReport(report) {
     lines.push(`  Task: ${action.taskUrl}`);
     if (action.prUrl) lines.push(`  PR: ${action.prUrl}`);
     if (action.branchName) lines.push(`  Branch: ${action.branchName}`);
+    if (action.reviewSubjectSha) lines.push(`  Review subject SHA: ${action.reviewSubjectSha}`);
     if (action.integrationBranch) lines.push(`  QA branch: ${action.integrationBranch}${action.integrationBranchUrl ? ` (${action.integrationBranchUrl})` : ""}`);
     if (action.integrationStatus) lines.push(`  QA status: ${action.integrationStatus}`);
     if (action.integrationCandidateBranch) lines.push(`  QA candidate: ${action.integrationCandidateBranch}${action.integrationCandidateCommit ? ` at ${action.integrationCandidateCommit}` : ""}`);
