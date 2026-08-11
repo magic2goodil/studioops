@@ -1615,8 +1615,9 @@ export async function recordReview(taskId, input = {}) {
     task.reviewSubjectCycle = candidateCycle;
     const stageIndex = stages.indexOf(stage);
     const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+    const cycleLimitLeadReview = cycleLimitLeadReviewApplies(state, project, task, stage);
     const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
-    if (earliestRequiredStage && stageIndex > earliestRequiredIndex) {
+    if (earliestRequiredStage && stageIndex > earliestRequiredIndex && !cycleLimitLeadReview) {
       throw new Error(
         `${earliestRequiredStage.label || earliestRequiredStage.key} must approve candidate cycle ${candidateCycle} at ${subjectSha} before ${stage.label || stage.key} can continue.`,
       );

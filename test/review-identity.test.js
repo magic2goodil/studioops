@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { dispatchSupervisorActions } from "../src/dispatcher.js";
+import { completeRun, planRunnableRuns } from "../src/runner.js";
 import {
   addProject,
   addTask,
@@ -8,6 +10,7 @@ import {
   recordReview,
   updateTask,
 } from "../src/store.js";
+import { createSupervisorReport } from "../src/supervisor.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const REVIEWER_FIX_SHA = "b".repeat(40);
@@ -253,5 +256,165 @@ test("reviewer commits restart required lanes without consuming a builder review
   assert.deepEqual(
     evidence.reviews.map((review) => review.stageKey),
     ["backend", "frontend", "accessibility", "lead"],
+  );
+});
+
+async function createCycleLimitReviewFixture(key, reviewPolicy = {}) {
+  const project = await addProject({
+    key,
+    name: key,
+    reviewPolicy,
+    reviewPipeline: [
+      {
+        key: "backend",
+        label: "Backend Review",
+        role: "backend-reviewer",
+        status: "backend_review",
+        required: true,
+      },
+      {
+        key: "lead",
+        label: "Primary Lead Review",
+        role: "lead-reviewer",
+        status: "lead_review",
+        required: true,
+      },
+    ],
+  });
+  const task = await addTask({
+    project: project.id,
+    title: `${key} task`,
+    status: "in_progress",
+    type: "bug",
+  });
+
+  await updateTask(task.id, {
+    status: "builder_review",
+    branchName: `codex/${key}`,
+    prUrl: `https://github.com/example/${key}/pull/1`,
+    subjectSha: SUBJECT_SHA,
+  });
+  await recordReview(task.id, {
+    stage: "backend",
+    outcome: "changes_requested",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+  });
+  await updateTask(task.id, { status: "builder_review", subjectSha: REVIEWER_FIX_SHA });
+  await recordReview(task.id, {
+    stage: "backend",
+    outcome: "changes_requested",
+    subjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+  });
+  return task;
+}
+
+test("cycle-limit lead can record changes_requested after an earlier rejection", async () => {
+  const task = await createCycleLimitReviewFixture("cycle-limit-lead-changes", {
+    maxBuilderReviewCycles: 2,
+    leadOwnsFinalDecisionAtLimit: true,
+  });
+
+  const supervisor = createSupervisorReport(await readState());
+  const action = supervisor.actions.find((item) => item.taskId === task.id);
+  assert.equal(action.type, "continue_review");
+  assert.equal(action.role, "lead-reviewer");
+  const dispatch = await dispatchSupervisorActions([action]);
+  assert.equal(dispatch.runs.length, 1);
+  assert.equal(
+    planRunnableRuns(await readState()).runnable.some((run) => run.id === dispatch.runs[0].id),
+    true,
+  );
+
+  const result = await recordReview(task.id, {
+    stage: "lead",
+    outcome: "changes_requested",
+    subjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+    body: "Final decision requires owner attention.",
+  });
+
+  const completed = await completeRun(dispatch.runs[0].id, { status: "completed" });
+  assert.equal(result.review.stageKey, "lead");
+  assert.equal(result.review.outcome, "changes_requested");
+  assert.equal(completed.status, "completed");
+  assert.notEqual(completed.exitCode, "review_outcome_missing");
+  const state = await readState();
+  const updated = state.tasks.find((item) => item.id === task.id);
+  assert.equal(updated.status, "user_review");
+  assert.equal(updated.assignedAgentRole, "owner");
+});
+
+test("cycle-limit lead approval follows the configured trusted QA route", async () => {
+  const task = await createCycleLimitReviewFixture("cycle-limit-lead-qa", {
+    maxBuilderReviewCycles: 2,
+    leadOwnsFinalDecisionAtLimit: true,
+    trustLeadApprovals: true,
+    integrationBranch: "qa/cycle-limit-lead",
+  });
+
+  const result = await recordReview(task.id, {
+    stage: "lead",
+    outcome: "approved",
+    subjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+  });
+
+  assert.equal(result.review.stageKey, "lead");
+  const state = await readState();
+  const updated = state.tasks.find((item) => item.id === task.id);
+  assert.equal(updated.status, "qa_review");
+  assert.equal(updated.assignedAgentRole, "owner");
+  assert.equal(updated.integrationBranch, "qa/cycle-limit-lead");
+});
+
+test("lead cannot bypass an earlier rejection before the cycle limit", async () => {
+  const project = await addProject({
+    key: "pre-limit-lead-ordering",
+    name: "Pre-limit lead ordering",
+    reviewPipeline: [
+      {
+        key: "backend",
+        label: "Backend Review",
+        role: "backend-reviewer",
+        status: "backend_review",
+        required: true,
+      },
+      {
+        key: "lead",
+        label: "Primary Lead Review",
+        role: "lead-reviewer",
+        status: "lead_review",
+        required: true,
+      },
+    ],
+    reviewPolicy: {
+      maxBuilderReviewCycles: 2,
+      leadOwnsFinalDecisionAtLimit: true,
+    },
+  });
+  const task = await addTask({ project: project.id, title: "Pre-limit task", status: "in_progress", type: "bug" });
+  await updateTask(task.id, {
+    status: "builder_review",
+    branchName: "codex/pre-limit-lead-ordering",
+    prUrl: "https://github.com/example/pre-limit-lead-ordering/pull/1",
+    subjectSha: SUBJECT_SHA,
+  });
+  await recordReview(task.id, {
+    stage: "backend",
+    outcome: "changes_requested",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+  });
+
+  await assert.rejects(
+    recordReview(task.id, {
+      stage: "lead",
+      outcome: "approved",
+      subjectSha: SUBJECT_SHA,
+      candidateCycle: 1,
+    }),
+    /Backend Review must approve candidate cycle 1/,
   );
 });
