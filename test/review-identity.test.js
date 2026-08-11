@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { dispatchSupervisorActions } from "../src/dispatcher.js";
+import { completeRun, planRunnableRuns } from "../src/runner.js";
 import {
   addProject,
   addTask,
@@ -8,6 +10,7 @@ import {
   recordReview,
   updateTask,
 } from "../src/store.js";
+import { createSupervisorReport } from "../src/supervisor.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const REVIEWER_FIX_SHA = "b".repeat(40);
@@ -313,6 +316,17 @@ test("cycle-limit lead can record changes_requested after an earlier rejection",
     leadOwnsFinalDecisionAtLimit: true,
   });
 
+  const supervisor = createSupervisorReport(await readState());
+  const action = supervisor.actions.find((item) => item.taskId === task.id);
+  assert.equal(action.type, "continue_review");
+  assert.equal(action.role, "lead-reviewer");
+  const dispatch = await dispatchSupervisorActions([action]);
+  assert.equal(dispatch.runs.length, 1);
+  assert.equal(
+    planRunnableRuns(await readState()).runnable.some((run) => run.id === dispatch.runs[0].id),
+    true,
+  );
+
   const result = await recordReview(task.id, {
     stage: "lead",
     outcome: "changes_requested",
@@ -321,8 +335,11 @@ test("cycle-limit lead can record changes_requested after an earlier rejection",
     body: "Final decision requires owner attention.",
   });
 
+  const completed = await completeRun(dispatch.runs[0].id, { status: "completed" });
   assert.equal(result.review.stageKey, "lead");
   assert.equal(result.review.outcome, "changes_requested");
+  assert.equal(completed.status, "completed");
+  assert.notEqual(completed.exitCode, "review_outcome_missing");
   const state = await readState();
   const updated = state.tasks.find((item) => item.id === task.id);
   assert.equal(updated.status, "user_review");
