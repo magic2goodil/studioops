@@ -255,3 +255,109 @@ test("reviewer commits restart required lanes without consuming a builder review
     ["backend", "frontend", "accessibility", "lead"],
   );
 });
+
+async function createCycleLimitLeadDecisionTask(key) {
+  const project = await addProject({
+    key,
+    name: "Cycle-limit lead decisions",
+    repoPath: `/tmp/${key}`,
+    reviewPipeline: [
+      {
+        key: "backend",
+        label: "Backend Review",
+        role: "backend-reviewer",
+        status: "backend_review",
+        required: true,
+      },
+      {
+        key: "lead",
+        label: "Primary Lead Review",
+        role: "lead-reviewer",
+        status: "lead_review",
+        required: true,
+      },
+    ],
+    reviewPolicy: {
+      maxBuilderReviewCycles: 1,
+      leadOwnsFinalDecisionAtLimit: true,
+    },
+  });
+  const task = await addTask({
+    project: project.id,
+    title: "Cycle-limit lead decision",
+    status: "in_progress",
+    type: "bug",
+  });
+  await updateTask(task.id, {
+    status: "builder_review",
+    branchName: `codex/${key}`,
+    prUrl: `https://github.com/example/${key}/pull/1`,
+    subjectSha: SUBJECT_SHA,
+  });
+  return task;
+}
+
+test("cycle-limit lead changes_requested is accepted after backend changes_requested", async () => {
+  const task = await createCycleLimitLeadDecisionTask("lead-cycle-limit-changes");
+
+  await recordReview(task.id, {
+    stage: "backend",
+    outcome: "changes_requested",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+    body: "Backend finding remains unresolved.",
+  });
+
+  let state = await readState();
+  let updated = state.tasks.find((item) => item.id === task.id);
+  assert.equal(updated.status, "lead_review");
+
+  await recordReview(task.id, {
+    stage: "lead",
+    outcome: "changes_requested",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+    body: "Human owner should decide whether to accept the residual risk.",
+  });
+
+  state = await readState();
+  updated = state.tasks.find((item) => item.id === task.id);
+  assert.equal(updated.status, "user_review");
+  assert.equal(updated.assignedAgentRole, "owner");
+  assert.deepEqual(
+    state.reviews.filter((review) => review.taskId === task.id).map((review) => review.stageKey),
+    ["backend", "lead"],
+  );
+  assert.equal(
+    state.reviews.find((review) => review.taskId === task.id && review.stageKey === "lead")?.outcome,
+    "changes_requested",
+  );
+});
+
+test("cycle-limit lead approval is accepted with residual risk after backend changes_requested", async () => {
+  const task = await createCycleLimitLeadDecisionTask("lead-cycle-limit-approval");
+
+  await recordReview(task.id, {
+    stage: "backend",
+    outcome: "changes_requested",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+  });
+  await recordReview(task.id, {
+    stage: "lead",
+    outcome: "approved",
+    subjectSha: SUBJECT_SHA,
+    candidateCycle: 1,
+    body: "Approved with residual risk documented for the owner.",
+  });
+
+  const state = await readState();
+  const updated = state.tasks.find((item) => item.id === task.id);
+  assert.equal(updated.status, "user_review");
+  assert.equal(updated.assignedAgentRole, "owner");
+  const leadReview = state.reviews.find((review) => review.taskId === task.id && review.stageKey === "lead");
+  assert.equal(leadReview?.outcome, "approved");
+  assert.equal(leadReview?.subjectSha, SUBJECT_SHA);
+  assert.equal(leadReview?.candidateCycle, 1);
+  assert.match(leadReview?.body || "", /residual risk/);
+});
