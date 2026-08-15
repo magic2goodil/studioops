@@ -112,10 +112,16 @@ export async function verifyLocalCandidate(root, identity, options = {}) {
   return { candidatePath, commitSha: commit, treeSha: tree, baseSha: parent };
 }
 
+export async function inspectLocalWorkspaceCandidate(workspacePath) {
+  return {
+    commitSha: await git(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: workspacePath }),
+    treeSha: await git(["rev-parse", "--verify", "HEAD^{tree}"], { cwd: workspacePath }),
+    baseSha: await git(["rev-parse", "--verify", "HEAD^1"], { cwd: workspacePath }),
+  };
+}
+
 export async function materializeLocalCandidate({ workspacePath, root, identity, branch, taskId, log }) {
-  const commitSha = await git(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: workspacePath });
-  const treeSha = await git(["rev-parse", "--verify", "HEAD^{tree}"], { cwd: workspacePath });
-  const baseSha = await git(["rev-parse", "--verify", "HEAD^1"], { cwd: workspacePath });
+  const { commitSha, treeSha, baseSha } = await inspectLocalWorkspaceCandidate(workspacePath);
   const candidateCycle = Math.max(1, Number(identity?.candidateCycle || 0));
   const candidateIdentity = { commitSha, treeSha, baseSha, branch: branch || "", candidateCycle, taskId };
   const artifactRef = localCandidateRef(candidateIdentity);
@@ -180,8 +186,9 @@ export async function prepareLocalWorkspace({ sourceRepoPath, workspacePath, bra
   await git(["checkout", "-B", branch, startSha], { cwd: workspacePath, env });
   await configureRemotes(workspacePath, originUrl, candidatePath);
   if (candidatePath) {
+    const actualHead = await git(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: workspacePath });
     const actualTree = await git(["rev-parse", "--verify", "HEAD^{tree}"], { cwd: workspacePath });
-    if (actualTree !== identity.treeSha) throw failure("local_candidate_tree_mismatch", "The isolated workspace tree differs from the recorded candidate tree.", "Repair or rematerialize the candidate before retrying review.");
+    if (actualHead !== identity.commitSha || actualTree !== identity.treeSha) throw failure("local_candidate_tree_mismatch", "The isolated workspace HEAD or tree differs from the recorded candidate identity.", "Repair or rematerialize the candidate before retrying review.");
   }
   log?.write(`Workspace strategy: isolated local candidate clone${candidatePath ? "" : " from local source"}\n`);
   return { candidatePath, startSha };

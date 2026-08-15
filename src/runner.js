@@ -38,6 +38,7 @@ import { readDiskAvailability } from "./worker-heartbeat.js";
 import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode } from "./config.js";
 import {
+  inspectLocalWorkspaceCandidate,
   localGitEnv,
   materializeLocalCandidate,
   prepareLocalWorkspace,
@@ -917,7 +918,7 @@ export function successfulHandoffFailure(state, run, task) {
   return "";
 }
 
-function applySuccessfulHandoff(state, run, task, now) {
+function applySuccessfulHandoff(state, run, task, now, options = {}) {
   if (!task) return;
   task.retryNotBefore = "";
   task.lastAutomationFailure = "";
@@ -932,7 +933,9 @@ function applySuccessfulHandoff(state, run, task, now) {
     task.status = "builder_review";
     task.assignedAgentRole = "";
     task.reviewerThreadId = "";
-    task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+    if (!options.preserveBuilderReviewCycle) {
+      task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+    }
     task.updatedAt = now;
   }
 }
@@ -1345,7 +1348,7 @@ export async function completeRun(runId, input = {}) {
           run.exitCode = handoffFailure;
           run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
         } else {
-          applySuccessfulHandoff(state, run, task, now);
+          applySuccessfulHandoff(state, run, task, now, input);
         }
       }
     }
@@ -1385,24 +1388,29 @@ export async function completeRun(runId, input = {}) {
 }
 
 export async function completeRunAfterExecution(run, input, executionRun = run) {
+  let preserveBuilderReviewCycle = false;
   if (input.status === "completed" && run.workflowMode === "local" && run.group === "builder") {
     try {
       const root = input.workspaceRoot
         || process.env.STUDIOOPS_WORKSPACE_ROOT
         || process.env.MISSION_CONTROL_WORKSPACE_ROOT
         || DEFAULT_WORKSPACE_ROOT;
-      const cycle = ["start_builder_fix", "return_to_builder"].includes(run.actionType)
+      const previousIdentity = candidateIdentityForRun(run);
+      const workspaceIdentity = await inspectLocalWorkspaceCandidate(executionRun.project?.repoPath || run.workspacePath);
+      const sourceTreeChanged = !previousIdentity.treeSha || previousIdentity.treeSha !== workspaceIdentity.treeSha;
+      const cycle = ["start_builder_fix", "return_to_builder"].includes(run.actionType) && sourceTreeChanged
         ? Math.max(1, Number(run.candidateCycle || 0) + 1)
         : Math.max(1, Number(run.candidateCycle || 0));
       const identity = await materializeLocalCandidate({
         workspacePath: executionRun.project?.repoPath || run.workspacePath,
         root,
-        identity: { ...candidateIdentityForRun(run), candidateCycle: cycle },
+        identity: { ...previousIdentity, candidateCycle: cycle },
         branch: run.branchName,
         taskId: run.taskId,
         log: input.log,
       });
       identity.candidateCycle = cycle;
+      preserveBuilderReviewCycle = !sourceTreeChanged && Number(run.candidateCycle || 0) > 0;
       const mutate = input.state ? async (mutator) => mutator(input.state) : mutateState;
       await mutate(async (state) => {
         const task = findTask(state, run.taskId);
@@ -1430,7 +1438,7 @@ export async function completeRunAfterExecution(run, input, executionRun = run) 
       });
     }
   }
-  return completeRun(run.id, input);
+  return completeRun(run.id, { ...input, preserveBuilderReviewCycle });
 }
 
 export async function reconcileStaleRuns(input = {}) {

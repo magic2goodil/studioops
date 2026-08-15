@@ -499,6 +499,73 @@ test("successful local builder completion materializes under the configured work
   }
 });
 
+test("unchanged local builder-fix trees preserve candidate and builder-review cycles", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-local-builder-metadata-repair-"));
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["checkout", "-b", "codex/demo-task_1"]);
+    await writeFile(path.join(repoPath, "candidate.txt"), "candidate\n", "utf8");
+    await git(repoPath, ["add", "candidate.txt"]);
+    await git(repoPath, ["commit", "-m", "Candidate"]);
+    const workspaceRoot = path.join(root, "configured-workspaces");
+    const candidateIdentity = await materializeLocalCandidate({
+      workspacePath: repoPath,
+      root: workspaceRoot,
+      branch: "codex/demo-task_1",
+      taskId: "task_1",
+      identity: { candidateCycle: 2 },
+    });
+    const run = {
+      id: "run_local_builder_fix",
+      taskId: "task_1",
+      projectId: "project_1",
+      group: "builder",
+      role: "builder",
+      actionType: "start_builder_fix",
+      status: "running",
+      workflowMode: "local",
+      branchName: candidateIdentity.branch,
+      candidateCycle: 2,
+      reviewSubjectSha: candidateIdentity.commitSha,
+      candidateIdentity,
+      project: { id: "project_1", key: "demo", repoPath },
+    };
+    const state = {
+      projects: [run.project],
+      tasks: [{
+        id: "task_1",
+        projectId: "project_1",
+        status: "in_progress",
+        branchName: run.branchName,
+        reviewCycle: 2,
+        reviewSubjectCycle: 2,
+        reviewSubjectSha: candidateIdentity.commitSha,
+        candidateIdentity,
+      }],
+      runs: [run],
+      comments: [],
+      events: [],
+    };
+
+    const completed = await completeRunAfterExecution(run, {
+      status: "completed",
+      exitCode: 0,
+      state,
+      workspaceRoot,
+    }, run);
+
+    assert.equal(completed.status, "completed");
+    assert.equal(state.tasks[0].status, "builder_review");
+    assert.equal(state.tasks[0].reviewCycle, 2);
+    assert.equal(state.tasks[0].reviewSubjectCycle, 2);
+    assert.equal(state.tasks[0].candidateIdentity.candidateCycle, 2);
+    assert.equal(state.tasks[0].candidateIdentity.commitSha, candidateIdentity.commitSha);
+    assert.equal(state.tasks[0].candidateIdentity.operationalLocalArtifactRef, candidateIdentity.operationalLocalArtifactRef);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("github preflight validates credentials and remote access without using a real network", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-github-runner-"));
   try {
