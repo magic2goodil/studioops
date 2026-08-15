@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   buildExactShaEvidence,
   assertExactShaEvidenceEnvironment,
@@ -13,7 +17,10 @@ import {
   validateRepositoryDependencies,
   validateSurfaceCoverage,
   validateTrackedSurfaceCoverage,
+  verifyExactShaEvidenceAgainstGit,
 } from "../src/impact-manifest.js";
+
+const execFileAsync = promisify(execFile);
 
 const manifest = validateOwnershipManifest(JSON.parse(await readFile("config/component-ownership.json", "utf8")));
 
@@ -175,4 +182,43 @@ test("exact-SHA evidence binds classification, commands, environment, retries, s
     }),
     /affected components do not match/,
   );
+});
+
+test("task evidence is verified against the manifest and diff stored at its exact Git SHA", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-impact-evidence-"));
+  try {
+    await execFileAsync("git", ["init"], { cwd: root });
+    await execFileAsync("git", ["config", "user.email", "studioops-test@example.com"], { cwd: root });
+    await execFileAsync("git", ["config", "user.name", "StudioOps Test"], { cwd: root });
+    await mkdir(path.join(root, "config"), { recursive: true });
+    await mkdir(path.join(root, "public"), { recursive: true });
+    await writeFile(path.join(root, "config", "component-ownership.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+    await writeFile(path.join(root, "public", "app.js"), "export const version = 1;\n");
+    await execFileAsync("git", ["add", "."], { cwd: root });
+    await execFileAsync("git", ["commit", "-m", "base"], { cwd: root });
+    const baseSha = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
+
+    await writeFile(path.join(root, "public", "app.js"), "export const version = 2;\n");
+    await execFileAsync("git", ["commit", "-am", "candidate"], { cwd: root });
+    const headSha = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
+    const treeSha = (await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root })).stdout.trim();
+    const classification = classifyChangedPaths(manifest, ["public/app.js"]);
+    const evidence = buildExactShaEvidence({
+      sourceSha: headSha,
+      classification,
+      commandResults: [{ command: "npm run check", ok: true, output: "passed", durationMs: 1 }],
+    });
+
+    const verified = await verifyExactShaEvidenceAgainstGit(root, baseSha, headSha, evidence, {
+      expectedTreeSha: treeSha,
+    });
+    assert.equal(verified.sourceSha, headSha);
+    assert.equal(verified.treeSha, treeSha);
+    await assert.rejects(
+      () => verifyExactShaEvidenceAgainstGit(root, baseSha, "f".repeat(40), evidence),
+      /different source SHA/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

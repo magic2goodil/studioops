@@ -329,6 +329,82 @@ export async function classifyGitImpact(repoPath, baseSha, headSha, options = {}
   return classifyChangedPaths(loaded.manifest, paths, options);
 }
 
+async function loadOwnershipManifestAtRef(repoPath, headSha, manifestPath = DEFAULT_OWNERSHIP_MANIFEST_PATH, options = {}) {
+  const normalizedHeadSha = normalizeSha(headSha, "ownership manifest source SHA");
+  const normalizedManifestPath = normalizePattern(manifestPath, "ownership manifest path");
+  let parsed;
+  try {
+    const result = await execFileAsync(options.gitBin || "git", [
+      "show", `${normalizedHeadSha}:${normalizedManifestPath}`,
+    ], {
+      cwd: repoPath,
+      timeout: Number(options.timeoutMs || 60_000),
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    parsed = JSON.parse(result.stdout);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error(`Ownership manifest at ${normalizedHeadSha} is malformed: ${error.message}`);
+    }
+    throw new Error(`Ownership manifest is unavailable at ${normalizedHeadSha}:${normalizedManifestPath}.`);
+  }
+  const manifest = validateOwnershipManifest(parsed);
+  return {
+    path: normalizedManifestPath,
+    manifest,
+    digest: ownershipManifestDigest(manifest),
+  };
+}
+
+export function exactShaEvidenceDigest(input) {
+  const evidence = normalizeExactShaEvidence(input);
+  return `sha256:${createHash("sha256").update(canonicalManifestJson(evidence)).digest("hex")}`;
+}
+
+export async function verifyExactShaEvidenceAgainstGit(repoPath, baseSha, headSha, input, options = {}) {
+  const normalizedBaseSha = normalizeSha(baseSha, "evidence base SHA");
+  const normalizedHeadSha = normalizeSha(headSha, "evidence head SHA");
+  const evidence = normalizeExactShaEvidence(input, { sourceSha: normalizedHeadSha });
+  const [changedPaths, loaded, treeResult] = await Promise.all([
+    gitChangedPaths(repoPath, normalizedBaseSha, normalizedHeadSha, options),
+    loadOwnershipManifestAtRef(repoPath, normalizedHeadSha, options.manifestPath, options),
+    execFileAsync(options.gitBin || "git", ["rev-parse", `${normalizedHeadSha}^{tree}`], {
+      cwd: repoPath,
+      timeout: Number(options.timeoutMs || 60_000),
+      maxBuffer: 1024 * 1024,
+    }),
+  ]);
+  if (loaded.digest !== evidence.manifestDigest) {
+    throw new Error("Exact-SHA evidence manifest does not match the manifest stored at the source SHA.");
+  }
+  const classification = classifyChangedPaths(loaded.manifest, changedPaths);
+  const sameList = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  const fields = ["changedPaths", "affectedComponents", "selectedComponents", "fullRegressionReasons"];
+  for (const field of fields) {
+    if (!sameList(evidence[field], classification[field])) {
+      throw new Error(`Exact-SHA evidence ${field} does not match repository-derived classification.`);
+    }
+  }
+  for (const flag of ["unknown", "shared", "ambiguous", "multiComponent", "fullRegression"]) {
+    if (evidence[flag] !== classification[flag]) {
+      throw new Error(`Exact-SHA evidence ${flag} does not match repository-derived classification.`);
+    }
+  }
+  const treeSha = String(treeResult.stdout || "").trim().toLowerCase();
+  if (options.expectedTreeSha && treeSha !== normalizeSha(options.expectedTreeSha, "expected evidence tree SHA")) {
+    throw new Error("Exact-SHA evidence source tree does not match the submitted candidate tree.");
+  }
+  return {
+    baseSha: normalizedBaseSha,
+    sourceSha: normalizedHeadSha,
+    treeSha,
+    manifestDigest: loaded.digest,
+    evidenceDigest: exactShaEvidenceDigest(evidence),
+    classification,
+    evidence,
+  };
+}
+
 export function validateDependencyEdges(manifestInput, edges = []) {
   const manifest = validateOwnershipManifest(manifestInput);
   const violations = [];

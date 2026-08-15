@@ -15,6 +15,7 @@ import {
 import { planDispatches } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
+import { exactShaEvidenceDigest } from "../src/impact-manifest.js";
 
 const MANIFEST_DIGEST = `sha256:${"9".repeat(64)}`;
 
@@ -94,6 +95,68 @@ test("normalized task impact retains verified exact-SHA evidence", () => {
   assert.deepEqual(evidence.affectedComponents, validationEvidence.affectedComponents);
   assert.equal(evidence.manifestDigest, validationEvidence.manifestDigest);
   assert.deepEqual(evidence.validationEvidence, validationEvidence);
+});
+
+test("cross-SHA and repository-unverified exact-SHA evidence fail closed for review routing", () => {
+  const sourceSha = "a".repeat(40);
+  const subjectSha = "b".repeat(40);
+  const validationEvidence = exactShaEvidenceFixture(sourceSha);
+  const project = { deliveryPolicy: { profile: "prototype-fast-lane" } };
+  const baseTask = {
+    reviewSubjectSha: subjectSha,
+    reviewSubjectCycle: 1,
+    impactEvidence: { validationEvidence },
+    candidateIdentity: {
+      commitSha: subjectSha,
+      treeSha: "c".repeat(40),
+      baseSha: "d".repeat(40),
+      branch: "feature/cross-sha",
+      candidateCycle: 1,
+      impactEvidence: { validationEvidence },
+    },
+  };
+
+  const crossSha = capabilityRoutingForTask(project, baseTask);
+  assert.deepEqual(crossSha.required, ["backend", "frontend", "accessibility", "lead"]);
+  assert.match(crossSha.evidence.validationEvidenceError, /different source SHA/);
+
+  const matchingEvidence = exactShaEvidenceFixture(subjectSha);
+  const unverified = capabilityRoutingForTask(project, {
+    ...baseTask,
+    impactEvidence: { validationEvidence: matchingEvidence },
+    candidateIdentity: {
+      ...baseTask.candidateIdentity,
+      impactEvidence: { validationEvidence: matchingEvidence },
+    },
+  });
+  assert.deepEqual(unverified.required, ["backend", "frontend", "accessibility", "lead"]);
+  assert.ok(unverified.evidence.fullRegressionReasons.includes("unverified_repository_classification"));
+
+  const verified = capabilityRoutingForTask(project, {
+    ...baseTask,
+    impactEvidence: {
+      validationEvidence: matchingEvidence,
+      changedFiles: ["public/forged.js"],
+      affectedComponents: ["browser-ui"],
+      selectedComponents: ["browser-ui"],
+    },
+    candidateIdentity: {
+      ...baseTask.candidateIdentity,
+      impactEvidence: { validationEvidence: matchingEvidence },
+    },
+    impactEvidenceRepositoryVerification: {
+      ok: true,
+      sourceSha: subjectSha,
+      baseSha: "d".repeat(40),
+      treeSha: "c".repeat(40),
+      manifestDigest: matchingEvidence.manifestDigest,
+      evidenceDigest: exactShaEvidenceDigest(matchingEvidence),
+    },
+  });
+  assert.deepEqual(verified.required, ["backend", "lead"]);
+  assert.deepEqual(verified.evidence.changedFiles, ["src/store.js"]);
+  assert.deepEqual(verified.evidence.affectedComponents, ["control-plane-core"]);
+  assert.equal(verified.evidence.validationEvidenceError, "");
 });
 
 test("explicit local mode requires a verified candidate while GitHub requires an exact subject", () => {
