@@ -1357,7 +1357,6 @@ export async function updateTask(taskId, patch) {
     const candidateIdentityMateriallyChanged = previousReviewSubjectSha
       && previousReviewSubjectSha === task.reviewSubjectSha
       && candidateIdentityIsComplete(candidateIdentityBeforePatch)
-      && candidateIdentityIsComplete(candidateIdentityAfterPatch)
       && !candidateMaterialMatches(candidateIdentityBeforePatch, candidateIdentityAfterPatch);
     if (candidateIdentityMateriallyChanged) {
       restartReviewsForSubjectChange(
@@ -1367,7 +1366,10 @@ export async function updateTask(taskId, patch) {
         previousReviewSubjectSha,
         task.reviewSubjectSha,
         new Date().toISOString(),
-        { candidateIdentityChanged: true },
+        {
+          candidateIdentityChanged: true,
+          candidateIdentityIncomplete: !candidateIdentityIsComplete(candidateIdentityAfterPatch),
+        },
       );
     }
     task.candidateIdentity = candidateIdentityForTask(task);
@@ -2587,6 +2589,7 @@ function setTaskWorkflowState(state, task, patch, now) {
 
 function restartReviewsForSubjectChange(state, task, project, previousSha, subjectSha, now, options = {}) {
   const candidateIdentityChanged = options.candidateIdentityChanged === true;
+  const candidateIdentityIncomplete = options.candidateIdentityIncomplete === true;
   if (!options.preserveCandidateCycle) {
     task.reviewSubjectCycle = Math.max(
       currentReviewCandidateCycle(task),
@@ -2621,7 +2624,13 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
   task.promotionStatus = "";
   const firstRequiredStage = reviewStagesForTask(project, task)
     .find((stage) => stage.required !== false);
-  if (firstRequiredStage) {
+  if (candidateIdentityIncomplete) {
+    setTaskWorkflowState(state, task, {
+      status: "needs_changes",
+      assignedAgentRole: "builder",
+      reviewerThreadId: "",
+    }, now);
+  } else if (firstRequiredStage) {
     setTaskWorkflowState(state, task, {
       status: firstRequiredStage.status,
       assignedAgentRole: firstRequiredStage.role,
@@ -2645,7 +2654,7 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
     state,
     task,
     candidateIdentityChanged
-      ? `Candidate identity changed while the subject SHA remained ${subjectSha}. Prior candidate-cycle approvals and capability skips are stale, so StudioOps restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.`
+      ? `Candidate identity changed while the subject SHA remained ${subjectSha}. Prior candidate-cycle approvals and capability skips are stale, so StudioOps ${candidateIdentityIncomplete ? "returned the task to the builder because the candidate identity is incomplete" : `restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"}`} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.`
       : `Review subject changed from ${previousSha} to ${subjectSha}. Prior candidate-cycle approvals are stale, so StudioOps restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.${options.preserveCandidateCycle ? " The verified tree, base, branch, and impact evidence are unchanged, so this metadata-only repair did not consume a candidate cycle." : ""}`,
     now,
   );

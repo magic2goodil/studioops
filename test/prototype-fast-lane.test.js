@@ -269,4 +269,21 @@ test("material impact changes invalidate same-SHA capability skips and start a n
     )),
     true,
   );
+
+  await updateTask(task.id, { impactEvidence: {} });
+  state = await readState();
+  current = state.tasks.find((item) => item.id === task.id);
+  assert.equal(current.reviewSubjectSha, sha);
+  assert.equal(current.reviewCycle, 1);
+  assert.equal(current.reviewSubjectCycle, 3);
+  assert.equal(current.status, "needs_changes");
+  assert.equal(current.assignedAgentRole, "builder");
+  assert.equal(candidateIdentityIsComplete(current.candidateIdentity), false);
+  assert.equal(
+    state.reviews.some((review) => (
+      review.taskId === task.id
+      && Number(review.candidateCycle) === 3
+    )),
+    false,
+  );
 });
