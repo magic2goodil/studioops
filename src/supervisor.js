@@ -10,6 +10,8 @@ import {
   reviewPolicyForProject,
   reviewMatchesCurrentCandidate,
   reviewStagesForTask,
+  projectUsesLocalWorkflow,
+  taskHasExactReviewSubject,
   VALID_STATUSES,
 } from "./store.js";
 import {
@@ -410,19 +412,22 @@ function taskActions(state, task, options = {}) {
   }
 
   if (task.status === "builder_review") {
-    const localMode = String(project.workflowMode || "").toLowerCase() === "local";
+    const localMode = projectUsesLocalWorkflow(project);
     const githubMode = String(project.workflowMode || "").toLowerCase() === "github";
     const candidateIdentity = candidateIdentityForTask(task);
     const identityMissing = !candidateIdentityIsComplete(candidateIdentity);
-    const requiresVerifiedCandidateIdentity = localMode
-      || capabilityRoutingForTask(project, task).policy.profile === "prototype-fast-lane";
+    const requiresVerifiedCandidateIdentity = capabilityRoutingForTask(project, task).policy.profile === "prototype-fast-lane";
+    const exactSubjectMissing = (localMode || githubMode) && !taskHasExactReviewSubject(task);
     const intakeMissing = !task.branchName
-      || (!localMode && (!task.prUrl || (githubMode && !task.reviewSubjectSha)))
+      || (localMode ? !taskHasExactReviewSubject(task) : !task.prUrl)
+      || exactSubjectMissing
       || (requiresVerifiedCandidateIdentity && identityMissing);
     if (intakeMissing) {
-      const reason = requiresVerifiedCandidateIdentity
-        ? "Builder review intake is incomplete: this workflow requires a branch and verified full candidate identity (commit, tree, base, branch, cycle, and current impact evidence)."
-        : "Builder review intake is incomplete: GitHub mode requires a branch, PR URL, and exact subject SHA candidate identity before reviewer routing.";
+      const reason = exactSubjectMissing
+        ? "Builder review intake is incomplete: this workflow requires a branch and exact full subject SHA before reviewer routing."
+        : requiresVerifiedCandidateIdentity
+          ? "Builder review intake is incomplete: the prototype fast lane requires a branch and verified full candidate identity (commit, tree, base, branch, cycle, and current impact evidence)."
+          : "Builder review intake is incomplete: GitHub mode requires a branch and PR URL before reviewer routing.";
       return [actionBase(state, task, "return_to_builder", "builder", reason, {
         ...options,
         nextStatus: "needs_changes",
@@ -630,6 +635,7 @@ export function formatSupervisorReport(report) {
     lines.push(`  Task: ${action.taskUrl}`);
     if (action.prUrl) lines.push(`  PR: ${action.prUrl}`);
     if (action.branchName) lines.push(`  Branch: ${action.branchName}`);
+    if (action.reviewSubjectSha) lines.push(`  Review subject SHA: ${action.reviewSubjectSha}`);
     if (action.integrationBranch) lines.push(`  QA branch: ${action.integrationBranch}${action.integrationBranchUrl ? ` (${action.integrationBranchUrl})` : ""}`);
     if (action.integrationStatus) lines.push(`  QA status: ${action.integrationStatus}`);
     if (action.integrationCandidateBranch) lines.push(`  QA candidate: ${action.integrationCandidateBranch}${action.integrationCandidateCommit ? ` at ${action.integrationCandidateCommit}` : ""}`);
