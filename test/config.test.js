@@ -1,0 +1,62 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  effectiveAutomationCapacity,
+  normalizeConfig,
+  projectFromConfig,
+} from "../src/config.js";
+
+test("missing installed automation capacity normalizes to three builders, reviewers, and runners", () => {
+  const config = normalizeConfig({ defaults: {} });
+
+  assert.equal(config.defaults.dispatcher.builderConcurrency, 3);
+  assert.equal(config.defaults.dispatcher.reviewerConcurrency, 3);
+  assert.equal(config.defaults.runner.limit, 3);
+  assert.deepEqual(effectiveAutomationCapacity(config), {
+    builderConcurrency: 3,
+    reviewerConcurrency: 3,
+    runnerLimit: 3,
+  });
+});
+
+test("intentional lower positive automation limits remain the effective configured capacity", () => {
+  const config = normalizeConfig({
+    defaults: {
+      dispatcher: { builderConcurrency: 1, reviewerConcurrency: 2 },
+      runner: { limit: 1 },
+    },
+  });
+
+  assert.equal(config.defaults.dispatcher.builderConcurrency, 1);
+  assert.equal(config.defaults.dispatcher.reviewerConcurrency, 2);
+  assert.equal(config.defaults.runner.limit, 1);
+  assert.deepEqual(effectiveAutomationCapacity(config), {
+    builderConcurrency: 1,
+    reviewerConcurrency: 2,
+    runnerLimit: 1,
+  });
+});
+
+test("top-level installed overrides determine effective capacity without rewriting defaults", () => {
+  const config = normalizeConfig({
+    defaults: {},
+    dispatcher: { builderConcurrency: 2, reviewerConcurrency: 1 },
+    runner: { maxRuns: 2 },
+  });
+
+  assert.deepEqual(effectiveAutomationCapacity(config), {
+    builderConcurrency: 2,
+    reviewerConcurrency: 1,
+    runnerLimit: 2,
+  });
+});
+
+test("project-level prototype fast lane policy survives config import", () => {
+  const project = projectFromConfig({
+    key: "prototype",
+    name: "Prototype",
+    deliveryPolicy: { profile: "prototype-fast-lane" },
+  });
+
+  assert.deepEqual(project.deliveryPolicy, { profile: "prototype-fast-lane" });
+});

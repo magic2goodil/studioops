@@ -160,6 +160,14 @@ Use the generated domain reviewer prompts. The reviewer should:
 
 The human owner is the final product and production-release authority. Tasks should reach the human owner only after backend/frontend/accessibility review has been completed or explicitly skipped and the primary team lead has approved the work into `user_review` or, when Trust Leads is enabled, `qa_review`.
 
+Owner and QA handoffs are not merge or deployment authority. The immutable
+candidate manifest remains authoritative, and production requires one explicit
+human decision naming the full commit SHA, target host, candidate-manifest or
+artifact SHA-256 digest, successful exact-commit health-check time, and a tested
+rollback commit or procedure. No delivery policy, task field, comment, status,
+or automated notification can substitute for that release packet or activate an
+automatic merge, tag, release, deployment, or external notification.
+
 When a task reaches `user_review`, StudioOps emits an `owner_review_requested` event and assigns the owner role. When Trust Leads routes a task to `qa_review`, StudioOps emits `qa_review_requested` and the supervisor reports `notify_qa_review`. External notifications should be built from those events rather than arbitrary status polling.
 
 When local QA passes, StudioOps emits `qa_passed`, assigns the promotion worker, and queues target-branch promotion. When promotion succeeds, it emits `release_candidate_ready` for the project. That event means the target branch is ready for owner release-candidate review; it does not mean production has deployed.

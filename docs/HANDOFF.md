@@ -294,6 +294,28 @@ codex/<project-key>-<task-id>-<short-title>
 27. The notifier sends a local owner/QA-review notification.
 28. The human owner makes the final production release decision.
 
+For a project using `prototype-fast-lane`, opt in only with
+`projects[].deliveryPolicy.profile` in `studioops.config.md`. Task
+`deliveryMode`, labels, titles, criteria, comments, and prose cannot activate the
+profile. The profile changes capability review routing only; it cannot authorize
+merge, release tags, production deployment, or external notification.
+
+The QA/owner handoff must preserve the immutable candidate manifest as the sole
+release authority. Before production, one explicit human approval must name:
+
+- the full immutable commit SHA;
+- the exact target host or production environment;
+- the candidate-manifest SHA-256 digest, or the exact artifact/candidate SHA-256
+  digest when the release workflow promotes a built artifact;
+- the timestamp of a successful health check that attested that exact commit;
+- a tested rollback commit or a tested rollback procedure.
+
+Task status, delivery mode, comments, and a successful automation action are not
+production approval. StudioOps may prepare validation, QA, and a release
+candidate, but no automation action may merge, tag, release, deploy, or send the
+production handoff externally. Do not add a parallel approval database or a
+deployment worker; bind the human decision to the existing immutable candidate.
+
 Default PR rule:
 
 - One PR should have one primary StudioOps task.

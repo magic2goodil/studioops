@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
+import {
+  dispatchSupervisorActions,
+  formatDispatchReport,
+  planDispatches,
+} from "../src/dispatcher.js";
 import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 
@@ -609,6 +613,262 @@ test("credit admission allows an affordable ordinary run at its configured quali
   assert.equal(report.runs[0].model, "gpt-5.6-luna");
   assert.equal(report.runs[0].creditAdmission.code, "included_quota_available");
   assert.equal(report.runs[0].creditAdmission.remainingPercent, 80);
+});
+
+test("one sweep exposes and uses three compatible builder and reviewer slots by default", () => {
+  const state = fixtureState();
+  state.projects = [];
+  state.tasks = [];
+  const actions = [];
+  for (let index = 1; index <= 6; index += 1) {
+    const projectId = `project_${index}`;
+    const taskId = `task_${index}`;
+    const reviewer = index > 3;
+    state.projects.push({ id: projectId, key: `demo-${index}`, name: `Demo ${index}` });
+    state.tasks.push({
+      id: taskId,
+      projectId,
+      title: reviewer ? `Review API ${index}` : `Build API ${index}`,
+      status: "ready",
+      lane: "backend",
+      workAreas: [`src/component-${index}/**`],
+    });
+    actions.push({
+      id: `${taskId}:${reviewer ? "review" : "build"}`,
+      type: reviewer ? "qa_integration_blocked" : "start_builder",
+      role: reviewer ? "backend-reviewer" : "builder",
+      projectId,
+      projectKey: `demo-${index}`,
+      taskId,
+      taskTitle: state.tasks.at(-1).title,
+      taskStatus: "ready",
+    });
+  }
+
+  const report = planDispatches(state, actions);
+
+  assert.equal(report.selected.filter((item) => item.group === "builder").length, 3);
+  assert.equal(report.selected.filter((item) => item.group === "reviewer").length, 3);
+  assert.deepEqual(report.effectiveCapacity.groups.builder, {
+    configuredLimit: 3,
+    active: 0,
+    selected: 3,
+    available: 0,
+  });
+  assert.deepEqual(report.effectiveCapacity.groups.reviewer, {
+    configuredLimit: 3,
+    active: 0,
+    selected: 3,
+    available: 0,
+  });
+});
+
+test("reports make an explicit lower concurrency limit distinct from lane conflicts", () => {
+  const state = fixtureState();
+  state.projects.push({ id: "project_2", key: "other", name: "Other" });
+  state.tasks = [
+    { id: "task_a", projectId: "project_1", title: "First API", status: "ready", lane: "backend", workAreas: ["src/a/**"] },
+    { id: "task_b", projectId: "project_2", title: "Second API", status: "ready", lane: "backend", workAreas: ["src/b/**"] },
+  ];
+  const actions = state.tasks.map((task) => ({
+    id: `${task.id}:start_builder`, type: "start_builder", role: "builder",
+    projectId: task.projectId, taskId: task.id, taskTitle: task.title, taskStatus: "ready",
+  }));
+  const limited = planDispatches(state, actions, { builderConcurrency: 1 });
+
+  assert.equal(limited.effectiveCapacity.groups.builder.configuredLimit, 1);
+  assert.equal(limited.skipped[0].reason, "builder_concurrency_limit");
+  assert.equal(limited.skipped[0].constraint, "concurrency_limit");
+
+  state.tasks[1].projectId = "project_1";
+  const conflicting = planDispatches(state, actions.map((action, index) => ({
+    ...action,
+    projectId: index ? "project_1" : action.projectId,
+  })), { builderConcurrency: 3 });
+  assert.match(conflicting.skipped[0].reason, /^lane_conflict:backend:/);
+  assert.equal(conflicting.skipped[0].constraint, "lane_or_file_scope_conflict");
+  assert.deepEqual(conflicting.skipped[0].fileScope, ["src/b/**"]);
+
+  const text = formatDispatchReport({
+    generatedAt: new Date().toISOString(), dryRun: true, runs: [], ...conflicting,
+  });
+  assert.match(text, /Effective capacity:.*builder 0\+1\/3/);
+  assert.match(text, /concurrency limits 0; lane\/file-scope conflicts 1/);
+});
+
+function criticalCreditFixture() {
+  const state = fixtureState();
+  state.tasks.push({
+    id: "task_credit",
+    projectId: "project_1",
+    title: "Secure production release migration",
+    status: "ready",
+    priority: "critical",
+  });
+  const action = {
+    id: "task_credit:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_credit",
+    taskTitle: "Secure production release migration",
+    taskStatus: "ready",
+  };
+  const options = {
+    state,
+    executionPolicy: {
+      modelTiers: {
+        economy: { model: "gpt-5.6-luna", reasoningEffort: "medium" },
+        critical: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+      },
+      tierRouting: { defaultTier: "economy", complexTier: "critical" },
+    },
+    creditPolicy: {
+      enabled: true,
+      probeTimeoutMs: 1000,
+      failClosedTiers: ["critical", "frontier"],
+      tierBudgets: { critical: { estimatedCredits: 30, minRemainingPercent: 20 } },
+    },
+    creditSnapshot: {
+      status: "unknown",
+      source: "sanitized-test-probe",
+      observedAt: new Date().toISOString(),
+      reason: "Temporary sanitized probe failure.",
+    },
+  };
+  return { state, action, options };
+}
+
+test("live dispatch retries one transient unknown snapshot outside admission and then succeeds", async () => {
+  const { state, action, options } = criticalCreditFixture();
+  let probes = 0;
+  options.creditSnapshotProbe = async () => {
+    probes += 1;
+    return {
+      status: "available",
+      source: "sanitized-test-probe",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 80,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    };
+  };
+
+  const report = await dispatchSupervisorActions([action], options);
+
+  assert.equal(probes, 1);
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.runs[0].modelTier, "critical");
+  assert.equal(report.runs[0].model, "gpt-5.6-sol");
+  assert.equal(state.tasks.at(-1).automationCircuit, undefined);
+});
+
+test("live dispatch probes an unknown snapshot exactly once and opens one circuit if still unknown", async () => {
+  const { state, action, options } = criticalCreditFixture();
+  let probes = 0;
+  options.creditSnapshotProbe = async () => {
+    probes += 1;
+    return { ...options.creditSnapshot, observedAt: new Date().toISOString() };
+  };
+
+  const report = await dispatchSupervisorActions([action], options);
+
+  assert.equal(probes, 1);
+  assert.equal(report.runs.length, 0);
+  assert.equal(report.skipped[0].reason, "credit_gate:credit_snapshot_unknown");
+  assert.equal(state.tasks.at(-1).automationCircuit.state, "open");
+  assert.equal(state.events.filter((event) => event.type === "credit_admission_blocked").length, 1);
+});
+
+test("plan mode never performs the unknown credit recovery probe", async () => {
+  const { action, options } = criticalCreditFixture();
+  options.dryRun = true;
+  let probes = 0;
+  options.creditSnapshotProbe = async () => {
+    probes += 1;
+    return { status: "available", observedAt: new Date().toISOString() };
+  };
+
+  const report = await dispatchSupervisorActions([action], options);
+
+  assert.equal(probes, 0);
+  assert.equal(report.dryRun, true);
+  assert.equal(report.skipped[0].reason, "credit_gate:credit_snapshot_unknown");
+});
+
+test("a retry that reports a real limit opens one circuit without another probe or model run", async () => {
+  const { state, action, options } = criticalCreditFixture();
+  let probes = 0;
+  options.creditSnapshotProbe = async () => {
+    probes += 1;
+    return {
+      status: "available",
+      source: "sanitized-test-probe",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 0,
+      reached: true,
+      reachedType: "usage_limit",
+      credits: { available: false, unlimited: false, balance: null },
+    };
+  };
+
+  const report = await dispatchSupervisorActions([action], options);
+
+  assert.equal(probes, 1);
+  assert.equal(report.runs.length, 0);
+  assert.equal(report.skipped[0].reason, "credit_gate:rate_limit_reached");
+  assert.equal(state.tasks.at(-1).automationCircuit.state, "open");
+  assert.equal(state.events.filter((event) => event.type === "credit_admission_blocked").length, 1);
+});
+
+test("a real rate limit fails closed without a retry or quality downgrade", async () => {
+  const { state, action, options } = criticalCreditFixture();
+  options.creditSnapshot = {
+    status: "available",
+    source: "sanitized-test-probe",
+    observedAt: new Date().toISOString(),
+    remainingPercent: 0,
+    reached: true,
+    reachedType: "usage_limit",
+    credits: { available: false, unlimited: false, balance: null },
+  };
+  let probes = 0;
+  options.creditSnapshotProbe = async () => {
+    probes += 1;
+    throw new Error("real limits must not be retried");
+  };
+
+  const report = await dispatchSupervisorActions([action], options);
+
+  assert.equal(probes, 0);
+  assert.equal(report.runs.length, 0);
+  assert.equal(report.skipped[0].reason, "credit_gate:rate_limit_reached");
+  assert.equal(state.tasks.at(-1).automationBlocker.modelTier, "critical");
+  assert.equal(state.tasks.at(-1).automationCircuit.state, "open");
+});
+
+test("owner handoff requires the immutable human production release packet", async () => {
+  const state = fixtureState();
+  const report = await dispatchSupervisorActions([{
+    id: "task_1:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_1",
+    taskTitle: "QA-ready task",
+    taskUrl: "http://127.0.0.1:4317/tasks/task_1",
+  }], { state });
+
+  assert.match(report.runs[0].prompt, /immutable candidate manifest/i);
+  assert.match(report.runs[0].prompt, /full commit SHA/);
+  assert.match(report.runs[0].prompt, /target host/);
+  assert.match(report.runs[0].prompt, /SHA-256 digest/);
+  assert.match(report.runs[0].prompt, /exact-commit health-check time/);
+  assert.match(report.runs[0].prompt, /tested rollback commit or procedure/);
+  assert.match(report.runs[0].prompt, /automation merge, tag, release, or deploy/i);
 });
 
 test("open task circuits stop redispatch without blocking owner notifications", () => {

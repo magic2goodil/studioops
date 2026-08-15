@@ -186,6 +186,17 @@ budget, then use the circuit-reset command shown on the task. If the account
 snapshot is unavailable or stale, configured `failClosedTiers` stop while
 lower tiers may continue.
 
+Live dispatch gives a fail-closed critical or frontier run one bounded recovery
+only when its first sanitized snapshot is unknown. Before opening the SQLite
+mutation transaction, the dispatcher performs one direct uncached
+`account/rateLimits/read` probe using `probeTimeoutMs`, then reassesses the same
+required quality tier. A usable result proceeds normally; a second unknown opens
+one owner-visible circuit. A real quota, rate-limit, purchased-credit balance,
+or reserve failure from either snapshot is never retried, never launches a model,
+and never downgrades quality. Plan mode performs no recovery probe. Credit logs
+and test fixtures contain only sanitized limit fields, never tokens, account
+identity, raw account payloads, or secrets.
+
 By default, the web UI is only available on the local machine:
 
 ```text
@@ -442,6 +453,14 @@ It must not:
 - commit secrets or private data
 - bypass the human owner review or Trust Leads QA gate
 
-The runner defaults to isolated workspaces and a limit of three active Codex runs. It can run multiple projects, or compatible lanes within the same project, at the same time.
+The runner defaults to isolated workspaces and a limit of three active Codex runs. Installed configurations normalize a missing runner limit to three while preserving an explicit lower positive limit. It can run multiple projects, or compatible lanes within the same project, at the same time.
 
 StudioOps treats backend and frontend work as compatible by default. Design conflicts with frontend, and devops/project-wide work conflicts with other lanes in the same project. That keeps parallel agents from editing the same UI/CSS/deployment surface while still allowing a real team-style flow.
+
+Automation ends at the owner handoff. It cannot merge, tag, release, deploy
+production, or send an external notification. The immutable candidate manifest
+remains the sole release authority. One human production release decision must
+name the full commit SHA, target host, candidate-manifest or artifact SHA-256
+digest, time of a successful health check that attested that exact commit, and a
+tested rollback commit or procedure. No task status, delivery mode, policy
+profile, comment, or prose substitutes for that packet.

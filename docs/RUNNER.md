@@ -44,7 +44,9 @@ npm run runner -- --plan --project event-horizons-web
 npm run runner
 ```
 
-The default limit is one active Codex run. This keeps parallel builders from independently inventing duplicate architecture, Sass mixins, or project conventions.
+The installed default limit is three active Codex runs. Explicit lower positive
+limits remain authoritative. Dispatcher lane/file-scope checks and transactional
+runner claims still prevent incompatible work from starting together.
 
 ## Model And Retry Policy
 
@@ -59,7 +61,7 @@ Before claiming work, the runner checks the data volume used for SQLite state an
 ## Run Continuously
 
 ```bash
-npm run runner -- --watch --interval 10 --limit 1
+npm run runner -- --watch --interval 10 --limit 3
 ```
 
 The LaunchAgent example lives at:
@@ -195,7 +197,7 @@ The runner can create branches, validate work, commit, push, and open/update PRs
 
 Systems-architect runs are read-only against product code. They inspect the repository and supplied assets, create/update StudioOps task records, and complete the durable architecture handoff described in [ARCHITECT.md](ARCHITECT.md).
 
-Once reviewers and lead review pass, the task moves to `user_review`, or to `qa_review` when Trust Leads is enabled. The notifier then tells the human owner. That is the local QA or merge/deploy gate; production still requires explicit owner approval.
+Once reviewers and lead review pass, the task moves to `user_review`, or to `qa_review` when Trust Leads is enabled. The notifier then tells the human owner. Automation stops there: it does not merge or deploy. Production requires one explicit human release decision bound to the immutable candidate manifest, full commit SHA, target host, candidate or artifact SHA-256 digest, successful exact-commit health-check time, and tested rollback commit or procedure.
 
 ## Isolated Workspaces
 
