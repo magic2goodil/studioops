@@ -74,6 +74,15 @@ test("an unknown explicit impact label fails closed even when the path is classi
   assert.deepEqual(routing.required, ["backend", "frontend", "accessibility", "lead"]);
 });
 
+test("normalized impact classifications remain stable when evidence is reused", () => {
+  const routing = capabilityRoutingForTask(
+    { deliveryPolicy: { profile: "prototype-fast-lane" } },
+    { impactEvidence: { changedFiles: ["src/App.jsx"], classifications: ["backend"] } },
+  );
+  assert.deepEqual(routing.evidence.classifications, ["backend"]);
+  assert.deepEqual(routing.required, ["backend", "frontend", "accessibility", "lead"]);
+});
+
 test("explicit local mode requires a verified candidate while GitHub requires an exact subject", () => {
   const base = {
     id: "task_1", projectId: "project_1", title: "Candidate", status: "builder_review",

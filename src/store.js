@@ -728,7 +728,12 @@ function normalizedImpactEvidence(value = {}) {
   const files = Array.isArray(value.changedFiles || value.files)
     ? [...new Set((value.changedFiles || value.files).map((item) => String(item || "").trim()).filter(Boolean))].sort()
     : [];
-  const explicit = Array.isArray(value.impact) ? value.impact.map((item) => String(item).trim().toLowerCase()) : [];
+  const explicitSource = Array.isArray(value.impact)
+    ? value.impact
+    : Array.isArray(value.classifications)
+      ? value.classifications
+      : [];
+  const explicit = explicitSource.map((item) => String(item).trim().toLowerCase());
   const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
   const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
