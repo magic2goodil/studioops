@@ -440,7 +440,7 @@ Commands:
   automation-tick               Advance ready, blocked, and review tasks
   automation-pause              Pause new builder and reviewer work
   automation-resume             Resume builder and reviewer work after verification
-  circuit-reset                 Reset one verified task or project circuit
+  circuit-reset                 Reset one verified task or project circuit using its expected generation
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
@@ -478,6 +478,10 @@ Task fields:
   --no-trust-leads              Disable Trust Leads for a project
   --integration-branch          Non-production branch used for QA integration bundles
   --subject-sha                 Exact full source SHA submitted for the current review cycle
+  --tree-sha                    Exact candidate tree SHA for fast-lane review intake
+  --base-sha                    Exact protected-base SHA for fast-lane review intake
+  --impact-files                Comma-separated changed paths for deterministic impact routing
+  --impact                      Comma-separated explicit impact classifications
   --partial-tasks               Explicit subset for an authorized partial QA candidate
   --partial-actor-id            Non-sensitive actor ID authorizing a partial candidate
   --partial-reason-code         Bounded reason code for excluding tasks
@@ -489,7 +493,7 @@ Automation:
   studioops automation-tick --project dollos --limit 10
   studioops automation-pause --reason "Incident investigation"
   studioops automation-resume --reason "Database and workers verified"
-  studioops circuit-reset --task task_101 --reason "Credentials verified"
+  studioops circuit-reset --task task_101 --expected-opened-at 2026-01-01T00:00:00.000Z --reason "Credentials verified"
   studioops supervisor --json
   studioops dispatcher --plan
   studioops runner --plan
@@ -808,6 +812,19 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "pr-url")) patch.prUrl = args["pr-url"];
     if (Object.prototype.hasOwnProperty.call(args, "subject-sha")) patch.subjectSha = args["subject-sha"];
     if (Object.prototype.hasOwnProperty.call(args, "sha")) patch.subjectSha = args.sha;
+    const candidateIdentity = {};
+    if (Object.prototype.hasOwnProperty.call(args, "tree-sha")) candidateIdentity.treeSha = args["tree-sha"];
+    if (Object.prototype.hasOwnProperty.call(args, "base-sha")) candidateIdentity.baseSha = args["base-sha"];
+    if (Object.keys(candidateIdentity).length) patch.candidateIdentity = candidateIdentity;
+    if (
+      Object.prototype.hasOwnProperty.call(args, "impact-files")
+      || Object.prototype.hasOwnProperty.call(args, "impact")
+    ) {
+      patch.impactEvidence = {
+        changedFiles: normalizeList(args["impact-files"]),
+        impact: normalizeList(args.impact),
+      };
+    }
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;
     if (Object.prototype.hasOwnProperty.call(args, "type")) patch.type = args.type;
     if (Object.prototype.hasOwnProperty.call(args, "lane")) patch.lane = args.lane;
@@ -920,6 +937,7 @@ Automation:
       project: args.project,
       reason: args.reason,
       author: args.author,
+      expectedOpenedAt: args["expected-opened-at"],
     });
     console.log(`Reset automation circuit for ${target.id}.`);
     return;

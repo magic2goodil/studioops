@@ -731,6 +731,7 @@ function normalizedImpactEvidence(value = {}) {
   const explicit = Array.isArray(value.impact) ? value.impact.map((item) => String(item).trim().toLowerCase()) : [];
   const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
+  const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
   const pathCapabilities = files.map((file) => {
     const capabilities = new Set();
     if (/(^|\/)(server|api|src\/(store|supervisor|dispatcher)|migrations?|db|auth|security|deploy|infra)(\/|\.|$)/i.test(file)) {
@@ -747,6 +748,7 @@ function normalizedImpactEvidence(value = {}) {
     || value.stale === true
     || value.conflicting === true
     || Boolean(value.staleReason || value.conflictReason)
+    || hasUnknownExplicitClassification
     || !files.length
     || pathCapabilities.some((capabilities) => capabilities.size === 0);
   const backendRequired = unknown || classifications.some((item) => ["backend", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment"].includes(item))
@@ -2029,7 +2031,7 @@ export function reconcileAutomationStateInState(state, input = {}) {
           snapshot,
           openedAt: now,
           nextCheapProbe: "Inspect the preserved run output and verify the underlying failure without launching a model.",
-          resumeAction: `studioops circuit-reset --task ${task.id} --reason verified`,
+          resumeAction: `studioops circuit-reset --task ${task.id} --expected-opened-at ${now} --reason verified`,
           remediation: "Repair or verify the underlying blocker, then explicitly reset this task circuit.",
         };
         task.automationBlocker = {
@@ -2154,6 +2156,10 @@ export function resetAutomationCircuitInState(state, input = {}) {
     throw new Error(`${task ? task.id : project.id} does not have an open automation circuit.`);
   }
   const previousCircuit = { ...target.automationCircuit };
+  const expectedOpenedAt = String(input.expectedOpenedAt || "").trim();
+  if (task && expectedOpenedAt && expectedOpenedAt !== String(previousCircuit.openedAt || "")) {
+    throw new Error("Automation circuit reset compare-and-set failed: circuit generation drifted.");
+  }
   const expected = input.expectedSnapshot || input.snapshot;
   const actual = target.automationCircuit.snapshot;
   if (expected && (!actual || !isDeepStrictEqual(expected, actual))) {
@@ -2229,6 +2235,9 @@ export function resetAutomationCircuitInState(state, input = {}) {
 }
 
 export async function resetAutomationCircuit(input = {}) {
+  if (input.task && !input.expectedSnapshot && !String(input.expectedOpenedAt || "").trim()) {
+    throw new Error("Task circuit reset requires --expected-opened-at or an expected snapshot.");
+  }
   return mutateState(async (state) => resetAutomationCircuitInState(state, input));
 }
 

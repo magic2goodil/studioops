@@ -270,7 +270,7 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
       snapshot,
       openedAt: now,
       nextCheapProbe: "Check current Codex usage limits without launching a model run.",
-      resumeAction: `studioops circuit-reset --task ${task.id} --reason credits_verified`,
+      resumeAction: `studioops circuit-reset --task ${task.id} --expected-opened-at ${now} --reason credits_verified`,
       remediation: "Wait for quota reset, add credits, or update the configured budget after review; then reset this task circuit.",
     };
     task.updatedAt = now;
@@ -415,7 +415,7 @@ function openExhaustedAttemptCircuits(state, actions, skipped, options, now) {
       snapshot,
       openedAt: now,
       nextCheapProbe: "Inspect the preserved run outputs and verify the underlying blocker without launching another model.",
-      resumeAction: `studioops circuit-reset --task ${task.id} --reason verified`,
+      resumeAction: `studioops circuit-reset --task ${task.id} --expected-opened-at ${now} --reason verified`,
       remediation: "Repair or verify the underlying blocker, then explicitly reset this task circuit.",
     };
     task.updatedAt = now;
