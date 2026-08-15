@@ -647,13 +647,15 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
       startRef = await remoteBranchExists(run.project.repoPath, branch)
         ? `origin/${branch}`
         : `origin/${defaultBranch}`;
-    } else {
+    } else if (!usesLocalCandidate(run)) {
       const base = run.preflightBaseRef && run.preflightBaseCommit
         ? { ref: run.preflightBaseRef, commit: run.preflightBaseCommit }
         : await resolveLocalBaseRef(run.project.repoPath, branch, defaultBranch);
       if (!base) throw new Error("Local workspace preparation could not resolve a valid local base ref.");
       startRef = base.ref;
       startCommit = base.commit;
+    } else {
+      startRef = `candidate:${run.candidateIdentity?.commitSha || run.reviewSubjectSha || "recorded"}`;
     }
 
     log.write(`Preparing isolated workspace for ${run.id}\n`);

@@ -1,4 +1,4 @@
-import { chmod, mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -66,6 +66,9 @@ function failure(code, message, remediation) {
 export async function verifyLocalCandidate(root, identity, options = {}) {
   const candidatePath = localCandidatePath(root, identity);
   if (!candidatePath) throw failure("local_candidate_identity_invalid", "The local candidate identity is incomplete or has an unsafe artifact reference.", "Repair the task candidate identity and rematerialize the candidate before retrying.");
+  if (!String(identity.branch || "").trim() || !Number.isSafeInteger(Number(identity.candidateCycle)) || Number(identity.candidateCycle) < 1) {
+    throw failure("local_candidate_identity_invalid", "The local candidate identity is missing its recorded branch or candidate cycle.", "Repair the task candidate identity and rematerialize the candidate before retrying.");
+  }
   try { await git(["rev-parse", "--git-dir"], { cwd: candidatePath }); } catch {
     throw failure("local_candidate_artifact_missing", `The managed local candidate artifact is missing: ${identity.operationalLocalArtifactRef || localCandidateRef(identity)}`, "Run the local builder again to rematerialize the candidate; review and candidate cycles were not changed.");
   }
@@ -91,7 +94,22 @@ export async function materializeLocalCandidate({ workspacePath, root, identity,
   const artifactRef = localCandidateRef(candidateIdentity);
   const artifactPath = localCandidatePath(root, { ...candidateIdentity, operationalLocalArtifactRef: artifactRef });
   await mkdir(path.dirname(artifactPath), { recursive: true, mode: 0o700 });
-  await rm(artifactPath, { recursive: true, force: true });
+  let artifactExists = false;
+  try {
+    const existing = await stat(artifactPath);
+    artifactExists = true;
+    if (!existing.isDirectory()) throw failure("local_candidate_artifact_conflict", `The managed local candidate path is not a Git artifact: ${artifactRef}`, "Move the conflicting artifact aside after confirming no active run references it, then retry.");
+    const current = await verifyLocalCandidate(root, { ...candidateIdentity, operationalLocalArtifactRef: artifactRef });
+    log?.write(`Local candidate already materialized: ${artifactRef} (${current.commitSha}, tree ${current.treeSha})\n`);
+    return { ...candidateIdentity, operationalLocalArtifactRef: artifactRef };
+  } catch (error) {
+    if (error?.code && error.code !== "ENOENT" && (error.code !== "local_candidate_artifact_missing" || artifactExists)) {
+      if (artifactExists && error.code === "local_candidate_artifact_missing") {
+        throw failure("local_candidate_artifact_conflict", `The managed local candidate artifact is stale or malformed: ${artifactRef}`, "Move the conflicting artifact aside after confirming no active run references it, then retry.");
+      }
+      throw error;
+    }
+  }
   await git(["clone", "--bare", "--no-hardlinks", workspacePath, artifactPath], { cwd: process.cwd(), timeout: 300_000, env: localGitEnv() });
   try { await git(["remote", "remove", "origin"], { cwd: artifactPath, env: localGitEnv() }); } catch {}
   await chmod(artifactPath, 0o700);
@@ -108,6 +126,9 @@ export async function configureRemotes(workspacePath, originUrl, candidatePath =
 
 export async function prepareLocalWorkspace({ sourceRepoPath, workspacePath, branch, originUrl, root, identity, useCandidate, log }) {
   const env = localGitEnv();
+  if (useCandidate && String(identity?.branch || "") !== String(branch || "")) {
+    throw failure("local_candidate_identity_mismatch", "The requested workspace branch differs from the recorded candidate branch.", "Restore the task branch and candidate identity together before retrying review.");
+  }
   const candidatePath = useCandidate ? (await verifyLocalCandidate(root, identity)).candidatePath : "";
   await git(["clone", "--no-tags", "--no-hardlinks", candidatePath || sourceRepoPath, workspacePath], { cwd: process.cwd(), timeout: 300_000, env });
   const startSha = candidatePath ? identity.commitSha : await git(["rev-parse", "--verify", "HEAD^{commit}"], { cwd: workspacePath });

@@ -39,6 +39,6 @@ test("local candidate materialization preserves exact commit, tree, base, and re
 test("missing or mismatched local candidates fail before workspace launch", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-local-candidate-missing-"));
   try {
-    await assert.rejects(() => verifyLocalCandidate(root, { commitSha: "a".repeat(40), treeSha: "b".repeat(40), baseSha: "c".repeat(40), candidateCycle: 1, operationalLocalArtifactRef: "candidates/task_1/1-a.git" }), (error) => error.code === "local_candidate_artifact_missing");
+    await assert.rejects(() => verifyLocalCandidate(root, { commitSha: "a".repeat(40), treeSha: "b".repeat(40), baseSha: "c".repeat(40), branch: "feature/task", candidateCycle: 1, operationalLocalArtifactRef: "candidates/task_1/1-a.git" }), (error) => error.code === "local_candidate_artifact_missing");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
