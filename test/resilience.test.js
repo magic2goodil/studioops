@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   applyGitHubRemoteRecoveryProbeResultInState,
@@ -8,10 +10,13 @@ import {
   resumeOperatorAutomationInState,
   scheduleGitHubRemoteRecoveryProbeInState,
   setOperatorPauseInState,
+  workflowSnapshotForTask,
 } from "../src/store.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 
 const NOW = Date.parse("2026-07-21T12:00:00.000Z");
+const CLI_PATH = fileURLToPath(new URL("../src/mission-control-cli.js", import.meta.url));
 
 function stateWith(task, runs = []) {
   return {
@@ -197,6 +202,7 @@ test("transient recovery opens a circuit instead of looping after the recovery b
   assert.match(result.actions.join("\n"), /opened automation circuit/);
   assert.equal(state.tasks[0].status, "blocked");
   assert.equal(state.tasks[0].automationCircuit.state, "open");
+  assert.equal(state.tasks[0].automationCircuit.snapshot.status, "queued");
   assert.equal(state.tasks[0].automationBlocker.type, "circuit");
 });
 
@@ -272,6 +278,129 @@ test("task circuit reset preserves evidence and starts a fresh dispatch epoch", 
   assert.equal(reset.automationBlocker, undefined);
   assert.ok(state.comments.some((comment) => /New execution epoch 1/.test(comment.body)));
   assert.ok(state.events.some((event) => event.type === "automation_circuit_reset"));
+});
+
+test("task circuit reset compare-and-set rejects live drift without overwriting candidate state", () => {
+  const snapshot = {
+    status: "lead_review",
+    assignedAgentRole: "lead-reviewer",
+    reviewCycle: 2,
+    reviewSubjectCycle: 3,
+    reviewSubjectSha: "a".repeat(40),
+    candidateIdentity: { commitSha: "a".repeat(40), treeSha: "b".repeat(40), baseSha: "c".repeat(40), branch: "feature/x", candidateCycle: 3 },
+    branchName: "feature/x",
+  };
+  const state = stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+    reviewCycle: 2,
+    reviewSubjectCycle: 3,
+    reviewSubjectSha: snapshot.reviewSubjectSha,
+    candidateIdentity: snapshot.candidateIdentity,
+    branchName: snapshot.branchName,
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: { state: "open", snapshot },
+  });
+  const reset = resetAutomationCircuitInState(state, { task: "task_1", snapshot, now: "2026-07-21T12:00:00.000Z" });
+  assert.equal(reset.status, "lead_review");
+  assert.equal(reset.assignedAgentRole, "lead-reviewer");
+  assert.equal(reset.reviewCycle, 2);
+  assert.equal(reset.reviewSubjectCycle, 3);
+  assert.deepEqual(reset.candidateIdentity, snapshot.candidateIdentity);
+
+  const driftedSha = "d".repeat(40);
+  const driftedState = stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+    reviewCycle: 2,
+    reviewSubjectCycle: 3,
+    reviewSubjectSha: driftedSha,
+    candidateIdentity: { ...snapshot.candidateIdentity, commitSha: driftedSha },
+    branchName: snapshot.branchName,
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: { state: "open", snapshot },
+  });
+  assert.throws(
+    () => resetAutomationCircuitInState(driftedState, { task: "task_1", snapshot }),
+    /live candidate identity drifted/,
+  );
+  assert.equal(driftedState.tasks[0].status, "blocked");
+  assert.equal(driftedState.tasks[0].reviewSubjectSha, driftedSha);
+  assert.equal(driftedState.tasks[0].automationCircuit.state, "open");
+
+  const expectedSnapshotState = stateWith({
+    status: "blocked",
+    reviewCycle: 2,
+    reviewSubjectCycle: 3,
+    reviewSubjectSha: snapshot.reviewSubjectSha,
+    candidateIdentity: snapshot.candidateIdentity,
+    branchName: snapshot.branchName,
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: { state: "open", snapshot },
+  });
+  assert.throws(
+    () => resetAutomationCircuitInState(expectedSnapshotState, {
+      task: "task_1",
+      snapshot: { ...snapshot, status: "frontend_review" },
+    }),
+    /workflow snapshot drifted/,
+  );
+});
+
+test("public circuit-reset CLI requires and verifies the expected circuit generation", async () => {
+  const openedAt = "2026-07-21T11:00:00.000Z";
+  const state = stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: {
+      state: "open",
+      openedAt,
+    },
+  });
+  state.tasks[0].automationCircuit.snapshot = workflowSnapshotForTask(state.tasks[0], {
+    status: "queued",
+    assignedAgentRole: "builder",
+  });
+  const isolated = await createHermeticTestEnvironment();
+  const storeUrl = new URL("../src/store.js", import.meta.url).href;
+  try {
+    const seed = spawnSync(process.execPath, ["--input-type=module", "-e", `import { writeState } from ${JSON.stringify(storeUrl)}; await writeState(JSON.parse(process.env.STUDIOOPS_TEST_STATE));`], {
+      encoding: "utf8",
+      env: { ...isolated.env, STUDIOOPS_TEST_STATE: JSON.stringify(state) },
+    });
+    assert.equal(seed.status, 0, seed.stderr);
+
+    const missing = spawnSync(process.execPath, [CLI_PATH, "circuit-reset", "--task", "task_1", "--reason", "verified"], {
+      encoding: "utf8",
+      env: isolated.env,
+    });
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /expected-opened-at/);
+
+    const stale = spawnSync(process.execPath, [CLI_PATH, "circuit-reset", "--task", "task_1", "--expected-opened-at", "2026-07-21T10:00:00.000Z", "--reason", "verified"], {
+      encoding: "utf8",
+      env: isolated.env,
+    });
+    assert.notEqual(stale.status, 0);
+    assert.match(stale.stderr, /circuit generation drifted/);
+
+    const reset = spawnSync(process.execPath, [CLI_PATH, "circuit-reset", "--task", "task_1", "--expected-opened-at", openedAt, "--reason", "verified"], {
+      encoding: "utf8",
+      env: isolated.env,
+    });
+    assert.equal(reset.status, 0, reset.stderr);
+    const inspect = spawnSync(process.execPath, ["--input-type=module", "-e", `import { readState } from ${JSON.stringify(storeUrl)}; const state = await readState(); console.log(JSON.stringify(state.tasks[0]));`], {
+      encoding: "utf8",
+      env: isolated.env,
+    });
+    assert.equal(inspect.status, 0, inspect.stderr);
+    const storedTask = JSON.parse(inspect.stdout);
+    assert.equal(storedTask.automationCircuit.state, "closed");
+    assert.equal(storedTask.status, "queued");
+  } finally {
+    await isolated.cleanup();
+  }
 });
 
 test("project circuit reset advances every project task into a fresh attempt epoch", () => {

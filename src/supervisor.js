@@ -1,12 +1,15 @@
 import {
   architectureIsCompleteInState,
+  capabilityRoutingForTask,
+  candidateIdentityForTask,
+  candidateIdentityIsComplete,
   cycleLimitLeadReviewApplies,
   currentReviewCandidateCycle,
   earliestIncompleteRequiredReviewStage,
   latestCurrentReviewForStage,
   reviewPolicyForProject,
   reviewMatchesCurrentCandidate,
-  reviewStagesForProject,
+  reviewStagesForTask,
   projectUsesLocalWorkflow,
   taskHasExactReviewSubject,
   VALID_STATUSES,
@@ -69,8 +72,8 @@ function isLeadReviewStage(stage) {
   return key === "lead" || role.includes("lead");
 }
 
-function leadReviewStageForProject(project) {
-  const stages = reviewStagesForProject(project);
+function leadReviewStageForProject(project, task) {
+  const stages = reviewStagesForTask(project, task);
   return stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
 }
 
@@ -86,14 +89,14 @@ function changeRequestedReviewsForCycle(state, task) {
 }
 
 function leadReviewCompleteForCycle(state, task, project) {
-  const leadStage = leadReviewStageForProject(project);
+  const leadStage = leadReviewStageForProject(project, task);
   if (!leadStage) return false;
   const latest = latestCurrentReviewForStage(state, task, leadStage);
   return latest && REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
 }
 
-function stageForStatus(project, status) {
-  return reviewStagesForProject(project).find((stage) => stage.status === status) || null;
+function stageForStatus(project, task) {
+  return reviewStagesForTask(project, task).find((stage) => stage.status === task.status) || null;
 }
 
 function nextOpenReviewStage(state, project, task) {
@@ -102,11 +105,18 @@ function nextOpenReviewStage(state, project, task) {
     && changeRequestedReviewsForCycle(state, task).length
   ) {
     if (leadReviewCompleteForCycle(state, task, project)) return null;
-    return leadReviewStageForProject(project);
+    return leadReviewStageForProject(project, task);
   }
-  return reviewStagesForProject(project).find((stage) => {
+  return reviewStagesForTask(project, task).find((stage) => {
     const latest = latestCurrentReviewForStage(state, task, stage);
     return !latest || !REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
+  }) || null;
+}
+
+function earliestIncompleteForTask(state, project, task) {
+  return reviewStagesForTask(project, task).find((stage) => {
+    const review = latestCurrentReviewForStage(state, task, stage);
+    return !review || !REVIEW_COMPLETE_OUTCOMES.has(review.outcome);
   }) || null;
 }
 
@@ -171,6 +181,8 @@ function actionBase(state, task, type, role, reason, options = {}) {
     integrationBlocker: task.integrationBlocker || "",
     reviewSubjectSha: task.reviewSubjectSha || "",
     candidateCycle: currentReviewCandidateCycle(task),
+    candidateIdentity: task.candidateIdentity || null,
+    skippedReviewLanes: capabilityRoutingForTask(project || {}, task).skipped,
     promptCommand: role && role !== "owner" && !String(role).includes("integration-worker") ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     integrationCommand: options.integrationCommand || "",
@@ -271,9 +283,9 @@ function taskActions(state, task, options = {}) {
 
   if (task.type === "epic" || hasChildren) return [];
 
-  const stages = reviewStagesForProject(project);
-  const currentStage = stageForStatus(project, task.status);
-  const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+  const stages = reviewStagesForTask(project, task);
+  const currentStage = stageForStatus(project, task);
+  const earliestRequiredStage = earliestIncompleteForTask(state, project, task);
   const currentStageIndex = stages.indexOf(currentStage);
   const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
   const cycleLimitLeadReview = cycleLimitLeadReviewApplies(
@@ -400,14 +412,23 @@ function taskActions(state, task, options = {}) {
   }
 
   if (task.status === "builder_review") {
-    const localWorkflow = projectUsesLocalWorkflow(project);
-    const missingReviewEvidence = !task.branchName
-      || (localWorkflow ? !taskHasExactReviewSubject(task) : !task.prUrl);
-    if (missingReviewEvidence) {
-      const evidence = localWorkflow
-        ? "branch and exact full subject SHA"
-        : "branch and PR URL";
-      return [actionBase(state, task, "return_to_builder", "builder", `Builder review intake is incomplete: ${evidence} are required before reviewer routing.`, {
+    const localMode = projectUsesLocalWorkflow(project);
+    const githubMode = String(project.workflowMode || "").toLowerCase() === "github";
+    const candidateIdentity = candidateIdentityForTask(task);
+    const identityMissing = !candidateIdentityIsComplete(candidateIdentity);
+    const requiresVerifiedCandidateIdentity = capabilityRoutingForTask(project, task).policy.profile === "prototype-fast-lane";
+    const exactSubjectMissing = (localMode || githubMode) && !taskHasExactReviewSubject(task);
+    const intakeMissing = !task.branchName
+      || (localMode ? !taskHasExactReviewSubject(task) : !task.prUrl)
+      || exactSubjectMissing
+      || (requiresVerifiedCandidateIdentity && identityMissing);
+    if (intakeMissing) {
+      const reason = exactSubjectMissing
+        ? "Builder review intake is incomplete: this workflow requires a branch and exact full subject SHA before reviewer routing."
+        : requiresVerifiedCandidateIdentity
+          ? "Builder review intake is incomplete: the prototype fast lane requires a branch and verified full candidate identity (commit, tree, base, branch, cycle, and current impact evidence)."
+          : "Builder review intake is incomplete: GitHub mode requires a branch and PR URL before reviewer routing.";
+      return [actionBase(state, task, "return_to_builder", "builder", reason, {
         ...options,
         nextStatus: "needs_changes",
       })];
@@ -434,7 +455,7 @@ function taskActions(state, task, options = {}) {
     if (latest.outcome === "changes_requested") {
       const policy = reviewPolicyForProject(project);
       if (policy.leadOwnsFinalDecisionAtLimit && reviewCycleAtLimit(project, task)) {
-        const leadStage = leadReviewStageForProject(project);
+        const leadStage = leadReviewStageForProject(project, task);
         if (leadStage && !isLeadReviewStage(currentStage)) {
           return [actionBase(state, task, "start_review", leadStage.role, `${currentStage.label || currentStage.key} requested changes at the ${policy.maxBuilderReviewCycles}-cycle review limit; route to lead for final decision.`, {
             ...options,

@@ -47,7 +47,7 @@ Configuration blockers such as missing or invalid GitHub App credentials remain 
 Builder and reviewer attempts are bounded. When the configured attempt budget and one bounded transient recovery are exhausted, StudioOps opens a task circuit and stops dispatching model runs for it. Inspect the preserved output, repair or verify the underlying blocker, then reset that one circuit:
 
 ```bash
-studioops circuit-reset --task task_123 --reason "Verified credentials and repository access"
+studioops circuit-reset --task task_123 --expected-opened-at <circuit-opened-at> --reason "Verified credentials and repository access"
 ```
 
 Incident-wide pauses are explicit and auditable:

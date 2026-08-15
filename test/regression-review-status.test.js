@@ -16,6 +16,7 @@ import {
   candidateReviewEvidenceForTask,
   generatePrompt,
   normalizeReviewPipeline,
+  recordReviewInState,
 } from "../src/store.js";
 
 const SUBJECT_SHA = "a".repeat(40);
@@ -452,6 +453,48 @@ test("cycle-limit lead review can make the final call without reopening the reje
   assert.equal(plan.selected[0].action.role, "lead-reviewer");
   assert.equal(ownerHandoff.selected.length, 0);
   assert.equal(ownerHandoff.skipped[0].reason, "earlier_review_incomplete:regression");
+});
+
+test("cycle-limit lead can record changes_requested and route the unresolved decision to the owner", () => {
+  const state = fixtureState({
+    status: "lead_review",
+    assignedAgentRole: "lead-reviewer",
+    reviewCycle: 2,
+    reviewSubjectSha: REVIEWER_FIX_SHA,
+    reviewSubjectCycle: 2,
+  }, [
+    {
+      id: "review_1",
+      taskId: "task_1",
+      projectId: "project_1",
+      stageKey: "regression",
+      status: "regression_review",
+      role: "qa-reviewer",
+      cycle: 2,
+      candidateCycle: 2,
+      subjectSha: REVIEWER_FIX_SHA,
+      outcome: "changes_requested",
+      createdAt: "2026-07-26T10:00:00.000Z",
+    },
+  ]);
+  state.projects[0].reviewPolicy = {
+    maxBuilderReviewCycles: 2,
+    leadOwnsFinalDecisionAtLimit: true,
+  };
+
+  const result = recordReviewInState(state, "task_1", {
+    stage: "lead",
+    outcome: "changes_requested",
+    subjectSha: REVIEWER_FIX_SHA,
+    candidateCycle: 2,
+    body: "Residual risk requires the human owner to decide.",
+  });
+
+  assert.equal(result.review.stageKey, "lead");
+  assert.equal(result.review.outcome, "changes_requested");
+  assert.equal(state.tasks[0].status, "user_review");
+  assert.equal(state.tasks[0].assignedAgentRole, "owner");
+  assert.match(result.actions.join("\n"), /lead requested human owner decision/);
 });
 
 test("lead review cannot bypass a rejecting lane before the configured cycle limit", () => {
