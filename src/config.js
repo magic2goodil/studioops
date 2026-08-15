@@ -9,6 +9,17 @@ export const CONFIG_FILE = "studioops.config.md";
 export const LEGACY_CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "studioops.config.example.md";
 export const PROJECT_WORKFLOW_MODES = new Set(["auto", "local", "github"]);
+export const MODULAR_ARCHITECTURE_STANDARD = "standards/modular-architecture-and-scoped-validation.md";
+
+export function withDefaultProjectStandards(value) {
+  const standards = Array.isArray(value)
+    ? value
+    : String(value || "").split(/\n|,/);
+  return [...new Set([
+    MODULAR_ARCHITECTURE_STANDARD,
+    ...standards.map((item) => String(item).trim()).filter(Boolean),
+  ])];
+}
 
 export function normalizeProjectWorkflowMode(value, fallback = "auto") {
   const normalized = String(value || fallback).trim().toLowerCase();
@@ -109,6 +120,9 @@ function reviewPolicyFromConfig(rawProject = {}, defaults = {}) {
 
 export function projectFromConfig(rawProject, defaults = {}) {
   const reviewPolicy = reviewPolicyFromConfig(rawProject, defaults);
+  const configuredStandards = hasOwnValue(rawProject, "standards")
+    ? rawProject.standards
+    : defaults.standards;
   return {
     key: rawProject.key,
     name: rawProject.name,
@@ -119,7 +133,7 @@ export function projectFromConfig(rawProject, defaults = {}) {
     defaultBranch: rawProject.defaultBranch || defaults.defaultBranch || "main",
     validationCommands: rawProject.validationCommands || defaults.validationCommands || [],
     contextLinks: rawProject.contextLinks || [],
-    standards: rawProject.standards || defaults.standards || [],
+    standards: withDefaultProjectStandards(configuredStandards),
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
     reviewPipeline: rawProject.reviewPipeline || defaults.reviewPipeline || [],
     reviewPolicy,

@@ -223,6 +223,39 @@ Component tasks should define:
 
 Twig is acceptable and preferred for PHP/Drupal-style projects when already available. Storybook is preferred for projects with enough reusable UI surface to justify it; otherwise a simpler component gallery is acceptable.
 
+## Modular Architecture And Impact-Scoped Validation
+
+Every StudioOps project includes
+`standards/modular-architecture-and-scoped-validation.md` as a required default.
+Project-specific standards and safety rules remain additive. Upgrade a persisted
+project without replacing its existing policy:
+
+```bash
+node src/mission-control-cli.js adopt-default-standards <project-key>
+```
+
+Use `--all` to upgrade every registered project. Adoption is idempotent: a
+current project is left unchanged and duplicate standard references are not
+created.
+
+Architect and implementation tasks must identify each affected component's
+owner, public contracts and adapters, owned data and migrations, dependency
+direction, rollback/compatibility boundary, and owned unit, contract,
+persistence, adapter/browser, and composition test layers. A deterministic
+ownership and dependency manifest must classify source paths and release
+surfaces. Unknown, shared, safety-sensitive, multi-component, contract, schema,
+workflow, composition-root, or deployment impact fails closed to full
+regression.
+
+Feature heads use one authoritative pull-request validation path and one stable
+aggregate required check; equivalent push and pull-request runs for the same
+head are prohibited. Protected integration candidates retain complete evidence
+for one exact immutable SHA. Promotion and release may reuse that evidence only
+when its SHA, manifest, environment, command, and artifact bindings still match,
+then run a concise cross-system smoke instead of repeating the unchanged full
+suite. Evidence reuse never bypasses a project-specific security, privacy,
+safety, approval, backup, rollback, or release gate.
+
 ## Build Flow
 
 When the user says to build:

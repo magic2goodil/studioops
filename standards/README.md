@@ -6,6 +6,7 @@ Projects can reference all of them or only the files that apply. Builders must r
 
 Default standards:
 
+- `modular-architecture-and-scoped-validation.md`
 - `engineering.md`
 - `design-system.md`
 - `frontend.md`
