@@ -5,6 +5,7 @@ import {
   candidateIdentityIsComplete,
   normalizeDeliveryPolicy,
 } from "../src/store.js";
+import { createSupervisorReport } from "../src/supervisor.js";
 
 test("delivery policy fails closed and never enables merge or deployment", () => {
   assert.equal(normalizeDeliveryPolicy({ profile: "ambiguous" }).profile, "standard");
@@ -36,6 +37,34 @@ test("unknown impact fails closed to backend and all specialist lanes", () => {
   const routing = capabilityRoutingForTask({ deliveryPolicy: { profile: "prototype-fast-lane" } }, {});
   assert.deepEqual(routing.required, ["backend", "frontend", "accessibility", "lead"]);
   assert.equal(routing.evidence.unknown, true);
+});
+
+test("stale or conflicting impact evidence fails closed to every specialist lane", () => {
+  for (const flag of ["stale", "conflicting"]) {
+    const routing = capabilityRoutingForTask(
+      { deliveryPolicy: { profile: "prototype-fast-lane" } },
+      { impactEvidence: { changedFiles: ["src/App.jsx"], [flag]: true } },
+    );
+    assert.deepEqual(routing.required, ["backend", "frontend", "accessibility", "lead"]);
+  }
+});
+
+test("explicit local mode requires a verified candidate while GitHub requires an exact subject", () => {
+  const base = {
+    id: "task_1", projectId: "project_1", title: "Candidate", status: "builder_review",
+    branchName: "feature/candidate", reviewCycle: 1, reviewSubjectCycle: 1,
+  };
+  const local = createSupervisorReport({
+    projects: [{ id: "project_1", workflowMode: "local", reviewPipeline: [] }],
+    tasks: [base], reviews: [], events: [], comments: [],
+  });
+  assert.equal(local.actions[0].type, "return_to_builder");
+
+  const github = createSupervisorReport({
+    projects: [{ id: "project_1", workflowMode: "github", reviewPipeline: [] }],
+    tasks: [{ ...base, prUrl: "https://github.com/example/repo/pull/1" }], reviews: [], events: [], comments: [],
+  });
+  assert.equal(github.actions[0].type, "return_to_builder");
 });
 
 test("candidate identity requires immutable repository coordinates", () => {

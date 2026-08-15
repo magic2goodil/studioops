@@ -1,6 +1,8 @@
 import {
   architectureIsCompleteInState,
   capabilityRoutingForTask,
+  candidateIdentityForTask,
+  candidateIdentityIsComplete,
   cycleLimitLeadReviewApplies,
   currentReviewCandidateCycle,
   earliestIncompleteRequiredReviewStage,
@@ -419,8 +421,17 @@ function taskActions(state, task, options = {}) {
 
   if (task.status === "builder_review") {
     const localMode = String(project.workflowMode || "").toLowerCase() === "local";
-    if (!task.branchName || (!localMode && !task.prUrl)) {
-      return [actionBase(state, task, "return_to_builder", "builder", "Builder review intake is incomplete: branch and PR URL are required before reviewer routing.", {
+    const githubMode = String(project.workflowMode || "").toLowerCase() === "github";
+    const candidateIdentity = candidateIdentityForTask(task);
+    const identityMissing = !candidateIdentityIsComplete(candidateIdentity);
+    const intakeMissing = !task.branchName
+      || (!localMode && (!task.prUrl || (githubMode && !task.reviewSubjectSha)))
+      || (localMode && identityMissing);
+    if (intakeMissing) {
+      const reason = localMode
+        ? "Builder review intake is incomplete: local mode requires a branch and verified full candidate identity (commit, tree, base, branch, cycle, and impact evidence)."
+        : "Builder review intake is incomplete: GitHub mode requires a branch, PR URL, and exact subject SHA candidate identity before reviewer routing.";
+      return [actionBase(state, task, "return_to_builder", "builder", reason, {
         ...options,
         nextStatus: "needs_changes",
       })];

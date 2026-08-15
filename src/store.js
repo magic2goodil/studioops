@@ -717,7 +717,12 @@ function normalizedImpactEvidence(value = {}) {
   const explicit = Array.isArray(value.impact) ? value.impact.map((item) => String(item).trim().toLowerCase()) : [];
   const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
-  const unknown = value.unknown === true || value.classified === false || !files.length && !classifications.length;
+  const unknown = value.unknown === true
+    || value.classified === false
+    || value.stale === true
+    || value.conflicting === true
+    || Boolean(value.staleReason || value.conflictReason)
+    || !files.length && !classifications.length;
   const backendRequired = unknown || classifications.some((item) => ["backend", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment"].includes(item))
     || files.some((file) => /(^|\/)(server|api|src\/store|migrations?|db|auth|security|deploy|infra)(\/|\.|$)/i.test(file));
   const frontend = classifications.includes("frontend") || classifications.includes("design-system") || files.some((file) => /\.(css|scss|sass|less|jsx|tsx|vue|svelte|html)$/i.test(file));
@@ -2667,7 +2672,12 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   if (task.status === "builder_review") {
     if (!task.reviewCycle) task.reviewCycle = 1;
     const projectWorkflowMode = String(project.workflowMode || "").toLowerCase();
-    if (!task.branchName || (projectWorkflowMode !== "local" && !task.prUrl)) {
+    const candidateIdentity = candidateIdentityForTask(task);
+    const missingCandidateIdentity = !candidateIdentityIsComplete(candidateIdentity);
+    const missingIntake = !task.branchName
+      || (projectWorkflowMode !== "local" && (!task.prUrl || (projectWorkflowMode === "github" && !task.reviewSubjectSha)))
+      || (projectWorkflowMode === "local" && missingCandidateIdentity);
+    if (missingIntake) {
       setTaskWorkflowState(state, task, {
         status: "needs_changes",
         assignedAgentRole: "builder",
