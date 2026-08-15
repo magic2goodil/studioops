@@ -1216,9 +1216,19 @@ export async function updateTask(taskId, patch) {
     // A status repair restores an invalid legacy record to the workflow; it must
     // not be treated as a new builder submission, which would discard the
     // review subject and cycle that make existing approvals auditable.
+    const candidateIdentityBeforePatch = candidateIdentityForTask(task);
+    const candidateIdentityAfterPatch = Object.prototype.hasOwnProperty.call(patch, "candidateIdentity")
+      ? normalizeCandidateIdentity(patch.candidateIdentity, task.candidateIdentity || {})
+      : candidateIdentityBeforePatch;
+    const unchangedVerifiedCandidate = candidateIdentityIsComplete(candidateIdentityBeforePatch)
+      && candidateIdentityIsComplete(candidateIdentityAfterPatch)
+      && JSON.stringify(candidateIdentityBeforePatch) === JSON.stringify(candidateIdentityAfterPatch)
+      && (!Object.prototype.hasOwnProperty.call(patch, "subjectSha")
+        || normalizeGitSha(patch.subjectSha, "review subject SHA") === task.reviewSubjectSha);
     const startedBuilderReviewCycle = !repairingLegacyStatus
       && patch.status === "builder_review"
-      && previousStatus !== "builder_review";
+      && previousStatus !== "builder_review"
+      && !unchangedVerifiedCandidate;
     if (startedBuilderReviewCycle) {
       task.reviewCycle = Number(task.reviewCycle || 0) + 1;
       task.reviewSubjectSha = "";
@@ -2067,12 +2077,6 @@ export function resetAutomationCircuitInState(state, input = {}) {
     closedBy: String(input.author || "StudioOps Owner").trim(),
     closeReason: String(input.reason || "Underlying blocker verified.").trim(),
   };
-  if (previousCircuit.snapshot) {
-    const restored = previousCircuit.snapshot;
-    for (const key of ["status", "assignedAgentRole", "reviewCycle", "reviewSubjectCycle", "reviewSubjectSha", "candidateIdentity"]) {
-      if (Object.prototype.hasOwnProperty.call(restored, key)) target[key] = restored[key];
-    }
-  }
   target.updatedAt = now;
   if (task) {
     const resumeStatus = VALID_STATUSES.has(task.automationBlocker?.resumeStatus)
@@ -2090,6 +2094,12 @@ export function resetAutomationCircuitInState(state, input = {}) {
       now,
       target.automationCircuit.closedBy,
     );
+  }
+  if (previousCircuit.snapshot) {
+    const restored = previousCircuit.snapshot;
+    for (const key of ["status", "assignedAgentRole", "reviewCycle", "reviewSubjectCycle", "reviewSubjectSha", "candidateIdentity"]) {
+      if (Object.prototype.hasOwnProperty.call(restored, key)) target[key] = restored[key];
+    }
   }
   state.events = state.events || [];
   state.events.push({

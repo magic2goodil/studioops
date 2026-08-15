@@ -274,6 +274,37 @@ test("task circuit reset preserves evidence and starts a fresh dispatch epoch", 
   assert.ok(state.events.some((event) => event.type === "automation_circuit_reset"));
 });
 
+test("task circuit reset compare-and-set restores the exact pre-block workflow snapshot", () => {
+  const snapshot = {
+    status: "lead_review",
+    assignedAgentRole: "lead-reviewer",
+    reviewCycle: 2,
+    reviewSubjectCycle: 3,
+    reviewSubjectSha: "a".repeat(40),
+    candidateIdentity: { commitSha: "a".repeat(40), treeSha: "b".repeat(40), baseSha: "c".repeat(40), branch: "feature/x", candidateCycle: 3 },
+  };
+  const state = stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+    reviewCycle: 2,
+    reviewSubjectCycle: 3,
+    reviewSubjectSha: snapshot.reviewSubjectSha,
+    candidateIdentity: snapshot.candidateIdentity,
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: { state: "open", snapshot },
+  });
+  const reset = resetAutomationCircuitInState(state, { task: "task_1", snapshot, now: "2026-07-21T12:00:00.000Z" });
+  assert.equal(reset.status, "lead_review");
+  assert.equal(reset.assignedAgentRole, "lead-reviewer");
+  assert.equal(reset.reviewCycle, 2);
+  assert.equal(reset.reviewSubjectCycle, 3);
+  assert.deepEqual(reset.candidateIdentity, snapshot.candidateIdentity);
+  assert.throws(
+    () => resetAutomationCircuitInState({ ...state, tasks: [{ ...state.tasks[0], automationCircuit: { state: "open", snapshot: { ...snapshot, status: "drifted" } } }] }, { task: "task_1", snapshot }),
+    /compare-and-set failed/,
+  );
+});
+
 test("project circuit reset advances every project task into a fresh attempt epoch", () => {
   const state = stateWith({ status: "ready" });
   state.projects[0].automationCircuit = {
