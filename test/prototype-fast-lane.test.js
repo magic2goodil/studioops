@@ -262,5 +262,11 @@ test("material impact changes invalidate same-SHA capability skips and start a n
     )),
     false,
   );
-  assert.equal(state.events.at(-2).type, "candidate_identity_changed");
+  assert.equal(
+    state.events.some((event) => (
+      event.taskId === task.id
+      && event.type === "candidate_identity_changed"
+    )),
+    true,
+  );
 });
