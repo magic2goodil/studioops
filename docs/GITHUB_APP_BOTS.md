@@ -177,7 +177,7 @@ You can override the mapping in `studioops.config.md`:
   "credentialsDir": "~/.codex/studioops/credentials/github-apps",
   "defaultRole": "default",
   "roleMap": {
-    "builder": "default",
+    "builder": "builder",
     "backend-reviewer": "backend-reviewer",
     "frontend-reviewer": "frontend-reviewer",
     "accessibility-reviewer": "accessibility-reviewer",
