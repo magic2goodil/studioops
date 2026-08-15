@@ -1354,6 +1354,22 @@ export async function updateTask(taskId, patch) {
         );
       }
     }
+    const candidateIdentityMateriallyChanged = previousReviewSubjectSha
+      && previousReviewSubjectSha === task.reviewSubjectSha
+      && candidateIdentityIsComplete(candidateIdentityBeforePatch)
+      && candidateIdentityIsComplete(candidateIdentityAfterPatch)
+      && !candidateMaterialMatches(candidateIdentityBeforePatch, candidateIdentityAfterPatch);
+    if (candidateIdentityMateriallyChanged) {
+      restartReviewsForSubjectChange(
+        state,
+        task,
+        project,
+        previousReviewSubjectSha,
+        task.reviewSubjectSha,
+        new Date().toISOString(),
+        { candidateIdentityChanged: true },
+      );
+    }
     task.candidateIdentity = candidateIdentityForTask(task);
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
@@ -2570,6 +2586,7 @@ function setTaskWorkflowState(state, task, patch, now) {
 }
 
 function restartReviewsForSubjectChange(state, task, project, previousSha, subjectSha, now, options = {}) {
+  const candidateIdentityChanged = options.candidateIdentityChanged === true;
   if (!options.preserveCandidateCycle) {
     task.reviewSubjectCycle = Math.max(
       currentReviewCandidateCycle(task),
@@ -2584,7 +2601,9 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
       continue;
     }
     invalidateCandidate(candidate, {
-      reason: `Task ${task.id} review subject changed after candidate assembly.`,
+      reason: candidateIdentityChanged
+        ? `Task ${task.id} candidate identity changed after candidate assembly.`
+        : `Task ${task.id} review subject changed after candidate assembly.`,
       expected: previousSha,
       observed: subjectSha,
       invalidatedAt: now,
@@ -2616,22 +2635,26 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
       && run.status === "queued"
     ) {
       run.status = "cancelled";
-      run.notes = `Cancelled before start because the review subject changed from ${previousSha} to ${subjectSha}.`;
+      run.notes = candidateIdentityChanged
+        ? "Cancelled before start because the candidate identity changed."
+        : `Cancelled before start because the review subject changed from ${previousSha} to ${subjectSha}.`;
       run.updatedAt = now;
     }
   }
   addAutomationComment(
     state,
     task,
-    `Review subject changed from ${previousSha} to ${subjectSha}. Prior candidate-cycle approvals are stale, so StudioOps restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.${options.preserveCandidateCycle ? " The verified tree, base, branch, and impact evidence are unchanged, so this metadata-only repair did not consume a candidate cycle." : ""}`,
+    candidateIdentityChanged
+      ? `Candidate identity changed while the subject SHA remained ${subjectSha}. Prior candidate-cycle approvals and capability skips are stale, so StudioOps restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.`
+      : `Review subject changed from ${previousSha} to ${subjectSha}. Prior candidate-cycle approvals are stale, so StudioOps restarted at ${firstRequiredStage?.label || firstRequiredStage?.key || "the first required review lane"} with candidate cycle ${task.reviewSubjectCycle}. The builder review cycle remains ${currentReviewCycle(task)}.${options.preserveCandidateCycle ? " The verified tree, base, branch, and impact evidence are unchanged, so this metadata-only repair did not consume a candidate cycle." : ""}`,
     now,
   );
   state.events.push({
     id: nextId(state.events, "event"),
-    type: "review_subject_changed",
+    type: candidateIdentityChanged ? "candidate_identity_changed" : "review_subject_changed",
     projectId: task.projectId,
     taskId: task.id,
-    message: `${task.title}: review subject changed and required reviews restarted`,
+    message: `${task.title}: ${candidateIdentityChanged ? "candidate identity" : "review subject"} changed and required reviews restarted`,
     createdAt: now,
   });
 }

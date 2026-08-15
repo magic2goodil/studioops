@@ -204,3 +204,63 @@ test("current impact evidence refreshes identity and unchanged-tree metadata rep
   assert.equal(current.candidateIdentity.commitSha, metadataSha);
   assert.deepEqual(current.candidateIdentity.impactEvidence.changedFiles, ["src/App.jsx"]);
 });
+
+test("material impact changes invalidate same-SHA capability skips and start a new candidate cycle", async () => {
+  const sha = "2".repeat(40);
+  const project = await addProject({
+    key: "fast-lane-impact-reclassification",
+    name: "Fast lane impact reclassification",
+    workflowMode: "github",
+    deliveryPolicy: { profile: "prototype-fast-lane" },
+  });
+  const task = await addTask({
+    project: project.id,
+    title: "Reclassify candidate impact",
+    status: "in_progress",
+    branchName: "feature/reclassification",
+    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+  });
+
+  await updateTask(task.id, {
+    status: "builder_review",
+    branchName: "feature/reclassification",
+    prUrl: "https://github.com/example/demo/pull/3",
+    subjectSha: sha,
+    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+    candidateIdentity: {
+      commitSha: sha,
+      treeSha: "3".repeat(40),
+      baseSha: "4".repeat(40),
+      branch: "feature/reclassification",
+      candidateCycle: 1,
+      impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+    },
+  });
+  await automationTick({ nowMs: Date.parse("2026-08-15T12:00:00.000Z") });
+
+  let state = await readState();
+  let current = state.tasks.find((item) => item.id === task.id);
+  assert.equal(current.status, "frontend_review");
+  assert.equal(state.reviews.find((review) => review.taskId === task.id && review.stageKey === "backend")?.outcome, "skipped");
+
+  await updateTask(task.id, {
+    impactEvidence: { changedFiles: ["src/store.js"], impact: ["backend"] },
+  });
+  state = await readState();
+  current = state.tasks.find((item) => item.id === task.id);
+  assert.equal(current.reviewSubjectSha, sha);
+  assert.equal(current.reviewCycle, 1);
+  assert.equal(current.reviewSubjectCycle, 2);
+  assert.equal(current.status, "backend_review");
+  assert.equal(current.assignedAgentRole, "backend-reviewer");
+  assert.deepEqual(current.candidateIdentity.impactEvidence.changedFiles, ["src/store.js"]);
+  assert.equal(
+    state.reviews.some((review) => (
+      review.taskId === task.id
+      && review.stageKey === "backend"
+      && Number(review.candidateCycle) === 2
+    )),
+    false,
+  );
+  assert.equal(state.events.at(-2).type, "candidate_identity_changed");
+});
