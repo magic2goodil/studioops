@@ -14,7 +14,7 @@ import {
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
 import { missionControlDataDir } from "./runtime-paths.js";
-import { normalizeProjectWorkflowMode } from "./config.js";
+import { normalizeProjectWorkflowMode, withDefaultProjectStandards } from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   DATABASE_FILE,
@@ -800,7 +800,7 @@ export async function addProject(input) {
       defaultBranch: String(input.defaultBranch || "main").trim(),
       validationCommands: normalizeList(input.validationCommands),
       contextLinks: normalizeList(input.contextLinks),
-      standards: normalizeList(input.standards),
+      standards: withDefaultProjectStandards(normalizeList(input.standards)),
       safetyRules: normalizeList(input.safetyRules),
       reviewPipeline: normalizeReviewPipeline(input.reviewPipeline),
       qaIntegration: input.qaIntegration || {},
@@ -851,7 +851,7 @@ export async function updateProject(projectId, patch = {}) {
       project.contextLinks = normalizeList(patch.contextLinks);
     }
     if (Object.prototype.hasOwnProperty.call(patch, "standards")) {
-      project.standards = normalizeList(patch.standards);
+      project.standards = withDefaultProjectStandards(normalizeList(patch.standards));
     }
     if (Object.prototype.hasOwnProperty.call(patch, "safetyRules")) {
       project.safetyRules = normalizeList(patch.safetyRules);
@@ -897,6 +897,32 @@ export async function updateProject(projectId, patch = {}) {
     });
     return project;
   });
+}
+
+export function adoptDefaultProjectStandardsInState(state, projectId, input = {}) {
+  const project = findProject(state, projectId);
+  if (!project) throw new Error(`Unknown project: ${projectId}`);
+  const previous = normalizeList(project.standards);
+  const standards = withDefaultProjectStandards(previous);
+  const added = standards.filter((standard) => !previous.includes(standard));
+  if (!added.length) return { project, standards, added, changed: false };
+
+  const now = input.now || new Date().toISOString();
+  project.standards = standards;
+  project.updatedAt = now;
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "project_default_standards_adopted",
+    projectId: project.id,
+    message: `Required StudioOps standards adopted: ${added.join(", ")}`,
+    createdAt: now,
+  });
+  return { project, standards, added, changed: true };
+}
+
+export async function adoptDefaultProjectStandards(projectId, input = {}) {
+  return mutateState(async (state) => adoptDefaultProjectStandardsInState(state, projectId, input));
 }
 
 function governedArchitectureParent(state, project, parentTaskId, architectureParentTaskId) {
@@ -2665,6 +2691,22 @@ export function functionalDeliveryContract(task = {}) {
   ].join("\n");
 }
 
+export function modularArchitectureAndValidationContract() {
+  return [
+    "- Assign every changed source path, route, table, migration, job, event, workflow, deploy surface, and test to one bounded component or an explicitly shared classification.",
+    "- For each affected component, identify its owner, public contracts and adapters, owned data, allowed dependency direction, rollback/compatibility boundary, and owned unit, contract, persistence, adapter/browser, and composition test layers.",
+    "- Keep business policy in one authoritative component. Reject duplicated policy, god modules, cross-component internal imports or raw data access, dependency cycles, and unowned release-sensitive surfaces.",
+    "- Prefer a modular monolith. Microservices, extra databases, brokers, queues, and caches require measured isolation, scale, durability, consistency, or reliability evidence.",
+    "- Select validation deterministically from the base/head diff plus an executable ownership and dependency manifest; path-ignore rules alone are not an impact model.",
+    "- Fail closed to full regression for shared-kernel, public-contract, identity, authorization, consent, safety, entitlement, schema/migration, event-version, composition-root, dependency/workflow/deployment, multi-component, ambiguous, or unclassified changes.",
+    "- Use one stable required aggregate check for selected jobs. A selected failure or cancellation fails it; intentionally unselected components remain neutral and visible.",
+    "- Do not emit equivalent push and pull-request validation runs for the same feature head. Protected integration commits retain one complete exact-SHA regression attestation.",
+    "- Exact-SHA evidence must bind the source SHA, ownership/dependency manifest digest, selected components, commands, outcomes, durations, retries/skips, environment contract, and artifact digests.",
+    "- Promotion and release may reuse successful evidence only when every binding still matches, followed by a concise cross-system smoke. Missing, stale, cross-SHA, malformed, unsuccessful, or environment-mismatched evidence requires full regression and blocks release until valid.",
+    "- Impact scoping is additive to project-specific security, privacy, safety, rollback, and release gates; it never waives or narrows them.",
+  ].join("\n");
+}
+
 function systemsArchitectPrompt(task, project, context) {
   const completionCommand = `node <STUDIOOPS_CLI_PATH> architecture-complete ${task.id} --body "..." --task-ids "task_..."`;
   return `You are the systems architect for StudioOps task ${task.id}.
@@ -2701,6 +2743,12 @@ ${context.projectContext}
 Project standards:
 ${context.standards}
 
+Project safety rules:
+${context.safety}
+
+Modular architecture and impact-scoped validation contract:
+${modularArchitectureAndValidationContract()}
+
 Architecture mandate:
 - Inspect the actual repository and every supplied mockup, screenshot, logo, and reference before proposing work. Inventory canonical assets and name the exact asset builders must use; never redraw or substitute a supplied logo without an explicit product decision.
 - Decompose the experience into functional slices: navigation, screens/components, user interactions, state transitions, data-bearing regions, background work, administration, and failure/recovery paths.
@@ -2710,6 +2758,9 @@ Architecture mandate:
 - Define performance budgets: critical payload sizes, query counts, rendering/loading strategy, concurrency assumptions, and what will be measured.
 - Define loading, empty, error, offline/retry, and degraded states—not only the happy-path mockup.
 - Define the local development and QA path, including seed data, services, health checks, and end-to-end smoke coverage.
+- Define bounded component ownership, public contracts, data ownership, dependency direction, rollback boundaries, owned test layers, and the deterministic ownership/dependency manifest that carries those decisions into every child task.
+- Define component-only, full-integration, pre-deploy evidence/smoke, total-release-time, and duplicate-workflow-count baselines and target budgets.
+- Design one authoritative pull-request validation path and one stable aggregate check. Ambiguous or shared impact must fail closed to full regression, and protected integration evidence must be reusable only at the exact immutable SHA.
 - Capture material decisions and rejected alternatives with concise reasons.
 - Break broad work into dependency-linked StudioOps child tasks. Each child must include the architectural constraints it consumes, observable acceptance criteria, validation commands/expectations, correct attachments, a narrow lane/work area, \`--parent ${task.id}\`, and \`--architecture-approved\`.
 - Preserve a single coherent architecture across those child tasks. Builders must not independently reinvent infrastructure or data contracts.
@@ -2764,7 +2815,47 @@ export function generatePrompt(state, taskId, role = "builder") {
       criteria,
       projectContext: context,
       standards,
+      safety,
     });
+  }
+
+  const normalizedRole = String(role || "").toLowerCase().replaceAll("_", "-");
+  if (normalizedRole === "release" || normalizedRole.includes("release-manager") || normalizedRole.includes("promotion")) {
+    return `You are the release manager for StudioOps task ${task.id}.
+
+Project: ${project.name}
+Repository path: ${project.repoPath || "(not recorded)"}
+Protected integration branch: ${reviewPolicy.integrationBranch || "(not configured)"}
+Release subject SHA: ${task.reviewSubjectSha || "(not recorded)"}
+Feature branch: ${task.branchName || "(not recorded)"}
+PR: ${task.prUrl || "(not recorded)"}
+
+Task:
+${task.title}
+
+Acceptance criteria:
+${criteria}
+
+Project safety rules:
+${safety}
+
+Project standards:
+${standards}
+
+Configured validation commands:
+${validation}
+
+Modular architecture and impact-scoped validation contract:
+${modularArchitectureAndValidationContract()}
+
+Release instructions:
+- Verify the release or tag SHA is reachable from the protected integration branch and exactly matches the successful QA attestation subject.
+- Reuse the complete regression attestation only when its exact SHA, ownership/dependency manifest digest, selected-component set, environment contract, commands, and artifact digests still match.
+- When the attestation remains valid, run only concise provenance, health, authorization/wiring, and cross-system smoke checks; do not repeat an unchanged full suite.
+- Missing, stale, malformed, cross-SHA, failed, or environment-mismatched evidence blocks promotion or release and requires a new complete regression.
+- Preserve every project-specific approval, backup, rollback, security, privacy, safety, and non-destructive deployment gate. Evidence reuse never authorizes production deployment by itself.
+- Do not merge, tag, deploy, or waive a gate without the explicit human authorization required by the project workflow.
+`;
   }
 
   if (role !== "builder") {
@@ -2821,6 +2912,9 @@ ${reviewPolicyText}
 Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
+Modular architecture and impact-scoped validation contract:
+${modularArchitectureAndValidationContract()}
+
 Review instructions:
 - Review as a senior engineer in the ${reviewerProfile.domain} lane.
 - Use \`show-task ${task.id}\` (or \`--json\`) only for read-only task inspection. Use \`status ${task.id} --status <canonical-status>\` only for an intentional status mutation; never omit \`--status\`.
@@ -2829,6 +2923,8 @@ Review instructions:
 ${reviewerProfile.focus.map((item) => `  - ${item}`).join("\n")}
 - Still check scope, behavior, tests, security, privacy, and maintainability.
 - Check the listed project standards and fail the task for material violations.
+- Reject god modules, duplicated policy, cross-component internal imports or raw data access, dependency cycles, unowned release surfaces, ambiguous impact classified as narrow, and unjustified microservice or database proliferation.
+- Verify the builder's exact-SHA evidence identifies changed and transitively affected components, the deterministic classifier input/output, selected commands, outcomes, timings, and any full-regression escalation.
 - For data/backend changes, check query shape, indexes, pagination, migrations, and privacy boundaries.
 - For frontend/UI changes, check responsive behavior, accessibility, visual hierarchy, component reuse, content editability, and browser console/runtime errors.
 - For accessibility review, check color contrast, readable typography, focus-visible states, keyboard tab order, semantic headings, link and button names, alt text, title text, form labels, ARIA use, and screen-reader basics across mobile, tablet, and desktop.
@@ -2901,6 +2997,9 @@ ${validation}
 Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
+Modular architecture and impact-scoped validation contract:
+${modularArchitectureAndValidationContract()}
+
 Builder instructions:
 - Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Use 'status ${task.id} --status <canonical-status>' only for an intentional status mutation; never omit '--status'.
 - Create or switch to the feature branch.
@@ -2910,6 +3009,7 @@ Builder instructions:
 - For data/backend tasks, consider query shape, indexes, pagination, migrations, and realistic data volume.
 - For location, auth, social, notification, behavioral analytics, personalization, AI training, or persuasion/coaching features, define the consent path, opt-out/revocation behavior, data minimization, and privacy notes before implementation.
 - For deployment/release tasks, keep PR and protected integration branch workflows to validation, artifacts, previews, or staging by default; require production deployment to run only from explicit releases/tags with safety checks; verify the release/tag commit is reachable from the protected integration branch; make \`workflow_dispatch\` dry-run/preview unless explicitly approved for an emergency production path; and avoid broad delete/sync cleanup against production.
+- Record the owning component, public contracts, owned data, dependency direction, rollback boundary, owned test layers, changed and transitively affected components, classifier decision, selected commands, exact SHA, outcomes, timings, and full-regression reason when escalation applies.
 - Keep changes scoped to this task.
 - Keep changes inside the task's lane and work areas. If you need to touch files outside that scope, add a StudioOps comment and either create a dependent task or explain why the scope must expand.
 - Do not commit secrets, private customer data, or unrelated refactors.

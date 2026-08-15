@@ -5,6 +5,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
   addComment,
+  adoptDefaultProjectStandards,
   addProject,
   addTask,
   automationTick,
@@ -32,6 +33,7 @@ import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
 import {
   expandHome,
   loadConfig,
+  MODULAR_ARCHITECTURE_STANDARD,
   projectFromConfig,
   writeConfig,
 } from "./config.js";
@@ -285,6 +287,7 @@ async function setup() {
         trustLeadApprovals: false,
         integrationBranch: "",
         standards: [
+          MODULAR_ARCHITECTURE_STANDARD,
           "standards/engineering.md",
           "standards/design-system.md",
           "standards/frontend.md",
@@ -426,6 +429,8 @@ Commands:
   show-task TASK_ID             Read-only inspection of one task and its current review subject
   add-project --key --name      Add a project
   update-project PROJECT        Update project settings and Trust Leads policy
+  adopt-default-standards PROJECT|--all
+                                Idempotently add required StudioOps standards
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Mutate task status (requires one canonical non-empty status)
@@ -451,7 +456,7 @@ Commands:
   runs                          List dispatch runs
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
-  prompt TASK_ID --role         Print builder, backend-reviewer, frontend-reviewer, accessibility-reviewer, or lead-reviewer prompt
+  prompt TASK_ID --role         Print builder, architect, reviewer, QA, or release-manager prompt
   qa-list                       List tasks waiting for local QA review
 
 Task fields:
@@ -730,6 +735,29 @@ Automation:
     }
     const project = await updateProject(projectId, patch);
     console.log(`Updated project ${project.id}: ${project.name}`);
+    return;
+  }
+
+  if (command === "adopt-default-standards") {
+    const state = await readStateReadOnly();
+    const projects = args.all
+      ? state.projects
+      : [state.projects.find((project) => (
+          project.id === (args._[1] || args.project)
+          || project.key === (args._[1] || args.project)
+        ))].filter(Boolean);
+    if (!projects.length) {
+      throw new Error(args.all
+        ? "No projects are registered."
+        : `Unknown project: ${args._[1] || args.project || "(missing)"}`);
+    }
+    let changed = 0;
+    for (const project of projects) {
+      const result = await adoptDefaultProjectStandards(project.id);
+      if (result.changed) changed += 1;
+      console.log(`${result.changed ? "Updated" : "Already current"} ${project.key}: ${result.project.standards.join(", ")}`);
+    }
+    console.log(`Adopted required standards for ${changed} project(s); ${projects.length - changed} already current.`);
     return;
   }
 
