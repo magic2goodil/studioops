@@ -1140,6 +1140,38 @@ async function runValidationCommands(repoPath, commands, options) {
   return results;
 }
 
+export function authorizeManifestValidationCommands(trustedCommands, requiredCommands) {
+  const trusted = [...new Set(normalizeList(trustedCommands))];
+  const required = [...new Set(normalizeList(requiredCommands))];
+  const trustedSet = new Set(trusted);
+  const unauthorized = required.filter((command) => !trustedSet.has(command));
+  return {
+    ok: unauthorized.length === 0,
+    commands: trusted,
+    trustedCommandCount: trusted.length,
+    requiredCommandCount: required.length,
+    unauthorizedCommandCount: unauthorized.length,
+  };
+}
+
+export async function verifyExactValidationWorkspace(repoPath, expectedSha, options = {}) {
+  const [head, trackedStatus] = await Promise.all([
+    git(repoPath, ["rev-parse", "--verify", "HEAD"], { ...options, allowFailure: true }),
+    git(repoPath, ["status", "--porcelain=v1", "--untracked-files=no"], { ...options, allowFailure: true }),
+  ]);
+  const headSha = head.ok ? head.output.trim() : "";
+  const trackedChangeCount = trackedStatus.ok
+    ? trackedStatus.output.split("\n").filter(Boolean).length
+    : -1;
+  return {
+    ok: head.ok && trackedStatus.ok && headSha === expectedSha && trackedChangeCount === 0,
+    headSha,
+    headMatches: head.ok && headSha === expectedSha,
+    trackedClean: trackedStatus.ok && trackedChangeCount === 0,
+    trackedChangeCount,
+  };
+}
+
 function projectMatches(project, options = {}) {
   const projectFilter = normalizeList(options.project || options.projects);
   if (!projectFilter.length) return true;
@@ -1861,16 +1893,37 @@ async function integrateProject(projectPlan, options = {}) {
         gitBin: options.gitBin,
       },
     );
-    const selectedValidationCommands = [...new Set([
-      ...validationCommands,
-      ...(result.impactClassification.selectedCommands || []),
-    ])];
-    result.validation = await runValidationCommands(executionRepoPath, selectedValidationCommands, options);
+    result.validationCommandAuthorization = authorizeManifestValidationCommands(
+      validationCommands,
+      result.impactClassification.selectedCommands || [],
+    );
+    if (!result.validationCommandAuthorization.ok) {
+      result.status = "validation_command_untrusted";
+      result.output = "The ownership manifest requires validation commands that are not authorized by the trusted project configuration. No validation command was executed and the candidate was not pushed.";
+      for (const task of mergedTasks) task.status = result.status;
+      return result;
+    }
+    result.validation = await runValidationCommands(
+      executionRepoPath,
+      result.validationCommandAuthorization.commands,
+      options,
+    );
     const failedValidation = result.validation.find((item) => !item.ok);
     if (failedValidation) {
       result.status = "validation_failed";
       result.output = `Validation failed: ${failedValidation.command}`;
       for (const task of mergedTasks) task.status = "validation_failed";
+      return result;
+    }
+    result.validationWorkspace = await verifyExactValidationWorkspace(
+      executionRepoPath,
+      result.commit,
+      gitOptions,
+    );
+    if (!result.validationWorkspace.ok) {
+      result.status = "validation_mutated_candidate";
+      result.output = "Validation changed the candidate HEAD or a tracked file. The candidate was not pushed and exact-SHA evidence was not created.";
+      for (const task of mergedTasks) task.status = result.status;
       return result;
     }
 
@@ -1995,6 +2048,20 @@ async function integrateProject(projectPlan, options = {}) {
         result.output,
         "The configured QA branch and attested local preview were synchronized; no immutable task candidate was requested.",
       );
+      return result;
+    }
+    result.validationWorkspace = await verifyExactValidationWorkspace(
+      executionRepoPath,
+      result.commit,
+      gitOptions,
+    );
+    if (!result.validationWorkspace.ok) {
+      result.status = "validation_mutated_candidate";
+      result.output = appendOutput(
+        result.output,
+        "The candidate HEAD or tracked tree changed after validation. Exact-SHA evidence was not created.",
+      );
+      for (const task of mergedTasks) task.status = result.status;
       return result;
     }
     let validationEvidence;
