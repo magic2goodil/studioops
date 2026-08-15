@@ -95,6 +95,11 @@ test("installed runner entrypoint reports the default and explicit lower capacit
     const configuredReport = JSON.parse((await runPlan()).stdout);
 
     assert.equal(configuredReport.limit, 1);
+
+    await writeConfig({ defaults: {}, runner: { maxRuns: 2 } }, isolated.configRoot);
+    const legacyTopLevelReport = JSON.parse((await runPlan()).stdout);
+
+    assert.equal(legacyTopLevelReport.limit, 2);
   } finally {
     await isolated.cleanup();
   }

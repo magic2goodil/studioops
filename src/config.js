@@ -58,8 +58,20 @@ export function normalizeConfig(config = {}) {
   const legacySupervisor = defaults.supervisor || {};
   const dispatcher = defaults.dispatcher || {};
   const runner = defaults.runner || {};
+  const topLevelRunner = config.runner || {};
+  const normalizedTopLevelRunner = (
+    hasOwnValue(topLevelRunner, "limit")
+    || hasOwnValue(topLevelRunner, "maxRuns")
+  ) ? {
+      ...topLevelRunner,
+      limit: positiveInteger(
+        topLevelRunner.limit ?? topLevelRunner.maxRuns,
+        INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
+      ),
+    } : topLevelRunner;
   return {
     ...config,
+    ...(hasOwnValue(config, "runner") ? { runner: normalizedTopLevelRunner } : {}),
     defaults: {
       ...defaults,
       dispatcher: {
