@@ -7,7 +7,8 @@ import {
   findTask,
   generatePrompt,
   mutateState,
-  reviewStagesForProject,
+  reviewStagesForTask,
+  workflowSnapshotForTask,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
@@ -242,6 +243,7 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
       options.creditPolicy,
     );
     const resumeStatus = task.status;
+    const snapshot = workflowSnapshotForTask(task);
     task.status = "blocked";
     task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
@@ -265,6 +267,7 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
       failureFingerprint: `${task.id}:${action.type}:${admission.tier}:${admission.code}`,
       attemptsConsumed: 0,
       maxAttempts: 0,
+      snapshot,
       openedAt: now,
       nextCheapProbe: "Check current Codex usage limits without launching a model run.",
       resumeAction: `studioops circuit-reset --task ${task.id} --reason credits_verified`,
@@ -344,7 +347,7 @@ function reviewDispatchSafetyReason(state, task, action) {
       : "";
   }
   if (!REVIEW_ACTIONS.has(action.type)) return "";
-  const stages = reviewStagesForProject(project);
+  const stages = reviewStagesForTask(project, task);
   const target = resolveReviewTargetStage(stages, task, action);
   if (target.reason) return target.reason;
   const targetStage = target.stage;
@@ -385,6 +388,7 @@ function openExhaustedAttemptCircuits(state, actions, skipped, options, now) {
     const attemptKey = executionAttemptKey(task, action);
     const attempts = executionAttemptCount(state, attemptKey);
     const resumeStatus = task.status;
+    const snapshot = workflowSnapshotForTask(task);
     task.status = "blocked";
     task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
@@ -408,6 +412,7 @@ function openExhaustedAttemptCircuits(state, actions, skipped, options, now) {
       failureFingerprint: `${task.id}:${attemptKey}:attempt_budget_exhausted`,
       attemptsConsumed: attempts,
       maxAttempts: policy.maxAttempts,
+      snapshot,
       openedAt: now,
       nextCheapProbe: "Inspect the preserved run outputs and verify the underlying blocker without launching another model.",
       resumeAction: `studioops circuit-reset --task ${task.id} --reason verified`,

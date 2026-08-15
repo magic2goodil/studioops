@@ -9,7 +9,7 @@ import {
   latestCurrentReviewForStage,
   reviewPolicyForProject,
   reviewMatchesCurrentCandidate,
-  reviewStagesForProject,
+  reviewStagesForTask,
   VALID_STATUSES,
 } from "./store.js";
 import {
@@ -70,19 +70,9 @@ function isLeadReviewStage(stage) {
   return key === "lead" || role.includes("lead");
 }
 
-function leadReviewStageForProject(project) {
-  const stages = reviewStagesForProject(project);
+function leadReviewStageForProject(project, task) {
+  const stages = reviewStagesForTask(project, task);
   return stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
-}
-
-function reviewStagesForTask(project, task) {
-  const routing = capabilityRoutingForTask(project, task);
-  if (routing.policy.profile !== "prototype-fast-lane") return reviewStagesForProject(project);
-  const allowed = new Set(routing.required);
-  return reviewStagesForProject(project).filter((stage) => {
-    const key = String(stage.key || "").toLowerCase();
-    return key === "lead" || String(stage.role || "").toLowerCase().includes("lead") || allowed.has(key);
-  });
 }
 
 function reviewCycleAtLimit(project, task) {
@@ -97,14 +87,14 @@ function changeRequestedReviewsForCycle(state, task) {
 }
 
 function leadReviewCompleteForCycle(state, task, project) {
-  const leadStage = leadReviewStageForProject(project);
+  const leadStage = leadReviewStageForProject(project, task);
   if (!leadStage) return false;
   const latest = latestCurrentReviewForStage(state, task, leadStage);
   return latest && REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
 }
 
-function stageForStatus(project, status) {
-  return reviewStagesForProject(project).find((stage) => stage.status === status) || null;
+function stageForStatus(project, task) {
+  return reviewStagesForTask(project, task).find((stage) => stage.status === task.status) || null;
 }
 
 function nextOpenReviewStage(state, project, task) {
@@ -113,7 +103,7 @@ function nextOpenReviewStage(state, project, task) {
     && changeRequestedReviewsForCycle(state, task).length
   ) {
     if (leadReviewCompleteForCycle(state, task, project)) return null;
-    return leadReviewStageForProject(project);
+    return leadReviewStageForProject(project, task);
   }
   return reviewStagesForTask(project, task).find((stage) => {
     const latest = latestCurrentReviewForStage(state, task, stage);
@@ -292,7 +282,7 @@ function taskActions(state, task, options = {}) {
   if (task.type === "epic" || hasChildren) return [];
 
   const stages = reviewStagesForTask(project, task);
-  const currentStage = stageForStatus(project, task.status);
+  const currentStage = stageForStatus(project, task);
   const earliestRequiredStage = earliestIncompleteForTask(state, project, task);
   const currentStageIndex = stages.indexOf(currentStage);
   const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
@@ -424,12 +414,14 @@ function taskActions(state, task, options = {}) {
     const githubMode = String(project.workflowMode || "").toLowerCase() === "github";
     const candidateIdentity = candidateIdentityForTask(task);
     const identityMissing = !candidateIdentityIsComplete(candidateIdentity);
+    const requiresVerifiedCandidateIdentity = localMode
+      || capabilityRoutingForTask(project, task).policy.profile === "prototype-fast-lane";
     const intakeMissing = !task.branchName
       || (!localMode && (!task.prUrl || (githubMode && !task.reviewSubjectSha)))
-      || (localMode && identityMissing);
+      || (requiresVerifiedCandidateIdentity && identityMissing);
     if (intakeMissing) {
-      const reason = localMode
-        ? "Builder review intake is incomplete: local mode requires a branch and verified full candidate identity (commit, tree, base, branch, cycle, and impact evidence)."
+      const reason = requiresVerifiedCandidateIdentity
+        ? "Builder review intake is incomplete: this workflow requires a branch and verified full candidate identity (commit, tree, base, branch, cycle, and current impact evidence)."
         : "Builder review intake is incomplete: GitHub mode requires a branch, PR URL, and exact subject SHA candidate identity before reviewer routing.";
       return [actionBase(state, task, "return_to_builder", "builder", reason, {
         ...options,
@@ -458,7 +450,7 @@ function taskActions(state, task, options = {}) {
     if (latest.outcome === "changes_requested") {
       const policy = reviewPolicyForProject(project);
       if (policy.leadOwnsFinalDecisionAtLimit && reviewCycleAtLimit(project, task)) {
-        const leadStage = leadReviewStageForProject(project);
+        const leadStage = leadReviewStageForProject(project, task);
         if (leadStage && !isLeadReviewStage(currentStage)) {
           return [actionBase(state, task, "start_review", leadStage.role, `${currentStage.label || currentStage.key} requested changes at the ${policy.maxBuilderReviewCycles}-cycle review limit; route to lead for final decision.`, {
             ...options,
