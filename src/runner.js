@@ -37,6 +37,12 @@ import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-po
 import { readDiskAvailability } from "./worker-heartbeat.js";
 import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode } from "./config.js";
+import {
+  localGitEnv,
+  materializeLocalCandidate,
+  prepareLocalWorkspace,
+  verifyLocalCandidate,
+} from "./workspace.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -239,6 +245,21 @@ export function resolveProjectWorkflowMode(project = {}, originUrl = "") {
   return parseGitHubRepoUrl(project.repoUrl) || parseGitHubRepoUrl(originUrl) ? "github" : "local";
 }
 
+function candidateIdentityForRun(run) {
+  const identity = run.candidateIdentity || {};
+  return {
+    ...identity,
+    commitSha: String(identity.commitSha || run.reviewSubjectSha || "").trim().toLowerCase(),
+    branch: String(identity.branch || run.branchName || "").trim(),
+    candidateCycle: Number(identity.candidateCycle || run.candidateCycle || 0),
+    taskId: run.taskId,
+  };
+}
+
+function usesLocalCandidate(run) {
+  return run.group === "reviewer" || ["start_builder_fix", "return_to_builder"].includes(run.actionType);
+}
+
 function preflightFailure(code, message, remediation, details = {}) {
   return { ok: false, code, message, remediation, ...details };
 }
@@ -424,6 +445,22 @@ export async function preflightRun(run, input = {}) {
   }
   const workflowMode = resolveProjectWorkflowMode(project, originUrl);
   if (workflowMode === "local") {
+    if (usesLocalCandidate(run)) {
+      try {
+        const candidateIdentity = candidateIdentityForRun(run);
+        await verifyLocalCandidate(
+          input.workspaceRoot || process.env.STUDIOOPS_WORKSPACE_ROOT || DEFAULT_WORKSPACE_ROOT,
+          candidateIdentity,
+        );
+        return { ok: true, workflowMode, originUrl, candidateIdentity };
+      } catch (error) {
+        return preflightFailure(
+          error.code || "local_candidate_preflight_failed",
+          error.message,
+          error.remediation || "Repair the local candidate artifact and retry; review and candidate cycles remain unchanged.",
+        );
+      }
+    }
     const base = await resolveLocalBaseRef(
       repoPath,
       branchNameForRun(run),
@@ -571,7 +608,7 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
     };
   }
   const workflowMode = run.workflowMode || resolveProjectWorkflowMode(run.project, run.preflightOriginUrl);
-  const gitEnv = workflowAuthEnv(workflowMode, authContext, process.env);
+  const gitEnv = workflowMode === "local" ? localGitEnv() : workflowAuthEnv(workflowMode, authContext, process.env);
   const enabled = booleanOption(
     input.useWorkspaces
       ?? input.workspaces
@@ -626,7 +663,16 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
     log.write(`Start ref: ${startRef}\n`);
 
     if (workflowMode === "local") {
-      await createLocalCloneWorkspace(run, workspacePath, branch, startCommit, log, gitEnv);
+      await prepareLocalWorkspace({
+        sourceRepoPath: run.project.repoPath,
+        workspacePath,
+        branch,
+        originUrl: run.preflightOriginUrl || await gitOutput(["remote", "get-url", "origin"], { cwd: run.project.repoPath }),
+        root: workspaceRoot,
+        identity: run.candidateIdentity || run,
+        useCandidate: usesLocalCandidate(run),
+        log,
+      });
       const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "local-clone" };
       await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
       return workspace;
@@ -730,6 +776,7 @@ export function planRunnableRuns(state, input = {}) {
     runnable.push({
       ...run,
       project,
+      candidateIdentity: task?.candidateIdentity ? { ...task.candidateIdentity, taskId: task.id } : undefined,
     });
   }
 
@@ -1198,6 +1245,7 @@ export async function claimRuns(input = {}) {
       run.preflightOriginUrl = preflight.originUrl || "";
       run.preflightBaseRef = preflight.baseRef || "";
       run.preflightBaseCommit = preflight.baseCommit || "";
+      if (preflight.candidateIdentity) run.candidateIdentity = { ...preflight.candidateIdentity };
       const profile = laneProfile(findTask(state, run.taskId) || {}, run);
       run.lane = run.lane || profile.lane;
       run.conflictGroup = run.conflictGroup || profile.conflictGroup;
@@ -1326,6 +1374,51 @@ export async function completeRun(runId, input = {}) {
 
     return run;
   });
+}
+
+async function completeRunAfterExecution(run, input, executionRun = run) {
+  if (input.status === "completed" && run.workflowMode === "local" && run.group === "builder") {
+    try {
+      const root = input.workspaceRoot || process.env.STUDIOOPS_WORKSPACE_ROOT || DEFAULT_WORKSPACE_ROOT;
+      const cycle = ["start_builder_fix", "return_to_builder"].includes(run.actionType)
+        ? Math.max(1, Number(run.candidateCycle || 0) + 1)
+        : Math.max(1, Number(run.candidateCycle || 0));
+      const identity = await materializeLocalCandidate({
+        workspacePath: executionRun.project?.repoPath || run.workspacePath,
+        root,
+        identity: { ...candidateIdentityForRun(run), candidateCycle: cycle },
+        branch: run.branchName,
+        taskId: run.taskId,
+        log: input.log,
+      });
+      identity.candidateCycle = cycle;
+      await mutateState(async (state) => {
+        const task = findTask(state, run.taskId);
+        if (!task) return;
+        task.branchName = task.branchName || run.branchName || identity.branch;
+        task.reviewSubjectSha = identity.commitSha;
+        task.reviewSubjectCycle = cycle;
+        task.candidateIdentity = {
+          commitSha: identity.commitSha,
+          treeSha: identity.treeSha,
+          baseSha: identity.baseSha,
+          branch: task.branchName,
+          candidateCycle: cycle,
+          operationalLocalArtifactRef: identity.operationalLocalArtifactRef,
+          impactEvidence: task.impactEvidence,
+        };
+        task.updatedAt = new Date().toISOString();
+      });
+    } catch (error) {
+      return completeRun(run.id, {
+        ...input,
+        status: "failed",
+        exitCode: error.code || "local_candidate_materialization_failed",
+        notes: `${input.notes || ""}\n\n${error.message}\n\nRemediation: ${error.remediation || "Repair the local candidate and retry."}`.trim(),
+      });
+    }
+  }
+  return completeRun(run.id, input);
 }
 
 export async function reconcileStaleRuns(input = {}) {
@@ -1503,13 +1596,13 @@ async function runClaimedRunWithSdk(run, input = {}) {
     await cleanupGitHubAppAuth(authContext);
   }
 
-  const completed = await completeRun(run.id, {
+  const completed = await completeRunAfterExecution(run, {
     status,
     exitCode,
     outputPath,
     lastMessagePath,
     notes,
-  });
+  }, executionRun);
   if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
   return completed;
 }
@@ -1623,13 +1716,13 @@ async function runClaimedRunWithCli(run, input = {}) {
       log.write(`\nRunner spawn error: ${notes}\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
-      const completed = await completeRun(run.id, {
+      const completed = await completeRunAfterExecution(run, {
         status: "failed",
         exitCode: "spawn_error",
         outputPath,
         lastMessagePath,
         notes,
-      });
+      }, executionRun);
       resolve(completed);
     });
     child.on("close", async (code) => {
