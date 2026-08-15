@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { loadConfig } from "./config.js";
+import { INSTALLED_AUTOMATION_CAPACITY, loadConfig } from "./config.js";
 import { readState } from "./store.js";
 import {
   formatRunnerPlan,
@@ -13,7 +13,7 @@ import {
 } from "./worker-heartbeat.js";
 
 const DEFAULT_INTERVAL_SECONDS = 10;
-const DEFAULT_LIMIT = 1;
+const DEFAULT_LIMIT = INSTALLED_AUTOMATION_CAPACITY.runnerLimit;
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -133,7 +133,7 @@ async function main() {
 Usage:
   studioops-runner --plan
   studioops-runner
-  studioops-runner --watch --interval 10 --limit 1
+  studioops-runner --watch --interval 10 --limit 3
   studioops-runner --watch --timeout-ms 7200000
   studioops-runner --provider codex-sdk
   studioops-runner --model gpt-5.6-sol --model-reasoning-effort high
@@ -143,7 +143,7 @@ Usage:
   studioops-runner --no-github-app-auth
   MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk studioops-runner
   MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=high studioops-runner
-  studioops runner --project event-horizons-web --limit 1
+  studioops runner --project event-horizons-web --limit 3
 
 The runner claims queued builder/reviewer dispatch runs and launches a Codex
 provider against the target project repository. Providers: codex-cli, codex-sdk.

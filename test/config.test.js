@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   effectiveAutomationCapacity,
   normalizeConfig,
   projectFromConfig,
+  writeConfig,
 } from "../src/config.js";
+import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+
+const execFileAsync = promisify(execFile);
 
 test("missing installed automation capacity normalizes to three builders, reviewers, and runners", () => {
   const config = normalizeConfig({ defaults: {} });
@@ -65,6 +72,32 @@ test("top-level installed overrides determine effective capacity without rewriti
     reviewerConcurrency: 1,
     runnerLimit: 2,
   });
+});
+
+test("installed runner entrypoint reports the default and explicit lower capacity", async () => {
+  const isolated = await createHermeticTestEnvironment();
+  try {
+    const command = [
+      path.resolve("src/mission-control-runner.js"),
+      "--plan",
+      "--json",
+    ];
+    const runPlan = () => execFileAsync(process.execPath, command, {
+      cwd: process.cwd(),
+      env: isolated.env,
+      timeout: 30_000,
+    });
+    const defaultReport = JSON.parse((await runPlan()).stdout);
+
+    assert.equal(defaultReport.limit, 3);
+
+    await writeConfig({ defaults: { runner: { limit: 1 } } }, isolated.configRoot);
+    const configuredReport = JSON.parse((await runPlan()).stdout);
+
+    assert.equal(configuredReport.limit, 1);
+  } finally {
+    await isolated.cleanup();
+  }
 });
 
 test("project-level prototype fast lane policy survives config import", () => {
