@@ -1,4 +1,4 @@
-import { chmod, mkdir, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -30,9 +30,30 @@ export function localCandidateRef(identity = {}) {
 }
 
 export function localCandidatePath(root, identity = {}) {
-  const ref = String(identity.operationalLocalArtifactRef || localCandidateRef(identity));
-  if (!ref || ref.includes("..") || path.isAbsolute(ref)) return "";
+  const expectedRef = localCandidateRef(identity);
+  const ref = String(identity.operationalLocalArtifactRef || expectedRef);
+  if (!expectedRef || ref !== expectedRef || ref.includes("..") || path.isAbsolute(ref)) return "";
   return path.join(resolveWorkspaceRoot(root), ref);
+}
+
+async function assertManagedPath(root, artifactRef, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(root);
+  await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
+  let current = workspaceRoot;
+  for (const segment of path.dirname(artifactRef).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      const entry = await lstat(current);
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw failure("local_candidate_path_unsafe", `The managed local candidate path is not a safe directory: ${artifactRef}`, "Remove the conflicting path only after confirming no active run or current candidate references it, then retry.");
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      if (!options.create) throw failure("local_candidate_artifact_missing", `The managed local candidate artifact is missing: ${artifactRef}`, "Run the local builder again to rematerialize the candidate; review and candidate cycles were not changed.");
+      await mkdir(current, { mode: 0o700 });
+    }
+    await chmod(current, 0o700);
+  }
 }
 
 async function git(args, options = {}) {
@@ -69,7 +90,13 @@ export async function verifyLocalCandidate(root, identity, options = {}) {
   if (!String(identity.branch || "").trim() || !Number.isSafeInteger(Number(identity.candidateCycle)) || Number(identity.candidateCycle) < 1) {
     throw failure("local_candidate_identity_invalid", "The local candidate identity is missing its recorded branch or candidate cycle.", "Repair the task candidate identity and rematerialize the candidate before retrying.");
   }
-  try { await git(["rev-parse", "--git-dir"], { cwd: candidatePath }); } catch {
+  const artifactRef = identity.operationalLocalArtifactRef || localCandidateRef(identity);
+  await assertManagedPath(root, artifactRef);
+  try {
+    const artifactStat = await lstat(candidatePath);
+    if (artifactStat.isSymbolicLink() || !artifactStat.isDirectory()) throw new Error("unsafe artifact");
+    await git(["rev-parse", "--git-dir"], { cwd: candidatePath });
+  } catch {
     throw failure("local_candidate_artifact_missing", `The managed local candidate artifact is missing: ${identity.operationalLocalArtifactRef || localCandidateRef(identity)}`, "Run the local builder again to rematerialize the candidate; review and candidate cycles were not changed.");
   }
   for (const [key, value, type] of [["commitSha", identity.commitSha, "commit"], ["treeSha", identity.treeSha, "tree"], ["baseSha", identity.baseSha, "commit"]]) {
@@ -93,7 +120,7 @@ export async function materializeLocalCandidate({ workspacePath, root, identity,
   const candidateIdentity = { commitSha, treeSha, baseSha, branch: branch || "", candidateCycle, taskId };
   const artifactRef = localCandidateRef(candidateIdentity);
   const artifactPath = localCandidatePath(root, { ...candidateIdentity, operationalLocalArtifactRef: artifactRef });
-  await mkdir(path.dirname(artifactPath), { recursive: true, mode: 0o700 });
+  await assertManagedPath(root, artifactRef, { create: true });
   let artifactExists = false;
   try {
     const existing = await stat(artifactPath);
@@ -119,9 +146,27 @@ export async function materializeLocalCandidate({ workspacePath, root, identity,
 }
 
 export async function configureRemotes(workspacePath, originUrl, candidatePath = "") {
-  try { await git(["remote", "remove", "origin"], { cwd: workspacePath }); } catch {}
-  if (originUrl) await git(["remote", "add", "origin", originUrl], { cwd: workspacePath });
-  if (candidatePath) await git(["remote", "add", "local-candidate", candidatePath], { cwd: workspacePath });
+  const env = localGitEnv();
+  const inertOriginUrl = sanitizeOriginUrl(originUrl);
+  try { await git(["remote", "remove", "origin"], { cwd: workspacePath, env }); } catch {}
+  if (inertOriginUrl) await git(["remote", "add", "origin", inertOriginUrl], { cwd: workspacePath, env });
+  if (candidatePath) await git(["remote", "add", "local-candidate", candidatePath], { cwd: workspacePath, env });
+}
+
+export function sanitizeOriginUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol) && !parsed.password) return raw;
+    if (["http:", "https:"].includes(parsed.protocol)) parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return raw;
+  }
 }
 
 export async function prepareLocalWorkspace({ sourceRepoPath, workspacePath, branch, originUrl, root, identity, useCandidate, log }) {

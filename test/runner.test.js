@@ -12,6 +12,7 @@ import {
   branchReuseSafetyReason,
   claimRuns,
   cloneFallbackSource,
+  completeRunAfterExecution,
   performGitHubRemoteRecoveryProbe,
   planRunnableRuns,
   preflightRun,
@@ -20,6 +21,7 @@ import {
   runGitHubRemoteRecoveryProbes,
   runQueuedRuns,
 } from "../src/runner.js";
+import { materializeLocalCandidate } from "../src/workspace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -405,6 +407,93 @@ test("systems architect preflight validates the source checkout without GitHub c
     assert.equal(result.workflowMode, "local");
     assert.equal(result.originUrl, "https://github.com/example/demo.git");
     assert.equal(authCalls, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("local reviewer preflight binds the artifact to the run SHA and candidate cycle", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-local-review-identity-"));
+  try {
+    const repoPath = await createRepository(root);
+    await writeFile(path.join(repoPath, "candidate.txt"), "candidate\n", "utf8");
+    await git(repoPath, ["add", "candidate.txt"]);
+    await git(repoPath, ["commit", "-m", "Candidate"]);
+    const identity = await materializeLocalCandidate({
+      workspacePath: repoPath,
+      root,
+      branch: "codex/demo-task_1",
+      taskId: "task_1",
+      identity: { candidateCycle: 3 },
+    });
+    const run = {
+      id: "run_review",
+      taskId: "task_1",
+      group: "reviewer",
+      role: "backend-reviewer",
+      actionType: "start_review",
+      branchName: identity.branch,
+      reviewSubjectSha: identity.commitSha,
+      candidateCycle: identity.candidateCycle,
+      candidateIdentity: identity,
+      project: { key: "demo", repoPath, repoUrl: "", workflowMode: "local", defaultBranch: "main" },
+    };
+
+    assert.equal((await preflightRun(run, { workspaceRoot: root })).ok, true);
+    const wrongSha = await preflightRun({ ...run, reviewSubjectSha: "f".repeat(40) }, { workspaceRoot: root });
+    assert.equal(wrongSha.code, "local_candidate_identity_mismatch");
+    const wrongCycle = await preflightRun({ ...run, candidateCycle: 4 }, { workspaceRoot: root });
+    assert.equal(wrongCycle.code, "local_candidate_identity_mismatch");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("successful local builder completion materializes under the configured workspace root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-local-builder-completion-"));
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["checkout", "-b", "codex/demo-task_1"]);
+    await writeFile(path.join(repoPath, "candidate.txt"), "candidate\n", "utf8");
+    await git(repoPath, ["add", "candidate.txt"]);
+    await git(repoPath, ["commit", "-m", "Candidate"]);
+    const workspaceRoot = path.join(root, "configured-workspaces");
+    const run = {
+      id: "run_local_builder",
+      taskId: "task_1",
+      projectId: "project_1",
+      group: "builder",
+      role: "builder",
+      actionType: "start_builder",
+      status: "running",
+      workflowMode: "local",
+      branchName: "codex/demo-task_1",
+      candidateCycle: 1,
+      project: { id: "project_1", key: "demo", repoPath },
+    };
+    const state = {
+      projects: [run.project],
+      tasks: [{ id: "task_1", projectId: "project_1", status: "in_progress", branchName: run.branchName }],
+      runs: [run],
+      comments: [],
+      events: [],
+    };
+
+    const completed = await completeRunAfterExecution(run, {
+      status: "completed",
+      exitCode: 0,
+      state,
+      workspaceRoot,
+    }, run);
+
+    assert.equal(completed.status, "completed");
+    assert.equal(state.tasks[0].status, "builder_review");
+    assert.equal(state.tasks[0].candidateIdentity.commitSha, await git(repoPath, ["rev-parse", "HEAD"]));
+    assert.match(state.tasks[0].candidateIdentity.operationalLocalArtifactRef, /^candidates\/task_1\/1-/);
+    assert.equal(
+      await git(path.join(workspaceRoot, state.tasks[0].candidateIdentity.operationalLocalArtifactRef), ["rev-parse", `${state.tasks[0].candidateIdentity.commitSha}^{tree}`]),
+      state.tasks[0].candidateIdentity.treeSha,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

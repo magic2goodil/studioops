@@ -41,6 +41,7 @@ import {
   localGitEnv,
   materializeLocalCandidate,
   prepareLocalWorkspace,
+  sanitizeOriginUrl,
   verifyLocalCandidate,
 } from "./workspace.js";
 
@@ -247,13 +248,26 @@ export function resolveProjectWorkflowMode(project = {}, originUrl = "") {
 
 function candidateIdentityForRun(run) {
   const identity = run.candidateIdentity || {};
-  return {
+  const candidateIdentity = {
     ...identity,
     commitSha: String(identity.commitSha || run.reviewSubjectSha || "").trim().toLowerCase(),
     branch: String(identity.branch || run.branchName || "").trim(),
     candidateCycle: Number(identity.candidateCycle || run.candidateCycle || 0),
     taskId: run.taskId,
   };
+  const reviewSubjectSha = String(run.reviewSubjectSha || "").trim().toLowerCase();
+  const candidateCycle = Number(run.candidateCycle || 0);
+  if (
+    (reviewSubjectSha && candidateIdentity.commitSha !== reviewSubjectSha)
+    || (candidateCycle > 0 && candidateIdentity.candidateCycle !== candidateCycle)
+    || (run.branchName && candidateIdentity.branch !== run.branchName)
+  ) {
+    const error = new Error("The recorded local candidate identity does not match the run review SHA, branch, or candidate cycle.");
+    error.code = "local_candidate_identity_mismatch";
+    error.remediation = "Cancel the stale run and redispatch it from the task's current exact candidate; review and candidate cycles remain unchanged.";
+    throw error;
+  }
+  return candidateIdentity;
 }
 
 function usesLocalCandidate(run) {
@@ -435,24 +449,28 @@ export async function preflightRun(run, input = {}) {
     );
   }
 
-  const originUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
+  const repositoryOriginUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
+  const configuredOriginUrl = sanitizeOriginUrl(project.repoUrl || repositoryOriginUrl);
   if (run.group === "architect") {
     return {
       ok: true,
       workflowMode: "local",
-      originUrl,
+      originUrl: configuredOriginUrl,
     };
   }
-  const workflowMode = resolveProjectWorkflowMode(project, originUrl);
+  const workflowMode = resolveProjectWorkflowMode(project, repositoryOriginUrl);
   if (workflowMode === "local") {
     if (usesLocalCandidate(run)) {
       try {
         const candidateIdentity = candidateIdentityForRun(run);
         await verifyLocalCandidate(
-          input.workspaceRoot || process.env.STUDIOOPS_WORKSPACE_ROOT || DEFAULT_WORKSPACE_ROOT,
+          input.workspaceRoot
+            || process.env.STUDIOOPS_WORKSPACE_ROOT
+            || process.env.MISSION_CONTROL_WORKSPACE_ROOT
+            || DEFAULT_WORKSPACE_ROOT,
           candidateIdentity,
         );
-        return { ok: true, workflowMode, originUrl, candidateIdentity };
+        return { ok: true, workflowMode, originUrl: configuredOriginUrl, candidateIdentity };
       } catch (error) {
         return preflightFailure(
           error.code || "local_candidate_preflight_failed",
@@ -476,13 +494,13 @@ export async function preflightRun(run, input = {}) {
     return {
       ok: true,
       workflowMode,
-      originUrl,
+      originUrl: configuredOriginUrl,
       baseRef: base.ref,
       baseCommit: base.commit,
     };
   }
 
-  if (!parseGitHubRepoUrl(originUrl)) {
+  if (!parseGitHubRepoUrl(repositoryOriginUrl)) {
     return preflightFailure(
       "missing_github_origin",
       "GitHub workflow mode requires an origin remote hosted on github.com.",
@@ -507,13 +525,13 @@ export async function preflightRun(run, input = {}) {
   try {
     await checkRemote({ ...run, workflowMode, project: { ...project, workflowMode } }, authContext, input);
   } catch (error) {
-    const repository = parseGitHubRepoUrl(originUrl);
+    const repository = parseGitHubRepoUrl(repositoryOriginUrl);
     return preflightFailure(
       "inaccessible_github_remote",
       `The GitHub origin is not accessible: ${redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext))}`,
       "Verify the origin URL, repository access, network connection, and GitHub App installation permissions.",
       {
-        originUrl,
+        originUrl: repositoryOriginUrl,
         owner: repository?.owner || "",
         repository: repository?.name || "",
       },
@@ -521,7 +539,7 @@ export async function preflightRun(run, input = {}) {
   } finally {
     await cleanupAuth(authContext);
   }
-  return { ok: true, workflowMode, originUrl };
+  return { ok: true, workflowMode, originUrl: repositoryOriginUrl };
 }
 
 async function localBranchExists(repoPath, branch) {
@@ -580,18 +598,6 @@ async function createCloneWorkspace(run, workspacePath, branch, startRef, log, g
   await git(["checkout", "-B", branch, startRef], { cwd: workspacePath, env: gitEnv });
   log.write(`Workspace strategy: isolated clone fallback\n`);
   log.write(`Clone source: ${originUrl ? "origin remote" : "local repository"}\n`);
-}
-
-async function createLocalCloneWorkspace(run, workspacePath, branch, startCommit, log, gitEnv) {
-  await git(["clone", "--no-tags", "--no-hardlinks", run.project.repoPath, workspacePath], {
-    cwd: process.cwd(),
-    timeout: 300_000,
-    env: gitEnv,
-  });
-  await git(["checkout", "-B", branch, startCommit], { cwd: workspacePath, env: gitEnv });
-  await git(["remote", "remove", "origin"], { cwd: workspacePath, env: gitEnv });
-  log.write("Workspace strategy: isolated local clone fallback\n");
-  log.write("Clone source: local repository\n");
 }
 
 export function cloneFallbackSource(repoPath, originUrl) {
@@ -1378,10 +1384,13 @@ export async function completeRun(runId, input = {}) {
   });
 }
 
-async function completeRunAfterExecution(run, input, executionRun = run) {
+export async function completeRunAfterExecution(run, input, executionRun = run) {
   if (input.status === "completed" && run.workflowMode === "local" && run.group === "builder") {
     try {
-      const root = input.workspaceRoot || process.env.STUDIOOPS_WORKSPACE_ROOT || DEFAULT_WORKSPACE_ROOT;
+      const root = input.workspaceRoot
+        || process.env.STUDIOOPS_WORKSPACE_ROOT
+        || process.env.MISSION_CONTROL_WORKSPACE_ROOT
+        || DEFAULT_WORKSPACE_ROOT;
       const cycle = ["start_builder_fix", "return_to_builder"].includes(run.actionType)
         ? Math.max(1, Number(run.candidateCycle || 0) + 1)
         : Math.max(1, Number(run.candidateCycle || 0));
@@ -1394,7 +1403,8 @@ async function completeRunAfterExecution(run, input, executionRun = run) {
         log: input.log,
       });
       identity.candidateCycle = cycle;
-      await mutateState(async (state) => {
+      const mutate = input.state ? async (mutator) => mutator(input.state) : mutateState;
+      await mutate(async (state) => {
         const task = findTask(state, run.taskId);
         if (!task) return;
         task.branchName = task.branchName || run.branchName || identity.branch;
@@ -1604,6 +1614,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     outputPath,
     lastMessagePath,
     notes,
+    workspaceRoot: input.workspaceRoot,
   }, executionRun);
   if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
   return completed;
@@ -1742,13 +1753,14 @@ async function runClaimedRunWithCli(run, input = {}) {
       log.write(`\nStudioOps Runner finished ${run.id} at ${new Date().toISOString()} with code ${code}\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
-      const completed = await completeRun(run.id, {
+      const completed = await completeRunAfterExecution(run, {
         status: code === 0 ? "completed" : "failed",
         exitCode: code,
         outputPath,
         lastMessagePath,
         notes,
-      });
+        workspaceRoot: input.workspaceRoot,
+      }, executionRun);
       resolve(completed);
     });
     child.stdin.end(prompt);
