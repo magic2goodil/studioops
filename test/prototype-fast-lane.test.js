@@ -14,6 +14,8 @@ import {
 import { planDispatches } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 
+const MANIFEST_DIGEST = `sha256:${"9".repeat(64)}`;
+
 test("delivery policy fails closed and never enables merge or deployment", () => {
   assert.equal(normalizeDeliveryPolicy({ profile: "ambiguous" }).profile, "standard");
   assert.deepEqual(
@@ -32,7 +34,7 @@ test("delivery policy fails closed and never enables merge or deployment", () =>
 test("prototype UI impact skips backend but retains accessibility and lead", () => {
   const routing = capabilityRoutingForTask(
     { deliveryPolicy: { profile: "prototype-fast-lane" } },
-    { reviewSubjectSha: "a".repeat(40), reviewSubjectCycle: 2, impactEvidence: { changedFiles: ["src/App.jsx"] } },
+    { reviewSubjectSha: "a".repeat(40), reviewSubjectCycle: 2, impactEvidence: { changedFiles: ["src/App.jsx"], manifestDigest: MANIFEST_DIGEST } },
   );
   assert.deepEqual(routing.required, ["frontend", "accessibility", "lead"]);
   assert.equal(routing.skipped[0].stageKey, "backend");
@@ -126,10 +128,10 @@ test("custom backend stages are skipped by their actual identity and cannot also
     tasks: [{
       id: "task_1", projectId: "project_1", title: "UI candidate", type: "feature", status: "builder_review",
       branchName: "feature/ui", prUrl: "https://github.com/example/demo/pull/1", reviewCycle: 1,
-      reviewSubjectCycle: 1, reviewSubjectSha: sha, impactEvidence: { changedFiles: ["src/App.jsx"] },
+      reviewSubjectCycle: 1, reviewSubjectSha: sha, impactEvidence: { changedFiles: ["src/App.jsx"], manifestDigest: MANIFEST_DIGEST },
       candidateIdentity: {
         commitSha: sha, treeSha: "b".repeat(40), baseSha: "c".repeat(40), branch: "feature/ui", candidateCycle: 1,
-        impactEvidence: { changedFiles: ["src/App.jsx"] },
+        impactEvidence: { changedFiles: ["src/App.jsx"], manifestDigest: MANIFEST_DIGEST },
       },
     }],
     reviews: [], runs: [], comments: [], events: [],
@@ -153,7 +155,7 @@ test("current impact evidence refreshes identity and unchanged-tree metadata rep
   const metadataSha = "e".repeat(40);
   const treeSha = "f".repeat(40);
   const baseSha = "1".repeat(40);
-  const impactEvidence = { changedFiles: ["src/App.jsx"], impact: ["frontend"] };
+  const impactEvidence = { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST };
   const project = await addProject({
     key: "fast-lane-cycle-stability",
     name: "Fast lane cycle stability",
@@ -218,7 +220,7 @@ test("material impact changes invalidate same-SHA capability skips and start a n
     title: "Reclassify candidate impact",
     status: "in_progress",
     branchName: "feature/reclassification",
-    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST },
   });
 
   await updateTask(task.id, {
@@ -226,14 +228,14 @@ test("material impact changes invalidate same-SHA capability skips and start a n
     branchName: "feature/reclassification",
     prUrl: "https://github.com/example/demo/pull/3",
     subjectSha: sha,
-    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST },
     candidateIdentity: {
       commitSha: sha,
       treeSha: "3".repeat(40),
       baseSha: "4".repeat(40),
       branch: "feature/reclassification",
       candidateCycle: 1,
-      impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+      impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST },
     },
   });
   await automationTick({ nowMs: Date.parse("2026-08-15T12:00:00.000Z") });

@@ -10,6 +10,7 @@ import test from "node:test";
 import { maintenanceWriteBlocker } from "../src/state-database.js";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
+import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -154,6 +155,7 @@ test("SQLite rejects mutation of a frozen candidate manifest and rolls back atom
         subjectSha: integrationSha,
         evidenceDigest: `sha256:${"d".repeat(64)}`,
       }],
+      validationEvidence: exactShaEvidenceFixture(integrationSha),
       preview: {
         url: "http://127.0.0.1:4174/",
         status: "healthy",

@@ -5,6 +5,7 @@ import {
 } from "./store.js";
 import { projectUsesTrustLeadQa } from "./integration-policy.js";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
+import { assertExactShaEvidenceEnvironment } from "./impact-manifest.js";
 
 const OWNER_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_bundle_ready"]);
 const QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed", "release_candidate_ready"]);
@@ -177,6 +178,7 @@ function candidateForBundle(state, bundle) {
   if (!candidate) return null;
   try {
     assertCandidateEnvelope(candidate);
+    assertExactShaEvidenceEnvironment(candidate.manifest.validationEvidence);
   } catch {
     return null;
   }

@@ -1,0 +1,243 @@
+{
+  "schemaVersion": "studioops.component-ownership.v1",
+  "fullRegressionCommands": [
+    "npm run check",
+    "git diff --check"
+  ],
+  "environmentContract": {
+    "id": "studioops.node-local.v1",
+    "node": ">=22.5",
+    "packageManager": "npm",
+    "testIsolation": "scripts/run-tests.js"
+  },
+  "components": {
+    "control-plane-core": {
+      "owner": "StudioOps control-plane maintainers",
+      "classification": "bounded",
+      "paths": [
+        "src/candidate-manifest.js",
+        "src/candidate-repository.js",
+        "src/config.js",
+        "src/credit-policy.js",
+        "src/execution-policy.js",
+        "src/impact-manifest.js",
+        "src/integration-policy.js",
+        "src/local-state-migration.js",
+        "src/owner-inbox.js",
+        "src/product-tiers.js",
+        "src/runtime-paths.js",
+        "src/self-update-lease.js",
+        "src/state-database.js",
+        "src/store.js",
+        "src/work-lanes.js"
+      ],
+      "entryAdapters": [],
+      "workflowReleaseSurfaces": [],
+      "ownedTests": [
+        "test/candidate-manifest.test.js",
+        "test/credit-policy.test.js",
+        "test/exact-sha-evidence-fixture.js",
+        "test/execution-policy.test.js",
+        "test/identity-verification.test.js",
+        "test/impact-manifest.test.js",
+        "test/local-state-migration.test.js",
+        "test/modular-architecture-standard.test.js",
+        "test/owner-inbox.test.js",
+        "test/product-tiers.test.js",
+        "test/prototype-fast-lane.test.js",
+        "test/regression-review-status.test.js",
+        "test/review-identity.test.js",
+        "test/state-database-helper.js",
+        "test/state-database.test.js",
+        "test/task-status-integrity.test.js"
+      ],
+      "publicContracts": [
+        "transactional workflow store API",
+        "candidate manifest and exact-SHA evidence schemas",
+        "project configuration and integration policy"
+      ],
+      "ownedData": [
+        "SQLite workflow state and migrations",
+        "immutable candidate envelopes"
+      ],
+      "allowedDependencies": [],
+      "impactEdges": [
+        "automation-runtime",
+        "qa-release",
+        "entry-adapters",
+        "packaging-release"
+      ],
+      "rollbackBoundary": "Schema-compatible store and candidate readers remain authoritative during rollback.",
+      "testLayers": ["unit", "contract", "persistence", "composition"],
+      "validationCommands": ["npm run check"]
+    },
+    "automation-runtime": {
+      "owner": "StudioOps automation maintainers",
+      "classification": "bounded",
+      "paths": [
+        "src/dispatcher.js",
+        "src/git-lock.js",
+        "src/github-app-auth.js",
+        "src/runner.js",
+        "src/runtime-install.js",
+        "src/self-update.js",
+        "src/supervisor.js",
+        "src/watchdog.js",
+        "src/worker-heartbeat.js"
+      ],
+      "entryAdapters": [],
+      "workflowReleaseSurfaces": [],
+      "ownedTests": [
+        "test/automation-blocker.test.js",
+        "test/dispatcher.test.js",
+        "test/git-lock.test.js",
+        "test/github-app-auth.test.js",
+        "test/local-builder-review.test.js",
+        "test/resilience.test.js",
+        "test/runner.test.js",
+        "test/runtime-install.test.js",
+        "test/runtime-paths.test.js",
+        "test/self-update.test.js",
+        "test/supervisor.test.js",
+        "test/test-environment-probe.js",
+        "test/test-environment.test.js",
+        "test/watchdog.test.js"
+      ],
+      "publicContracts": [
+        "durable dispatch and run lifecycle",
+        "workspace isolation and worker recovery"
+      ],
+      "ownedData": ["run records, leases, heartbeats, and automation circuits"],
+      "allowedDependencies": ["control-plane-core"],
+      "impactEdges": ["qa-release", "entry-adapters", "packaging-release"],
+      "rollbackBoundary": "Workers may be stopped and resumed from durable run state.",
+      "testLayers": ["unit", "contract", "adapter", "composition"],
+      "validationCommands": ["npm run check"]
+    },
+    "qa-release": {
+      "owner": "StudioOps release-integrity maintainers",
+      "classification": "bounded",
+      "paths": [
+        "src/notifier.js",
+        "src/promotion.js",
+        "src/qa-integration.js"
+      ],
+      "entryAdapters": [],
+      "workflowReleaseSurfaces": [],
+      "ownedTests": [
+        "test/notifier.test.js",
+        "test/promotion.test.js",
+        "test/qa-integration.test.js"
+      ],
+      "publicContracts": [
+        "immutable QA candidate assembly",
+        "owner-gated release-candidate promotion"
+      ],
+      "ownedData": ["QA bundles, candidate attestations, and promotion records"],
+      "allowedDependencies": ["control-plane-core", "automation-runtime"],
+      "impactEdges": ["entry-adapters"],
+      "rollbackBoundary": "Invalidated candidates remain auditable and are never overwritten.",
+      "testLayers": ["unit", "contract", "adapter", "composition"],
+      "validationCommands": ["npm run check"]
+    },
+    "entry-adapters": {
+      "owner": "StudioOps interface maintainers",
+      "classification": "bounded",
+      "paths": [],
+      "entryAdapters": [
+        "src/server.js",
+        "src/mission-control-*.js"
+      ],
+      "workflowReleaseSurfaces": [],
+      "ownedTests": [
+        "test/accessibility-review.test.js",
+        "test/architecture.test.js",
+        "test/owner-inbox-ui.test.js"
+      ],
+      "publicContracts": ["localhost HTTP/JSON API", "StudioOps command-line interface"],
+      "ownedData": [],
+      "allowedDependencies": ["control-plane-core", "automation-runtime", "qa-release"],
+      "impactEdges": ["browser-ui"],
+      "rollbackBoundary": "CLI and HTTP compatibility aliases remain available for one release boundary.",
+      "testLayers": ["contract", "adapter", "browser", "composition"],
+      "validationCommands": ["npm run check"]
+    },
+    "browser-ui": {
+      "owner": "StudioOps product-interface maintainers",
+      "classification": "bounded",
+      "paths": ["public/**"],
+      "entryAdapters": [],
+      "workflowReleaseSurfaces": [],
+      "ownedTests": ["test/visual/**"],
+      "publicContracts": ["owner-first browser UI and static asset contract"],
+      "ownedData": [],
+      "allowedDependencies": ["entry-adapters"],
+      "impactEdges": [],
+      "rollbackBoundary": "Static assets can roll back independently while the HTTP API remains compatible.",
+      "testLayers": ["unit", "browser", "accessibility", "visual"],
+      "validationCommands": ["npm run check"]
+    },
+    "packaging-release": {
+      "owner": "StudioOps release-integrity maintainers",
+      "classification": "shared",
+      "paths": [
+        "config/**",
+        "plugins/**",
+        "scripts/**",
+        "package.json",
+        "package-lock.json",
+        "studioops.config.example.md"
+      ],
+      "entryAdapters": [],
+      "workflowReleaseSurfaces": [
+        ".github/workflows/**",
+        "scripts/**",
+        "package.json",
+        "package-lock.json"
+      ],
+      "ownedTests": [
+        "test/plugin-submission.test.js",
+        "test/studioops-plugin-client.test.js"
+      ],
+      "publicContracts": ["npm package, Codex plugin, worker release, and CI workflow surfaces"],
+      "ownedData": [],
+      "allowedDependencies": [
+        "control-plane-core",
+        "automation-runtime"
+      ],
+      "impactEdges": [],
+      "rollbackBoundary": "Published runtime releases are immutable and the current pointer swaps atomically.",
+      "testLayers": ["contract", "adapter", "composition"],
+      "validationCommands": ["npm run check", "git diff --check"]
+    },
+    "governance": {
+      "owner": "StudioOps maintainers",
+      "classification": "shared",
+      "paths": [
+        "AGENTS.md",
+        "CONTRIBUTING.md",
+        "LICENSE",
+        "PRIVACY.md",
+        "README.md",
+        "SECURITY.md",
+        "SUPPORT.md",
+        "TERMS.md",
+        "docs/**",
+        "standards/**",
+        ".github/ISSUE_TEMPLATE/**",
+        ".github/pull_request_template.md",
+        ".gitignore"
+      ],
+      "entryAdapters": [],
+      "workflowReleaseSurfaces": [],
+      "ownedTests": [],
+      "publicContracts": ["engineering, security, privacy, support, and release policy"],
+      "ownedData": [],
+      "allowedDependencies": [],
+      "impactEdges": [],
+      "rollbackBoundary": "Policy changes require an explicit reviewed revert.",
+      "testLayers": ["contract"],
+      "validationCommands": ["npm run check"]
+    }
+  }
+}

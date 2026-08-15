@@ -17,6 +17,7 @@ import {
 import { missionControlDataDir } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode, withDefaultProjectStandards } from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
+import { assertExactShaEvidenceEnvironment } from "./impact-manifest.js";
 import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
@@ -737,6 +738,18 @@ function normalizedImpactEvidence(value = {}) {
   const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
   const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
+  const manifestDigest = /^sha256:[a-f0-9]{64}$/i.test(String(value.manifestDigest || ""))
+    ? String(value.manifestDigest).toLowerCase()
+    : "";
+  const directComponents = Array.isArray(value.directComponents)
+    ? [...new Set(value.directComponents.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+    : [];
+  const affectedComponents = Array.isArray(value.affectedComponents)
+    ? [...new Set(value.affectedComponents.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+    : [];
+  const selectedComponents = Array.isArray(value.selectedComponents)
+    ? [...new Set(value.selectedComponents.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+    : [];
   const pathCapabilities = files.map((file) => {
     const capabilities = new Set();
     if (/(^|\/)(server|api|src\/(store|supervisor|dispatcher)|migrations?|db|auth|security|deploy|infra)(\/|\.|$)/i.test(file)) {
@@ -748,6 +761,7 @@ function normalizedImpactEvidence(value = {}) {
     }
     return capabilities;
   });
+  const hasExecutableComponentClassification = directComponents.length > 0 || affectedComponents.length > 0;
   const unknown = value.unknown === true
     || value.classified === false
     || value.stale === true
@@ -755,13 +769,38 @@ function normalizedImpactEvidence(value = {}) {
     || Boolean(value.staleReason || value.conflictReason)
     || hasUnknownExplicitClassification
     || !files.length
-    || pathCapabilities.some((capabilities) => capabilities.size === 0);
-  const backendRequired = unknown || classifications.some((item) => ["backend", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment"].includes(item))
+    || (!hasExecutableComponentClassification && pathCapabilities.some((capabilities) => capabilities.size === 0));
+  const fullRegressionReasons = [...new Set([
+    ...(Array.isArray(value.fullRegressionReasons) ? value.fullRegressionReasons : []),
+    ...(!manifestDigest ? ["missing_manifest_binding"] : []),
+    ...(value.shared === true ? ["shared_surface"] : []),
+    ...(value.ambiguous === true ? ["ambiguous_ownership"] : []),
+    ...(value.multiComponent === true ? ["multi_component"] : []),
+  ].map(String).map((item) => item.trim()).filter(Boolean))].sort();
+  const fullRegression = value.fullRegression === true || fullRegressionReasons.length > 0;
+  const backendRequired = fullRegression || unknown || classifications.some((item) => ["backend", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment"].includes(item))
     || pathCapabilities.some((capabilities) => capabilities.has("backend"));
   const frontend = classifications.includes("frontend") || classifications.includes("design-system")
+    || affectedComponents.some((item) => ["browser-ui", "entry-adapters"].includes(item))
     || pathCapabilities.some((capabilities) => capabilities.has("frontend"));
   const accessibility = classifications.includes("accessibility") || frontend;
-  return { changedFiles: files, classifications, unknown, backendRequired, frontend, accessibility };
+  return {
+    changedFiles: files,
+    classifications,
+    directComponents,
+    affectedComponents,
+    selectedComponents,
+    manifestDigest,
+    unknown,
+    shared: value.shared === true,
+    ambiguous: value.ambiguous === true,
+    multiComponent: value.multiComponent === true,
+    fullRegression,
+    fullRegressionReasons,
+    backendRequired,
+    frontend,
+    accessibility,
+  };
 }
 
 export function normalizeCandidateIdentity(value = {}, fallback = {}) {
@@ -826,9 +865,9 @@ export function capabilityRoutingForTask(project = {}, task = {}) {
   const evidence = normalizedImpactEvidence(task.impactEvidence || task);
   if (policy.profile !== "prototype-fast-lane") return { policy, evidence, required: [...CAPABILITY_KEYS], skipped: [] };
   const required = new Set(["lead"]);
-  if (evidence.backendRequired) required.add("backend");
-  if (evidence.unknown || evidence.frontend) required.add("frontend");
-  if (evidence.unknown || evidence.accessibility) required.add("accessibility");
+  if (evidence.fullRegression || evidence.backendRequired) required.add("backend");
+  if (evidence.fullRegression || evidence.unknown || evidence.frontend) required.add("frontend");
+  if (evidence.fullRegression || evidence.unknown || evidence.accessibility) required.add("accessibility");
   const skipped = CAPABILITY_KEYS.filter((key) => !required.has(key)).map((key) => ({
     stageKey: key, outcome: "skipped", reason: "inapplicable_capability", subjectSha: task.reviewSubjectSha || "", candidateCycle: currentReviewCandidateCycle(task),
   }));
@@ -1578,6 +1617,7 @@ export async function completeArchitecture(taskId, input = {}) {
 
 function qaDecisionSubject(candidate, input = {}) {
   assertCandidateEnvelope(candidate);
+  assertExactShaEvidenceEnvironment(candidate.manifest.validationEvidence);
   const candidateId = String(input.candidateId || "").trim();
   const manifestDigest = String(input.manifestDigest || "").trim();
   const integrationSha = normalizeGitSha(input.integrationSha, "QA integration SHA");

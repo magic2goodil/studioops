@@ -482,6 +482,16 @@ Task fields:
   --base-sha                    Exact protected-base SHA for fast-lane review intake
   --impact-files                Comma-separated changed paths for deterministic impact routing
   --impact                      Comma-separated explicit impact classifications
+  --impact-manifest-digest      SHA-256 digest of the executable ownership manifest
+  --impact-components           Comma-separated directly changed components
+  --affected-components         Comma-separated transitively affected components
+  --selected-components         Comma-separated components selected for validation
+  --impact-full-regression      Record fail-closed full-regression selection
+  --impact-reasons              Comma-separated machine-readable escalation reasons
+  --impact-unknown              Record unclassified impact
+  --impact-shared               Record shared-surface impact
+  --impact-ambiguous            Record ambiguous ownership
+  --impact-multi-component      Record multi-component impact
   --partial-tasks               Explicit subset for an authorized partial QA candidate
   --partial-actor-id            Non-sensitive actor ID authorizing a partial candidate
   --partial-reason-code         Bounded reason code for excluding tasks
@@ -819,10 +829,30 @@ Automation:
     if (
       Object.prototype.hasOwnProperty.call(args, "impact-files")
       || Object.prototype.hasOwnProperty.call(args, "impact")
+      || Object.prototype.hasOwnProperty.call(args, "impact-manifest-digest")
+      || Object.prototype.hasOwnProperty.call(args, "impact-components")
+      || Object.prototype.hasOwnProperty.call(args, "affected-components")
+      || Object.prototype.hasOwnProperty.call(args, "selected-components")
+      || Object.prototype.hasOwnProperty.call(args, "impact-full-regression")
+      || Object.prototype.hasOwnProperty.call(args, "impact-reasons")
+      || Object.prototype.hasOwnProperty.call(args, "impact-unknown")
+      || Object.prototype.hasOwnProperty.call(args, "impact-shared")
+      || Object.prototype.hasOwnProperty.call(args, "impact-ambiguous")
+      || Object.prototype.hasOwnProperty.call(args, "impact-multi-component")
     ) {
       patch.impactEvidence = {
         changedFiles: normalizeList(args["impact-files"]),
         impact: normalizeList(args.impact),
+        manifestDigest: args["impact-manifest-digest"] || "",
+        directComponents: normalizeList(args["impact-components"]),
+        affectedComponents: normalizeList(args["affected-components"]),
+        selectedComponents: normalizeList(args["selected-components"]),
+        fullRegression: [true, "true", "1", "yes"].includes(args["impact-full-regression"]),
+        fullRegressionReasons: normalizeList(args["impact-reasons"]),
+        unknown: [true, "true", "1", "yes"].includes(args["impact-unknown"]),
+        shared: [true, "true", "1", "yes"].includes(args["impact-shared"]),
+        ambiguous: [true, "true", "1", "yes"].includes(args["impact-ambiguous"]),
+        multiComponent: [true, "true", "1", "yes"].includes(args["impact-multi-component"]),
       };
     }
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;

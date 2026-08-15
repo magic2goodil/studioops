@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
+import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const BASE_SHA = "b".repeat(40);
@@ -112,6 +113,7 @@ function candidateManifest() {
       subjectSha: INTEGRATION_SHA,
       evidenceDigest: `sha256:${"e".repeat(64)}`,
     }],
+    validationEvidence: exactShaEvidenceFixture(INTEGRATION_SHA),
     preview: {
       url: PREVIEW_URL,
       status: "healthy",

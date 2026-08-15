@@ -46,6 +46,34 @@ async function git(repoPath, args) {
   return `${result.stdout || ""}${result.stderr || ""}`.trim();
 }
 
+async function installTestOwnershipManifest(repoPath) {
+  const manifest = {
+    schemaVersion: "studioops.component-ownership.v1",
+    fullRegressionCommands: ["git diff --check"],
+    environmentContract: { id: "studioops.qa-test.v1", node: ">=22.5" },
+    components: {
+      application: {
+        owner: "QA fixture",
+        classification: "bounded",
+        paths: ["**"],
+        entryAdapters: [],
+        workflowReleaseSurfaces: [],
+        ownedTests: [],
+        publicContracts: ["fixture application"],
+        ownedData: [],
+        allowedDependencies: [],
+        impactEdges: [],
+        rollbackBoundary: "fixture commit",
+        testLayers: ["composition"],
+        validationCommands: ["git diff --check"],
+      },
+    },
+  };
+  await mkdir(path.join(repoPath, "config"), { recursive: true });
+  await writeFile(path.join(repoPath, "config", "component-ownership.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await git(repoPath, ["add", "config/component-ownership.json"]);
+}
+
 async function stateWithReviewEvidence(state) {
   state.reviews = state.reviews || [];
   for (const task of state.tasks || []) {
@@ -634,6 +662,7 @@ test("validation commands use the QA integration PATH override", async () => {
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
     await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
+    await installTestOwnershipManifest(repoPath);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
     await git(repoPath, ["commit", "-m", "base"]);
@@ -718,6 +747,7 @@ test("QA integration redacts GitHub token values from validation output before s
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
     await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
+    await installTestOwnershipManifest(repoPath);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
     await git(repoPath, ["commit", "-m", "base"]);
@@ -1015,6 +1045,7 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
     await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
+    await installTestOwnershipManifest(repoPath);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
     await git(repoPath, ["commit", "-m", "base"]);

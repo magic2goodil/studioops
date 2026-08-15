@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
+import { normalizeExactShaEvidence } from "./impact-manifest.js";
 
-export const CANDIDATE_MANIFEST_SCHEMA_VERSION = "studioops.candidate-manifest.v1";
+export const CANDIDATE_MANIFEST_SCHEMA_VERSION = "studioops.candidate-manifest.v2";
+const LEGACY_CANDIDATE_MANIFEST_SCHEMA_VERSION = "studioops.candidate-manifest.v1";
 const GIT_SHA_PATTERN = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const COMPLETE_REVIEW_OUTCOMES = new Set(["approved", "skipped"]);
@@ -264,6 +266,10 @@ export function manifestDigest(manifest) {
 }
 
 export function buildCandidateManifest(input = {}) {
+  const schemaVersion = input.schemaVersion || CANDIDATE_MANIFEST_SCHEMA_VERSION;
+  if (![CANDIDATE_MANIFEST_SCHEMA_VERSION, LEGACY_CANDIDATE_MANIFEST_SCHEMA_VERSION].includes(schemaVersion)) {
+    throw new Error(`Unsupported candidate manifest schema: ${schemaVersion}`);
+  }
   const sources = uniqueBy(
     (Array.isArray(input.sources) ? input.sources : [])
       .map(normalizeSource)
@@ -287,6 +293,9 @@ export function buildCandidateManifest(input = {}) {
     "check ID",
   );
   if (!checks.length) throw new Error("Candidate manifest requires check evidence.");
+  const validationEvidence = schemaVersion === CANDIDATE_MANIFEST_SCHEMA_VERSION
+    ? normalizeExactShaEvidence(input.validationEvidence, { sourceSha: integrationSha })
+    : null;
   const preview = {
     url: normalizePreviewUrl(input.preview?.url),
     status: requiredString(input.preview?.status, "preview status"),
@@ -299,7 +308,7 @@ export function buildCandidateManifest(input = {}) {
     throw new Error("Candidate preview must be verified at the integration SHA.");
   }
   return {
-    schemaVersion: CANDIDATE_MANIFEST_SCHEMA_VERSION,
+    schemaVersion,
     candidateId: requiredString(input.candidateId, "candidate ID"),
     projectId: requiredString(input.projectId, "project ID"),
     base: {
@@ -312,6 +321,7 @@ export function buildCandidateManifest(input = {}) {
       sha: integrationSha,
     },
     checks,
+    ...(validationEvidence ? { validationEvidence } : {}),
     preview,
     assembly: normalizeAssembly(input.assembly, new Set(sources.map((source) => source.taskId))),
   };
