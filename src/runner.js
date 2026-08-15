@@ -12,6 +12,7 @@ import {
   formatGitHubAppAuthForPrompt,
   githubAppAuthEnv,
   githubAppAuthSecrets,
+  isBranchWritingAction,
   parseGitHubRepoUrl,
   prepareGitHubAppAuth,
   redactSecrets,
@@ -51,7 +52,6 @@ const RUNNABLE_STATUSES = new Set(["queued"]);
 const ACTIVE_STATUSES = new Set(["running"]);
 const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "preview_blocked", "blocked"]);
-const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
 const ARCHITECTURE_GATED_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "unblock_task"]);
 const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_PREFLIGHT_RETRY_DELAY_MS = 250;
@@ -263,7 +263,7 @@ function workflowAuthEnv(workflowMode, authContext, baseEnv = process.env) {
 }
 
 function isBranchWriterRun(run) {
-  return run.group === "builder" && BRANCH_WRITER_ACTIONS.has(run.actionType);
+  return run.group === "builder" && isBranchWritingAction(run.actionType);
 }
 
 export function branchReuseSafetyReason(run, pr) {
@@ -730,6 +730,7 @@ export function planRunnableRuns(state, input = {}) {
     runnable.push({
       ...run,
       project,
+      workAreas: normalizeList(task?.workAreas),
     });
   }
 
@@ -1202,6 +1203,7 @@ export async function claimRuns(input = {}) {
       run.lane = run.lane || profile.lane;
       run.conflictGroup = run.conflictGroup || profile.conflictGroup;
       run.fileScope = Array.isArray(run.fileScope) && run.fileScope.length ? run.fileScope : profile.fileScope;
+      run.workAreas = normalizeList(task?.workAreas);
       run.provider = normalizeProvider(input.provider || run.provider);
       const executionPolicy = resolveExecutionPolicy(findTask(state, run.taskId) || {}, run, input);
       run.model = run.model || executionPolicy.model || input.model;

@@ -30,6 +30,8 @@ That directory is ignored by git.
 
 The runner uses GitHub App auth by default for builder and reviewer runs. If credentials are missing, invalid, or not installed on the target repository, the run fails before Codex starts. This prevents a worker from falling back to your personal `gh` login or SSH identity for bot-authored PR work.
 
+The shared `StudioOps Bot` registration intentionally does not request workflow-write authority. Projects that need builders to update GitHub workflow files must use the separate role Apps described below.
+
 ## Separate Role Apps
 
 If you want GitHub to show different bot actors for different automation roles, run:
@@ -49,6 +51,8 @@ This creates manifests for:
 
 Separate role apps create clearer GitHub audit trails, but they also mean more app registrations, installations, private keys, and installation tokens to rotate and monitor.
 
+The Builder registration is the only generated role manifest that requests repository `workflows: write`. Reviewer and Promotion Worker registrations omit that permission. After adding this permission to an existing Builder App, a repository or organization owner must approve the pending permission change on each installation before workflow-scoped runs can mint tokens.
+
 ## Permissions
 
 The manifest requests:
@@ -58,6 +62,15 @@ The manifest requests:
 - `issues: write` for PR comments and labels
 - `checks: read` and `actions: read` for CI/status inspection
 - `metadata: read`, required by GitHub Apps
+
+The separate Builder App additionally requests `workflows: write` at registration time. StudioOps does not include it in every builder token. Runtime token minting adds `workflows: write` only when all of these conditions hold:
+
+- the normalized role is exactly `builder`
+- the action is a branch-writing builder action
+- the run's non-empty `fileScope` and the task's current non-empty `workAreas` normalize to the same declarations
+- at least one declaration is exactly `.github/workflows` or a descendant such as `.github/workflows/validation.yml`
+
+Broad declarations such as `.github/**`, lookalikes such as `.github/workflows-ci/**`, traversal-like paths, mismatched declarations, and missing scope metadata do not receive workflow permission. Ordinary builders, reviewers, QA integration, and promotion continue to receive their existing narrower token permissions. StudioOps never requests Actions write, Administration, Deployments, Environments, organization permissions, merge authority, or release authority as part of this feature.
 
 Webhooks are not requested by default. StudioOps can add webhook handling later if we use a public endpoint or tunnel and want GitHub to actively push events into the local task board.
 
@@ -81,13 +94,15 @@ When the runner claims a builder or reviewer run, it:
 - reads the role's app metadata from `~/.codex/studioops/credentials/github-apps/`
 - signs a GitHub App JWT with the local private key
 - resolves the app installation for the run's `github.com` repository
-- creates a repository-scoped installation token with only the role permissions needed for branch, PR, comment, and review activity
+- creates a repository-scoped installation token with only the role and declared-run permissions needed for branch, PR, comment, review, and explicitly scoped workflow activity
 - passes the token to child Codex runs as `GH_TOKEN` and `GITHUB_TOKEN` so `gh pr create`, comments, and reviews use the app identity
 - passes the token to `git` through `GIT_ASKPASS`, not through command arguments or remote URLs
 - rewrites GitHub SSH remotes to HTTPS for the child process only, so `git push origin ...` uses HTTPS without changing persistent remotes
 - redacts the installation token from runner logs and last-message files if a child process prints it
 
 Installation tokens are short-lived. GitHub controls the final expiry, and StudioOps rejects expired token responses.
+
+GitHub returns `403` while a requested App permission is unavailable or a pending installation permission change has not been approved. StudioOps fails the run in that state. It does not retry with personal `gh` credentials, a PAT, SSH, or a cached installation token. Approve the Builder App's pending permission change on the target repository, then retry so the runner can mint a fresh short-lived token.
 
 ## Pull Request Publish Flow
 
@@ -144,7 +159,7 @@ For a smoke test, use a harmless documentation-only branch, push it through the 
 
 ## Role Mapping
 
-With `npm run setup-github-app`, all roles use `~/.codex/studioops/credentials/github-apps/default/`.
+With `npm run setup-github-app`, all roles use `~/.codex/studioops/credentials/github-apps/default/`. That shared App deliberately cannot publish GitHub workflow changes.
 
 With `npm run setup-github-role-apps`, StudioOps looks for these directories:
 

@@ -13,6 +13,14 @@ const DEFAULT_RUNTIME_DIR = path.join(missionControlDataDir(), "run-outputs", "g
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
 const TOKEN_REDACTION = "[REDACTED_GITHUB_APP_TOKEN]";
+const WORKFLOW_SCOPE_ROOT = ".github/workflows";
+const BRANCH_WRITING_ACTIONS = new Set([
+  "start_builder",
+  "start_builder_fix",
+  "return_to_builder",
+  "qa_integration_blocked",
+  "unblock_task",
+]);
 
 const ROLE_PERMISSIONS = {
   builder: {
@@ -90,6 +98,95 @@ function normalizeRole(value) {
   if (normalized.includes("lead")) return "lead-reviewer";
   if (normalized.includes("builder")) return "builder";
   return normalized || "builder";
+}
+
+function normalizePermissionRole(value) {
+  return String(value || "").trim().toLowerCase().replaceAll("_", "-");
+}
+
+function normalizeRunAction(value) {
+  return String(value || "").trim().toLowerCase().replaceAll("-", "_");
+}
+
+export function isBranchWritingAction(value) {
+  return BRANCH_WRITING_ACTIONS.has(normalizeRunAction(value));
+}
+
+function normalizeDeclaredScopes(value, label) {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { ok: false, reason: `${label}_missing`, scopes: [] };
+  }
+
+  const scopes = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      return { ok: false, reason: `${label}_ambiguous`, scopes: [] };
+    }
+    let scope = item.trim();
+    while (scope.startsWith("./")) scope = scope.slice(2);
+    scope = scope.replace(/\/+$/g, "");
+    if (
+      !scope
+      || scope.startsWith("/")
+      || scope.includes("\\")
+      || scope.includes("\0")
+      || /^[a-zA-Z]:/.test(scope)
+    ) {
+      return { ok: false, reason: `${label}_ambiguous`, scopes: [] };
+    }
+
+    const segments = scope.split("/");
+    if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+      return { ok: false, reason: `${label}_traversal`, scopes: [] };
+    }
+
+    const workflowScoped = scope === WORKFLOW_SCOPE_ROOT
+      || scope.startsWith(`${WORKFLOW_SCOPE_ROOT}/`);
+    const lowerScope = scope.toLowerCase();
+    const workflowLookalike = !workflowScoped && (
+      lowerScope.startsWith(".github/workflow")
+      || lowerScope.includes("/.github/workflows")
+    );
+    const ambiguousGitHubGlob = !workflowScoped
+      && /[*?[\]{}]/.test(scope)
+      && (
+        scope.startsWith(".github/")
+        || scope.includes("/.github/")
+        || lowerScope.includes("workflow")
+      );
+    if (workflowLookalike || ambiguousGitHubGlob) {
+      return { ok: false, reason: `${label}_ambiguous`, scopes: [] };
+    }
+    scopes.push(scope);
+  }
+
+  return { ok: true, reason: "", scopes: unique(scopes).sort() };
+}
+
+export function classifyWorkflowWritePermission(run = {}) {
+  if (normalizePermissionRole(run.role) !== "builder") {
+    return { granted: false, reason: "role_not_builder" };
+  }
+  if (!isBranchWritingAction(run.actionType)) {
+    return { granted: false, reason: "action_not_branch_writing" };
+  }
+
+  const fileScope = normalizeDeclaredScopes(run.fileScope, "file_scope");
+  if (!fileScope.ok) return { granted: false, reason: fileScope.reason };
+  const workAreas = normalizeDeclaredScopes(run.workAreas, "work_areas");
+  if (!workAreas.ok) return { granted: false, reason: workAreas.reason };
+  if (
+    fileScope.scopes.length !== workAreas.scopes.length
+    || fileScope.scopes.some((scope, index) => scope !== workAreas.scopes[index])
+  ) {
+    return { granted: false, reason: "declared_scopes_mismatch" };
+  }
+  if (!fileScope.scopes.some((scope) => (
+    scope === WORKFLOW_SCOPE_ROOT || scope.startsWith(`${WORKFLOW_SCOPE_ROOT}/`)
+  ))) {
+    return { granted: false, reason: "workflow_scope_not_declared" };
+  }
+  return { granted: true, reason: "declared_workflow_builder_run" };
 }
 
 function unique(values) {
@@ -320,8 +417,11 @@ async function loadConfiguredApp(credentialsDir, role, appOptions = {}) {
   );
 }
 
-function permissionsForRole(role) {
-  return { ...(ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.default) };
+function permissionsForRun(run, role) {
+  const permissions = { ...(ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.default) };
+  const workflowPermission = classifyWorkflowWritePermission(run);
+  if (workflowPermission.granted) permissions.workflows = "write";
+  return { permissions, workflowPermission };
 }
 
 async function createRuntimeAskpass(runId, runtimeDir = DEFAULT_RUNTIME_DIR) {
@@ -506,18 +606,31 @@ export async function prepareGitHubAppAuth(run, input = {}) {
     }
     throw error;
   }
-  const permissions = permissionsForRole(role);
-  const accessToken = await githubJson(
-    `/app/installations/${encodeURIComponent(installation.id)}/access_tokens`,
-    {
-      method: "POST",
-      token: jwt,
-      body: {
-        repositories: [repo.name],
-        permissions,
+  const { permissions, workflowPermission } = permissionsForRun(run, role);
+  let accessToken;
+  try {
+    accessToken = await githubJson(
+      `/app/installations/${encodeURIComponent(installation.id)}/access_tokens`,
+      {
+        method: "POST",
+        token: jwt,
+        body: {
+          repositories: [repo.name],
+          permissions,
+        },
       },
-    },
-  );
+    );
+  } catch (error) {
+    if (Number(error?.status) === 403) {
+      const permissionError = new Error(
+        `github_app_permissions_not_approved: GitHub rejected the requested ${role} installation token permissions for ${repo.owner}/${repo.name}. Approve any pending GitHub App permission changes for that installation, then retry. StudioOps will not fall back to personal credentials or a cached token.`,
+      );
+      permissionError.code = "github_app_permissions_not_approved";
+      permissionError.cause = error;
+      throw permissionError;
+    }
+    throw error;
+  }
   if (!accessToken.token) throw new Error(`GitHub App installation ${installation.id} did not return an access token.`);
   if (!accessToken.expires_at || Date.parse(accessToken.expires_at) <= Date.now()) {
     throw new Error(`GitHub App installation ${installation.id} returned an expired or invalid token.`);
@@ -531,6 +644,7 @@ export async function prepareGitHubAppAuth(run, input = {}) {
     token: accessToken.token,
     expiresAt: accessToken.expires_at,
     permissions,
+    workflowPermission,
     installationId: installation.id,
     askpassPath: await createRuntimeAskpass(run.id, input.githubAppRuntimeDir || DEFAULT_RUNTIME_DIR),
   };
