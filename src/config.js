@@ -55,6 +55,7 @@ export function effectiveAutomationCapacity(config = {}) {
 
 export function normalizeConfig(config = {}) {
   const defaults = config.defaults || {};
+  const legacySupervisor = defaults.supervisor || {};
   const dispatcher = defaults.dispatcher || {};
   const runner = defaults.runner || {};
   return {
@@ -64,11 +65,15 @@ export function normalizeConfig(config = {}) {
       dispatcher: {
         ...dispatcher,
         builderConcurrency: positiveInteger(
-          dispatcher.builderConcurrency,
+          hasOwnValue(dispatcher, "builderConcurrency")
+            ? dispatcher.builderConcurrency
+            : legacySupervisor.builderConcurrency,
           INSTALLED_AUTOMATION_CAPACITY.builderConcurrency,
         ),
         reviewerConcurrency: positiveInteger(
-          dispatcher.reviewerConcurrency,
+          hasOwnValue(dispatcher, "reviewerConcurrency")
+            ? dispatcher.reviewerConcurrency
+            : legacySupervisor.reviewerConcurrency,
           INSTALLED_AUTOMATION_CAPACITY.reviewerConcurrency,
         ),
       },

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   dispatchSupervisorActions,
   formatDispatchReport,
@@ -7,6 +10,9 @@ import {
 } from "../src/dispatcher.js";
 import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+
+const execFileAsync = promisify(execFile);
 
 function fixtureState() {
   return {
@@ -661,6 +667,29 @@ test("one sweep exposes and uses three compatible builder and reviewer slots by 
     selected: 3,
     available: 0,
   });
+});
+
+test("installed dispatcher plan JSON includes effective capacity", async () => {
+  const isolated = await createHermeticTestEnvironment();
+  try {
+    const { stdout } = await execFileAsync(process.execPath, [
+      path.resolve("src/mission-control-dispatcher.js"),
+      "--plan",
+      "--json",
+    ], {
+      cwd: process.cwd(),
+      env: isolated.env,
+      timeout: 30_000,
+    });
+    const report = JSON.parse(stdout);
+
+    assert.equal(report.dryRun, true);
+    assert.equal(report.effectiveCapacity.groups.builder.configuredLimit, 3);
+    assert.equal(report.effectiveCapacity.groups.reviewer.configuredLimit, 3);
+    assert.equal(report.effectiveCapacity.maxDispatchesPerSweep, 6);
+  } finally {
+    await isolated.cleanup();
+  }
 });
 
 test("reports make an explicit lower concurrency limit distinct from lane conflicts", () => {

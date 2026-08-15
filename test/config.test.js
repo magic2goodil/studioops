@@ -37,6 +37,22 @@ test("intentional lower positive automation limits remain the effective configur
   });
 });
 
+test("legacy supervisor limits remain effective when dispatcher limits are missing", () => {
+  const config = normalizeConfig({
+    defaults: {
+      supervisor: { builderConcurrency: 1, reviewerConcurrency: 2 },
+    },
+  });
+
+  assert.equal(config.defaults.dispatcher.builderConcurrency, 1);
+  assert.equal(config.defaults.dispatcher.reviewerConcurrency, 2);
+  assert.deepEqual(effectiveAutomationCapacity(config), {
+    builderConcurrency: 1,
+    reviewerConcurrency: 2,
+    runnerLimit: 3,
+  });
+});
+
 test("top-level installed overrides determine effective capacity without rewriting defaults", () => {
   const config = normalizeConfig({
     defaults: {},

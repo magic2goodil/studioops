@@ -96,6 +96,7 @@ async function runOnce(args) {
       generatedAt: report.generatedAt,
       dryRun: true,
       runs: [],
+      effectiveCapacity: plan.effectiveCapacity,
       selected: plan.selected,
       skipped: plan.skipped,
     };
