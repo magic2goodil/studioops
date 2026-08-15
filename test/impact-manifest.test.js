@@ -7,9 +7,12 @@ import {
   classifyChangedPaths,
   normalizeExactShaEvidence,
   ownershipManifestDigest,
+  parseGitNameStatus,
   validateDependencyEdges,
   validateOwnershipManifest,
   validateRepositoryDependencies,
+  validateSurfaceCoverage,
+  validateTrackedSurfaceCoverage,
 } from "../src/impact-manifest.js";
 
 const manifest = validateOwnershipManifest(JSON.parse(await readFile("config/component-ownership.json", "utf8")));
@@ -75,6 +78,15 @@ test("shared and ambiguous surfaces fail closed", () => {
   assert.ok(ambiguous.fullRegressionReasons.includes("ambiguous_ownership"));
 });
 
+test("rename classification includes both source and destination ownership", () => {
+  const changedPaths = parseGitNameStatus("R100\0src/store.js\0public/store.js\0");
+  assert.deepEqual(changedPaths, ["public/store.js", "src/store.js"]);
+  const result = classifyChangedPaths(manifest, changedPaths);
+  assert.deepEqual(result.directComponents, ["browser-ui", "control-plane-core"]);
+  assert.equal(result.multiComponent, true);
+  assert.equal(result.fullRegression, true);
+});
+
 test("prohibited dependencies are executable failures", () => {
   const result = validateDependencyEdges(manifest, [
     { from: "automation-runtime", to: "control-plane-core", sourcePath: "src/runner.js", targetPath: "src/store.js" },
@@ -96,12 +108,32 @@ test("repository imports obey the executable component dependency direction", as
   assert.equal(result.ok, true);
 });
 
+test("every tracked surface has exactly one executable owner", async () => {
+  const result = await validateTrackedSurfaceCoverage(process.cwd(), manifest);
+  assert.deepEqual(result.unowned, []);
+  assert.deepEqual(result.ambiguous, []);
+  assert.equal(result.ok, true);
+
+  const incomplete = structuredClone(manifest);
+  incomplete.components["browser-ui"].paths.push("src/store.js");
+  const rejected = validateSurfaceCoverage(incomplete, ["src/store.js", "unowned/release.yml"]);
+  assert.deepEqual(rejected.unowned, ["unowned/release.yml"]);
+  assert.deepEqual(rejected.ambiguous, [{
+    path: "src/store.js",
+    components: ["browser-ui", "control-plane-core"],
+  }]);
+  assert.equal(rejected.ok, false);
+});
+
 test("exact-SHA evidence binds classification, commands, environment, retries, skips, and artifacts", () => {
   const classification = classifyChangedPaths(manifest, ["config/component-ownership.json"]);
   const evidence = buildExactShaEvidence({
     sourceSha: "a".repeat(40),
     classification,
-    commandResults: [{ command: "npm run check", ok: true, output: "ok", durationMs: 42, retries: 1, skips: ["none"] }],
+    commandResults: [
+      { command: "npm run check", ok: true, output: "ok", durationMs: 42, retries: 1, skips: ["none"] },
+      { command: "git diff --check", ok: true, output: "", durationMs: 2, retries: 0, skips: [] },
+    ],
   });
   assert.equal(evidence.sourceSha, "a".repeat(40));
   assert.equal(evidence.manifestDigest, ownershipManifestDigest(manifest));
@@ -121,5 +153,26 @@ test("exact-SHA evidence binds classification, commands, environment, retries, s
   assert.throws(
     () => assertExactShaEvidenceEnvironment(evidence, { platform: "different-platform" }),
     /environment mismatch/,
+  );
+  assert.throws(
+    () => normalizeExactShaEvidence({
+      ...evidence,
+      selectedComponents: evidence.selectedComponents.slice(1),
+    }),
+    /selected components do not match/,
+  );
+  assert.throws(
+    () => normalizeExactShaEvidence({
+      ...evidence,
+      commands: evidence.commands.map((command) => ({ ...command, command: "true" })),
+    }),
+    /missing required command/,
+  );
+  assert.throws(
+    () => normalizeExactShaEvidence({
+      ...evidence,
+      affectedComponents: ["browser-ui"],
+    }),
+    /affected components do not match/,
   );
 });

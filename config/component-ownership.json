@@ -15,6 +15,7 @@
       "owner": "StudioOps control-plane maintainers",
       "classification": "bounded",
       "paths": [
+        "data/mission-control.example.json",
         "src/candidate-manifest.js",
         "src/candidate-repository.js",
         "src/config.js",
@@ -181,7 +182,9 @@
       "owner": "StudioOps release-integrity maintainers",
       "classification": "shared",
       "paths": [
+        ".agents/plugins/marketplace.json",
         "config/**",
+        "deploy/local/**",
         "plugins/**",
         "scripts/**",
         "package.json",
@@ -190,7 +193,9 @@
       ],
       "entryAdapters": [],
       "workflowReleaseSurfaces": [
+        ".agents/plugins/marketplace.json",
         ".github/workflows/**",
+        "deploy/local/**",
         "scripts/**",
         "package.json",
         "package-lock.json"

@@ -236,6 +236,7 @@ export function classifyChangedPaths(manifestInput, changedPaths, options = {}) 
       manifestDigest: "",
       manifestError: error.message,
       selectedCommands: [],
+      ownershipManifest: null,
     };
   }
   const manifestDigest = ownershipManifestDigest(manifest);
@@ -286,14 +287,31 @@ export function classifyChangedPaths(manifestInput, changedPaths, options = {}) 
     manifestError: "",
     selectedCommands,
     environmentContract: manifest.environmentContract,
+    ownershipManifest: manifest,
   };
+}
+
+export function parseGitNameStatus(output) {
+  const fields = String(output || "").split("\0");
+  if (fields.at(-1) === "") fields.pop();
+  const paths = [];
+  for (let index = 0; index < fields.length;) {
+    const status = fields[index++];
+    if (!/^[ACDMRTUXB][0-9]*$/.test(status)) {
+      throw new Error(`Malformed Git name-status entry: ${status || "(empty)"}`);
+    }
+    const pathCount = /^[RC]/.test(status) ? 2 : 1;
+    if (index + pathCount > fields.length) throw new Error(`Malformed Git name-status entry for ${status}.`);
+    for (let offset = 0; offset < pathCount; offset += 1) paths.push(normalizeChangedPath(fields[index++]));
+  }
+  return [...new Set(paths)].sort();
 }
 
 async function gitChangedPaths(repoPath, baseSha, headSha, options = {}) {
   const result = await execFileAsync(options.gitBin || "git", [
-    "diff", "--name-only", "-z", "--diff-filter=ACDMRTUXB", `${baseSha}...${headSha}`,
+    "diff", "--name-status", "-z", "--find-renames", "--diff-filter=ACDMRTUXB", `${baseSha}...${headSha}`,
   ], { cwd: repoPath, timeout: Number(options.timeoutMs || 60_000), maxBuffer: 4 * 1024 * 1024 });
-  return String(result.stdout || "").split("\0").filter(Boolean);
+  return parseGitNameStatus(result.stdout);
 }
 
 export async function classifyGitImpact(repoPath, baseSha, headSha, options = {}) {
@@ -394,6 +412,30 @@ export async function validateRepositoryDependencies(repoPath, manifestInput) {
   };
 }
 
+export function validateSurfaceCoverage(manifestInput, trackedPaths = []) {
+  const manifest = validateOwnershipManifest(manifestInput);
+  const paths = [...new Set(trackedPaths.map(normalizeChangedPath))].sort();
+  const pathClassifications = paths.map((repositoryPath) => ({
+    path: repositoryPath,
+    owners: directOwners(manifest, repositoryPath),
+  }));
+  const unowned = pathClassifications.filter((item) => item.owners.length === 0).map((item) => item.path);
+  const ambiguous = pathClassifications.filter((item) => item.owners.length > 1).map((item) => ({
+    path: item.path,
+    components: item.owners.map((owner) => owner.componentId).sort(),
+  }));
+  return { ok: unowned.length === 0 && ambiguous.length === 0, unowned, ambiguous, pathClassifications };
+}
+
+export async function validateTrackedSurfaceCoverage(repoPath, manifestInput, options = {}) {
+  const result = await execFileAsync(options.gitBin || "git", ["ls-files", "-z"], {
+    cwd: repoPath,
+    timeout: Number(options.timeoutMs || 60_000),
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return validateSurfaceCoverage(manifestInput, String(result.stdout || "").split("\0").filter(Boolean));
+}
+
 function normalizeDigest(value, label) {
   const digest = requiredString(value, label).toLowerCase();
   if (!DIGEST_PATTERN.test(digest)) throw new Error(`${label} must be a SHA-256 digest.`);
@@ -418,7 +460,11 @@ export function normalizeExactShaEvidence(input, expected = {}) {
     throw new Error(`Unsupported exact-SHA evidence schema: ${String(input.schemaVersion || "missing")}`);
   }
   const sourceSha = normalizeSha(input.sourceSha, "evidence source SHA");
+  const ownershipManifest = validateOwnershipManifest(input.ownershipManifest);
   const manifestDigest = normalizeDigest(input.manifestDigest, "evidence ownership manifest digest");
+  if (manifestDigest !== ownershipManifestDigest(ownershipManifest)) {
+    throw new Error("Exact-SHA evidence ownership manifest digest does not match its executable manifest.");
+  }
   if (expected.sourceSha && sourceSha !== normalizeSha(expected.sourceSha, "expected evidence source SHA")) {
     throw new Error("Exact-SHA evidence is bound to a different source SHA.");
   }
@@ -444,6 +490,7 @@ export function normalizeExactShaEvidence(input, expected = {}) {
     schemaVersion: EXACT_SHA_EVIDENCE_SCHEMA_VERSION,
     sourceSha,
     manifestDigest,
+    ownershipManifest,
     changedPaths: stringList(input.changedPaths || [], "evidence changed paths"),
     affectedComponents: stringList(input.affectedComponents || [], "evidence affected components"),
     selectedComponents: stringList(input.selectedComponents || [], "evidence selected components"),
@@ -472,6 +519,43 @@ export function normalizeExactShaEvidence(input, expected = {}) {
   if (failClosedImpact && !evidence.fullRegressionReasons.length) {
     throw new Error("Fail-closed exact-SHA evidence requires a full-regression reason.");
   }
+  const recomputed = classifyChangedPaths(ownershipManifest, evidence.changedPaths);
+  const sameList = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  if (!evidence.changedPaths.length) throw new Error("Exact-SHA evidence requires changed paths.");
+  if (!sameList(evidence.affectedComponents, recomputed.affectedComponents)) {
+    throw new Error("Exact-SHA evidence affected components do not match the executable manifest classification.");
+  }
+  for (const flag of ["unknown", "shared", "ambiguous", "multiComponent"]) {
+    if (evidence[flag] !== recomputed[flag]) {
+      throw new Error(`Exact-SHA evidence ${flag} status does not match the executable manifest classification.`);
+    }
+  }
+  if (recomputed.fullRegression && !evidence.fullRegression) {
+    throw new Error("Exact-SHA evidence narrowed a fail-closed manifest classification.");
+  }
+  for (const reason of recomputed.fullRegressionReasons) {
+    if (!evidence.fullRegressionReasons.includes(reason)) {
+      throw new Error(`Exact-SHA evidence is missing full-regression reason ${reason}.`);
+    }
+  }
+  const expectedComponents = evidence.fullRegression
+    ? Object.keys(ownershipManifest.components).sort()
+    : recomputed.affectedComponents;
+  if (!sameList(evidence.selectedComponents, expectedComponents)) {
+    throw new Error("Exact-SHA evidence selected components do not match the required validation scope.");
+  }
+  const requiredCommands = evidence.fullRegression
+    ? ownershipManifest.fullRegressionCommands
+    : [...new Set(expectedComponents.flatMap((id) => ownershipManifest.components[id].validationCommands))].sort();
+  const recordedCommands = new Set(commands.map((command) => command.command));
+  for (const command of requiredCommands) {
+    if (!recordedCommands.has(command)) throw new Error(`Exact-SHA evidence is missing required command: ${command}`);
+  }
+  for (const [key, value] of Object.entries(ownershipManifest.environmentContract)) {
+    if (JSON.stringify(evidence.environmentContract[key]) !== JSON.stringify(value)) {
+      throw new Error(`Exact-SHA evidence environment contract does not match the manifest for ${key}.`);
+    }
+  }
   return evidence;
 }
 
@@ -493,6 +577,7 @@ export function buildExactShaEvidence(input = {}) {
     schemaVersion: EXACT_SHA_EVIDENCE_SCHEMA_VERSION,
     sourceSha: input.sourceSha,
     manifestDigest: classification.manifestDigest,
+    ownershipManifest: classification.ownershipManifest,
     changedPaths: classification.changedPaths,
     affectedComponents: classification.affectedComponents,
     selectedComponents: classification.selectedComponents,

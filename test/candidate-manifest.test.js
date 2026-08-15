@@ -8,6 +8,7 @@ import {
   invalidateCandidate,
   manifestDigest,
 } from "../src/candidate-manifest.js";
+import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
 
 const SHA = {
   base: "1".repeat(40),
@@ -15,37 +16,12 @@ const SHA = {
   sourceB: "3".repeat(40),
   integration: "4".repeat(40),
 };
-const OWNERSHIP_DIGEST = `sha256:${"9".repeat(64)}`;
 
 function validationEvidence(sourceSha = SHA.integration, overrides = {}) {
-  return {
-    schemaVersion: "studioops.exact-sha-validation.v1",
-    sourceSha,
-    manifestDigest: OWNERSHIP_DIGEST,
-    changedPaths: ["src/store.js"],
-    affectedComponents: ["control-plane-core"],
-    selectedComponents: ["control-plane-core"],
-    unknown: false,
-    shared: false,
-    fullRegression: false,
-    fullRegressionReasons: [],
-    commands: [{
-      command: "npm run check",
-      outcome: "passed",
-      durationMs: 10,
-      retries: 0,
-      skips: [],
-      artifactDigests: [`sha256:${"a".repeat(64)}`],
-    }],
-    environmentContract: {
-      id: "studioops.test.v1",
-      nodeVersion: process.version,
-      platform: process.platform,
-      architecture: process.arch,
-    },
-    artifactDigests: [`sha256:${"a".repeat(64)}`],
-    ...overrides,
-  };
+  return { ...exactShaEvidenceFixture(sourceSha), commands: [{
+    ...exactShaEvidenceFixture(sourceSha).commands[0],
+    durationMs: 10,
+  }], ...overrides };
 }
 
 function review(id, stageKey, subjectSha, candidateCycle = 2) {
@@ -175,10 +151,6 @@ test("security-relevant manifest drift changes the digest", () => {
     },
     {
       ...base,
-      validationEvidence: validationEvidence(SHA.integration, { manifestDigest: `sha256:${"8".repeat(64)}` }),
-    },
-    {
-      ...base,
       preview: { ...base.preview, url: "http://127.0.0.1:5000/" },
     },
     {
@@ -203,6 +175,13 @@ test("security-relevant manifest drift changes the digest", () => {
   for (const changedInput of changedInputs) {
     assert.notEqual(manifestDigest(buildCandidateManifest(changedInput)), originalDigest);
   }
+  assert.throws(
+    () => buildCandidateManifest({
+      ...base,
+      validationEvidence: validationEvidence(SHA.integration, { manifestDigest: `sha256:${"8".repeat(64)}` }),
+    }),
+    /does not match its executable manifest/,
+  );
 });
 
 test("reviews fail closed on malformed SHA, wrong subject, or wrong cycle", () => {

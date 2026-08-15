@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 
 import path from "node:path";
-import { classifyGitImpact, loadOwnershipManifest, validateRepositoryDependencies } from "../src/impact-manifest.js";
+import {
+  classifyGitImpact,
+  loadOwnershipManifest,
+  validateRepositoryDependencies,
+  validateTrackedSurfaceCoverage,
+} from "../src/impact-manifest.js";
 
 function argument(name) {
   const index = process.argv.indexOf(name);
@@ -21,8 +26,10 @@ const classification = await classifyGitImpact(repoPath, baseSha, headSha, {
 if (process.argv.includes("--check-dependencies") && !classification.manifestError) {
   const { manifest } = await loadOwnershipManifest(repoPath);
   const dependencyResult = await validateRepositoryDependencies(repoPath, manifest);
+  const coverageResult = await validateTrackedSurfaceCoverage(repoPath, manifest);
   classification.dependencyValidation = dependencyResult;
-  if (!dependencyResult.ok) process.exitCode = 1;
+  classification.surfaceCoverage = coverageResult;
+  if (!dependencyResult.ok || !coverageResult.ok) process.exitCode = 1;
 }
 
 process.stdout.write(`${JSON.stringify(classification, null, 2)}\n`);

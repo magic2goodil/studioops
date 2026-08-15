@@ -17,7 +17,7 @@ import {
 import { missionControlDataDir } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode, withDefaultProjectStandards } from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
-import { assertExactShaEvidenceEnvironment } from "./impact-manifest.js";
+import { assertExactShaEvidenceEnvironment, normalizeExactShaEvidence } from "./impact-manifest.js";
 import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
@@ -725,9 +725,13 @@ export function normalizeDeliveryPolicy(value = {}) {
   };
 }
 
-function normalizedImpactEvidence(value = {}) {
-  const files = Array.isArray(value.changedFiles || value.files)
-    ? [...new Set((value.changedFiles || value.files).map((item) => String(item || "").trim()).filter(Boolean))].sort()
+export function normalizedImpactEvidence(value = {}) {
+  const validationEvidence = value.validationEvidence || value.exactShaEvidence
+    ? normalizeExactShaEvidence(value.validationEvidence || value.exactShaEvidence)
+    : null;
+  const changedFiles = value.changedFiles || value.files || validationEvidence?.changedPaths;
+  const files = Array.isArray(changedFiles)
+    ? [...new Set(changedFiles.map((item) => String(item || "").trim()).filter(Boolean))].sort()
     : [];
   const explicitSource = Array.isArray(value.impact)
     ? value.impact
@@ -738,17 +742,20 @@ function normalizedImpactEvidence(value = {}) {
   const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
   const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
-  const manifestDigest = /^sha256:[a-f0-9]{64}$/i.test(String(value.manifestDigest || ""))
-    ? String(value.manifestDigest).toLowerCase()
+  const manifestDigestValue = value.manifestDigest || validationEvidence?.manifestDigest || "";
+  const manifestDigest = /^sha256:[a-f0-9]{64}$/i.test(String(manifestDigestValue))
+    ? String(manifestDigestValue).toLowerCase()
     : "";
   const directComponents = Array.isArray(value.directComponents)
     ? [...new Set(value.directComponents.map(String).map((item) => item.trim()).filter(Boolean))].sort()
     : [];
-  const affectedComponents = Array.isArray(value.affectedComponents)
-    ? [...new Set(value.affectedComponents.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+  const affectedSource = value.affectedComponents || validationEvidence?.affectedComponents;
+  const affectedComponents = Array.isArray(affectedSource)
+    ? [...new Set(affectedSource.map(String).map((item) => item.trim()).filter(Boolean))].sort()
     : [];
-  const selectedComponents = Array.isArray(value.selectedComponents)
-    ? [...new Set(value.selectedComponents.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+  const selectedSource = value.selectedComponents || validationEvidence?.selectedComponents;
+  const selectedComponents = Array.isArray(selectedSource)
+    ? [...new Set(selectedSource.map(String).map((item) => item.trim()).filter(Boolean))].sort()
     : [];
   const pathCapabilities = files.map((file) => {
     const capabilities = new Set();
@@ -762,7 +769,7 @@ function normalizedImpactEvidence(value = {}) {
     return capabilities;
   });
   const hasExecutableComponentClassification = directComponents.length > 0 || affectedComponents.length > 0;
-  const unknown = value.unknown === true
+  const unknown = value.unknown === true || validationEvidence?.unknown === true
     || value.classified === false
     || value.stale === true
     || value.conflicting === true
@@ -771,13 +778,13 @@ function normalizedImpactEvidence(value = {}) {
     || !files.length
     || (!hasExecutableComponentClassification && pathCapabilities.some((capabilities) => capabilities.size === 0));
   const fullRegressionReasons = [...new Set([
-    ...(Array.isArray(value.fullRegressionReasons) ? value.fullRegressionReasons : []),
+    ...(Array.isArray(value.fullRegressionReasons) ? value.fullRegressionReasons : validationEvidence?.fullRegressionReasons || []),
     ...(!manifestDigest ? ["missing_manifest_binding"] : []),
-    ...(value.shared === true ? ["shared_surface"] : []),
-    ...(value.ambiguous === true ? ["ambiguous_ownership"] : []),
-    ...(value.multiComponent === true ? ["multi_component"] : []),
+    ...(value.shared === true || validationEvidence?.shared === true ? ["shared_surface"] : []),
+    ...(value.ambiguous === true || validationEvidence?.ambiguous === true ? ["ambiguous_ownership"] : []),
+    ...(value.multiComponent === true || validationEvidence?.multiComponent === true ? ["multi_component"] : []),
   ].map(String).map((item) => item.trim()).filter(Boolean))].sort();
-  const fullRegression = value.fullRegression === true || fullRegressionReasons.length > 0;
+  const fullRegression = value.fullRegression === true || validationEvidence?.fullRegression === true || fullRegressionReasons.length > 0;
   const backendRequired = fullRegression || unknown || classifications.some((item) => ["backend", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment"].includes(item))
     || pathCapabilities.some((capabilities) => capabilities.has("backend"));
   const frontend = classifications.includes("frontend") || classifications.includes("design-system")
@@ -791,10 +798,11 @@ function normalizedImpactEvidence(value = {}) {
     affectedComponents,
     selectedComponents,
     manifestDigest,
+    validationEvidence,
     unknown,
-    shared: value.shared === true,
-    ambiguous: value.ambiguous === true,
-    multiComponent: value.multiComponent === true,
+    shared: value.shared === true || validationEvidence?.shared === true,
+    ambiguous: value.ambiguous === true || validationEvidence?.ambiguous === true,
+    multiComponent: value.multiComponent === true || validationEvidence?.multiComponent === true,
     fullRegression,
     fullRegressionReasons,
     backendRequired,

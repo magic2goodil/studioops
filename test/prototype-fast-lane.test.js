@@ -8,11 +8,13 @@ import {
   candidateIdentityForTask,
   candidateIdentityIsComplete,
   normalizeDeliveryPolicy,
+  normalizedImpactEvidence,
   readState,
   updateTask,
 } from "../src/store.js";
 import { planDispatches } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
 
 const MANIFEST_DIGEST = `sha256:${"9".repeat(64)}`;
 
@@ -83,6 +85,15 @@ test("normalized impact classifications remain stable when evidence is reused", 
   );
   assert.deepEqual(routing.evidence.classifications, ["backend"]);
   assert.deepEqual(routing.required, ["backend", "frontend", "accessibility", "lead"]);
+});
+
+test("normalized task impact retains verified exact-SHA evidence", () => {
+  const validationEvidence = exactShaEvidenceFixture("a".repeat(40));
+  const evidence = normalizedImpactEvidence({ validationEvidence });
+  assert.deepEqual(evidence.changedFiles, validationEvidence.changedPaths);
+  assert.deepEqual(evidence.affectedComponents, validationEvidence.affectedComponents);
+  assert.equal(evidence.manifestDigest, validationEvidence.manifestDigest);
+  assert.deepEqual(evidence.validationEvidence, validationEvidence);
 });
 
 test("explicit local mode requires a verified candidate while GitHub requires an exact subject", () => {
