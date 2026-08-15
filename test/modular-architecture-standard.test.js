@@ -137,6 +137,8 @@ test("builder and architect prompts carry bounded ownership and fail-closed sele
   const builder = generatePrompt(state, "task_1", "builder");
   const architect = generatePrompt(state, "task_1", "systems-architect");
 
+  assert.match(builder, /status task_1 --status builder_review --subject-sha <full-head-sha>/);
+
   for (const prompt of [builder, architect]) {
     assert.match(prompt, /owning component|component(?:'s|, identify its) owner/i);
     assert.match(prompt, /public contracts/i);

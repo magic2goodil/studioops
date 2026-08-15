@@ -48,6 +48,42 @@ async function writeLegacyState(root, state) {
   await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(state)}\n`);
 }
 
+function builderReviewStatusState(workflowMode, prUrl) {
+  return {
+    meta: { stateIntegrityVersion: 4 },
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      workflowMode,
+      reviewPipeline: [{
+        key: "backend",
+        label: "Backend Review",
+        role: "backend-reviewer",
+        status: "backend_review",
+        required: true,
+      }],
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Exact builder handoff",
+      status: "in_progress",
+      branchName: "codex/demo-exact-sha",
+      prUrl,
+      reviewCycle: 0,
+      reviewSubjectSha: "a".repeat(40),
+      reviewSubjectCycle: 0,
+    }],
+    comments: [],
+    reviews: [],
+    events: [],
+    runs: [],
+    qaBundles: [],
+    candidates: [],
+  };
+}
+
 async function readPersistedState(root, env) {
   const result = await execFileAsync(process.execPath, [
     "--input-type=module",
@@ -109,6 +145,64 @@ test("status without a value and show-task leave the task unchanged", async () =
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const [workflowMode, prUrl] of [
+  ["local", ""],
+  ["github", "https://github.com/example/demo/pull/1"],
+]) {
+  test(`builder-review status atomically persists the exact SHA for ${workflowMode} workflow`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), `studioops-builder-review-${workflowMode}-`));
+    try {
+      await writeLegacyState(root, builderReviewStatusState(workflowMode, prUrl));
+      const env = await environmentForTestControlRoot(root);
+      const subjectSha = "b".repeat(40);
+      await execFileAsync(process.execPath, [
+        cliPath,
+        "status",
+        "task_1",
+        "--status",
+        "builder_review",
+        "--subject-sha",
+        subjectSha,
+      ], { cwd: root, env });
+
+      const state = await readPersistedState(root, env);
+      const task = state.tasks[0];
+      assert.equal(task.status, "builder_review");
+      assert.equal(task.reviewSubjectSha, subjectSha);
+      assert.equal(task.reviewCycle, 1);
+      assert.equal(task.reviewSubjectCycle, 1);
+      const report = createSupervisorReport(state);
+      assert.equal(report.actions[0].type, "start_review");
+      assert.equal(report.actions[0].reviewSubjectSha, subjectSha);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("builder-review status fails closed for missing or non-full subject SHA", async () => {
+  for (const subjectSha of [null, "not-a-sha", "c".repeat(12)]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-builder-review-invalid-"));
+    try {
+      await writeLegacyState(root, builderReviewStatusState("github", "https://github.com/example/demo/pull/1"));
+      const env = await environmentForTestControlRoot(root);
+      const args = [cliPath, "status", "task_1", "--status", "builder_review"];
+      if (subjectSha !== null) args.push("--subject-sha", subjectSha);
+      await assert.rejects(
+        execFileAsync(process.execPath, args, { cwd: root, env }),
+        /full head SHA|review subject SHA/,
+      );
+      const task = (await readPersistedState(root, env)).tasks[0];
+      assert.equal(task.status, "in_progress");
+      assert.equal(task.reviewCycle, 0);
+      assert.equal(task.reviewSubjectSha, "a".repeat(40));
+      assert.equal(createSupervisorReport(await readPersistedState(root, env)).actions.length, 0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

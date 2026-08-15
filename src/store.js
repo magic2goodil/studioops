@@ -3317,7 +3317,7 @@ Modular architecture and impact-scoped validation contract:
 ${modularArchitectureAndValidationContract()}
 
 Builder instructions:
-- Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Use 'status ${task.id} --status <canonical-status>' only for an intentional status mutation; never omit '--status'.
+- Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Use 'status ${task.id} --status builder_review --subject-sha <full-head-sha>' for the builder handoff so the exact SHA is persisted atomically; use 'status ${task.id} --status <canonical-status>' for other intentional status mutations; never omit '--status'.
 - Create or switch to the feature branch.
 - For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
 - For UI tasks, implement and verify mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.
@@ -3333,7 +3333,7 @@ Builder instructions:
 - Commit and push only if the user/project workflow asks for that.
 - Link the feature branch and pull request on the task when available.
 - Add a task comment with changed files, validation results, known gaps, PR link, and next review step.
-- Move the task to \`builder_review\` only after the branch, exact full head SHA, validation notes, and builder comment are present. GitHub workflows also require the PR URL; local workflows must leave the PR URL empty. Include the SHA as \`--subject-sha\` when updating the task.
+- Move the task to \`builder_review\` only after the branch, exact full head SHA, validation notes, and builder comment are present. Use \`status ${task.id} --status builder_review --subject-sha <full-head-sha>\` so the SHA is persisted atomically with the transition. GitHub workflows also require the PR URL; local workflows must leave the PR URL empty.
 `;
 }
 

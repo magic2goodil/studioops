@@ -433,7 +433,7 @@ Commands:
                                 Idempotently add required StudioOps standards
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
-  status TASK_ID --status       Mutate task status (requires one canonical non-empty status)
+  status TASK_ID --status       Mutate task status (builder_review also requires --subject-sha FULL_SHA)
   comment TASK_ID --body        Add a builder/reviewer comment
   architecture-complete TASK   Record the architecture decision and implementation task graph
   review TASK_ID --stage        Record approved, skipped, or changes_requested
@@ -862,7 +862,15 @@ Automation:
     if (!taskId || !Object.prototype.hasOwnProperty.call(args, "status") || typeof args.status !== "string" || !args.status.trim()) {
       throw new Error("Usage: status TASK_ID --status CANONICAL_STATUS (status is a mutation; use show-task TASK_ID for read-only inspection)");
     }
-    const task = await updateTask(taskId, { status: args.status });
+    const patch = { status: args.status };
+    if (args.status.trim() === "builder_review") {
+      const subjectSha = args["subject-sha"] ?? args.sha;
+      if (typeof subjectSha !== "string" || !subjectSha.trim()) {
+        throw new Error("Usage: status TASK_ID --status builder_review --subject-sha FULL_SHA (the exact full head SHA is required for reviewer intake)");
+      }
+      patch.subjectSha = subjectSha;
+    }
+    const task = await updateTask(taskId, patch);
     console.log(`${task.id} -> ${task.status}`);
     return;
   }
