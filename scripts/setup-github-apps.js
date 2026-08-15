@@ -123,6 +123,15 @@ function appEndpoint({ owner, org }) {
 }
 
 function appManifest(app, baseUrl) {
+  const defaultPermissions = {
+    actions: "read",
+    checks: "read",
+    contents: "write",
+    issues: "write",
+    metadata: "read",
+    pull_requests: "write",
+  };
+  if (app.role === "builder") defaultPermissions.workflows = "write";
   return {
     name: app.name,
     url: REPO_URL,
@@ -130,14 +139,7 @@ function appManifest(app, baseUrl) {
     callback_urls: [`${baseUrl}/callback`],
     description: app.description,
     public: false,
-    default_permissions: {
-      actions: "read",
-      checks: "read",
-      contents: "write",
-      issues: "write",
-      metadata: "read",
-      pull_requests: "write",
-    },
+    default_permissions: defaultPermissions,
     request_oauth_on_install: false,
     setup_on_update: false,
   };
