@@ -1,5 +1,6 @@
 import {
   architectureIsCompleteInState,
+  capabilityRoutingForTask,
   cycleLimitLeadReviewApplies,
   currentReviewCandidateCycle,
   earliestIncompleteRequiredReviewStage,
@@ -72,6 +73,16 @@ function leadReviewStageForProject(project) {
   return stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
 }
 
+function reviewStagesForTask(project, task) {
+  const routing = capabilityRoutingForTask(project, task);
+  if (routing.policy.profile !== "prototype-fast-lane") return reviewStagesForProject(project);
+  const allowed = new Set(routing.required);
+  return reviewStagesForProject(project).filter((stage) => {
+    const key = String(stage.key || "").toLowerCase();
+    return key === "lead" || String(stage.role || "").toLowerCase().includes("lead") || allowed.has(key);
+  });
+}
+
 function reviewCycleAtLimit(project, task) {
   return currentReviewCycle(task) >= reviewPolicyForProject(project).maxBuilderReviewCycles;
 }
@@ -102,9 +113,16 @@ function nextOpenReviewStage(state, project, task) {
     if (leadReviewCompleteForCycle(state, task, project)) return null;
     return leadReviewStageForProject(project);
   }
-  return reviewStagesForProject(project).find((stage) => {
+  return reviewStagesForTask(project, task).find((stage) => {
     const latest = latestCurrentReviewForStage(state, task, stage);
     return !latest || !REVIEW_COMPLETE_OUTCOMES.has(latest.outcome);
+  }) || null;
+}
+
+function earliestIncompleteForTask(state, project, task) {
+  return reviewStagesForTask(project, task).find((stage) => {
+    const review = latestCurrentReviewForStage(state, task, stage);
+    return !review || !REVIEW_COMPLETE_OUTCOMES.has(review.outcome);
   }) || null;
 }
 
@@ -169,6 +187,8 @@ function actionBase(state, task, type, role, reason, options = {}) {
     integrationBlocker: task.integrationBlocker || "",
     reviewSubjectSha: task.reviewSubjectSha || "",
     candidateCycle: currentReviewCandidateCycle(task),
+    candidateIdentity: task.candidateIdentity || null,
+    skippedReviewLanes: capabilityRoutingForTask(project || {}, task).skipped,
     promptCommand: role && role !== "owner" && !String(role).includes("integration-worker") ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     integrationCommand: options.integrationCommand || "",
@@ -269,9 +289,9 @@ function taskActions(state, task, options = {}) {
 
   if (task.type === "epic" || hasChildren) return [];
 
-  const stages = reviewStagesForProject(project);
+  const stages = reviewStagesForTask(project, task);
   const currentStage = stageForStatus(project, task.status);
-  const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
+  const earliestRequiredStage = earliestIncompleteForTask(state, project, task);
   const currentStageIndex = stages.indexOf(currentStage);
   const earliestRequiredIndex = stages.indexOf(earliestRequiredStage);
   const cycleLimitLeadReview = cycleLimitLeadReviewApplies(
@@ -398,7 +418,8 @@ function taskActions(state, task, options = {}) {
   }
 
   if (task.status === "builder_review") {
-    if (!task.branchName || !task.prUrl) {
+    const localMode = String(project.workflowMode || "").toLowerCase() === "local";
+    if (!task.branchName || (!localMode && !task.prUrl)) {
       return [actionBase(state, task, "return_to_builder", "builder", "Builder review intake is incomplete: branch and PR URL are required before reviewer routing.", {
         ...options,
         nextStatus: "needs_changes",
