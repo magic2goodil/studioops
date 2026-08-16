@@ -10,11 +10,256 @@ export const LEGACY_CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "studioops.config.example.md";
 export const PROJECT_WORKFLOW_MODES = new Set(["auto", "local", "github"]);
 export const MODULAR_ARCHITECTURE_STANDARD = "standards/modular-architecture-and-scoped-validation.md";
+export const STANDING_RELEASE_AUTHORIZATION_ACTIONS = new Set(["grant", "revoke"]);
 export const INSTALLED_AUTOMATION_CAPACITY = Object.freeze({
   builderConcurrency: 3,
   reviewerConcurrency: 3,
   runnerLimit: 3,
 });
+
+const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/;
+const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const CAPABILITY_KEY_PATTERN = /^[a-z][a-z0-9.-]{2,63}$/;
+const REASON_CODE_PATTERN = /^[a-z][a-z0-9_]{2,63}$/;
+const GITHUB_REPOSITORY_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38})\/[a-z0-9._-]{1,100}$/;
+const SIMPLE_COORDINATE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const WORKFLOW_COORDINATE_PATTERN = /^[A-Za-z0-9.][A-Za-z0-9._/-]{0,159}$/;
+const ROLLBACK_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,191}$/;
+
+function requiredString(value, label) {
+  const normalized = String(value || "").trim();
+  if (!normalized) throw new Error(`${label} is required.`);
+  return normalized;
+}
+
+function normalizeOpaqueId(value, label) {
+  const normalized = requiredString(value, label);
+  if (!OPAQUE_ID_PATTERN.test(normalized)) {
+    throw new Error(`${label} must be an opaque 8-128 character identifier using only letters, numbers, _ or -.`);
+  }
+  return normalized;
+}
+
+function normalizeIsoTimestamp(value, label) {
+  const normalized = requiredString(value, label);
+  const timestamp = Date.parse(normalized);
+  if (
+    !Number.isFinite(timestamp)
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/i.test(normalized)
+  ) {
+    throw new Error(`${label} must be an ISO-8601 timestamp with a timezone.`);
+  }
+  return new Date(timestamp).toISOString();
+}
+
+function boundedCoordinate(value, label, pattern) {
+  const normalized = requiredString(value, label);
+  if (
+    !pattern.test(normalized)
+    || normalized.includes("..")
+    || normalized.startsWith("/")
+    || normalized.endsWith("/")
+  ) {
+    throw new Error(`${label} is not a valid bounded non-sensitive coordinate.`);
+  }
+  return normalized;
+}
+
+export function normalizeGitHubRepository(value) {
+  const raw = requiredString(value, "Standing release repository");
+  const match = raw.match(
+    /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https?:\/\/github\.com\/)?([^/:?#\s]+)\/([^/#?\s]+?)(?:\.git)?$/i,
+  );
+  if (!match) {
+    throw new Error("Standing release repository must be an exact GitHub owner/repository coordinate.");
+  }
+  const repository = `${match[1]}/${match[2].replace(/\.git$/i, "")}`.toLowerCase();
+  if (!GITHUB_REPOSITORY_PATTERN.test(repository)) {
+    throw new Error("Standing release repository must be a valid GitHub owner/repository coordinate.");
+  }
+  return repository;
+}
+
+function normalizeTargetHostname(value) {
+  const raw = requiredString(value, "Standing release target hostname").toLowerCase();
+  if (
+    raw.length > 253
+    || raw.includes(":")
+    || raw.includes("/")
+    || raw.endsWith(".")
+    || !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(raw)
+  ) {
+    throw new Error("Standing release target hostname must be one exact DNS hostname without a scheme, port, path, or wildcard.");
+  }
+  return raw;
+}
+
+function normalizeHealthPath(value) {
+  const raw = requiredString(value, "Standing release health path");
+  if (
+    raw.length > 256
+    || !raw.startsWith("/")
+    || raw.startsWith("//")
+    || raw.includes("?")
+    || raw.includes("#")
+    || raw.includes("\\")
+  ) {
+    throw new Error("Standing release health path must be one bounded absolute URL path without a host, query, or fragment.");
+  }
+  let decoded;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new Error("Standing release health path contains invalid URL encoding.");
+  }
+  if (decoded.split("/").some((segment) => segment === "." || segment === "..")) {
+    throw new Error("Standing release health path cannot contain traversal segments.");
+  }
+  return raw;
+}
+
+function normalizeRevocation(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Standing release revocation must be an object.");
+  }
+  const reasonCode = requiredString(value.reasonCode, "Standing release revocation reason code").toLowerCase();
+  if (!REASON_CODE_PATTERN.test(reasonCode)) {
+    throw new Error("Standing release revocation reason code must be 3-64 lowercase letters, numbers, or underscores.");
+  }
+  return {
+    revokedByActorId: normalizeOpaqueId(value.revokedByActorId, "Standing release revocation actor ID"),
+    revokedAt: normalizeIsoTimestamp(value.revokedAt, "Standing release revocation timestamp"),
+    reasonCode,
+  };
+}
+
+export function normalizeStandingReleaseAuthorizationGrant(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Standing release authorization grant must be an object.");
+  }
+  return {
+    authorizationId: normalizeOpaqueId(value.authorizationId, "Standing release authorization ID"),
+    ownerActorId: normalizeOpaqueId(value.ownerActorId, "Standing release owner actor ID"),
+    grantedAt: normalizeIsoTimestamp(value.grantedAt, "Standing release grant timestamp"),
+    repository: normalizeGitHubRepository(value.repository),
+    targetHostname: normalizeTargetHostname(value.targetHostname),
+    deploymentWorkflow: boundedCoordinate(
+      value.deploymentWorkflow,
+      "Standing release deployment workflow",
+      WORKFLOW_COORDINATE_PATTERN,
+    ),
+    environment: boundedCoordinate(value.environment, "Standing release environment", SIMPLE_COORDINATE_PATTERN),
+    artifactName: boundedCoordinate(value.artifactName, "Standing release artifact name", SIMPLE_COORDINATE_PATTERN),
+    healthPath: normalizeHealthPath(value.healthPath),
+    rollbackWorkflow: boundedCoordinate(
+      value.rollbackWorkflow,
+      "Standing release rollback workflow",
+      WORKFLOW_COORDINATE_PATTERN,
+    ),
+    rollbackReference: boundedCoordinate(
+      value.rollbackReference,
+      "Standing release rollback reference",
+      ROLLBACK_REFERENCE_PATTERN,
+    ),
+    revocation: value.revocation == null ? null : normalizeRevocation(value.revocation),
+  };
+}
+
+export function normalizeStandingReleaseAuthorizationHistory(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error("Standing release authorization history must be an array.");
+  }
+  const history = value.map((record) => normalizeStandingReleaseAuthorizationGrant(record));
+  const authorizationIds = new Set();
+  let activeCount = 0;
+  for (const record of history) {
+    if (authorizationIds.has(record.authorizationId)) {
+      throw new Error(`Duplicate standing release authorization ID: ${record.authorizationId}`);
+    }
+    authorizationIds.add(record.authorizationId);
+    if (!record.revocation) activeCount += 1;
+  }
+  if (activeCount > 1) {
+    throw new Error("A project cannot have more than one active standing release authorization.");
+  }
+  return history;
+}
+
+export function activeStandingReleaseAuthorization(project = {}) {
+  const history = normalizeStandingReleaseAuthorizationHistory(
+    project.standingReleaseAuthorizationHistory,
+  );
+  return history.find((record) => !record.revocation) || null;
+}
+
+export function standingReleaseAuthorizationState(project = {}) {
+  const history = normalizeStandingReleaseAuthorizationHistory(
+    project.standingReleaseAuthorizationHistory,
+  );
+  const activeAuthorization = history.find((record) => !record.revocation) || null;
+  return {
+    enabled: Boolean(activeAuthorization),
+    activeAuthorization,
+    history,
+  };
+}
+
+export function normalizeStandingReleaseAuthorizationCommand(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Standing release authorization update must be an object.");
+  }
+  const action = String(value.action || "").trim().toLowerCase();
+  if (!STANDING_RELEASE_AUTHORIZATION_ACTIONS.has(action)) {
+    throw new Error("Standing release authorization action must be grant or revoke.");
+  }
+  if (action === "grant") {
+    const grant = normalizeStandingReleaseAuthorizationGrant(value.grant || value);
+    if (grant.revocation) {
+      throw new Error("A new standing release authorization grant cannot include a revocation record.");
+    }
+    return { action, grant };
+  }
+  return {
+    action,
+    authorizationId: normalizeOpaqueId(value.authorizationId, "Standing release authorization ID"),
+    revocation: normalizeRevocation(value.revocation || value),
+  };
+}
+
+export function normalizeOperationalCapabilityBlockers(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error("Operational capability blockers must be an array.");
+  }
+  const seen = new Set();
+  return value.map((item) => {
+    const source = typeof item === "string" ? { capabilityKey: item } : item;
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      throw new Error("Each operational capability blocker must be a capability key or object.");
+    }
+    const capabilityKey = String(source.capabilityKey || "").trim().toLowerCase();
+    const governingTaskId = String(source.governingTaskId || "").trim();
+    if (!capabilityKey && !governingTaskId) {
+      throw new Error("An operational capability blocker requires a capability key or governing task ID.");
+    }
+    if (capabilityKey && !CAPABILITY_KEY_PATTERN.test(capabilityKey)) {
+      throw new Error("Operational capability keys must be 3-64 lowercase letters, numbers, dots, or hyphens.");
+    }
+    if (governingTaskId && !TASK_ID_PATTERN.test(governingTaskId)) {
+      throw new Error("Operational capability governing task ID must be an opaque identifier.");
+    }
+    const normalized = {
+      scope: "release",
+      capabilityKey,
+      governingTaskId,
+    };
+    const key = `${capabilityKey}\u0000${governingTaskId}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    return normalized;
+  }).filter(Boolean);
+}
 
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
@@ -235,6 +480,9 @@ export function projectFromConfig(rawProject, defaults = {}) {
       ...(rawProject.promotion || {}),
     },
     deliveryPolicy: rawProject.deliveryPolicy || defaults.deliveryPolicy || {},
+    standingReleaseAuthorizationHistory: normalizeStandingReleaseAuthorizationHistory(
+      rawProject.standingReleaseAuthorizationHistory,
+    ),
     localQaPreview: rawProject.localQaPreview || rawProject.qaIntegration?.localPreview || null,
     trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
     integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),

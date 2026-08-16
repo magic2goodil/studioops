@@ -67,3 +67,35 @@ test("ordinary dependency blockers still return to the builder queue", async () 
   assert.deepEqual(tick.actions, ["task_1: unblocked"]);
   assert.equal(state.tasks[0].status, "queued");
 });
+
+test("release-scoped operational capability blockers do not enter builder or review ordering", async () => {
+  const builderState = fixtureState({
+    status: "ready",
+    operationalCapabilityBlockers: [{
+      scope: "release",
+      capabilityKey: "standing-production-release",
+      governingTaskId: "task_534",
+    }],
+  });
+  const builderReport = createSupervisorReport(builderState);
+  assert.equal(builderReport.actions.length, 1);
+  assert.equal(builderReport.actions[0].type, "start_builder");
+  assert.deepEqual(builderReport.actions[0].dependencies, []);
+
+  const reviewState = fixtureState({
+    status: "builder_review",
+    branchName: "codex/demo",
+    reviewCycle: 1,
+    reviewSubjectCycle: 1,
+    reviewSubjectSha: "a".repeat(40),
+    operationalCapabilityBlockers: [{
+      scope: "release",
+      capabilityKey: "standing-production-release",
+      governingTaskId: "task_534",
+    }],
+  });
+  reviewState.projects[0].workflowMode = "local";
+  const tick = await automationTick({ state: reviewState, limit: 10 });
+  assert.deepEqual(tick.actions, ["task_1: routed to backend-reviewer"]);
+  assert.equal(reviewState.tasks[0].status, "backend_review");
+});
