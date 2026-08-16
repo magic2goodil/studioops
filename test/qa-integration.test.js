@@ -474,11 +474,17 @@ test("candidate manifest validation commands require a trusted project allowlist
   );
   assert.deepEqual(authorized, {
     ok: true,
-    commands: ["npm run check", "git diff --check"],
+    commands: ["git diff --check"],
     trustedCommandCount: 2,
     requiredCommandCount: 1,
     unauthorizedCommandCount: 0,
   });
+
+  const failClosed = authorizeManifestValidationCommands(
+    ["npm run check", "git diff --check"],
+    [],
+  );
+  assert.deepEqual(failClosed.commands, ["npm run check", "git diff --check"]);
 
   const rejected = authorizeManifestValidationCommands(
     ["npm run check"],
@@ -559,11 +565,31 @@ test("QA integration never executes candidate-controlled manifest commands", asy
   }
 });
 
+test("QA integration executes only classifier-selected trusted commands", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-command-selection-"));
+  const sentinel = path.join(root, "unselected-command-ran");
+  const unselectedCommand = `touch ${JSON.stringify(sentinel)}`;
+  try {
+    await createValidationSecurityFixture(root, {
+      validationCommands: ["git diff --check", unselectedCommand],
+    });
+    const report = await runQaIntegrationFixture(root, {
+      input: { githubAppAuth: false },
+    });
+    assert.equal(report.projects[0].status, "preview_missing");
+    assert.deepEqual(report.projects[0].validation.map((item) => item.command), ["git diff --check"]);
+    await assert.rejects(readFile(sentinel), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("QA integration rejects a passing validation that mutates a tracked file", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-validation-mutation-"));
   const mutationCommand = `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('app.txt', 'mutated\\n')"`;
   try {
     const fixture = await createValidationSecurityFixture(root, {
+      manifestCommand: mutationCommand,
       validationCommands: [mutationCommand, "git diff --check"],
     });
     const report = await runQaIntegrationFixture(root, {
@@ -922,6 +948,7 @@ test("QA integration redacts GitHub token values from validation output before s
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const fakeToken = "ghs_fake-validation-secret-token";
+  const validationCommand = `${JSON.stringify(process.execPath)} -e "console.log(process.env.GH_TOKEN); console.error(process.env.MISSION_CONTROL_GITHUB_TOKEN)"`;
 
   try {
     await git(root, ["init", "--bare", remotePath]);
@@ -930,6 +957,11 @@ test("QA integration redacts GitHub token values from validation output before s
     await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
     await installTestOwnershipManifest(repoPath);
+    const manifestPath = path.join(repoPath, "config", "component-ownership.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.fullRegressionCommands.push(validationCommand);
+    manifest.components.application.validationCommands.push(validationCommand);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
     await git(repoPath, ["commit", "-m", "base"]);
@@ -941,8 +973,6 @@ test("QA integration redacts GitHub token values from validation output before s
     await git(repoPath, ["commit", "-am", "feature"]);
     await git(repoPath, ["push", "origin", "feature/task"]);
     await git(repoPath, ["checkout", "main"]);
-
-    const validationCommand = `${JSON.stringify(process.execPath)} -e "console.log(process.env.GH_TOKEN); console.error(process.env.MISSION_CONTROL_GITHUB_TOKEN)"`;
 
     await mkdir(path.join(root, "data"), { recursive: true });
     await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({

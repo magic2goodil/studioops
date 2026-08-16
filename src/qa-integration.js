@@ -1147,7 +1147,10 @@ export function authorizeManifestValidationCommands(trustedCommands, requiredCom
   const unauthorized = required.filter((command) => !trustedSet.has(command));
   return {
     ok: unauthorized.length === 0,
-    commands: trusted,
+    // A valid impact classification selects the smallest trusted command set.
+    // Missing or malformed manifests cannot select commands, so retain the
+    // trusted project suite as the fail-closed validation fallback.
+    commands: unauthorized.length ? trusted : required.length ? required : trusted,
     trustedCommandCount: trusted.length,
     requiredCommandCount: required.length,
     unauthorizedCommandCount: unauthorized.length,
