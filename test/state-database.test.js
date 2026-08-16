@@ -145,6 +145,32 @@ test("standing release authorization survives restart with immutable grant and o
 
     await runStoreScript(root, `
       import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+      const base = ${JSON.stringify(standingReleaseGrant())};
+      const unsafeGrants = [
+        { ...base, rollbackReference: "github_pat_abcdefghijklmnopqrstuvwxyz" },
+        { ...base, healthPath: "/Users/example/private/health" },
+        { ...base, environment: "production\\n" },
+        { ...base, grantedAt: "2026-02-30T12:00:00.000Z" }
+      ];
+      for (const grant of unsafeGrants) {
+        let rejected = false;
+        try {
+          await updateProject("project_1", {
+            standingReleaseAuthorization: { action: "grant", ...grant }
+          });
+        } catch {
+          rejected = true;
+        }
+        if (!rejected) throw new Error("Unsafe standing release grant was persisted.");
+      }
+    `);
+    assert.equal(
+      readPersistedState(root).projects[0].standingReleaseAuthorizationHistory,
+      undefined,
+    );
+
+    await runStoreScript(root, `
+      import { updateProject } from ${JSON.stringify(storeModuleUrl)};
       await updateProject("project_1", {
         standingReleaseAuthorization: {
           action: "grant",
@@ -160,6 +186,26 @@ test("standing release authorization survives restart with immutable grant and o
       "example/demo",
     );
     assert.equal(persisted.projects[0].standingReleaseAuthorizationHistory[0].revocation, null);
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+        await updateProject("project_1", {
+          standingReleaseAuthorization: {
+            action: "revoke",
+            authorizationId: "authorization_01",
+            revokedByActorId: "owner_actor_02",
+            revokedAt: "2026-08-16T11:59:59.999Z",
+            reasonCode: "owner_requested"
+          }
+        });
+      `),
+      /cannot precede its grant/,
+    );
+    assert.equal(
+      readPersistedState(root).projects[0].standingReleaseAuthorizationHistory[0].revocation,
+      null,
+    );
 
     await assert.rejects(
       () => runStoreScript(root, `

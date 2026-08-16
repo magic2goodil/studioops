@@ -195,6 +195,93 @@ test("standing release grants fail closed on malformed identity and target bindi
   );
 });
 
+test("every persisted release coordinate rejects credential shapes, local paths, and control characters", () => {
+  const credential = "github_pat_abcdefghijklmnopqrstuvwxyz";
+  const credentialValues = {
+    deploymentWorkflow: credential,
+    environment: credential,
+    artifactName: credential,
+    healthPath: `/health/${credential}`,
+    rollbackWorkflow: credential,
+    rollbackReference: credential,
+  };
+  for (const [field, value] of Object.entries(credentialValues)) {
+    assert.throws(
+      () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({ [field]: value })),
+      /credential-shaped/,
+      field,
+    );
+  }
+
+  const localPathValues = {
+    deploymentWorkflow: "Users/example/private/deploy.yml",
+    environment: "/Users/example/private",
+    artifactName: "/tmp/private-artifact",
+    healthPath: "/Users/example/private/health",
+    rollbackWorkflow: "home/example/private/rollback.yml",
+    rollbackReference: "refs/tags/.codex/private/reference",
+  };
+  for (const [field, value] of Object.entries(localPathValues)) {
+    assert.throws(
+      () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({ [field]: value })),
+      /local filesystem path/,
+      field,
+    );
+  }
+
+  for (const field of Object.keys(credentialValues)) {
+    const value = field === "healthPath" ? "/healthz\n" : `${validStandingReleaseGrant()[field]}\n`;
+    assert.throws(
+      () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({ [field]: value })),
+      /control characters/,
+      field,
+    );
+  }
+  assert.throws(
+    () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      healthPath: "/health/github%5Fpat%5Fabcdefghijklmnopqrstuvwxyz",
+    })),
+    /credential-shaped/,
+  );
+  assert.throws(
+    () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      healthPath: "/Users%2Fexample%2Fprivate%2Fhealth",
+    })),
+    /local filesystem path/,
+  );
+  assert.throws(
+    () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      healthPath: "/health%0Ahidden",
+    })),
+    /control characters/,
+  );
+});
+
+test("standing release audit timestamps reject impossible dates and reverse chronology", () => {
+  assert.throws(
+    () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      grantedAt: "2026-02-30T12:00:00.000Z",
+    })),
+    /real calendar instant/,
+  );
+  assert.equal(
+    normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      grantedAt: "2028-02-29T12:00:00-05:00",
+    })).grantedAt,
+    "2028-02-29T17:00:00.000Z",
+  );
+  assert.throws(
+    () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      revocation: {
+        revokedByActorId: "owner_actor_02",
+        revokedAt: "2026-08-16T11:59:59.999Z",
+        reasonCode: "owner_requested",
+      },
+    })),
+    /cannot precede its grant/,
+  );
+});
+
 test("operational capability blockers are release-scoped and deduplicated", () => {
   assert.deepEqual(normalizeOperationalCapabilityBlockers([
     "standing-production-release",

@@ -25,9 +25,40 @@ const GITHUB_REPOSITORY_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38})\/[a-z0-9._-]{1,1
 const SIMPLE_COORDINATE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKFLOW_COORDINATE_PATTERN = /^[A-Za-z0-9.][A-Za-z0-9._/-]{0,159}$/;
 const ROLLBACK_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,191}$/;
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/;
+const CREDENTIAL_SHAPE_PATTERNS = [
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/i,
+  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/i,
+  /\bnpm_[A-Za-z0-9]{20,}\b/i,
+  /\bxox[baprs]-[A-Za-z0-9-]{16,}\b/i,
+  /\bAIza[A-Za-z0-9_-]{30,}\b/,
+  /\bsk-[A-Za-z0-9_-]{20,}\b/i,
+  /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/i,
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/,
+  /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/-]{16,}={0,2}\b/i,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+  /\b(?:password|passwd|token|secret|api[_-]?key|private[_-]?key)\s*[:=]\s*[^\s,;]+/i,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,
+  /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^@\s/]+@/i,
+];
+const LOCAL_PATH_PATTERNS = [
+  /^file:\/\//i,
+  /^[A-Za-z]:[\\/]/,
+  /^\\\\/,
+  /^~[\\/]/,
+  /^(?:Users|home|tmp|var|private|Volumes|etc|opt|usr|root)[\\/]/i,
+  /^[\\/](?:Users|home|tmp|var|private|Volumes|etc|opt|usr|root)[\\/]/i,
+  /(?:^|[\\/])[A-Za-z]:[\\/]/,
+  /[\\/]\.(?:ssh|aws)[\\/]/i,
+  /[\\/]\.codex[\\/]/i,
+];
 
 function requiredString(value, label) {
-  const normalized = String(value || "").trim();
+  const raw = String(value || "");
+  if (CONTROL_CHARACTER_PATTERN.test(raw)) {
+    throw new Error(`${label} cannot contain control characters.`);
+  }
+  const normalized = raw.trim();
   if (!normalized) throw new Error(`${label} is required.`);
   return normalized;
 }
@@ -42,18 +73,56 @@ function normalizeOpaqueId(value, label) {
 
 function normalizeIsoTimestamp(value, label) {
   const normalized = requiredString(value, label);
+  const match = normalized.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/i,
+  );
   const timestamp = Date.parse(normalized);
   if (
-    !Number.isFinite(timestamp)
-    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/i.test(normalized)
+    !match
+    || !Number.isFinite(timestamp)
   ) {
     throw new Error(`${label} must be an ISO-8601 timestamp with a timezone.`);
+  }
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, , zone] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const offset = zone === "Z" ? null : zone.slice(1).split(":").map(Number);
+  if (
+    month < 1
+    || month > 12
+    || day < 1
+    || day > daysInMonth[month - 1]
+    || hour > 23
+    || minute > 59
+    || second > 59
+    || (offset && (offset[0] > 23 || offset[1] > 59))
+  ) {
+    throw new Error(`${label} must name a real calendar instant.`);
   }
   return new Date(timestamp).toISOString();
 }
 
+function assertNonSensitiveReleaseCoordinate(value, label) {
+  if (CONTROL_CHARACTER_PATTERN.test(value)) {
+    throw new Error(`${label} cannot contain control characters.`);
+  }
+  if (CREDENTIAL_SHAPE_PATTERNS.some((pattern) => pattern.test(value))) {
+    throw new Error(`${label} cannot contain a credential-shaped or secret-assignment value.`);
+  }
+  if (LOCAL_PATH_PATTERNS.some((pattern) => pattern.test(value))) {
+    throw new Error(`${label} cannot contain a local filesystem path.`);
+  }
+}
+
 function boundedCoordinate(value, label, pattern) {
   const normalized = requiredString(value, label);
+  assertNonSensitiveReleaseCoordinate(normalized, label);
   if (
     !pattern.test(normalized)
     || normalized.includes("..")
@@ -96,6 +165,7 @@ function normalizeTargetHostname(value) {
 
 function normalizeHealthPath(value) {
   const raw = requiredString(value, "Standing release health path");
+  assertNonSensitiveReleaseCoordinate(raw, "Standing release health path");
   if (
     raw.length > 256
     || !raw.startsWith("/")
@@ -112,6 +182,7 @@ function normalizeHealthPath(value) {
   } catch {
     throw new Error("Standing release health path contains invalid URL encoding.");
   }
+  assertNonSensitiveReleaseCoordinate(decoded, "Standing release health path");
   if (decoded.split("/").some((segment) => segment === "." || segment === "..")) {
     throw new Error("Standing release health path cannot contain traversal segments.");
   }
@@ -133,11 +204,19 @@ function normalizeRevocation(value = {}) {
   };
 }
 
+export function assertStandingReleaseRevocationChronology(grantedAt, revokedAt) {
+  const normalizedGrant = normalizeIsoTimestamp(grantedAt, "Standing release grant timestamp");
+  const normalizedRevocation = normalizeIsoTimestamp(revokedAt, "Standing release revocation timestamp");
+  if (Date.parse(normalizedRevocation) < Date.parse(normalizedGrant)) {
+    throw new Error("Standing release revocation timestamp cannot precede its grant timestamp.");
+  }
+}
+
 export function normalizeStandingReleaseAuthorizationGrant(value = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Standing release authorization grant must be an object.");
   }
-  return {
+  const grant = {
     authorizationId: normalizeOpaqueId(value.authorizationId, "Standing release authorization ID"),
     ownerActorId: normalizeOpaqueId(value.ownerActorId, "Standing release owner actor ID"),
     grantedAt: normalizeIsoTimestamp(value.grantedAt, "Standing release grant timestamp"),
@@ -163,6 +242,10 @@ export function normalizeStandingReleaseAuthorizationGrant(value = {}) {
     ),
     revocation: value.revocation == null ? null : normalizeRevocation(value.revocation),
   };
+  if (grant.revocation) {
+    assertStandingReleaseRevocationChronology(grant.grantedAt, grant.revocation.revokedAt);
+  }
+  return grant;
 }
 
 export function normalizeStandingReleaseAuthorizationHistory(value) {

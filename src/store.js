@@ -17,6 +17,7 @@ import {
 import { missionControlDataDir } from "./runtime-paths.js";
 import {
   activeStandingReleaseAuthorization,
+  assertStandingReleaseRevocationChronology,
   normalizeOperationalCapabilityBlockers,
   normalizeProjectWorkflowMode,
   normalizeStandingReleaseAuthorizationCommand,
@@ -978,6 +979,10 @@ export function applyStandingReleaseAuthorizationUpdateInState(state, project, v
   if (history[index].revocation) {
     throw new Error(`Standing release authorization is already revoked: ${command.authorizationId}`);
   }
+  assertStandingReleaseRevocationChronology(
+    history[index].grantedAt,
+    command.revocation.revokedAt,
+  );
   const revoked = {
     ...history[index],
     revocation: command.revocation,

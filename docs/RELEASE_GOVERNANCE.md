@@ -32,8 +32,10 @@ Grant authority with the existing local `PATCH /api/projects/:project` contract:
 The repository is canonicalized to lowercase `owner/repository`. The hostname
 contains no scheme, port, wildcard, credentials, or path. Workflows, environment,
 artifact, health path, and rollback reference are bounded coordinates, not raw
-provider payloads. Actor and authorization IDs are opaque identifiers; names and
-email addresses are not accepted as identities.
+provider payloads. Every persisted coordinate rejects control characters,
+credential and secret-assignment shapes, and local filesystem paths before the
+project transaction can commit. Actor and authorization IDs are opaque
+identifiers; names and email addresses are not accepted as identities.
 
 Only one project may have an active grant. A project must revoke its active
 grant before reauthorization, and reauthorization appends a new ID and record.
@@ -58,9 +60,11 @@ Revoke authority with:
 Revocation only adds the bounded revocation object. It cannot replace grant
 bindings, be removed, or be recorded twice. Direct writes to
 `standingReleaseAuthorizationHistory` through the project update contract are
-rejected. Grant and revoke events contain only project and authorization IDs,
-generic messages, and timestamps; repository, hostname, actor, local path,
-credential, customer, and provider payload data stay out of events.
+rejected. Grant and revocation timestamps must name real ISO-8601 calendar
+instants, and revocation cannot precede its grant. Grant and revoke events
+contain only project and authorization IDs, generic messages, and timestamps;
+repository, hostname, actor, local path, credential, customer, and provider
+payload data stay out of events.
 
 ## Operational capability blockers
 
