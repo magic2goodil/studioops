@@ -37,6 +37,14 @@ import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-po
 import { readDiskAvailability } from "./worker-heartbeat.js";
 import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode } from "./config.js";
+import {
+  inspectLocalWorkspaceCandidate,
+  localGitEnv,
+  materializeLocalCandidate,
+  prepareLocalWorkspace,
+  sanitizeOriginUrl,
+  verifyLocalCandidate,
+} from "./workspace.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -239,6 +247,34 @@ export function resolveProjectWorkflowMode(project = {}, originUrl = "") {
   return parseGitHubRepoUrl(project.repoUrl) || parseGitHubRepoUrl(originUrl) ? "github" : "local";
 }
 
+function candidateIdentityForRun(run) {
+  const identity = run.candidateIdentity || {};
+  const candidateIdentity = {
+    ...identity,
+    commitSha: String(identity.commitSha || run.reviewSubjectSha || "").trim().toLowerCase(),
+    branch: String(identity.branch || run.branchName || "").trim(),
+    candidateCycle: Number(identity.candidateCycle || run.candidateCycle || 0),
+    taskId: run.taskId,
+  };
+  const reviewSubjectSha = String(run.reviewSubjectSha || "").trim().toLowerCase();
+  const candidateCycle = Number(run.candidateCycle || 0);
+  if (
+    (reviewSubjectSha && candidateIdentity.commitSha !== reviewSubjectSha)
+    || (candidateCycle > 0 && candidateIdentity.candidateCycle !== candidateCycle)
+    || (run.branchName && candidateIdentity.branch !== run.branchName)
+  ) {
+    const error = new Error("The recorded local candidate identity does not match the run review SHA, branch, or candidate cycle.");
+    error.code = "local_candidate_identity_mismatch";
+    error.remediation = "Cancel the stale run and redispatch it from the task's current exact candidate; review and candidate cycles remain unchanged.";
+    throw error;
+  }
+  return candidateIdentity;
+}
+
+function usesLocalCandidate(run) {
+  return run.group === "reviewer" || ["start_builder_fix", "return_to_builder"].includes(run.actionType);
+}
+
 function preflightFailure(code, message, remediation, details = {}) {
   return { ok: false, code, message, remediation, ...details };
 }
@@ -414,16 +450,36 @@ export async function preflightRun(run, input = {}) {
     );
   }
 
-  const originUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
+  const repositoryOriginUrl = await gitOutput(["remote", "get-url", "origin"], { cwd: repoPath });
+  const configuredOriginUrl = sanitizeOriginUrl(project.repoUrl || repositoryOriginUrl);
   if (run.group === "architect") {
     return {
       ok: true,
       workflowMode: "local",
-      originUrl,
+      originUrl: configuredOriginUrl,
     };
   }
-  const workflowMode = resolveProjectWorkflowMode(project, originUrl);
+  const workflowMode = resolveProjectWorkflowMode(project, repositoryOriginUrl);
   if (workflowMode === "local") {
+    if (usesLocalCandidate(run)) {
+      try {
+        const candidateIdentity = candidateIdentityForRun(run);
+        await verifyLocalCandidate(
+          input.workspaceRoot
+            || process.env.STUDIOOPS_WORKSPACE_ROOT
+            || process.env.MISSION_CONTROL_WORKSPACE_ROOT
+            || DEFAULT_WORKSPACE_ROOT,
+          candidateIdentity,
+        );
+        return { ok: true, workflowMode, originUrl: configuredOriginUrl, candidateIdentity };
+      } catch (error) {
+        return preflightFailure(
+          error.code || "local_candidate_preflight_failed",
+          error.message,
+          error.remediation || "Repair the local candidate artifact and retry; review and candidate cycles remain unchanged.",
+        );
+      }
+    }
     const base = await resolveLocalBaseRef(
       repoPath,
       branchNameForRun(run),
@@ -439,13 +495,13 @@ export async function preflightRun(run, input = {}) {
     return {
       ok: true,
       workflowMode,
-      originUrl,
+      originUrl: configuredOriginUrl,
       baseRef: base.ref,
       baseCommit: base.commit,
     };
   }
 
-  if (!parseGitHubRepoUrl(originUrl)) {
+  if (!parseGitHubRepoUrl(repositoryOriginUrl)) {
     return preflightFailure(
       "missing_github_origin",
       "GitHub workflow mode requires an origin remote hosted on github.com.",
@@ -470,13 +526,13 @@ export async function preflightRun(run, input = {}) {
   try {
     await checkRemote({ ...run, workflowMode, project: { ...project, workflowMode } }, authContext, input);
   } catch (error) {
-    const repository = parseGitHubRepoUrl(originUrl);
+    const repository = parseGitHubRepoUrl(repositoryOriginUrl);
     return preflightFailure(
       "inaccessible_github_remote",
       `The GitHub origin is not accessible: ${redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext))}`,
       "Verify the origin URL, repository access, network connection, and GitHub App installation permissions.",
       {
-        originUrl,
+        originUrl: repositoryOriginUrl,
         owner: repository?.owner || "",
         repository: repository?.name || "",
       },
@@ -484,7 +540,7 @@ export async function preflightRun(run, input = {}) {
   } finally {
     await cleanupAuth(authContext);
   }
-  return { ok: true, workflowMode, originUrl };
+  return { ok: true, workflowMode, originUrl: repositoryOriginUrl };
 }
 
 async function localBranchExists(repoPath, branch) {
@@ -545,18 +601,6 @@ async function createCloneWorkspace(run, workspacePath, branch, startRef, log, g
   log.write(`Clone source: ${originUrl ? "origin remote" : "local repository"}\n`);
 }
 
-async function createLocalCloneWorkspace(run, workspacePath, branch, startCommit, log, gitEnv) {
-  await git(["clone", "--no-tags", "--no-hardlinks", run.project.repoPath, workspacePath], {
-    cwd: process.cwd(),
-    timeout: 300_000,
-    env: gitEnv,
-  });
-  await git(["checkout", "-B", branch, startCommit], { cwd: workspacePath, env: gitEnv });
-  await git(["remote", "remove", "origin"], { cwd: workspacePath, env: gitEnv });
-  log.write("Workspace strategy: isolated local clone fallback\n");
-  log.write("Clone source: local repository\n");
-}
-
 export function cloneFallbackSource(repoPath, originUrl) {
   return String(originUrl || "").trim() || repoPath;
 }
@@ -571,7 +615,7 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
     };
   }
   const workflowMode = run.workflowMode || resolveProjectWorkflowMode(run.project, run.preflightOriginUrl);
-  const gitEnv = workflowAuthEnv(workflowMode, authContext, process.env);
+  const gitEnv = workflowMode === "local" ? localGitEnv() : workflowAuthEnv(workflowMode, authContext, process.env);
   const enabled = booleanOption(
     input.useWorkspaces
       ?? input.workspaces
@@ -610,13 +654,15 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
       startRef = await remoteBranchExists(run.project.repoPath, branch)
         ? `origin/${branch}`
         : `origin/${defaultBranch}`;
-    } else {
+    } else if (!usesLocalCandidate(run)) {
       const base = run.preflightBaseRef && run.preflightBaseCommit
         ? { ref: run.preflightBaseRef, commit: run.preflightBaseCommit }
         : await resolveLocalBaseRef(run.project.repoPath, branch, defaultBranch);
       if (!base) throw new Error("Local workspace preparation could not resolve a valid local base ref.");
       startRef = base.ref;
       startCommit = base.commit;
+    } else {
+      startRef = `candidate:${run.candidateIdentity?.commitSha || run.reviewSubjectSha || "recorded"}`;
     }
 
     log.write(`Preparing isolated workspace for ${run.id}\n`);
@@ -626,7 +672,16 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
     log.write(`Start ref: ${startRef}\n`);
 
     if (workflowMode === "local") {
-      await createLocalCloneWorkspace(run, workspacePath, branch, startCommit, log, gitEnv);
+      await prepareLocalWorkspace({
+        sourceRepoPath: run.project.repoPath,
+        workspacePath,
+        branch,
+        originUrl: run.preflightOriginUrl || await gitOutput(["remote", "get-url", "origin"], { cwd: run.project.repoPath }),
+        root: workspaceRoot,
+        identity: run.candidateIdentity || run,
+        useCandidate: usesLocalCandidate(run),
+        log,
+      });
       const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "local-clone" };
       await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
       return workspace;
@@ -730,6 +785,7 @@ export function planRunnableRuns(state, input = {}) {
     runnable.push({
       ...run,
       project,
+      candidateIdentity: task?.candidateIdentity ? { ...task.candidateIdentity, taskId: task.id } : undefined,
     });
   }
 
@@ -862,7 +918,7 @@ export function successfulHandoffFailure(state, run, task) {
   return "";
 }
 
-function applySuccessfulHandoff(state, run, task, now) {
+function applySuccessfulHandoff(state, run, task, now, options = {}) {
   if (!task) return;
   task.retryNotBefore = "";
   task.lastAutomationFailure = "";
@@ -877,7 +933,9 @@ function applySuccessfulHandoff(state, run, task, now) {
     task.status = "builder_review";
     task.assignedAgentRole = "";
     task.reviewerThreadId = "";
-    task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+    if (!options.preserveBuilderReviewCycle) {
+      task.reviewCycle = Number(task.reviewCycle || 0) + 1;
+    }
     task.updatedAt = now;
   }
 }
@@ -1198,6 +1256,7 @@ export async function claimRuns(input = {}) {
       run.preflightOriginUrl = preflight.originUrl || "";
       run.preflightBaseRef = preflight.baseRef || "";
       run.preflightBaseCommit = preflight.baseCommit || "";
+      if (preflight.candidateIdentity) run.candidateIdentity = { ...preflight.candidateIdentity };
       const profile = laneProfile(findTask(state, run.taskId) || {}, run);
       run.lane = run.lane || profile.lane;
       run.conflictGroup = run.conflictGroup || profile.conflictGroup;
@@ -1289,7 +1348,7 @@ export async function completeRun(runId, input = {}) {
           run.exitCode = handoffFailure;
           run.notes = run.notes ? `${run.notes}\n\n${handoffFailure}` : handoffFailure;
         } else {
-          applySuccessfulHandoff(state, run, task, now);
+          applySuccessfulHandoff(state, run, task, now, input);
         }
       }
     }
@@ -1326,6 +1385,60 @@ export async function completeRun(runId, input = {}) {
 
     return run;
   });
+}
+
+export async function completeRunAfterExecution(run, input, executionRun = run) {
+  let preserveBuilderReviewCycle = false;
+  if (input.status === "completed" && run.workflowMode === "local" && run.group === "builder") {
+    try {
+      const root = input.workspaceRoot
+        || process.env.STUDIOOPS_WORKSPACE_ROOT
+        || process.env.MISSION_CONTROL_WORKSPACE_ROOT
+        || DEFAULT_WORKSPACE_ROOT;
+      const previousIdentity = candidateIdentityForRun(run);
+      const workspaceIdentity = await inspectLocalWorkspaceCandidate(executionRun.project?.repoPath || run.workspacePath);
+      const sourceTreeChanged = !previousIdentity.treeSha || previousIdentity.treeSha !== workspaceIdentity.treeSha;
+      const cycle = ["start_builder_fix", "return_to_builder"].includes(run.actionType) && sourceTreeChanged
+        ? Math.max(1, Number(run.candidateCycle || 0) + 1)
+        : Math.max(1, Number(run.candidateCycle || 0));
+      const identity = await materializeLocalCandidate({
+        workspacePath: executionRun.project?.repoPath || run.workspacePath,
+        root,
+        identity: { ...previousIdentity, candidateCycle: cycle },
+        branch: run.branchName,
+        taskId: run.taskId,
+        log: input.log,
+      });
+      identity.candidateCycle = cycle;
+      preserveBuilderReviewCycle = !sourceTreeChanged && Number(run.candidateCycle || 0) > 0;
+      const mutate = input.state ? async (mutator) => mutator(input.state) : mutateState;
+      await mutate(async (state) => {
+        const task = findTask(state, run.taskId);
+        if (!task) return;
+        task.branchName = task.branchName || run.branchName || identity.branch;
+        task.reviewSubjectSha = identity.commitSha;
+        task.reviewSubjectCycle = cycle;
+        task.candidateIdentity = {
+          commitSha: identity.commitSha,
+          treeSha: identity.treeSha,
+          baseSha: identity.baseSha,
+          branch: task.branchName,
+          candidateCycle: cycle,
+          operationalLocalArtifactRef: identity.operationalLocalArtifactRef,
+          impactEvidence: task.impactEvidence,
+        };
+        task.updatedAt = new Date().toISOString();
+      });
+    } catch (error) {
+      return completeRun(run.id, {
+        ...input,
+        status: "failed",
+        exitCode: error.code || "local_candidate_materialization_failed",
+        notes: `${input.notes || ""}\n\n${error.message}\n\nRemediation: ${error.remediation || "Repair the local candidate and retry."}`.trim(),
+      });
+    }
+  }
+  return completeRun(run.id, { ...input, preserveBuilderReviewCycle });
 }
 
 export async function reconcileStaleRuns(input = {}) {
@@ -1503,13 +1616,14 @@ async function runClaimedRunWithSdk(run, input = {}) {
     await cleanupGitHubAppAuth(authContext);
   }
 
-  const completed = await completeRun(run.id, {
+  const completed = await completeRunAfterExecution(run, {
     status,
     exitCode,
     outputPath,
     lastMessagePath,
     notes,
-  });
+    workspaceRoot: input.workspaceRoot,
+  }, executionRun);
   if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
   return completed;
 }
@@ -1623,13 +1737,13 @@ async function runClaimedRunWithCli(run, input = {}) {
       log.write(`\nRunner spawn error: ${notes}\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
-      const completed = await completeRun(run.id, {
+      const completed = await completeRunAfterExecution(run, {
         status: "failed",
         exitCode: "spawn_error",
         outputPath,
         lastMessagePath,
         notes,
-      });
+      }, executionRun);
       resolve(completed);
     });
     child.on("close", async (code) => {
@@ -1647,13 +1761,14 @@ async function runClaimedRunWithCli(run, input = {}) {
       log.write(`\nStudioOps Runner finished ${run.id} at ${new Date().toISOString()} with code ${code}\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
-      const completed = await completeRun(run.id, {
+      const completed = await completeRunAfterExecution(run, {
         status: code === 0 ? "completed" : "failed",
         exitCode: code,
         outputPath,
         lastMessagePath,
         notes,
-      });
+        workspaceRoot: input.workspaceRoot,
+      }, executionRun);
       resolve(completed);
     });
     child.stdin.end(prompt);
