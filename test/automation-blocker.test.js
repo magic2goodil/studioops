@@ -114,3 +114,39 @@ test("automation resolves operational repair references only after repair comple
   assert.equal(state.tasks[0].operationalRepair.resolutionStatus, "done");
   assert.ok(state.events.some((event) => event.type === "operational_repair_resolved"));
 });
+
+test("operational repair resume preserves an existing builder review candidate", async () => {
+  const reviewSubjectSha = "a".repeat(40);
+  const state = fixtureState({
+    status: "builder_review",
+    reviewCycle: 2,
+    reviewSubjectSha,
+    reviewSubjectCycle: 2,
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "done",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "builder_review",
+  });
+
+  const resolved = await automationTick({ state, limit: 10 });
+
+  assert.deepEqual(resolved.actions, ["task_1: operational repair resolved"]);
+  assert.equal(state.tasks[0].status, "builder_review");
+  assert.equal(state.tasks[0].reviewCycle, 2);
+  assert.equal(state.tasks[0].reviewSubjectSha, reviewSubjectSha);
+  assert.equal(state.tasks[0].reviewSubjectCycle, 2);
+});

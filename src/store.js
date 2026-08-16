@@ -2979,7 +2979,7 @@ function advanceOperationalRepairInState(state, task, options = {}) {
     status: repair.resumeStatus,
     assignedAgentRole: "",
     reviewerThreadId: "",
-  }, now);
+  }, now, { preserveReviewCandidate: true });
   const body = `Operational repair ${repairTask.id} reached ${repairTask.status}. Automation resolved the reference and restored this task to ${repair.resumeStatus}.`;
   addAutomationComment(state, task, body, now, author);
   state.events = state.events || [];
@@ -3011,12 +3011,16 @@ function addAutomationComment(state, task, body, now, author = "StudioOps Automa
   return true;
 }
 
-function setTaskWorkflowState(state, task, patch, now) {
+function setTaskWorkflowState(state, task, patch, now, options = {}) {
   const previousStatus = task.status;
   for (const [key, value] of Object.entries(patch)) {
     task[key] = value;
   }
-  if (patch.status === "builder_review" && previousStatus !== "builder_review") {
+  if (
+    patch.status === "builder_review"
+    && previousStatus !== "builder_review"
+    && !options.preserveReviewCandidate
+  ) {
     task.reviewCycle = Number(task.reviewCycle || 0) + 1;
     task.reviewSubjectSha = "";
     task.reviewSubjectCycle = Math.max(
