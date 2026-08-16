@@ -8,6 +8,7 @@ import {
   invalidateCandidate,
   manifestDigest,
 } from "../src/candidate-manifest.js";
+import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
 
 const SHA = {
   base: "1".repeat(40),
@@ -15,6 +16,13 @@ const SHA = {
   sourceB: "3".repeat(40),
   integration: "4".repeat(40),
 };
+
+function validationEvidence(sourceSha = SHA.integration, overrides = {}) {
+  return { ...exactShaEvidenceFixture(sourceSha), commands: [{
+    ...exactShaEvidenceFixture(sourceSha).commands[0],
+    durationMs: 10,
+  }], ...overrides };
+}
 
 function review(id, stageKey, subjectSha, candidateCycle = 2) {
   return {
@@ -60,6 +68,7 @@ function manifestInput(overrides = {}) {
         evidenceDigest: `sha256:${"a".repeat(64)}`,
       },
     ],
+    validationEvidence: validationEvidence(),
     preview: {
       url: "http://127.0.0.1:4174/",
       status: "healthy",
@@ -93,6 +102,22 @@ test("candidate manifest canonicalizes stable arrays and object keys", () => {
   assert.equal(manifestDigest(first), manifestDigest(second));
   assert.deepEqual(first.sources.map((source) => source.taskId), ["task_1", "task_2"]);
   assert.deepEqual(first.sources[0].reviews.map((item) => item.id), ["review_1", "review_2"]);
+});
+
+test("v2 requires exact-SHA evidence while historical v1 envelopes remain readable", () => {
+  const current = manifestInput();
+  const { validationEvidence: _discarded, ...legacy } = current;
+  assert.throws(
+    () => buildCandidateManifest({ ...legacy, schemaVersion: "studioops.candidate-manifest.v2" }),
+    /Exact-SHA validation evidence is required/,
+  );
+  const candidate = createCandidateEnvelope({
+    manifest: { ...legacy, schemaVersion: "studioops.candidate-manifest.v1" },
+    createdAt: "2026-07-25T12:00:00.000Z",
+  });
+  assert.equal(assertCandidateEnvelope(candidate), candidate);
+  assert.equal(candidate.manifest.schemaVersion, "studioops.candidate-manifest.v1");
+  assert.equal(candidate.manifest.validationEvidence, undefined);
 });
 
 test("security-relevant manifest drift changes the digest", () => {
@@ -144,11 +169,19 @@ test("security-relevant manifest drift changes the digest", () => {
         },
       },
       checks: [{ ...base.checks[0], subjectSha: "5".repeat(40) }],
+      validationEvidence: validationEvidence("5".repeat(40)),
     },
   ];
   for (const changedInput of changedInputs) {
     assert.notEqual(manifestDigest(buildCandidateManifest(changedInput)), originalDigest);
   }
+  assert.throws(
+    () => buildCandidateManifest({
+      ...base,
+      validationEvidence: validationEvidence(SHA.integration, { manifestDigest: `sha256:${"8".repeat(64)}` }),
+    }),
+    /does not match its executable manifest/,
+  );
 });
 
 test("reviews fail closed on malformed SHA, wrong subject, or wrong cycle", () => {

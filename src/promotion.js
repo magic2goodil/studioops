@@ -14,6 +14,7 @@ import {
   assertCandidateEnvelope,
   invalidateCandidate,
 } from "./candidate-manifest.js";
+import { assertExactShaEvidenceEnvironment } from "./impact-manifest.js";
 import { verifyCandidateRepositoryState } from "./candidate-repository.js";
 import { mutateState, readState } from "./store.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
@@ -432,6 +433,7 @@ function promotionBranchName(projectPlan) {
 function candidateHasValidQaPass(candidate) {
   try {
     assertCandidateEnvelope(candidate);
+    assertExactShaEvidenceEnvironment(candidate.manifest.validationEvidence);
   } catch {
     return false;
   }

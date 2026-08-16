@@ -10,6 +10,7 @@ import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
 import { planPromotions } from "../src/promotion.js";
 import { readPersistedState } from "./state-database-helper.js";
+import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
 
 const execFileAsync = promisify(execFile);
 const promotionModuleUrl = pathToFileURL(path.join(process.cwd(), "src/promotion.js")).href;
@@ -87,6 +88,7 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
         subjectSha: integrationSha,
         evidenceDigest: `sha256:${"a".repeat(64)}`,
       }],
+      validationEvidence: exactShaEvidenceFixture(integrationSha),
       preview: {
         url: "http://127.0.0.1:4174/",
         status: "healthy",
@@ -344,6 +346,7 @@ test("owner QA cannot pass only part of a multi-task candidate", async () => {
           subjectSha: sourceTwoSha,
           evidenceDigest: `sha256:${"a".repeat(64)}`,
         }],
+        validationEvidence: exactShaEvidenceFixture(sourceTwoSha),
         preview: {
           url: "http://127.0.0.1:4174/",
           status: "healthy",

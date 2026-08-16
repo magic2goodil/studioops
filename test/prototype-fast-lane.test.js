@@ -8,11 +8,16 @@ import {
   candidateIdentityForTask,
   candidateIdentityIsComplete,
   normalizeDeliveryPolicy,
+  normalizedImpactEvidence,
   readState,
   updateTask,
 } from "../src/store.js";
 import { planDispatches } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { exactShaEvidenceFixture } from "./exact-sha-evidence-fixture.js";
+import { exactShaEvidenceDigest } from "../src/impact-manifest.js";
+
+const MANIFEST_DIGEST = `sha256:${"9".repeat(64)}`;
 
 test("delivery policy fails closed and never enables merge or deployment", () => {
   assert.equal(normalizeDeliveryPolicy({ profile: "ambiguous" }).profile, "standard");
@@ -32,7 +37,7 @@ test("delivery policy fails closed and never enables merge or deployment", () =>
 test("prototype UI impact skips backend but retains accessibility and lead", () => {
   const routing = capabilityRoutingForTask(
     { deliveryPolicy: { profile: "prototype-fast-lane" } },
-    { reviewSubjectSha: "a".repeat(40), reviewSubjectCycle: 2, impactEvidence: { changedFiles: ["src/App.jsx"] } },
+    { reviewSubjectSha: "a".repeat(40), reviewSubjectCycle: 2, impactEvidence: { changedFiles: ["src/App.jsx"], manifestDigest: MANIFEST_DIGEST } },
   );
   assert.deepEqual(routing.required, ["frontend", "accessibility", "lead"]);
   assert.equal(routing.skipped[0].stageKey, "backend");
@@ -83,6 +88,77 @@ test("normalized impact classifications remain stable when evidence is reused", 
   assert.deepEqual(routing.required, ["backend", "frontend", "accessibility", "lead"]);
 });
 
+test("normalized task impact retains verified exact-SHA evidence", () => {
+  const validationEvidence = exactShaEvidenceFixture("a".repeat(40));
+  const evidence = normalizedImpactEvidence({ validationEvidence });
+  assert.deepEqual(evidence.changedFiles, validationEvidence.changedPaths);
+  assert.deepEqual(evidence.affectedComponents, validationEvidence.affectedComponents);
+  assert.equal(evidence.manifestDigest, validationEvidence.manifestDigest);
+  assert.deepEqual(evidence.validationEvidence, validationEvidence);
+});
+
+test("cross-SHA and repository-unverified exact-SHA evidence fail closed for review routing", () => {
+  const sourceSha = "a".repeat(40);
+  const subjectSha = "b".repeat(40);
+  const validationEvidence = exactShaEvidenceFixture(sourceSha);
+  const project = { deliveryPolicy: { profile: "prototype-fast-lane" } };
+  const baseTask = {
+    reviewSubjectSha: subjectSha,
+    reviewSubjectCycle: 1,
+    impactEvidence: { validationEvidence },
+    candidateIdentity: {
+      commitSha: subjectSha,
+      treeSha: "c".repeat(40),
+      baseSha: "d".repeat(40),
+      branch: "feature/cross-sha",
+      candidateCycle: 1,
+      impactEvidence: { validationEvidence },
+    },
+  };
+
+  const crossSha = capabilityRoutingForTask(project, baseTask);
+  assert.deepEqual(crossSha.required, ["backend", "frontend", "accessibility", "lead"]);
+  assert.match(crossSha.evidence.validationEvidenceError, /different source SHA/);
+
+  const matchingEvidence = exactShaEvidenceFixture(subjectSha);
+  const unverified = capabilityRoutingForTask(project, {
+    ...baseTask,
+    impactEvidence: { validationEvidence: matchingEvidence },
+    candidateIdentity: {
+      ...baseTask.candidateIdentity,
+      impactEvidence: { validationEvidence: matchingEvidence },
+    },
+  });
+  assert.deepEqual(unverified.required, ["backend", "frontend", "accessibility", "lead"]);
+  assert.ok(unverified.evidence.fullRegressionReasons.includes("unverified_repository_classification"));
+
+  const verified = capabilityRoutingForTask(project, {
+    ...baseTask,
+    impactEvidence: {
+      validationEvidence: matchingEvidence,
+      changedFiles: ["public/forged.js"],
+      affectedComponents: ["browser-ui"],
+      selectedComponents: ["browser-ui"],
+    },
+    candidateIdentity: {
+      ...baseTask.candidateIdentity,
+      impactEvidence: { validationEvidence: matchingEvidence },
+    },
+    impactEvidenceRepositoryVerification: {
+      ok: true,
+      sourceSha: subjectSha,
+      baseSha: "d".repeat(40),
+      treeSha: "c".repeat(40),
+      manifestDigest: matchingEvidence.manifestDigest,
+      evidenceDigest: exactShaEvidenceDigest(matchingEvidence),
+    },
+  });
+  assert.deepEqual(verified.required, ["backend", "lead"]);
+  assert.deepEqual(verified.evidence.changedFiles, ["src/store.js"]);
+  assert.deepEqual(verified.evidence.affectedComponents, ["control-plane-core"]);
+  assert.equal(verified.evidence.validationEvidenceError, "");
+});
+
 test("explicit local mode requires a verified candidate while GitHub requires an exact subject", () => {
   const base = {
     id: "task_1", projectId: "project_1", title: "Candidate", status: "builder_review",
@@ -126,10 +202,10 @@ test("custom backend stages are skipped by their actual identity and cannot also
     tasks: [{
       id: "task_1", projectId: "project_1", title: "UI candidate", type: "feature", status: "builder_review",
       branchName: "feature/ui", prUrl: "https://github.com/example/demo/pull/1", reviewCycle: 1,
-      reviewSubjectCycle: 1, reviewSubjectSha: sha, impactEvidence: { changedFiles: ["src/App.jsx"] },
+      reviewSubjectCycle: 1, reviewSubjectSha: sha, impactEvidence: { changedFiles: ["src/App.jsx"], manifestDigest: MANIFEST_DIGEST },
       candidateIdentity: {
         commitSha: sha, treeSha: "b".repeat(40), baseSha: "c".repeat(40), branch: "feature/ui", candidateCycle: 1,
-        impactEvidence: { changedFiles: ["src/App.jsx"] },
+        impactEvidence: { changedFiles: ["src/App.jsx"], manifestDigest: MANIFEST_DIGEST },
       },
     }],
     reviews: [], runs: [], comments: [], events: [],
@@ -153,7 +229,7 @@ test("current impact evidence refreshes identity and unchanged-tree metadata rep
   const metadataSha = "e".repeat(40);
   const treeSha = "f".repeat(40);
   const baseSha = "1".repeat(40);
-  const impactEvidence = { changedFiles: ["src/App.jsx"], impact: ["frontend"] };
+  const impactEvidence = { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST };
   const project = await addProject({
     key: "fast-lane-cycle-stability",
     name: "Fast lane cycle stability",
@@ -218,7 +294,7 @@ test("material impact changes invalidate same-SHA capability skips and start a n
     title: "Reclassify candidate impact",
     status: "in_progress",
     branchName: "feature/reclassification",
-    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST },
   });
 
   await updateTask(task.id, {
@@ -226,14 +302,14 @@ test("material impact changes invalidate same-SHA capability skips and start a n
     branchName: "feature/reclassification",
     prUrl: "https://github.com/example/demo/pull/3",
     subjectSha: sha,
-    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST },
     candidateIdentity: {
       commitSha: sha,
       treeSha: "3".repeat(40),
       baseSha: "4".repeat(40),
       branch: "feature/reclassification",
       candidateCycle: 1,
-      impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
+      impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"], manifestDigest: MANIFEST_DIGEST },
     },
   });
   await automationTick({ nowMs: Date.parse("2026-08-15T12:00:00.000Z") });

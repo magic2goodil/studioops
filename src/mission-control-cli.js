@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { promisify } from "node:util";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
@@ -432,7 +434,7 @@ Commands:
   adopt-default-standards PROJECT|--all
                                 Idempotently add required StudioOps standards
   add-task --project --title    Add a task
-  update-task TASK_ID           Update task status, branch, PR, or metadata
+  update-task TASK_ID           Update task status, branch, PR, metadata, or --impact-evidence-file JSON
   status TASK_ID --status       Mutate task status (requires one canonical non-empty status)
   comment TASK_ID --body        Add a builder/reviewer comment
   architecture-complete TASK   Record the architecture decision and implementation task graph
@@ -482,6 +484,16 @@ Task fields:
   --base-sha                    Exact protected-base SHA for fast-lane review intake
   --impact-files                Comma-separated changed paths for deterministic impact routing
   --impact                      Comma-separated explicit impact classifications
+  --impact-manifest-digest      SHA-256 digest of the executable ownership manifest
+  --impact-components           Comma-separated directly changed components
+  --affected-components         Comma-separated transitively affected components
+  --selected-components         Comma-separated components selected for validation
+  --impact-full-regression      Record fail-closed full-regression selection
+  --impact-reasons              Comma-separated machine-readable escalation reasons
+  --impact-unknown              Record unclassified impact
+  --impact-shared               Record shared-surface impact
+  --impact-ambiguous            Record ambiguous ownership
+  --impact-multi-component      Record multi-component impact
   --partial-tasks               Explicit subset for an authorized partial QA candidate
   --partial-actor-id            Non-sensitive actor ID authorizing a partial candidate
   --partial-reason-code         Bounded reason code for excluding tasks
@@ -816,13 +828,55 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "tree-sha")) candidateIdentity.treeSha = args["tree-sha"];
     if (Object.prototype.hasOwnProperty.call(args, "base-sha")) candidateIdentity.baseSha = args["base-sha"];
     if (Object.keys(candidateIdentity).length) patch.candidateIdentity = candidateIdentity;
+    const validationEvidence = Object.prototype.hasOwnProperty.call(args, "impact-evidence-file")
+      ? JSON.parse(await readFile(path.resolve(String(args["impact-evidence-file"])), "utf8"))
+      : null;
     if (
-      Object.prototype.hasOwnProperty.call(args, "impact-files")
+      validationEvidence || Object.prototype.hasOwnProperty.call(args, "impact-files")
       || Object.prototype.hasOwnProperty.call(args, "impact")
+      || Object.prototype.hasOwnProperty.call(args, "impact-manifest-digest")
+      || Object.prototype.hasOwnProperty.call(args, "impact-components")
+      || Object.prototype.hasOwnProperty.call(args, "affected-components")
+      || Object.prototype.hasOwnProperty.call(args, "selected-components")
+      || Object.prototype.hasOwnProperty.call(args, "impact-full-regression")
+      || Object.prototype.hasOwnProperty.call(args, "impact-reasons")
+      || Object.prototype.hasOwnProperty.call(args, "impact-unknown")
+      || Object.prototype.hasOwnProperty.call(args, "impact-shared")
+      || Object.prototype.hasOwnProperty.call(args, "impact-ambiguous")
+      || Object.prototype.hasOwnProperty.call(args, "impact-multi-component")
     ) {
       patch.impactEvidence = {
-        changedFiles: normalizeList(args["impact-files"]),
+        changedFiles: Object.prototype.hasOwnProperty.call(args, "impact-files")
+          ? normalizeList(args["impact-files"])
+          : validationEvidence?.changedPaths || [],
         impact: normalizeList(args.impact),
+        manifestDigest: args["impact-manifest-digest"] || validationEvidence?.manifestDigest || "",
+        directComponents: normalizeList(args["impact-components"]),
+        affectedComponents: Object.prototype.hasOwnProperty.call(args, "affected-components")
+          ? normalizeList(args["affected-components"])
+          : validationEvidence?.affectedComponents || [],
+        selectedComponents: Object.prototype.hasOwnProperty.call(args, "selected-components")
+          ? normalizeList(args["selected-components"])
+          : validationEvidence?.selectedComponents || [],
+        fullRegression: Object.prototype.hasOwnProperty.call(args, "impact-full-regression")
+          ? [true, "true", "1", "yes"].includes(args["impact-full-regression"])
+          : validationEvidence?.fullRegression === true,
+        fullRegressionReasons: Object.prototype.hasOwnProperty.call(args, "impact-reasons")
+          ? normalizeList(args["impact-reasons"])
+          : validationEvidence?.fullRegressionReasons || [],
+        unknown: Object.prototype.hasOwnProperty.call(args, "impact-unknown")
+          ? [true, "true", "1", "yes"].includes(args["impact-unknown"])
+          : validationEvidence?.unknown === true,
+        shared: Object.prototype.hasOwnProperty.call(args, "impact-shared")
+          ? [true, "true", "1", "yes"].includes(args["impact-shared"])
+          : validationEvidence?.shared === true,
+        ambiguous: Object.prototype.hasOwnProperty.call(args, "impact-ambiguous")
+          ? [true, "true", "1", "yes"].includes(args["impact-ambiguous"])
+          : validationEvidence?.ambiguous === true,
+        multiComponent: Object.prototype.hasOwnProperty.call(args, "impact-multi-component")
+          ? [true, "true", "1", "yes"].includes(args["impact-multi-component"])
+          : validationEvidence?.multiComponent === true,
+        validationEvidence,
       };
     }
     if (Object.prototype.hasOwnProperty.call(args, "description")) patch.description = args.description;

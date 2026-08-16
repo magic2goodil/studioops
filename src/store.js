@@ -18,6 +18,12 @@ import { missionControlDataDir } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode, withDefaultProjectStandards } from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
+  assertExactShaEvidenceEnvironment,
+  exactShaEvidenceDigest,
+  normalizeExactShaEvidence,
+  verifyExactShaEvidenceAgainstGit,
+} from "./impact-manifest.js";
+import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
   ensureStateDatabase,
@@ -724,9 +730,22 @@ export function normalizeDeliveryPolicy(value = {}) {
   };
 }
 
-function normalizedImpactEvidence(value = {}) {
-  const files = Array.isArray(value.changedFiles || value.files)
-    ? [...new Set((value.changedFiles || value.files).map((item) => String(item || "").trim()).filter(Boolean))].sort()
+export function normalizedImpactEvidence(value = {}, options = {}) {
+  const rawValidationEvidence = value.validationEvidence || value.exactShaEvidence || null;
+  let validationEvidence = null;
+  let validationEvidenceError = "";
+  try {
+    validationEvidence = rawValidationEvidence
+      ? normalizeExactShaEvidence(rawValidationEvidence, {
+          sourceSha: options.expectedSourceSha || "",
+        })
+      : null;
+  } catch (error) {
+    validationEvidenceError = String(error?.message || error);
+  }
+  const changedFiles = validationEvidence?.changedPaths || value.changedFiles || value.files;
+  const files = Array.isArray(changedFiles)
+    ? [...new Set(changedFiles.map((item) => String(item || "").trim()).filter(Boolean))].sort()
     : [];
   const explicitSource = Array.isArray(value.impact)
     ? value.impact
@@ -737,6 +756,21 @@ function normalizedImpactEvidence(value = {}) {
   const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
   const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
+  const manifestDigestValue = validationEvidence?.manifestDigest || value.manifestDigest || "";
+  const manifestDigest = /^sha256:[a-f0-9]{64}$/i.test(String(manifestDigestValue))
+    ? String(manifestDigestValue).toLowerCase()
+    : "";
+  const directComponents = Array.isArray(value.directComponents)
+    ? [...new Set(value.directComponents.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+    : [];
+  const affectedSource = validationEvidence?.affectedComponents || value.affectedComponents;
+  const affectedComponents = Array.isArray(affectedSource)
+    ? [...new Set(affectedSource.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+    : [];
+  const selectedSource = validationEvidence?.selectedComponents || value.selectedComponents;
+  const selectedComponents = Array.isArray(selectedSource)
+    ? [...new Set(selectedSource.map(String).map((item) => item.trim()).filter(Boolean))].sort()
+    : [];
   const pathCapabilities = files.map((file) => {
     const capabilities = new Set();
     if (/(^|\/)(server|api|src\/(store|supervisor|dispatcher)|migrations?|db|auth|security|deploy|infra)(\/|\.|$)/i.test(file)) {
@@ -748,20 +782,53 @@ function normalizedImpactEvidence(value = {}) {
     }
     return capabilities;
   });
-  const unknown = value.unknown === true
+  const hasExecutableComponentClassification = directComponents.length > 0 || affectedComponents.length > 0;
+  const unknown = value.unknown === true || validationEvidence?.unknown === true
+    || Boolean(validationEvidenceError)
+    || (Boolean(rawValidationEvidence) && options.repositoryVerified === false)
     || value.classified === false
     || value.stale === true
     || value.conflicting === true
     || Boolean(value.staleReason || value.conflictReason)
     || hasUnknownExplicitClassification
     || !files.length
-    || pathCapabilities.some((capabilities) => capabilities.size === 0);
-  const backendRequired = unknown || classifications.some((item) => ["backend", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment"].includes(item))
+    || (!hasExecutableComponentClassification && pathCapabilities.some((capabilities) => capabilities.size === 0));
+  const fullRegressionReasons = [...new Set([
+    ...(Array.isArray(value.fullRegressionReasons) ? value.fullRegressionReasons : validationEvidence?.fullRegressionReasons || []),
+    ...(!manifestDigest ? ["missing_manifest_binding"] : []),
+    ...(value.shared === true || validationEvidence?.shared === true ? ["shared_surface"] : []),
+    ...(value.ambiguous === true || validationEvidence?.ambiguous === true ? ["ambiguous_ownership"] : []),
+    ...(value.multiComponent === true || validationEvidence?.multiComponent === true ? ["multi_component"] : []),
+    ...(validationEvidenceError ? ["invalid_exact_sha_evidence"] : []),
+    ...(rawValidationEvidence && options.repositoryVerified === false ? ["unverified_repository_classification"] : []),
+  ].map(String).map((item) => item.trim()).filter(Boolean))].sort();
+  const fullRegression = value.fullRegression === true || validationEvidence?.fullRegression === true || fullRegressionReasons.length > 0;
+  const backendRequired = fullRegression || unknown || classifications.some((item) => ["backend", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment"].includes(item))
     || pathCapabilities.some((capabilities) => capabilities.has("backend"));
   const frontend = classifications.includes("frontend") || classifications.includes("design-system")
+    || affectedComponents.some((item) => ["browser-ui", "entry-adapters"].includes(item))
     || pathCapabilities.some((capabilities) => capabilities.has("frontend"));
   const accessibility = classifications.includes("accessibility") || frontend;
-  return { changedFiles: files, classifications, unknown, backendRequired, frontend, accessibility };
+  return {
+    changedFiles: files,
+    classifications,
+    directComponents,
+    affectedComponents,
+    selectedComponents,
+    manifestDigest,
+    validationEvidence,
+    validationEvidenceDigest: validationEvidence ? exactShaEvidenceDigest(validationEvidence) : "",
+    validationEvidenceError,
+    unknown,
+    shared: value.shared === true || validationEvidence?.shared === true,
+    ambiguous: value.ambiguous === true || validationEvidence?.ambiguous === true,
+    multiComponent: value.multiComponent === true || validationEvidence?.multiComponent === true,
+    fullRegression,
+    fullRegressionReasons,
+    backendRequired,
+    frontend,
+    accessibility,
+  };
 }
 
 export function normalizeCandidateIdentity(value = {}, fallback = {}) {
@@ -823,12 +890,29 @@ function capabilityForReviewStage(stage = {}) {
 
 export function capabilityRoutingForTask(project = {}, task = {}) {
   const policy = normalizeDeliveryPolicy(project.deliveryPolicy);
-  const evidence = normalizedImpactEvidence(task.impactEvidence || task);
+  const preliminaryEvidence = normalizedImpactEvidence(task.impactEvidence || task, {
+    expectedSourceSha: task.reviewSubjectSha || "",
+  });
+  const identity = candidateIdentityForTask(task);
+  const repositoryVerification = task.impactEvidenceRepositoryVerification || {};
+  const repositoryVerified = Boolean(
+    preliminaryEvidence.validationEvidence
+      && repositoryVerification.ok === true
+      && repositoryVerification.sourceSha === task.reviewSubjectSha
+      && repositoryVerification.baseSha === identity.baseSha
+      && repositoryVerification.treeSha === identity.treeSha
+      && repositoryVerification.manifestDigest === preliminaryEvidence.manifestDigest
+      && repositoryVerification.evidenceDigest === preliminaryEvidence.validationEvidenceDigest
+  );
+  const evidence = normalizedImpactEvidence(task.impactEvidence || task, {
+    expectedSourceSha: task.reviewSubjectSha || "",
+    repositoryVerified,
+  });
   if (policy.profile !== "prototype-fast-lane") return { policy, evidence, required: [...CAPABILITY_KEYS], skipped: [] };
   const required = new Set(["lead"]);
-  if (evidence.backendRequired) required.add("backend");
-  if (evidence.unknown || evidence.frontend) required.add("frontend");
-  if (evidence.unknown || evidence.accessibility) required.add("accessibility");
+  if (evidence.fullRegression || evidence.backendRequired) required.add("backend");
+  if (evidence.fullRegression || evidence.unknown || evidence.frontend) required.add("frontend");
+  if (evidence.fullRegression || evidence.unknown || evidence.accessibility) required.add("accessibility");
   const skipped = CAPABILITY_KEYS.filter((key) => !required.has(key)).map((key) => ({
     stageKey: key, outcome: "skipped", reason: "inapplicable_capability", subjectSha: task.reviewSubjectSha || "", candidateCycle: currentReviewCandidateCycle(task),
   }));
@@ -1373,6 +1457,49 @@ export async function updateTask(taskId, patch) {
       );
     }
     task.candidateIdentity = candidateIdentityForTask(task);
+    if (task.impactEvidence?.validationEvidence) {
+      try {
+        const verification = await verifyExactShaEvidenceAgainstGit(
+          project.repoPath,
+          task.candidateIdentity.baseSha,
+          task.reviewSubjectSha,
+          task.impactEvidence.validationEvidence,
+          { expectedTreeSha: task.candidateIdentity.treeSha },
+        );
+        task.impactEvidenceRepositoryVerification = {
+          ok: true,
+          baseSha: verification.baseSha,
+          sourceSha: verification.sourceSha,
+          treeSha: verification.treeSha,
+          manifestDigest: verification.manifestDigest,
+          evidenceDigest: verification.evidenceDigest,
+          verifiedAt: new Date().toISOString(),
+          error: "",
+        };
+      } catch (error) {
+        task.impactEvidenceRepositoryVerification = {
+          ok: false,
+          baseSha: task.candidateIdentity.baseSha,
+          sourceSha: task.reviewSubjectSha,
+          treeSha: task.candidateIdentity.treeSha,
+          manifestDigest: task.impactEvidence.manifestDigest,
+          evidenceDigest: task.impactEvidence.validationEvidenceDigest || "",
+          verifiedAt: new Date().toISOString(),
+          error: String(error?.message || error),
+        };
+      }
+    } else {
+      task.impactEvidenceRepositoryVerification = {
+        ok: false,
+        baseSha: task.candidateIdentity.baseSha,
+        sourceSha: task.reviewSubjectSha,
+        treeSha: task.candidateIdentity.treeSha,
+        manifestDigest: task.impactEvidence?.manifestDigest || "",
+        evidenceDigest: "",
+        verifiedAt: new Date().toISOString(),
+        error: "Exact-SHA impact evidence is unavailable.",
+      };
+    }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
       && patch.status !== "blocked"
@@ -1578,6 +1705,7 @@ export async function completeArchitecture(taskId, input = {}) {
 
 function qaDecisionSubject(candidate, input = {}) {
   assertCandidateEnvelope(candidate);
+  assertExactShaEvidenceEnvironment(candidate.manifest.validationEvidence);
   const candidateId = String(input.candidateId || "").trim();
   const manifestDigest = String(input.manifestDigest || "").trim();
   const integrationSha = normalizeGitSha(input.integrationSha, "QA integration SHA");

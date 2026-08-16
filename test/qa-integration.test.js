@@ -15,9 +15,12 @@ import {
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
 import {
+  authorizeManifestValidationCommands,
   planQaIntegrations,
   projectPlanHasWork,
   qaResultFingerprint,
+  validationManifestBindingForTasks,
+  verifyExactValidationWorkspace,
 } from "../src/qa-integration.js";
 import { readPersistedState } from "./state-database-helper.js";
 
@@ -44,6 +47,34 @@ async function run(command, args, options = {}) {
 async function git(repoPath, args) {
   const result = await run("git", args, { cwd: repoPath });
   return `${result.stdout || ""}${result.stderr || ""}`.trim();
+}
+
+async function installTestOwnershipManifest(repoPath) {
+  const manifest = {
+    schemaVersion: "studioops.component-ownership.v1",
+    fullRegressionCommands: ["git diff --check"],
+    environmentContract: { id: "studioops.qa-test.v1", node: ">=22.5" },
+    components: {
+      application: {
+        owner: "QA fixture",
+        classification: "bounded",
+        paths: ["**"],
+        entryAdapters: [],
+        workflowReleaseSurfaces: [],
+        ownedTests: [],
+        publicContracts: ["fixture application"],
+        ownedData: [],
+        allowedDependencies: [],
+        impactEdges: [],
+        rollbackBoundary: "fixture commit",
+        testLayers: ["composition"],
+        validationCommands: ["git diff --check"],
+      },
+    },
+  };
+  await mkdir(path.join(repoPath, "config"), { recursive: true });
+  await writeFile(path.join(repoPath, "config", "component-ownership.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await git(repoPath, ["add", "config/component-ownership.json"]);
 }
 
 async function stateWithReviewEvidence(state) {
@@ -95,6 +126,70 @@ async function runQaIntegrationFixture(root, options = {}) {
     env: options.env,
   });
   return JSON.parse(result.stdout.trim());
+}
+
+async function createValidationSecurityFixture(root, options = {}) {
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  await git(root, ["init", "--bare", remotePath]);
+  await git(root, ["clone", remotePath, repoPath]);
+  await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
+  await git(repoPath, ["config", "user.name", "StudioOps Test"]);
+  await git(repoPath, ["checkout", "-b", "main"]);
+  await installTestOwnershipManifest(repoPath);
+  await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+  await git(repoPath, ["add", "app.txt"]);
+  await git(repoPath, ["commit", "-m", "base"]);
+  await git(repoPath, ["push", "origin", "main"]);
+  await git(repoPath, ["push", "origin", "main:qa/integration"]);
+  const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+
+  await git(repoPath, ["checkout", "-b", "feature/task"]);
+  await writeFile(path.join(repoPath, "app.txt"), "feature\n", "utf8");
+  if (options.manifestCommand) {
+    const manifestPath = path.join(repoPath, "config", "component-ownership.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.fullRegressionCommands.push(options.manifestCommand);
+    manifest.components.application.validationCommands.push(options.manifestCommand);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  }
+  await git(repoPath, ["add", "app.txt", "config/component-ownership.json"]);
+  await git(repoPath, ["commit", "-m", "feature"]);
+  await git(repoPath, ["push", "origin", "feature/task"]);
+  await git(repoPath, ["checkout", "main"]);
+
+  await mkdir(path.join(root, "data"), { recursive: true });
+  const state = await stateWithReviewEvidence({
+    meta: {},
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath,
+      repoUrl: "",
+      defaultBranch: "main",
+      validationCommands: options.validationCommands || ["git diff --check"],
+      reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/integration" },
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Feature task",
+      status: "qa_review",
+      branchName: "feature/task",
+      prUrl: "",
+    }],
+    comments: [],
+    events: [],
+    reviews: [],
+    runs: [],
+  });
+  await writeFile(
+    path.join(root, "data", "mission-control.json"),
+    `${JSON.stringify(state, null, 2)}\n`,
+    "utf8",
+  );
+  return { remotePath, repoPath, baseSha };
 }
 
 async function addReviewedQaTask(root, task, subjectSha) {
@@ -296,7 +391,7 @@ process.exit(1);
       repoPath,
       repoUrl: "",
       defaultBranch: "main",
-      validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+      validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
       reviewPolicy: {
         trustLeadApprovals: true,
         integrationBranch: "qa/integration",
@@ -370,6 +465,147 @@ test("review policy Trust Leads settings override stale top-level mirrors", () =
   );
   assert.equal(imported.reviewPolicy.trustLeadApprovals, true);
   assert.equal(imported.reviewPolicy.integrationBranch, "qa/imported");
+});
+
+test("candidate manifest validation commands require a trusted project allowlist", () => {
+  const authorized = authorizeManifestValidationCommands(
+    ["npm run check", "git diff --check"],
+    ["git diff --check"],
+  );
+  assert.deepEqual(authorized, {
+    ok: true,
+    commands: ["git diff --check"],
+    trustedCommandCount: 2,
+    requiredCommandCount: 1,
+    unauthorizedCommandCount: 0,
+  });
+
+  const failClosed = authorizeManifestValidationCommands(
+    ["npm run check", "git diff --check"],
+    [],
+  );
+  assert.deepEqual(failClosed.commands, ["npm run check", "git diff --check"]);
+
+  const rejected = authorizeManifestValidationCommands(
+    ["npm run check"],
+    ["npm run check", "touch candidate-controlled-command-ran"],
+  );
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.unauthorizedCommandCount, 1);
+  assert.deepEqual(rejected.commands, ["npm run check"]);
+});
+
+test("a missing task manifest binding forces full regression even when another task is bound", () => {
+  assert.deepEqual(validationManifestBindingForTasks([
+    { impactEvidence: { manifestDigest: `sha256:${"a".repeat(64)}` } },
+    { impactEvidence: {} },
+  ]), {
+    expectedManifestDigests: [`sha256:${"a".repeat(64)}`],
+    fullRegressionReasons: ["missing_manifest_binding"],
+  });
+});
+
+test("exact validation workspace rejects tracked mutations and HEAD drift", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-exact-workspace-"));
+  try {
+    await git(root, ["init"]);
+    await git(root, ["config", "user.email", "mission-control-test@example.com"]);
+    await git(root, ["config", "user.name", "StudioOps Test"]);
+    await writeFile(path.join(root, "app.txt"), "committed\n", "utf8");
+    await git(root, ["add", "app.txt"]);
+    await git(root, ["commit", "-m", "candidate"]);
+    const candidateSha = await git(root, ["rev-parse", "HEAD"]);
+
+    assert.deepEqual(await verifyExactValidationWorkspace(root, candidateSha), {
+      ok: true,
+      headSha: candidateSha,
+      headMatches: true,
+      trackedClean: true,
+      trackedChangeCount: 0,
+    });
+
+    await writeFile(path.join(root, "app.txt"), "validation mutation\n", "utf8");
+    const dirty = await verifyExactValidationWorkspace(root, candidateSha);
+    assert.equal(dirty.ok, false);
+    assert.equal(dirty.headMatches, true);
+    assert.equal(dirty.trackedClean, false);
+    assert.equal(dirty.trackedChangeCount, 1);
+
+    await git(root, ["add", "app.txt"]);
+    await git(root, ["commit", "-m", "drift"]);
+    const drifted = await verifyExactValidationWorkspace(root, candidateSha);
+    assert.equal(drifted.ok, false);
+    assert.equal(drifted.headMatches, false);
+    assert.equal(drifted.trackedClean, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QA integration never executes candidate-controlled manifest commands", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-command-authorization-"));
+  const sentinel = path.join(root, "candidate-command-ran");
+  try {
+    const fixture = await createValidationSecurityFixture(root, {
+      manifestCommand: `touch ${JSON.stringify(sentinel)}`,
+      validationCommands: ["git diff --check"],
+    });
+    const report = await runQaIntegrationFixture(root, {
+      input: { githubAppAuth: false },
+    });
+    assert.equal(report.projects[0].status, "validation_command_untrusted");
+    assert.equal(report.projects[0].validationCommandAuthorization.unauthorizedCommandCount, 1);
+    await assert.rejects(readFile(sentinel), /ENOENT/);
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      fixture.baseSha,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QA integration executes only classifier-selected trusted commands", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-command-selection-"));
+  const sentinel = path.join(root, "unselected-command-ran");
+  const unselectedCommand = `touch ${JSON.stringify(sentinel)}`;
+  try {
+    await createValidationSecurityFixture(root, {
+      validationCommands: ["git diff --check", unselectedCommand],
+    });
+    const report = await runQaIntegrationFixture(root, {
+      input: { githubAppAuth: false },
+    });
+    assert.equal(report.projects[0].status, "preview_missing");
+    assert.deepEqual(report.projects[0].validation.map((item) => item.command), ["git diff --check"]);
+    await assert.rejects(readFile(sentinel), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QA integration rejects a passing validation that mutates a tracked file", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-validation-mutation-"));
+  const mutationCommand = `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('app.txt', 'mutated\\n')"`;
+  try {
+    const fixture = await createValidationSecurityFixture(root, {
+      manifestCommand: mutationCommand,
+      validationCommands: [mutationCommand, "git diff --check"],
+    });
+    const report = await runQaIntegrationFixture(root, {
+      input: { githubAppAuth: false },
+    });
+    assert.equal(report.projects[0].status, "validation_mutated_candidate");
+    assert.equal(report.projects[0].validation.every((item) => item.ok), true);
+    assert.equal(report.projects[0].validationWorkspace.headMatches, true);
+    assert.equal(report.projects[0].validationWorkspace.trackedClean, false);
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      fixture.baseSha,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("QA integration skips already-ready tasks unless forced", () => {
@@ -634,6 +870,7 @@ test("validation commands use the QA integration PATH override", async () => {
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
     await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
+    await installTestOwnershipManifest(repoPath);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
     await git(repoPath, ["commit", "-m", "base"]);
@@ -657,7 +894,7 @@ test("validation commands use the QA integration PATH override", async () => {
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: ["mc-qa-check"],
+          validationCommands: ["mc-qa-check", "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -711,6 +948,7 @@ test("QA integration redacts GitHub token values from validation output before s
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const fakeToken = "ghs_fake-validation-secret-token";
+  const validationCommand = `${JSON.stringify(process.execPath)} -e "console.log(process.env.GH_TOKEN); console.error(process.env.MISSION_CONTROL_GITHUB_TOKEN)"`;
 
   try {
     await git(root, ["init", "--bare", remotePath]);
@@ -718,6 +956,12 @@ test("QA integration redacts GitHub token values from validation output before s
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
     await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
+    await installTestOwnershipManifest(repoPath);
+    const manifestPath = path.join(repoPath, "config", "component-ownership.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.fullRegressionCommands.push(validationCommand);
+    manifest.components.application.validationCommands.push(validationCommand);
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
     await git(repoPath, ["commit", "-m", "base"]);
@@ -730,8 +974,6 @@ test("QA integration redacts GitHub token values from validation output before s
     await git(repoPath, ["push", "origin", "feature/task"]);
     await git(repoPath, ["checkout", "main"]);
 
-    const validationCommand = `${JSON.stringify(process.execPath)} -e "console.log(process.env.GH_TOKEN); console.error(process.env.MISSION_CONTROL_GITHUB_TOKEN)"`;
-
     await mkdir(path.join(root, "data"), { recursive: true });
     await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
       meta: {},
@@ -743,7 +985,7 @@ test("QA integration redacts GitHub token values from validation output before s
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [validationCommand],
+          validationCommands: [validationCommand, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -832,7 +1074,7 @@ test("failed validation leaves the owner checkout untouched and does not push", 
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(1)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(1)"`, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -923,7 +1165,7 @@ test("QA integration rejects source drift before merge or candidate push", async
         name: "Demo",
         repoPath,
         defaultBranch: "main",
-        validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+        validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
         reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/integration" },
       }],
       tasks: [
@@ -1015,6 +1257,7 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
     await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
     await git(repoPath, ["config", "user.name", "StudioOps Test"]);
     await git(repoPath, ["checkout", "-b", "main"]);
+    await installTestOwnershipManifest(repoPath);
     await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
     await git(repoPath, ["add", "app.txt"]);
     await git(repoPath, ["commit", "-m", "base"]);
@@ -1044,7 +1287,7 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
           localQaPreview: {
             enabled: true,
             checkoutPath: previewPath,
@@ -1212,7 +1455,7 @@ test("QA integration can sync default branch changes into QA and refresh a local
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -1297,7 +1540,7 @@ test("QA integration preserves a distinct origin push URL in the isolated worksp
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -1372,7 +1615,7 @@ test("QA integration refuses a repo without origin instead of pushing back into 
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -1455,7 +1698,7 @@ test("QA integration refuses workspace roots inside the registered repo", async 
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -1522,7 +1765,7 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
           repoPath,
           repoUrl: "https://github.com/example/demo",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
@@ -1606,7 +1849,7 @@ test("QA integration keeps sanitized project workspace segments inside the works
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`],
+          validationCommands: [`${JSON.stringify(process.execPath)} -e "process.exit(0)"`, "git diff --check"],
           reviewPolicy: {
             trustLeadApprovals: true,
             integrationBranch: "qa/integration",
