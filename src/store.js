@@ -770,6 +770,20 @@ function assertOperationalRepairCanBeRecorded(task, requestedRepairTaskId) {
   );
 }
 
+function assertOperationalRepairInactive(task, operation) {
+  const repair = activeOperationalRepair(task);
+  if (!repair) return;
+  throw taskRelationshipError(
+    "repair_reference_active",
+    `Task ${task.id} cannot ${operation} while operational repair ${repair.repairTaskId} is active.`,
+    {
+      sourceTaskId: task.id,
+      sourceProjectId: task.projectId,
+      repairTaskId: repair.repairTaskId,
+    },
+  );
+}
+
 function normalizedOperationalRepairInput(state, task, input = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw taskRelationshipError(
@@ -1913,6 +1927,7 @@ function completedArchitectureGraphIsValid(state, parent) {
 export function completeArchitectureInState(state, taskId, input = {}) {
   const task = findTask(state, taskId);
   if (!task) throw new Error(`Unknown task: ${taskId}`);
+  assertOperationalRepairInactive(task, "complete architecture");
   const summary = String(input.body || input.summary || "").trim();
   if (summary.length < 120) {
     throw new Error("Architecture completion requires a substantive summary of at least 120 characters.");
@@ -2229,6 +2244,7 @@ export async function addComment(taskId, body, author = "user") {
 export function recordReviewInState(state, taskId, input = {}) {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
+    assertOperationalRepairInactive(task, "record a review");
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     const stages = reviewStagesForTask(project, task);

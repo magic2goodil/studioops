@@ -7,6 +7,7 @@ import {
   claimDueGitHubRemoteRecoveryProbesInState,
   clearOperationalRepairInState,
   recordOperationalRepairInState,
+  recordReviewInState,
   resetAutomationCircuitInState,
   scheduleGitHubRemoteRecoveryProbeInState,
 } from "../src/store.js";
@@ -405,4 +406,52 @@ test("operational repair resume preserves an existing builder review candidate",
   assert.equal(state.tasks[0].reviewCycle, 2);
   assert.equal(state.tasks[0].reviewSubjectSha, reviewSubjectSha);
   assert.equal(state.tasks[0].reviewSubjectCycle, 2);
+});
+
+test("a stale reviewer outcome cannot bypass an active operational repair", () => {
+  const reviewSubjectSha = "a".repeat(40);
+  const state = fixtureState({
+    status: "backend_review",
+    reviewCycle: 2,
+    reviewSubjectSha,
+    reviewSubjectCycle: 2,
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "backend_review",
+  });
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => recordReviewInState(state, "task_1", {
+      stage: "backend",
+      outcome: "changes_requested",
+      candidateCycle: 2,
+      subjectSha: reviewSubjectSha,
+      body: "This result arrived after the task entered operational repair.",
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.deepEqual(state.reviews, []);
+  assert.equal(state.events.length, eventCount);
+  assert.ok(!createSupervisorReport(state).actions.some((action) => (
+    action.taskId === "task_1" && action.type === "start_review"
+  )));
 });

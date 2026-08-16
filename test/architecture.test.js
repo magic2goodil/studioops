@@ -9,6 +9,7 @@ import {
   completeArchitectureInState,
   functionalDeliveryContract,
   generatePrompt,
+  recordOperationalRepairInState,
   taskRequiresArchitecture,
 } from "../src/store.js";
 
@@ -377,4 +378,42 @@ test("architecture validity reports cross-project product edges with child and d
     resolutionStatus: "",
   };
   assert.equal(architectureGraphValidityInState(state, "task_1").valid, true);
+});
+
+test("architecture completion cannot bypass an active operational repair", () => {
+  const state = fixtureState({
+    status: "architecture_in_progress",
+    architectureStatus: "in_progress",
+  });
+  state.projects.push({ id: "project_2", key: "operations", name: "Operations" });
+  state.tasks.push(
+    governedChild(),
+    {
+      id: "task_3",
+      projectId: "project_2",
+      title: "Repair workflow integrity",
+      status: "ready",
+      dependsOnTaskIds: [],
+    },
+  );
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_3",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "architecture_pending",
+  });
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => completeArchitectureInState(state, "task_1", {
+      body: "Keep the existing modular monolith and transactional workflow authority while preserving the active operational repair gate.",
+      taskIds: ["task_2"],
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].architectureStatus, "in_progress");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.equal(state.tasks[1].status, "architecture_pending");
+  assert.equal(state.events.length, eventCount);
 });
