@@ -85,6 +85,30 @@ const DEPENDENCY_COMPLETE_STATUSES = new Set([
   "closed",
 ]);
 
+const VALID_OPERATIONAL_REPAIR_REASON_CODES = new Set([
+  "automation_configuration",
+  "data_integrity",
+  "dependency_repair",
+  "infrastructure_repair",
+  "repository_access",
+  "workflow_integrity",
+]);
+
+const SAFE_OPERATIONAL_REPAIR_RESUME_STATUSES = new Set([
+  "architecture_pending",
+  "ready",
+  "queued",
+  "builder_review",
+  "backend_review",
+  "frontend_review",
+  "accessibility_review",
+  "regression_review",
+  "lead_review",
+  "qa_review",
+  "needs_changes",
+  "user_review",
+]);
+
 const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
 const DEFAULT_ORPHANED_TASK_GRACE_MS = 15 * 60 * 1000;
 const DEFAULT_TRANSIENT_RECOVERY_MS = 2 * 60 * 1000;
@@ -166,6 +190,8 @@ export {
   VALID_STATUSES,
   VALID_REVIEW_OUTCOMES,
   VALID_RUN_STATUSES,
+  VALID_OPERATIONAL_REPAIR_REASON_CODES,
+  SAFE_OPERATIONAL_REPAIR_RESUME_STATUSES,
   DEFAULT_REVIEW_PIPELINE,
   DEFAULT_REVIEW_POLICY,
   VALID_DELIVERY_POLICY_PROFILES,
@@ -703,6 +729,92 @@ function normalizeBoolean(value, defaultValue = false) {
   return defaultValue;
 }
 
+export class TaskRelationshipError extends Error {
+  constructor(code, message, diagnostic = {}) {
+    super(message);
+    this.name = "TaskRelationshipError";
+    this.code = code;
+    this.reasonCode = code;
+    this.diagnostic = {
+      code,
+      reason: code,
+      ...diagnostic,
+    };
+    this.details = this.diagnostic;
+  }
+}
+
+function taskRelationshipError(code, message, diagnostic = {}) {
+  return new TaskRelationshipError(code, message, diagnostic);
+}
+
+function activeOperationalRepair(task = {}) {
+  const repair = task.operationalRepair;
+  return repair && !repair.resolvedAt ? repair : null;
+}
+
+function normalizedOperationalRepairInput(state, task, input = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw taskRelationshipError(
+      "repair_reference_invalid",
+      "Operational repair must be a structured reference.",
+      { sourceTaskId: task.id, sourceProjectId: task.projectId },
+    );
+  }
+  const callerOwnedFields = new Set(["repairTaskId", "reasonCode", "resumeStatus"]);
+  const systemOwnedFields = Object.keys(input).filter((key) => !callerOwnedFields.has(key));
+  if (systemOwnedFields.length) {
+    throw taskRelationshipError(
+      "repair_reference_invalid",
+      `Operational repair audit fields are system-owned: ${systemOwnedFields.join(", ")}.`,
+      { sourceTaskId: task.id, sourceProjectId: task.projectId },
+    );
+  }
+
+  const repairTaskId = String(input.repairTaskId || "").trim();
+  const reasonCode = String(input.reasonCode || "").trim().toLowerCase();
+  const resumeStatus = String(input.resumeStatus || "").trim();
+  const repairTask = findTask(state, repairTaskId);
+  if (!repairTaskId || !repairTask || repairTaskId === task.id) {
+    throw taskRelationshipError(
+      "repair_reference_invalid",
+      repairTaskId === task.id
+        ? "A task cannot reference itself as its operational repair."
+        : `Unknown operational repair task: ${repairTaskId || "(missing)"}`,
+      {
+        sourceTaskId: task.id,
+        sourceProjectId: task.projectId,
+        repairTaskId,
+        repairProjectId: repairTask?.projectId || "",
+      },
+    );
+  }
+  if (!VALID_OPERATIONAL_REPAIR_REASON_CODES.has(reasonCode)) {
+    throw taskRelationshipError(
+      "repair_reason_invalid",
+      `Invalid operational repair reason code: ${reasonCode || "(missing)"}`,
+      { sourceTaskId: task.id, sourceProjectId: task.projectId, repairTaskId, reasonCode },
+    );
+  }
+  if (!SAFE_OPERATIONAL_REPAIR_RESUME_STATUSES.has(resumeStatus)) {
+    throw taskRelationshipError(
+      "repair_resume_status_invalid",
+      `Unsafe operational repair resume status: ${resumeStatus || "(missing)"}`,
+      { sourceTaskId: task.id, sourceProjectId: task.projectId, repairTaskId, resumeStatus },
+    );
+  }
+  return { repairTask, repairTaskId, reasonCode, resumeStatus };
+}
+
+function validatePersistedOperationalRepair(state, task) {
+  if (!task.operationalRepair) return null;
+  return normalizedOperationalRepairInput(state, task, {
+    repairTaskId: task.operationalRepair.repairTaskId,
+    reasonCode: task.operationalRepair.reasonCode,
+    resumeStatus: task.operationalRepair.resumeStatus,
+  });
+}
+
 function normalizeDeliveryMode(value, fallback = "functional") {
   const mode = String(value || "").trim().toLowerCase();
   return VALID_DELIVERY_MODES.has(mode) ? mode : fallback;
@@ -1080,6 +1192,73 @@ function governedArchitectureParent(state, project, parentTaskId, architecturePa
   return parent;
 }
 
+function applyOperationalRepairRecordInState(state, task, normalized, options = {}) {
+  const now = options.now || new Date().toISOString();
+  const recordedBy = (String(options.author || "StudioOps Workflow").trim() || "StudioOps Workflow")
+    .slice(0, 120);
+  const replaced = Boolean(task.operationalRepair);
+  task.operationalRepair = {
+    repairTaskId: normalized.repairTaskId,
+    reasonCode: normalized.reasonCode,
+    resumeStatus: normalized.resumeStatus,
+    recordedAt: now,
+    recordedBy,
+    resolvedAt: "",
+    resolvedBy: "",
+    resolutionStatus: "",
+  };
+  task.status = "blocked";
+  task.assignedAgentRole = "";
+  task.reviewerThreadId = "";
+  task.updatedAt = now;
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: replaced ? "operational_repair_replaced" : "operational_repair_recorded",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.id} blocked on operational repair ${normalized.repairTaskId} (${normalized.reasonCode})`,
+    createdAt: now,
+  });
+  return task.operationalRepair;
+}
+
+export function recordOperationalRepairInState(state, taskId, input = {}, options = {}) {
+  const task = findTask(state, taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  const normalized = normalizedOperationalRepairInput(state, task, input);
+  applyOperationalRepairRecordInState(state, task, normalized, options);
+  return task;
+}
+
+export async function recordOperationalRepair(taskId, input = {}, options = {}) {
+  return mutateState(async (state) => recordOperationalRepairInState(state, taskId, input, options));
+}
+
+export function clearOperationalRepairInState(state, taskId, options = {}) {
+  const task = findTask(state, taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  if (!task.operationalRepair) return task;
+  const now = options.now || new Date().toISOString();
+  const repairTaskId = task.operationalRepair.repairTaskId;
+  delete task.operationalRepair;
+  task.updatedAt = now;
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "operational_repair_cleared",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.id} operational repair reference ${repairTaskId} cleared`,
+    createdAt: now,
+  });
+  return task;
+}
+
+export async function clearOperationalRepair(taskId, options = {}) {
+  return mutateState(async (state) => clearOperationalRepairInState(state, taskId, options));
+}
+
 export async function addTask(input) {
   return mutateState(async (state) => {
     const now = new Date().toISOString();
@@ -1089,7 +1268,8 @@ export async function addTask(input) {
     if (!title) throw new Error("Task title is required.");
     const parentTaskId = String(input.parentTaskId || input.parent || input.epic || "").trim();
     const dependsOnTaskIds = normalizeList(input.dependsOnTaskIds || input.dependsOn || input.dependencies);
-    validateTaskRelationships(state, "", parentTaskId, dependsOnTaskIds);
+    const taskId = nextId(state.tasks, "task");
+    validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds, project.id);
     const architectureApproved = normalizeBoolean(input.architectureApproved, false);
     const requestedArchitectureParentTaskId = String(input.architectureParentTaskId || "").trim();
     const architectureParentTaskId = architectureApproved
@@ -1111,7 +1291,7 @@ export async function addTask(input) {
     );
     if (!VALID_STATUSES.has(status)) throw new Error(`Invalid status: ${status}`);
     const task = {
-      id: nextId(state.tasks, "task"),
+      id: taskId,
       projectId: project.id,
       title,
       description: String(input.description || "").trim(),
@@ -1155,6 +1335,10 @@ export async function addTask(input) {
       createdAt: now,
       updatedAt: now,
     };
+    if (Object.prototype.hasOwnProperty.call(input, "operationalRepair")) {
+      const repair = normalizedOperationalRepairInput(state, task, input.operationalRepair);
+      applyOperationalRepairRecordInState(state, task, repair, { now });
+    }
     state.tasks.push(task);
     state.events.push({
       id: nextId(state.events, "event"),
@@ -1205,6 +1389,49 @@ export async function updateTask(taskId, patch) {
     ) {
       throw new Error("Architecture parent requires architectureApproved so the child remains gated until completion.");
     }
+    const candidateParentTaskId = Object.prototype.hasOwnProperty.call(patch, "parentTaskId")
+      ? String(patch.parentTaskId || "").trim()
+      : task.parentTaskId || "";
+    const candidateDependsOnTaskIds = Object.prototype.hasOwnProperty.call(patch, "dependsOnTaskIds")
+      ? normalizeList(patch.dependsOnTaskIds)
+      : normalizeList(task.dependsOnTaskIds);
+    validateTaskRelationships(
+      state,
+      task.id,
+      candidateParentTaskId,
+      candidateDependsOnTaskIds,
+      task.projectId,
+    );
+    const requestedOperationalRepair = Object.prototype.hasOwnProperty.call(patch, "operationalRepair")
+      ? normalizedOperationalRepairInput(state, task, patch.operationalRepair)
+      : null;
+    if (!requestedOperationalRepair) validatePersistedOperationalRepair(state, task);
+    if (requestedOperationalRepair && patch.status && patch.status !== "blocked") {
+      throw taskRelationshipError(
+        "repair_reference_invalid",
+        "Recording an operational repair requires the task to enter blocked status.",
+        { sourceTaskId: task.id, sourceProjectId: task.projectId, requestedStatus: patch.status },
+      );
+    }
+    if (activeOperationalRepair(task) && patch.status && patch.status !== "blocked" && !requestedOperationalRepair) {
+      throw taskRelationshipError(
+        "repair_reference_active",
+        `Task ${task.id} cannot leave blocked status while operational repair ${task.operationalRepair.repairTaskId} is active.`,
+        {
+          sourceTaskId: task.id,
+          sourceProjectId: task.projectId,
+          repairTaskId: task.operationalRepair.repairTaskId,
+        },
+      );
+    }
+    const approvedArchitectureParentId = normalizeBoolean(patch.architectureApproved, false)
+      ? governedArchitectureParent(
+        state,
+        project,
+        candidateParentTaskId,
+        String(patch.architectureParentTaskId || "").trim(),
+      ).id
+      : "";
     const previousStatus = task.status;
     const allowed = [
       "title",
@@ -1261,13 +1488,7 @@ export async function updateTask(taskId, patch) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, "architectureApproved")) {
       if (normalizeBoolean(patch.architectureApproved, false)) {
-        const requestedParentId = String(patch.architectureParentTaskId || "").trim();
-        task.architectureParentTaskId = governedArchitectureParent(
-          state,
-          project,
-          task.parentTaskId,
-          requestedParentId,
-        ).id;
+        task.architectureParentTaskId = approvedArchitectureParentId;
         task.architectureRequired = true;
         task.architectureStatus = "pending";
       } else {
@@ -1282,12 +1503,14 @@ export async function updateTask(taskId, patch) {
       task.labels = normalizeList(patch.labels);
     }
     if (Object.prototype.hasOwnProperty.call(patch, "dependsOnTaskIds")) {
-      task.dependsOnTaskIds = normalizeList(patch.dependsOnTaskIds);
+      task.dependsOnTaskIds = candidateDependsOnTaskIds;
     }
     if (Object.prototype.hasOwnProperty.call(patch, "workAreas")) {
       task.workAreas = normalizeList(patch.workAreas);
     }
-    validateTaskRelationships(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
+    if (requestedOperationalRepair) {
+      applyOperationalRepairRecordInState(state, task, requestedOperationalRepair);
+    }
     if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
       task.attachments = normalizeAttachments(patch.attachments);
     }
@@ -1403,6 +1626,83 @@ export async function updateTask(taskId, patch) {
   }, ownsValidStatus ? { repairTaskId: taskId } : {});
 }
 
+export function repairLegacyTaskRelationshipsInState(state, taskId, input = {}, options = {}) {
+  const task = findTask(state, taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  const crossProjectDependencyIds = normalizeList(task.dependsOnTaskIds).filter((dependencyId) => {
+    const dependency = findTask(state, dependencyId);
+    return dependency && dependency.projectId !== task.projectId;
+  });
+  if (!crossProjectDependencyIds.length) {
+    throw taskRelationshipError(
+      "legacy_repair_not_required",
+      `Task ${task.id} has no cross-project product dependencies to repair.`,
+      { sourceTaskId: task.id, sourceProjectId: task.projectId },
+    );
+  }
+
+  const requestedRemovalIds = normalizeList(
+    input.removeDependencyTaskIds
+      || input.removeDependsOnTaskIds
+      || input.dependsOnTaskIdsToRemove,
+  );
+  const removalIds = requestedRemovalIds.length ? requestedRemovalIds : crossProjectDependencyIds;
+  const invalidRemovalId = removalIds.find((id) => !crossProjectDependencyIds.includes(id));
+  const unremovedCrossProjectId = crossProjectDependencyIds.find((id) => !removalIds.includes(id));
+  if (invalidRemovalId || unremovedCrossProjectId) {
+    throw taskRelationshipError(
+      "legacy_repair_invalid",
+      invalidRemovalId
+        ? `Legacy repair can remove only cross-project dependencies; ${invalidRemovalId} is not an offending edge.`
+        : `Legacy repair must remove every cross-project dependency; ${unremovedCrossProjectId} would remain.`,
+      {
+        sourceTaskId: task.id,
+        sourceProjectId: task.projectId,
+        dependencyTaskId: invalidRemovalId || unremovedCrossProjectId,
+      },
+    );
+  }
+
+  const repairInput = input.operationalRepair || {
+    repairTaskId: input.repairTaskId,
+    reasonCode: input.reasonCode,
+    resumeStatus: input.resumeStatus,
+  };
+  const normalizedRepair = normalizedOperationalRepairInput(state, task, repairInput);
+  const remainingDependencyIds = normalizeList(task.dependsOnTaskIds)
+    .filter((dependencyId) => !removalIds.includes(dependencyId));
+  validateTaskRelationships(
+    state,
+    task.id,
+    task.parentTaskId || "",
+    remainingDependencyIds,
+    task.projectId,
+  );
+
+  const now = options.now || new Date().toISOString();
+  task.dependsOnTaskIds = remainingDependencyIds;
+  applyOperationalRepairRecordInState(state, task, normalizedRepair, { ...options, now });
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "legacy_task_relationship_repaired",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.id} removed cross-project product dependencies ${removalIds.join(", ")} and recorded operational repair ${normalizedRepair.repairTaskId}`,
+    createdAt: now,
+  });
+  return task;
+}
+
+export async function repairLegacyTaskRelationships(taskId, input = {}, options = {}) {
+  return mutateState(
+    async (state) => repairLegacyTaskRelationshipsInState(state, taskId, input, options),
+    { repairTaskId: taskId },
+  );
+}
+
+export const repairLegacyTaskRelationshipInState = repairLegacyTaskRelationshipsInState;
+export const repairLegacyTaskRelationship = repairLegacyTaskRelationships;
+
 function missingArchitectureChildContractFields(child) {
   const missing = [];
   if (!String(child.description || "").trim()) missing.push("architecture constraints/description");
@@ -1438,12 +1738,36 @@ function assertArchitectureDependencyGraph(state, parent, childTasks) {
   for (const child of childTasks) {
     for (const dependencyId of child.dependsOnTaskIds || []) {
       if (dependencyId === parent.id) {
-        throw new Error(`Architecture child ${child.id} cannot depend on its architecture parent.`);
+        throw taskRelationshipError(
+          "architecture_parent_dependency",
+          `Architecture child ${child.id} cannot depend on its architecture parent.`,
+          { parentTaskId: parent.id, childTaskId: child.id, dependencyTaskId: dependencyId },
+        );
       }
       const dependency = findTask(state, dependencyId);
-      if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
+      if (!dependency) {
+        throw taskRelationshipError(
+          "unknown_dependency",
+          `Unknown dependency task: ${dependencyId}`,
+          { parentTaskId: parent.id, childTaskId: child.id, dependencyTaskId: dependencyId },
+        );
+      }
       if (dependency.projectId !== parent.projectId) {
-        throw new Error(`Architecture child ${child.id} depends on a task from another project.`);
+        throw taskRelationshipError(
+          "cross_project_dependency",
+          `Architecture child ${child.id} in project ${child.projectId} cannot depend on task ${dependency.id} in project ${dependency.projectId}.`,
+          {
+            parentTaskId: parent.id,
+            sourceTaskId: child.id,
+            childTaskId: child.id,
+            sourceProjectId: child.projectId,
+            childProjectId: child.projectId,
+            dependencyTaskId: dependency.id,
+            targetTaskId: dependency.id,
+            dependencyProjectId: dependency.projectId,
+            targetProjectId: dependency.projectId,
+          },
+        );
       }
     }
   }
@@ -1452,7 +1776,11 @@ function assertArchitectureDependencyGraph(state, parent, childTasks) {
   const visited = new Set();
   function visit(taskId) {
     if (visiting.has(taskId)) {
-      throw new Error("Architecture child dependency graph contains a cycle.");
+      throw taskRelationshipError(
+        "dependency_cycle",
+        "Architecture child dependency graph contains a cycle.",
+        { parentTaskId: parent.id, childTaskId: taskId },
+      );
     }
     if (visited.has(taskId)) return;
     visiting.add(taskId);
@@ -1466,19 +1794,50 @@ function assertArchitectureDependencyGraph(state, parent, childTasks) {
   for (const child of childTasks) visit(child.id);
 }
 
-function completedArchitectureGraphIsValid(state, parent) {
+function invalidArchitectureGraph(reason, parent, diagnostic = {}) {
+  return {
+    valid: false,
+    ok: false,
+    code: reason,
+    reason,
+    reasonCode: reason,
+    parentTaskId: parent?.id || "",
+    parentProjectId: parent?.projectId || "",
+    ...diagnostic,
+  };
+}
+
+export function architectureGraphValidityInState(state, parentOrTaskId) {
+  const parent = typeof parentOrTaskId === "string"
+    ? findTask(state, parentOrTaskId)
+    : parentOrTaskId;
+  if (!parent) return invalidArchitectureGraph("unknown_architecture_parent", null);
   const decisionTaskIds = parent.architectureDecisionTaskIds || [];
-  if (!decisionTaskIds.length || new Set(decisionTaskIds).size !== decisionTaskIds.length) return false;
+  if (!decisionTaskIds.length) return invalidArchitectureGraph("empty_decision_graph", parent);
+  if (new Set(decisionTaskIds).size !== decisionTaskIds.length) {
+    return invalidArchitectureGraph("duplicate_decision_task", parent);
+  }
   const childTasks = decisionTaskIds.map((id) => findTask(state, id));
-  if (childTasks.some((child) => (
-    !child
-    || child.projectId !== parent.projectId
+  const missingChildIndex = childTasks.findIndex((child) => !child);
+  if (missingChildIndex !== -1) {
+    return invalidArchitectureGraph("unknown_architecture_child", parent, {
+      childTaskId: decisionTaskIds[missingChildIndex],
+    });
+  }
+  const invalidChild = childTasks.find((child) => (
+    child.projectId !== parent.projectId
     || child.parentTaskId !== parent.id
     || child.architectureParentTaskId !== parent.id
     || !child.architectureRequired
     || child.architectureStatus !== "inherited"
     || missingArchitectureChildContractFields(child).length
-  ))) return false;
+  ));
+  if (invalidChild) {
+    return invalidArchitectureGraph("architecture_child_invalid", parent, {
+      childTaskId: invalidChild.id,
+      childProjectId: invalidChild.projectId,
+    });
+  }
 
   const governedChildIds = (state.tasks || [])
     .filter((child) => child.architectureParentTaskId === parent.id)
@@ -1488,14 +1847,33 @@ function completedArchitectureGraphIsValid(state, parent) {
   if (
     governedChildIds.length !== recordedChildIds.length
     || governedChildIds.some((id, index) => id !== recordedChildIds[index])
-  ) return false;
+  ) return invalidArchitectureGraph("architecture_child_set_mismatch", parent);
 
   try {
     assertArchitectureDependencyGraph(state, parent, childTasks);
-  } catch {
-    return false;
+  } catch (error) {
+    return invalidArchitectureGraph(
+      error.code || "architecture_dependency_graph_invalid",
+      parent,
+      error.diagnostic || {},
+    );
   }
-  return true;
+  return {
+    valid: true,
+    ok: true,
+    code: "valid",
+    reason: "valid",
+    reasonCode: "valid",
+    parentTaskId: parent.id,
+    parentProjectId: parent.projectId,
+  };
+}
+
+export const completedArchitectureGraphValidityInState = architectureGraphValidityInState;
+export const architectureGraphValidity = architectureGraphValidityInState;
+
+function completedArchitectureGraphIsValid(state, parent) {
+  return architectureGraphValidityInState(state, parent).valid;
 }
 
 export function completeArchitectureInState(state, taskId, input = {}) {
@@ -2318,7 +2696,13 @@ export function findTask(state, taskId) {
   return state.tasks.find((task) => task.id === taskId) || null;
 }
 
-function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds) {
+export function validateTaskRelationships(
+  state,
+  taskId,
+  parentTaskId,
+  dependsOnTaskIds,
+  sourceProjectId = findTask(state, taskId)?.projectId || "",
+) {
   if (parentTaskId) {
     if (parentTaskId === taskId) throw new Error("A task cannot be its own parent.");
     if (!findTask(state, parentTaskId)) throw new Error(`Unknown parent task: ${parentTaskId}`);
@@ -2332,7 +2716,24 @@ function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds
   }
   for (const dependencyId of dependsOnTaskIds || []) {
     if (dependencyId === taskId) throw new Error("A task cannot depend on itself.");
-    if (!findTask(state, dependencyId)) throw new Error(`Unknown dependency task: ${dependencyId}`);
+    const dependency = findTask(state, dependencyId);
+    if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
+    if (sourceProjectId && dependency.projectId !== sourceProjectId) {
+      throw taskRelationshipError(
+        "cross_project_dependency",
+        `Task ${taskId || "(new)"} in project ${sourceProjectId} cannot depend on task ${dependency.id} in project ${dependency.projectId}.`,
+        {
+          sourceTaskId: taskId,
+          childTaskId: taskId,
+          sourceProjectId,
+          childProjectId: sourceProjectId,
+          dependencyTaskId: dependency.id,
+          targetTaskId: dependency.id,
+          dependencyProjectId: dependency.projectId,
+          targetProjectId: dependency.projectId,
+        },
+      );
+    }
   }
 }
 
@@ -2544,6 +2945,53 @@ function dependencyTasks(state, task) {
 
 function incompleteDependencies(state, task) {
   return dependencyTasks(state, task).filter((dependency) => !DEPENDENCY_COMPLETE_STATUSES.has(dependency.status));
+}
+
+function advanceOperationalRepairInState(state, task, options = {}) {
+  const repair = activeOperationalRepair(task);
+  if (!repair) return { handled: false, actions: [] };
+  const now = options.now || new Date().toISOString();
+  const author = (String(options.author || "StudioOps Automation").trim() || "StudioOps Automation")
+    .slice(0, 120);
+  const repairTask = findTask(state, repair.repairTaskId);
+  const referenceIsValid = Boolean(
+    repairTask
+    && repairTask.id !== task.id
+    && VALID_OPERATIONAL_REPAIR_REASON_CODES.has(repair.reasonCode)
+    && SAFE_OPERATIONAL_REPAIR_RESUME_STATUSES.has(repair.resumeStatus),
+  );
+  if (!referenceIsValid || !DEPENDENCY_COMPLETE_STATUSES.has(repairTask.status)) {
+    if (task.status !== "blocked") {
+      setTaskWorkflowState(state, task, {
+        status: "blocked",
+        assignedAgentRole: "",
+        reviewerThreadId: "",
+      }, now);
+      return { handled: true, actions: [`${task.id}: blocked by operational repair`] };
+    }
+    return { handled: true, actions: [] };
+  }
+
+  repair.resolvedAt = now;
+  repair.resolvedBy = author;
+  repair.resolutionStatus = repairTask.status;
+  setTaskWorkflowState(state, task, {
+    status: repair.resumeStatus,
+    assignedAgentRole: "",
+    reviewerThreadId: "",
+  }, now);
+  const body = `Operational repair ${repairTask.id} reached ${repairTask.status}. Automation resolved the reference and restored this task to ${repair.resumeStatus}.`;
+  addAutomationComment(state, task, body, now, author);
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "operational_repair_resolved",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.id} restored to ${repair.resumeStatus} after operational repair ${repairTask.id} reached ${repairTask.status}`,
+    createdAt: now,
+  });
+  return { handled: true, actions: [`${task.id}: operational repair resolved`] };
 }
 
 function addAutomationComment(state, task, body, now, author = "StudioOps Automation") {
@@ -2793,6 +3241,9 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   const actions = [];
   const project = findProject(state, task.projectId);
   if (!project) return actions;
+
+  const operationalRepair = advanceOperationalRepairInState(state, task, { now, author });
+  if (operationalRepair.handled) return operationalRepair.actions;
 
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
   if (task.type === "epic" || hasChildren) return actions;
