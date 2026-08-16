@@ -553,12 +553,14 @@ export async function preflightRun(run, input = {}) {
     preflightOriginUrl: repositoryOriginUrl,
     project: { ...project, workflowMode },
   };
+  let inheritedCredentialFailure = null;
   if (isGitHubSshOrigin(repositoryOriginUrl)) {
     const checkInherited = input.checkInheritedGitHubCredentials || defaultInheritedGitHubCredentialCheck;
     try {
       await checkInherited(githubRun, input);
       return { ok: true, workflowMode, originUrl: repositoryOriginUrl, gitAuthStrategy: "inherited-ssh" };
-    } catch {
+    } catch (error) {
+      inheritedCredentialFailure = error;
       // A role GitHub App remains the bounded fallback when the machine's SSH/gh identity is unavailable.
     }
   }
@@ -571,10 +573,17 @@ export async function preflightRun(run, input = {}) {
     authContext = await prepareAuth(githubRun, input);
   } catch (error) {
     const code = githubCredentialFailure(error);
+    const inheritedDetail = inheritedCredentialFailure
+      ? ` Inherited SSH/gh preflight failed first: ${redactSecrets(
+          inheritedCredentialFailure?.message || String(inheritedCredentialFailure),
+        )}`
+      : "";
     return preflightFailure(
       code,
-      `GitHub credentials could not be prepared: ${error?.message || String(error)}`,
-      "Repair the configured GitHub App credentials and installation for this repository, then restore the task to its prior queue state.",
+      `GitHub credentials could not be prepared: ${error?.message || String(error)}${inheritedDetail}`,
+      inheritedCredentialFailure
+        ? "Repair the installed worker PATH or inherited SSH/gh authentication; GitHub App installation remains only a fallback. Then restore the task to its prior queue state."
+        : "Repair the configured GitHub App credentials and installation for this repository, then restore the task to its prior queue state.",
     );
   }
   try {
