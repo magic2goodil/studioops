@@ -162,6 +162,12 @@ test("standing release grants normalize exact non-sensitive release coordinates"
     action: "grant",
     ...validStandingReleaseGrant(),
   }).grant.authorizationId, "authorization_01");
+  assert.equal(
+    normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      healthPath: "/health/v1/status-check.json",
+    })).healthPath,
+    "/health/v1/status-check.json",
+  );
 });
 
 test("standing release grants fail closed on malformed identity and target bindings", () => {
@@ -255,6 +261,22 @@ test("every persisted release coordinate rejects credential shapes, local paths,
     })),
     /control characters/,
   );
+
+  for (const healthPath of [
+    "/health/github%255Fpat%255Fabcdefghijklmnopqrstuvwxyz",
+    "/Users%252Fexample%252Fprivate%252Fhealth",
+    "/health/%252e%252e/admin",
+    "/health/%250Ahidden",
+    "/health/<owner@example.com>",
+    "/health/customer@example.com",
+    "/health/free form",
+  ]) {
+    assert.throws(
+      () => normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({ healthPath })),
+      /bounded unencoded ASCII path segments/,
+      healthPath,
+    );
+  }
 });
 
 test("standing release audit timestamps reject impossible dates and reverse chronology", () => {

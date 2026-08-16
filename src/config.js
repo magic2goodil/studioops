@@ -25,6 +25,7 @@ const GITHUB_REPOSITORY_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,38})\/[a-z0-9._-]{1,1
 const SIMPLE_COORDINATE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const WORKFLOW_COORDINATE_PATTERN = /^[A-Za-z0-9.][A-Za-z0-9._/-]{0,159}$/;
 const ROLLBACK_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,191}$/;
+const HEALTH_PATH_PATTERN = /^\/(?:[A-Za-z0-9._~-]+\/)*[A-Za-z0-9._~-]*$/;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/;
 const CREDENTIAL_SHAPE_PATTERNS = [
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/i,
@@ -185,6 +186,11 @@ function normalizeHealthPath(value) {
   assertNonSensitiveReleaseCoordinate(decoded, "Standing release health path");
   if (decoded.split("/").some((segment) => segment === "." || segment === "..")) {
     throw new Error("Standing release health path cannot contain traversal segments.");
+  }
+  if (raw.includes("%") || !HEALTH_PATH_PATTERN.test(raw)) {
+    throw new Error(
+      "Standing release health path must use bounded unencoded ASCII path segments.",
+    );
   }
   return raw;
 }

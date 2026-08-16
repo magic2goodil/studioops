@@ -34,8 +34,11 @@ contains no scheme, port, wildcard, credentials, or path. Workflows, environment
 artifact, health path, and rollback reference are bounded coordinates, not raw
 provider payloads. Every persisted coordinate rejects control characters,
 credential and secret-assignment shapes, and local filesystem paths before the
-project transaction can commit. Actor and authorization IDs are opaque
-identifiers; names and email addresses are not accepted as identities.
+project transaction can commit. Health paths additionally allow only bounded,
+unencoded ASCII URL-path segments; percent encoding and free-form identity or
+customer-shaped text fail closed instead of entering persistent policy. Actor
+and authorization IDs are opaque identifiers; names and email addresses are not
+accepted as identities.
 
 Only one project may have an active grant. A project must revoke its active
 grant before reauthorization, and reauthorization appends a new ID and record.

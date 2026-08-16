@@ -149,6 +149,11 @@ test("standing release authorization survives restart with immutable grant and o
       const unsafeGrants = [
         { ...base, rollbackReference: "github_pat_abcdefghijklmnopqrstuvwxyz" },
         { ...base, healthPath: "/Users/example/private/health" },
+        { ...base, healthPath: "/health/github%255Fpat%255Fabcdefghijklmnopqrstuvwxyz" },
+        { ...base, healthPath: "/Users%252Fexample%252Fprivate%252Fhealth" },
+        { ...base, healthPath: "/health/%252e%252e/admin" },
+        { ...base, healthPath: "/health/%250Ahidden" },
+        { ...base, healthPath: "/health/customer@example.com" },
         { ...base, environment: "production\\n" },
         { ...base, grantedAt: "2026-02-30T12:00:00.000Z" }
       ];
