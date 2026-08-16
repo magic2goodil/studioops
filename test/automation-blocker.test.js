@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSupervisorReport } from "../src/supervisor.js";
-import { automationTick } from "../src/store.js";
+import {
+  applyGitHubRemoteRecoveryProbeResultInState,
+  automationTick,
+  claimDueGitHubRemoteRecoveryProbesInState,
+  clearOperationalRepairInState,
+  recordOperationalRepairInState,
+  recordReviewInState,
+  resetAutomationCircuitInState,
+  scheduleGitHubRemoteRecoveryProbeInState,
+} from "../src/store.js";
 
 function fixtureState(taskPatch = {}) {
   return {
@@ -66,4 +75,383 @@ test("ordinary dependency blockers still return to the builder queue", async () 
 
   assert.deepEqual(tick.actions, ["task_1: unblocked"]);
   assert.equal(state.tasks[0].status, "queued");
+});
+
+test("automation resolves operational repair references only after repair completion", async () => {
+  const state = fixtureState({ status: "lead_review" });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "lead_review",
+  }, {
+    now: "2026-08-16T10:00:00.000Z",
+    author: "StudioOps Workflow",
+  });
+
+  const waiting = await automationTick({
+    state,
+    limit: 10,
+    nowMs: Date.parse("2026-08-16T10:01:00.000Z"),
+  });
+  assert.deepEqual(waiting.actions, []);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+
+  state.tasks[1].status = "done";
+  const resolved = await automationTick({
+    state,
+    limit: 10,
+    nowMs: Date.parse("2026-08-16T10:02:00.000Z"),
+  });
+  assert.deepEqual(resolved.actions, ["task_1: operational repair resolved"]);
+  assert.equal(state.tasks[0].status, "lead_review");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "2026-08-16T10:02:00.000Z");
+  assert.equal(state.tasks[0].operationalRepair.resolvedBy, "StudioOps Automation");
+  assert.equal(state.tasks[0].operationalRepair.resolutionStatus, "done");
+  assert.ok(state.events.some((event) => event.type === "operational_repair_resolved"));
+});
+
+test("an incomplete operational repair cannot be cleared or replaced to resume workflow", async () => {
+  const state = fixtureState({ status: "lead_review" });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push(
+    {
+      id: "task_2",
+      projectId: "project_2",
+      title: "Incomplete workflow repair",
+      status: "ready",
+      dependsOnTaskIds: [],
+    },
+    {
+      id: "task_3",
+      projectId: "project_2",
+      title: "Unrelated completed repair",
+      status: "done",
+      dependsOnTaskIds: [],
+    },
+  );
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "lead_review",
+  }, {
+    now: "2026-08-16T10:00:00.000Z",
+    author: "StudioOps Workflow",
+  });
+  const recordedRepair = structuredClone(state.tasks[0].operationalRepair);
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => clearOperationalRepairInState(state, "task_1"),
+    (error) => error.code === "repair_reference_active",
+  );
+  assert.throws(
+    () => recordOperationalRepairInState(state, "task_1", {
+      repairTaskId: "task_3",
+      reasonCode: "workflow_integrity",
+      resumeStatus: "lead_review",
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+  assert.equal(state.events.length, eventCount);
+
+  const waiting = await automationTick({ state, limit: 10 });
+  assert.deepEqual(waiting.actions, []);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.deepEqual(state.tasks[0].operationalRepair, recordedRepair);
+  assert.ok(!state.events.some((event) => [
+    "operational_repair_cleared",
+    "operational_repair_replaced",
+  ].includes(event.type)));
+});
+
+test("an active operational repair suppresses transient blocker reconciliation", async () => {
+  const state = fixtureState({
+    automationBlocker: {
+      type: "transient",
+      reason: "runner_interrupted",
+      resumeStatus: "queued",
+      blockedAt: "2026-08-16T10:00:00.000Z",
+      recoveryCount: 0,
+    },
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "queued",
+  });
+
+  const tick = await automationTick({
+    state,
+    limit: 1,
+    nowMs: Date.parse("2026-08-16T10:10:00.000Z"),
+    transientRecoveryMs: 60_000,
+  });
+
+  assert.deepEqual(tick.actions, []);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.equal(state.tasks[0].automationBlocker.reason, "runner_interrupted");
+  assert.equal(state.tasks[0].lastAutomationRecoveryCount, undefined);
+  assert.ok(!state.events.some((event) => event.type === "transient_failure_recovered"));
+});
+
+test("operational repair suppresses GitHub recovery claims and already-leased results", async () => {
+  const nowMs = Date.parse("2026-08-16T10:00:00.000Z");
+  const state = fixtureState({
+    branchName: "codex/demo-task",
+    prUrl: "https://github.com/example/demo/pull/1",
+  });
+  const run = {
+    id: "run_1",
+    taskId: "task_1",
+    projectId: "project_1",
+    status: "cancelled",
+    exitCode: "inaccessible_github_remote",
+    attemptKey: "",
+    role: "builder",
+    actionType: "start_builder",
+    branchName: "codex/demo-task",
+    prUrl: "https://github.com/example/demo/pull/1",
+  };
+  state.runs.push(run);
+  scheduleGitHubRemoteRecoveryProbeInState(state, run, {
+    nowMs,
+    owner: "example",
+    repository: "demo",
+    branchName: run.branchName,
+    prUrl: run.prUrl,
+    resumeStatus: "queued",
+  });
+  const [claim] = claimDueGitHubRemoteRecoveryProbesInState(state, {
+    nowMs: nowMs + 60_000,
+    leaseMs: 60_000,
+    leaseIdFactory: () => "lease_1",
+  });
+  assert.ok(claim);
+
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair repository access",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "repository_access",
+    resumeStatus: "queued",
+  });
+
+  assert.deepEqual(
+    applyGitHubRemoteRecoveryProbeResultInState(state, claim, {
+      ok: true,
+      code: "verified",
+    }, { nowMs: nowMs + 60_001 }),
+    {
+      applied: false,
+      reason: "probe_suppressed:operational_repair_active",
+    },
+  );
+  assert.deepEqual(claimDueGitHubRemoteRecoveryProbesInState(state, {
+    nowMs: nowMs + 120_001,
+  }), []);
+  assert.equal(scheduleGitHubRemoteRecoveryProbeInState(state, run, {
+    nowMs: nowMs + 120_001,
+    owner: "example",
+    repository: "demo",
+    branchName: run.branchName,
+    prUrl: run.prUrl,
+    resumeStatus: "queued",
+  }), null);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+
+  state.tasks[1].status = "done";
+  const resolved = await automationTick({ state, nowMs: nowMs + 180_000 });
+  assert.deepEqual(resolved.actions, ["task_1: operational repair resolved"]);
+  assert.equal(state.tasks[0].status, "queued");
+  assert.equal(state.tasks[0].operationalRepair.resolutionStatus, "done");
+  assert.equal(state.tasks[0].automationBlocker, undefined);
+  assert.deepEqual(
+    applyGitHubRemoteRecoveryProbeResultInState(state, claim, {
+      ok: true,
+      code: "verified",
+    }, { nowMs: nowMs + 180_001 }),
+    { applied: false, reason: "probe_lease_mismatch" },
+  );
+});
+
+test("an active operational repair prevents task circuit reset from resuming work", () => {
+  const openedAt = "2026-08-16T09:00:00.000Z";
+  const state = fixtureState({
+    automationBlocker: {
+      type: "transient",
+      reason: "runner_interrupted",
+      resumeStatus: "queued",
+    },
+    automationCircuit: {
+      state: "open",
+      openedAt,
+      generation: 1,
+    },
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "queued",
+  });
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => resetAutomationCircuitInState(state, {
+      task: "task_1",
+      expectedOpenedAt: openedAt,
+      reason: "Owner verified the prior runner failure.",
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationCircuit.state, "open");
+  assert.equal(state.tasks[0].automationBlocker.resumeStatus, "queued");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.equal(state.events.length, eventCount);
+  assert.ok(!createSupervisorReport(state).actions.some((action) => (
+    action.taskId === "task_1" && action.type === "start_builder"
+  )));
+});
+
+test("operational repair resume preserves an existing builder review candidate", async () => {
+  const reviewSubjectSha = "a".repeat(40);
+  const state = fixtureState({
+    status: "builder_review",
+    reviewCycle: 2,
+    reviewSubjectSha,
+    reviewSubjectCycle: 2,
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "done",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "builder_review",
+  });
+
+  const resolved = await automationTick({ state, limit: 10 });
+
+  assert.deepEqual(resolved.actions, ["task_1: operational repair resolved"]);
+  assert.equal(state.tasks[0].status, "builder_review");
+  assert.equal(state.tasks[0].reviewCycle, 2);
+  assert.equal(state.tasks[0].reviewSubjectSha, reviewSubjectSha);
+  assert.equal(state.tasks[0].reviewSubjectCycle, 2);
+});
+
+test("a stale reviewer outcome cannot bypass an active operational repair", () => {
+  const reviewSubjectSha = "a".repeat(40);
+  const state = fixtureState({
+    status: "backend_review",
+    reviewCycle: 2,
+    reviewSubjectSha,
+    reviewSubjectCycle: 2,
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "backend_review",
+  });
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => recordReviewInState(state, "task_1", {
+      stage: "backend",
+      outcome: "changes_requested",
+      candidateCycle: 2,
+      subjectSha: reviewSubjectSha,
+      body: "This result arrived after the task entered operational repair.",
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.deepEqual(state.reviews, []);
+  assert.equal(state.events.length, eventCount);
+  assert.ok(!createSupervisorReport(state).actions.some((action) => (
+    action.taskId === "task_1" && action.type === "start_review"
+  )));
 });

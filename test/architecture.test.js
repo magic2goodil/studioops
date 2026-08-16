@@ -5,9 +5,11 @@ import { resolveExecutionPolicy } from "../src/execution-policy.js";
 import { claimRuns, successfulHandoffFailure } from "../src/runner.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import {
+  architectureGraphValidityInState,
   completeArchitectureInState,
   functionalDeliveryContract,
   generatePrompt,
+  recordOperationalRepairInState,
   taskRequiresArchitecture,
 } from "../src/store.js";
 
@@ -334,4 +336,84 @@ test("runner rejects an architect exit that did not record a durable handoff", (
   state.tasks[0].architectureStatus = "completed";
   state.tasks[0].architectureDecisionTaskIds = ["task_2"];
   assert.equal(successfulHandoffFailure(state, run, state.tasks[0]), "");
+});
+
+test("architecture validity reports cross-project product edges with child and dependency diagnostics", () => {
+  const state = fixtureState();
+  state.projects.push({ id: "project_2", key: "operations", name: "Operations" });
+  state.tasks.push(governedChild());
+  completeArchitectureInState(state, "task_1", {
+    body: [
+      "Use the existing modular monolith and durable relational source of truth.",
+      "Keep product dependency ordering within the owning project and preserve transactional writes.",
+      "Do not add queues or caches without measured workload evidence.",
+    ].join(" "),
+    taskIds: ["task_2"],
+  });
+  state.tasks.push({
+    id: "task_3",
+    projectId: "project_2",
+    title: "Repair workflow automation",
+    status: "done",
+  });
+  state.tasks[1].dependsOnTaskIds = ["task_3"];
+
+  const validity = architectureGraphValidityInState(state, "task_1");
+  assert.equal(validity.valid, false);
+  assert.equal(validity.reason, "cross_project_dependency");
+  assert.equal(validity.childTaskId, "task_2");
+  assert.equal(validity.dependencyTaskId, "task_3");
+  assert.equal(validity.childProjectId, "project_1");
+  assert.equal(validity.dependencyProjectId, "project_2");
+
+  state.tasks[1].dependsOnTaskIds = [];
+  state.tasks[1].operationalRepair = {
+    repairTaskId: "task_3",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "queued",
+    recordedAt: "2026-08-16T12:00:00.000Z",
+    recordedBy: "StudioOps Workflow",
+    resolvedAt: "",
+    resolvedBy: "",
+    resolutionStatus: "",
+  };
+  assert.equal(architectureGraphValidityInState(state, "task_1").valid, true);
+});
+
+test("architecture completion cannot bypass an active operational repair", () => {
+  const state = fixtureState({
+    status: "architecture_in_progress",
+    architectureStatus: "in_progress",
+  });
+  state.projects.push({ id: "project_2", key: "operations", name: "Operations" });
+  state.tasks.push(
+    governedChild(),
+    {
+      id: "task_3",
+      projectId: "project_2",
+      title: "Repair workflow integrity",
+      status: "ready",
+      dependsOnTaskIds: [],
+    },
+  );
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_3",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "architecture_pending",
+  });
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => completeArchitectureInState(state, "task_1", {
+      body: "Keep the existing modular monolith and transactional workflow authority while preserving the active operational repair gate.",
+      taskIds: ["task_2"],
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].architectureStatus, "in_progress");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.equal(state.tasks[1].status, "architecture_pending");
+  assert.equal(state.events.length, eventCount);
 });
