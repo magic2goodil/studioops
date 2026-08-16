@@ -269,6 +269,7 @@ function recoveryProjectMatchesClaim(state, claim) {
 }
 
 function recoverySuppressionReason(state, task, input = {}) {
+  if (activeOperationalRepair(task)) return "operational_repair_active";
   if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) return "operator_pause";
   if (activeSelfUpdateLease(state, input)) return "self_update_in_progress";
   const project = findProject(state, task?.projectId);
@@ -381,6 +382,7 @@ export function scheduleGitHubRemoteRecoveryProbeInState(state, run, input = {})
   const now = input.now || new Date(nowMs).toISOString();
   const task = findTask(state, run.taskId);
   if (!task) return null;
+  if (activeOperationalRepair(task)) return null;
   const branchName = String(input.branchName || run.branchName || "").trim();
   const prUrl = String(input.prUrl ?? run.prUrl ?? "").trim();
   const resumeStatus = String(input.resumeStatus || "").trim();
@@ -3011,7 +3013,10 @@ function advanceOperationalRepairInState(state, task, options = {}) {
     status: repair.resumeStatus,
     assignedAgentRole: "",
     reviewerThreadId: "",
+    retryNotBefore: "",
+    lastAutomationFailure: "",
   }, now, { preserveReviewCandidate: true });
+  delete task.automationBlocker;
   const body = `Operational repair ${repairTask.id} reached ${repairTask.status}. Automation resolved the reference and restored this task to ${repair.resumeStatus}.`;
   addAutomationComment(state, task, body, now, author);
   state.events = state.events || [];

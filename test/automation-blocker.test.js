@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createSupervisorReport } from "../src/supervisor.js";
 import {
+  applyGitHubRemoteRecoveryProbeResultInState,
   automationTick,
+  claimDueGitHubRemoteRecoveryProbesInState,
   clearOperationalRepairInState,
   recordOperationalRepairInState,
+  scheduleGitHubRemoteRecoveryProbeInState,
 } from "../src/store.js";
 
 function fixtureState(taskPatch = {}) {
@@ -176,6 +179,98 @@ test("an incomplete operational repair cannot be cleared or replaced to resume w
     "operational_repair_cleared",
     "operational_repair_replaced",
   ].includes(event.type)));
+});
+
+test("operational repair suppresses GitHub recovery claims and already-leased results", async () => {
+  const nowMs = Date.parse("2026-08-16T10:00:00.000Z");
+  const state = fixtureState({
+    branchName: "codex/demo-task",
+    prUrl: "https://github.com/example/demo/pull/1",
+  });
+  const run = {
+    id: "run_1",
+    taskId: "task_1",
+    projectId: "project_1",
+    status: "cancelled",
+    exitCode: "inaccessible_github_remote",
+    attemptKey: "",
+    role: "builder",
+    actionType: "start_builder",
+    branchName: "codex/demo-task",
+    prUrl: "https://github.com/example/demo/pull/1",
+  };
+  state.runs.push(run);
+  scheduleGitHubRemoteRecoveryProbeInState(state, run, {
+    nowMs,
+    owner: "example",
+    repository: "demo",
+    branchName: run.branchName,
+    prUrl: run.prUrl,
+    resumeStatus: "queued",
+  });
+  const [claim] = claimDueGitHubRemoteRecoveryProbesInState(state, {
+    nowMs: nowMs + 60_000,
+    leaseMs: 60_000,
+    leaseIdFactory: () => "lease_1",
+  });
+  assert.ok(claim);
+
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair repository access",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "repository_access",
+    resumeStatus: "queued",
+  });
+
+  assert.deepEqual(
+    applyGitHubRemoteRecoveryProbeResultInState(state, claim, {
+      ok: true,
+      code: "verified",
+    }, { nowMs: nowMs + 60_001 }),
+    {
+      applied: false,
+      reason: "probe_suppressed:operational_repair_active",
+    },
+  );
+  assert.deepEqual(claimDueGitHubRemoteRecoveryProbesInState(state, {
+    nowMs: nowMs + 120_001,
+  }), []);
+  assert.equal(scheduleGitHubRemoteRecoveryProbeInState(state, run, {
+    nowMs: nowMs + 120_001,
+    owner: "example",
+    repository: "demo",
+    branchName: run.branchName,
+    prUrl: run.prUrl,
+    resumeStatus: "queued",
+  }), null);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+
+  state.tasks[1].status = "done";
+  const resolved = await automationTick({ state, nowMs: nowMs + 180_000 });
+  assert.deepEqual(resolved.actions, ["task_1: operational repair resolved"]);
+  assert.equal(state.tasks[0].status, "queued");
+  assert.equal(state.tasks[0].operationalRepair.resolutionStatus, "done");
+  assert.equal(state.tasks[0].automationBlocker, undefined);
+  assert.deepEqual(
+    applyGitHubRemoteRecoveryProbeResultInState(state, claim, {
+      ok: true,
+      code: "verified",
+    }, { nowMs: nowMs + 180_001 }),
+    { applied: false, reason: "probe_lease_mismatch" },
+  );
 });
 
 test("operational repair resume preserves an existing builder review candidate", async () => {
