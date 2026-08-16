@@ -15,7 +15,16 @@ import {
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
 import { missionControlDataDir } from "./runtime-paths.js";
-import { normalizeProjectWorkflowMode, withDefaultProjectStandards } from "./config.js";
+import {
+  activeStandingReleaseAuthorization,
+  assertStandingReleaseRevocationChronology,
+  normalizeOperationalCapabilityBlockers,
+  normalizeProjectWorkflowMode,
+  normalizeStandingReleaseAuthorizationCommand,
+  normalizeStandingReleaseAuthorizationHistory,
+  standingReleaseAuthorizationState,
+  withDefaultProjectStandards,
+} from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   DATABASE_FILE,
@@ -911,6 +920,91 @@ function reviewPolicyInputForProject(input = {}) {
   return reviewPolicy;
 }
 
+function standingReleaseAuthorizationIds(state) {
+  const ids = new Set();
+  for (const project of state.projects || []) {
+    for (const record of normalizeStandingReleaseAuthorizationHistory(
+      project.standingReleaseAuthorizationHistory,
+    )) {
+      if (ids.has(record.authorizationId)) {
+        throw new Error(`Duplicate standing release authorization ID: ${record.authorizationId}`);
+      }
+      ids.add(record.authorizationId);
+    }
+  }
+  return ids;
+}
+
+function assertSingleActiveStandingReleaseAuthorization(state, projectId = "") {
+  const activeProjects = (state.projects || []).filter((project) => (
+    project.id !== projectId && activeStandingReleaseAuthorization(project)
+  ));
+  if (activeProjects.length) {
+    throw new Error("Standing release authorization conflict: another project already has the active grant.");
+  }
+}
+
+export function applyStandingReleaseAuthorizationUpdateInState(state, project, value, input = {}) {
+  const command = normalizeStandingReleaseAuthorizationCommand(value);
+  const now = input.now || new Date().toISOString();
+  const history = normalizeStandingReleaseAuthorizationHistory(
+    project.standingReleaseAuthorizationHistory,
+  );
+  state.events = state.events || [];
+
+  if (command.action === "grant") {
+    if (history.some((record) => !record.revocation)) {
+      throw new Error("This project already has an active standing release authorization; revoke it before reauthorizing.");
+    }
+    assertSingleActiveStandingReleaseAuthorization(state, project.id);
+    if (standingReleaseAuthorizationIds(state).has(command.grant.authorizationId)) {
+      throw new Error(`Standing release authorization ID already exists: ${command.grant.authorizationId}`);
+    }
+    project.standingReleaseAuthorizationHistory = [...history, command.grant];
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "standing_release_authorization_granted",
+      projectId: project.id,
+      authorizationId: command.grant.authorizationId,
+      message: "Standing release authorization granted.",
+      createdAt: now,
+    });
+    return command.grant;
+  }
+
+  const index = history.findIndex((record) => record.authorizationId === command.authorizationId);
+  if (index === -1) {
+    throw new Error(`Unknown standing release authorization: ${command.authorizationId}`);
+  }
+  if (history[index].revocation) {
+    throw new Error(`Standing release authorization is already revoked: ${command.authorizationId}`);
+  }
+  assertStandingReleaseRevocationChronology(
+    history[index].grantedAt,
+    command.revocation.revokedAt,
+  );
+  const revoked = {
+    ...history[index],
+    revocation: command.revocation,
+  };
+  project.standingReleaseAuthorizationHistory = history.map((record, recordIndex) => (
+    recordIndex === index ? revoked : record
+  ));
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "standing_release_authorization_revoked",
+    projectId: project.id,
+    authorizationId: command.authorizationId,
+    message: "Standing release authorization revoked.",
+    createdAt: now,
+  });
+  return revoked;
+}
+
+export function standingReleaseAuthorizationForProject(project = {}) {
+  return standingReleaseAuthorizationState(project);
+}
+
 export async function addProject(input) {
   return mutateState(async (state) => {
     const now = new Date().toISOString();
@@ -921,6 +1015,12 @@ export async function addProject(input) {
     }
     const reviewPolicy = normalizeReviewPolicy(reviewPolicyInputForProject(input));
     const deliveryPolicy = normalizeDeliveryPolicy(input.deliveryPolicy);
+    const standingReleaseAuthorizationHistory = normalizeStandingReleaseAuthorizationHistory(
+      input.standingReleaseAuthorizationHistory,
+    );
+    if (standingReleaseAuthorizationHistory.length) {
+      throw new Error("New projects are unauthorized by default; grant standing release authorization through updateProject.");
+    }
     const project = {
       id: nextId(state.projects, "project"),
       key,
@@ -940,6 +1040,7 @@ export async function addProject(input) {
       promotion: input.promotion || {},
       reviewPolicy,
       deliveryPolicy,
+      standingReleaseAuthorizationHistory,
       trustLeadApprovals: reviewPolicy.trustLeadApprovals,
       integrationBranch: reviewPolicy.integrationBranch,
       createdAt: now,
@@ -950,7 +1051,7 @@ export async function addProject(input) {
       id: nextId(state.events, "event"),
       type: "project_created",
       projectId: project.id,
-      message: `Project created: ${project.name}`,
+      message: "Project created.",
       createdAt: now,
     });
     return project;
@@ -961,6 +1062,9 @@ export async function updateProject(projectId, patch = {}) {
   return mutateState(async (state) => {
     const project = findProject(state, projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
+    if (Object.prototype.hasOwnProperty.call(patch, "standingReleaseAuthorizationHistory")) {
+      throw new Error("Standing release authorization history is append-only; use the standingReleaseAuthorization grant or revoke command.");
+    }
     const now = new Date().toISOString();
     const allowed = [
       "name",
@@ -1023,12 +1127,20 @@ export async function updateProject(projectId, patch = {}) {
     if (Object.prototype.hasOwnProperty.call(patch, "deliveryPolicy")) {
       project.deliveryPolicy = normalizeDeliveryPolicy(patch.deliveryPolicy);
     }
+    if (Object.prototype.hasOwnProperty.call(patch, "standingReleaseAuthorization")) {
+      applyStandingReleaseAuthorizationUpdateInState(
+        state,
+        project,
+        patch.standingReleaseAuthorization,
+        { now },
+      );
+    }
     project.updatedAt = now;
     state.events.push({
       id: nextId(state.events, "event"),
       type: "project_updated",
       projectId: project.id,
-      message: `Project updated: ${project.name}`,
+      message: "Project settings updated.",
       createdAt: now,
     });
     return project;
@@ -1089,7 +1201,7 @@ export async function addTask(input) {
     if (!title) throw new Error("Task title is required.");
     const parentTaskId = String(input.parentTaskId || input.parent || input.epic || "").trim();
     const dependsOnTaskIds = normalizeList(input.dependsOnTaskIds || input.dependsOn || input.dependencies);
-    validateTaskRelationships(state, "", parentTaskId, dependsOnTaskIds);
+    validateTaskRelationships(state, "", parentTaskId, dependsOnTaskIds, project.id);
     const architectureApproved = normalizeBoolean(input.architectureApproved, false);
     const requestedArchitectureParentTaskId = String(input.architectureParentTaskId || "").trim();
     const architectureParentTaskId = architectureApproved
@@ -1124,6 +1236,9 @@ export async function addTask(input) {
       workAreas: normalizeList(input.workAreas || input.workArea || input["work-area"]),
       parentTaskId,
       dependsOnTaskIds,
+      operationalCapabilityBlockers: normalizeOperationalCapabilityBlockers(
+        input.operationalCapabilityBlockers,
+      ),
       userStory: String(input.userStory || input.story || "").trim(),
       expectedOutcome: String(input.expectedOutcome || input.expected || "").trim(),
       attachments: normalizeAttachments(input.attachments || input.attachment),
@@ -1155,6 +1270,7 @@ export async function addTask(input) {
       createdAt: now,
       updatedAt: now,
     };
+    validateOperationalCapabilityBlockers(state, task.operationalCapabilityBlockers);
     state.tasks.push(task);
     state.events.push({
       id: nextId(state.events, "event"),
@@ -1284,10 +1400,22 @@ export async function updateTask(taskId, patch) {
     if (Object.prototype.hasOwnProperty.call(patch, "dependsOnTaskIds")) {
       task.dependsOnTaskIds = normalizeList(patch.dependsOnTaskIds);
     }
+    if (Object.prototype.hasOwnProperty.call(patch, "operationalCapabilityBlockers")) {
+      task.operationalCapabilityBlockers = normalizeOperationalCapabilityBlockers(
+        patch.operationalCapabilityBlockers,
+      );
+    }
     if (Object.prototype.hasOwnProperty.call(patch, "workAreas")) {
       task.workAreas = normalizeList(patch.workAreas);
     }
-    validateTaskRelationships(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
+    validateTaskRelationships(
+      state,
+      task.id,
+      task.parentTaskId,
+      task.dependsOnTaskIds || [],
+      task.projectId,
+    );
+    validateOperationalCapabilityBlockers(state, task.operationalCapabilityBlockers || []);
     if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
       task.attachments = normalizeAttachments(patch.attachments);
     }
@@ -2318,10 +2446,22 @@ export function findTask(state, taskId) {
   return state.tasks.find((task) => task.id === taskId) || null;
 }
 
-function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds) {
+function validateOperationalCapabilityBlockers(state, blockers) {
+  for (const blocker of blockers || []) {
+    if (blocker.governingTaskId && !findTask(state, blocker.governingTaskId)) {
+      throw new Error(`Unknown operational capability governing task: ${blocker.governingTaskId}`);
+    }
+  }
+}
+
+function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds, projectId) {
   if (parentTaskId) {
     if (parentTaskId === taskId) throw new Error("A task cannot be its own parent.");
-    if (!findTask(state, parentTaskId)) throw new Error(`Unknown parent task: ${parentTaskId}`);
+    const parent = findTask(state, parentTaskId);
+    if (!parent) throw new Error(`Unknown parent task: ${parentTaskId}`);
+    if (projectId && parent.projectId !== projectId) {
+      throw new Error(`Parent task ${parentTaskId} belongs to another project.`);
+    }
     const seen = new Set([taskId]);
     let currentParentId = parentTaskId;
     while (currentParentId) {
@@ -2332,7 +2472,11 @@ function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds
   }
   for (const dependencyId of dependsOnTaskIds || []) {
     if (dependencyId === taskId) throw new Error("A task cannot depend on itself.");
-    if (!findTask(state, dependencyId)) throw new Error(`Unknown dependency task: ${dependencyId}`);
+    const dependency = findTask(state, dependencyId);
+    if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
+    if (projectId && dependency.projectId !== projectId) {
+      throw new Error(`Dependency task ${dependencyId} belongs to another project.`);
+    }
   }
 }
 

@@ -1,0 +1,207 @@
+{
+  "schema": "studioops.ownership-manifest.v1",
+  "feature": "standing-production-release-authorization",
+  "components": [
+    {
+      "id": "release-governance",
+      "owner": "StudioOps release-governance maintainers",
+      "paths": [
+        "src/config.js",
+        "src/store.js",
+        "test/config.test.js",
+        "test/state-database.test.js",
+        "docs/RELEASE_GOVERNANCE.md"
+      ],
+      "publicContracts": [
+        "standing release authorization normalization and default-off state",
+        "transactional project grant and one-way revocation update",
+        "same-project product dependency validation",
+        "release-scoped operationalCapabilityBlockers normalization"
+      ],
+      "adapters": [
+        "local project update API and CLI callers"
+      ],
+      "ownedData": [
+        "project.standingReleaseAuthorizationHistory",
+        "task.operationalCapabilityBlockers",
+        "standing_release_authorization_granted event",
+        "standing_release_authorization_revoked event"
+      ],
+      "dependsOn": [],
+      "prohibitedDependencies": [
+        "release orchestration internals",
+        "production provider adapters",
+        "notification adapters"
+      ],
+      "rollbackBoundary": "Revert contract callers while retaining unknown project history fields as inert audit evidence.",
+      "testLayers": {
+        "unit": [
+          "test/config.test.js"
+        ],
+        "contract": [
+          "test/automation-blocker.test.js"
+        ],
+        "persistence": [
+          "test/state-database.test.js"
+        ],
+        "composition": [
+          "npm run check"
+        ]
+      }
+    },
+    {
+      "id": "release-orchestration",
+      "owner": "StudioOps automation-routing maintainers",
+      "paths": [
+        "src/supervisor.js",
+        "src/dispatcher.js",
+        "test/automation-blocker.test.js",
+        "test/supervisor.test.js",
+        "test/dispatcher.test.js"
+      ],
+      "publicContracts": [
+        "deterministic start_production_release action",
+        "durable non-Codex production release run"
+      ],
+      "adapters": [
+        "supervisor planning sweep",
+        "dispatcher run persistence"
+      ],
+      "ownedData": [
+        "production release run routing fields"
+      ],
+      "dependsOn": [
+        "release-governance"
+      ],
+      "prohibitedDependencies": [
+        "production provider adapter internals",
+        "notification adapter internals"
+      ],
+      "rollbackBoundary": "Disable production release action generation; existing owner release-candidate handoff remains unchanged.",
+      "testLayers": {
+        "unit": [
+          "test/supervisor.test.js"
+        ],
+        "contract": [
+          "test/dispatcher.test.js"
+        ],
+        "persistence": [
+          "test/state-database.test.js"
+        ],
+        "composition": [
+          "npm run check"
+        ]
+      }
+    },
+    {
+      "id": "production-release-adapter",
+      "owner": "StudioOps promotion maintainers",
+      "paths": [
+        "src/promotion.js",
+        "test/promotion.test.js"
+      ],
+      "publicContracts": [
+        "restart-safe production release state machine",
+        "bounded GitHub and HTTPS release evidence"
+      ],
+      "adapters": [
+        "GitHub release provider",
+        "HTTPS health provider"
+      ],
+      "ownedData": [
+        "durable production release phase evidence"
+      ],
+      "dependsOn": [
+        "release-governance",
+        "release-orchestration"
+      ],
+      "prohibitedDependencies": [
+        "notification adapter internals"
+      ],
+      "rollbackBoundary": "Stop new side effects and preserve completed provider evidence for read-only reconciliation.",
+      "testLayers": {
+        "unit": [
+          "test/promotion.test.js"
+        ],
+        "contract": [
+          "test/promotion.test.js"
+        ],
+        "persistence": [
+          "test/state-database.test.js"
+        ],
+        "composition": [
+          "npm run check"
+        ]
+      }
+    },
+    {
+      "id": "owner-assurance",
+      "owner": "StudioOps owner-handoff maintainers",
+      "paths": [
+        "src/notifier.js",
+        "test/notifier.test.js",
+        "docs/LOCAL_AUTOMATION.md",
+        "docs/REVIEW_PIPELINE.md"
+      ],
+      "publicContracts": [
+        "persistent owner release-failure handoff",
+        "supplementary bounded local notification"
+      ],
+      "adapters": [
+        "owner inbox",
+        "local desktop notifier"
+      ],
+      "ownedData": [
+        "release failure notification attempts"
+      ],
+      "dependsOn": [
+        "release-governance",
+        "release-orchestration",
+        "production-release-adapter"
+      ],
+      "prohibitedDependencies": [],
+      "rollbackBoundary": "Retain the persistent owner inbox when supplementary notification delivery is disabled.",
+      "testLayers": {
+        "unit": [
+          "test/notifier.test.js"
+        ],
+        "contract": [
+          "test/notifier.test.js"
+        ],
+        "persistence": [
+          "test/state-database.test.js"
+        ],
+        "composition": [
+          "npm run check"
+        ]
+      }
+    }
+  ],
+  "shared": {
+    "classification": "release-sensitive-shared-contract",
+    "paths": [
+      "docs/release-governance-ownership.json"
+    ],
+    "owner": "StudioOps primary lead"
+  },
+  "impact": {
+    "classification": "full-regression",
+    "reasons": [
+      "authorization",
+      "public-contract",
+      "persistence-schema-shape",
+      "event-contract",
+      "dependency-ordering",
+      "workflow",
+      "deployment",
+      "multi-component"
+    ],
+    "requiredAggregate": "npm run check",
+    "targetedCommands": [
+      "node --test test/config.test.js test/automation-blocker.test.js test/state-database.test.js",
+      "git diff --check"
+    ],
+    "exactShaEvidenceRequired": true,
+    "missingOrAmbiguousClassification": "full-regression"
+  }
+}

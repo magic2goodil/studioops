@@ -53,6 +53,23 @@ function baseState() {
   };
 }
 
+function standingReleaseGrant(overrides = {}) {
+  return {
+    authorizationId: "authorization_01",
+    ownerActorId: "owner_actor_01",
+    grantedAt: "2026-08-16T12:00:00.000Z",
+    repository: "https://github.com/example/demo.git",
+    targetHostname: "release.example.com",
+    deploymentWorkflow: ".github/workflows/deploy.yml",
+    environment: "production",
+    artifactName: "web-dist",
+    healthPath: "/healthz",
+    rollbackWorkflow: ".github/workflows/rollback.yml",
+    rollbackReference: "refs/tags/v1.2.2",
+    ...overrides,
+  };
+}
+
 async function writeLegacyState(root, state = baseState()) {
   const dataDir = path.join(root, "data");
   await mkdir(dataDir, { recursive: true });
@@ -97,6 +114,252 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
       await backupStateDatabase(${JSON.stringify(backupPath)});
     `);
     assert.equal((await stat(backupPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("standing release authorization survives restart with immutable grant and one-way revocation history", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-standing-release-"));
+  try {
+    const state = baseState();
+    state.projects.push({ id: "project_2", key: "other", name: "Other" });
+    await writeLegacyState(root, state);
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+        await updateProject("project_1", {
+          standingReleaseAuthorization: {
+            action: "grant",
+            ...${JSON.stringify(standingReleaseGrant({ ownerActorId: "owner@example.com" }))}
+          }
+        });
+      `),
+      /opaque/,
+    );
+    assert.equal(
+      readPersistedState(root).projects[0].standingReleaseAuthorizationHistory,
+      undefined,
+    );
+
+    await runStoreScript(root, `
+      import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+      const base = ${JSON.stringify(standingReleaseGrant())};
+      const unsafeGrants = [
+        { ...base, rollbackReference: "github_pat_abcdefghijklmnopqrstuvwxyz" },
+        { ...base, healthPath: "/Users/example/private/health" },
+        { ...base, healthPath: "/health/github%255Fpat%255Fabcdefghijklmnopqrstuvwxyz" },
+        { ...base, healthPath: "/Users%252Fexample%252Fprivate%252Fhealth" },
+        { ...base, healthPath: "/health/%252e%252e/admin" },
+        { ...base, healthPath: "/health/%250Ahidden" },
+        { ...base, healthPath: "/health/customer@example.com" },
+        { ...base, environment: "production\\n" },
+        { ...base, grantedAt: "2026-02-30T12:00:00.000Z" }
+      ];
+      for (const grant of unsafeGrants) {
+        let rejected = false;
+        try {
+          await updateProject("project_1", {
+            standingReleaseAuthorization: { action: "grant", ...grant }
+          });
+        } catch {
+          rejected = true;
+        }
+        if (!rejected) throw new Error("Unsafe standing release grant was persisted.");
+      }
+    `);
+    assert.equal(
+      readPersistedState(root).projects[0].standingReleaseAuthorizationHistory,
+      undefined,
+    );
+
+    await runStoreScript(root, `
+      import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+      await updateProject("project_1", {
+        standingReleaseAuthorization: {
+          action: "grant",
+          ...${JSON.stringify(standingReleaseGrant())}
+        }
+      });
+    `);
+
+    let persisted = readPersistedState(root);
+    assert.equal(persisted.projects[0].standingReleaseAuthorizationHistory.length, 1);
+    assert.equal(
+      persisted.projects[0].standingReleaseAuthorizationHistory[0].repository,
+      "example/demo",
+    );
+    assert.equal(persisted.projects[0].standingReleaseAuthorizationHistory[0].revocation, null);
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+        await updateProject("project_1", {
+          standingReleaseAuthorization: {
+            action: "revoke",
+            authorizationId: "authorization_01",
+            revokedByActorId: "owner_actor_02",
+            revokedAt: "2026-08-16T11:59:59.999Z",
+            reasonCode: "owner_requested"
+          }
+        });
+      `),
+      /cannot precede its grant/,
+    );
+    assert.equal(
+      readPersistedState(root).projects[0].standingReleaseAuthorizationHistory[0].revocation,
+      null,
+    );
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+        await updateProject("project_2", {
+          standingReleaseAuthorization: {
+            action: "grant",
+            ...${JSON.stringify(standingReleaseGrant({ authorizationId: "authorization_02" }))}
+          }
+        });
+      `),
+      /another project already has the active grant/,
+    );
+
+    await runStoreScript(root, `
+      import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+      await updateProject("project_1", {
+        standingReleaseAuthorization: {
+          action: "revoke",
+          authorizationId: "authorization_01",
+          revokedByActorId: "owner_actor_02",
+          revokedAt: "2026-08-16T13:00:00.000Z",
+          reasonCode: "owner_requested"
+        }
+      });
+    `);
+
+    persisted = readPersistedState(root);
+    const originalGrant = persisted.projects[0].standingReleaseAuthorizationHistory[0];
+    assert.equal(originalGrant.authorizationId, "authorization_01");
+    assert.equal(originalGrant.targetHostname, "release.example.com");
+    assert.deepEqual(originalGrant.revocation, {
+      revokedByActorId: "owner_actor_02",
+      revokedAt: "2026-08-16T13:00:00.000Z",
+      reasonCode: "owner_requested",
+    });
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+        await updateProject("project_1", {
+          standingReleaseAuthorization: {
+            action: "revoke",
+            authorizationId: "authorization_01",
+            revokedByActorId: "owner_actor_02",
+            revokedAt: "2026-08-16T14:00:00.000Z",
+            reasonCode: "owner_requested"
+          }
+        });
+      `),
+      /already revoked/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+        await updateProject("project_1", { standingReleaseAuthorizationHistory: [] });
+      `),
+      /append-only/,
+    );
+
+    await runStoreScript(root, `
+      import { updateProject } from ${JSON.stringify(storeModuleUrl)};
+      await updateProject("project_1", {
+        standingReleaseAuthorization: {
+          action: "grant",
+          ...${JSON.stringify(standingReleaseGrant({
+            authorizationId: "authorization_02",
+            ownerActorId: "owner_actor_03",
+            grantedAt: "2026-08-16T15:00:00.000Z",
+            rollbackReference: "refs/tags/v1.2.3",
+          }))}
+        }
+      });
+    `);
+
+    persisted = readPersistedState(root);
+    assert.equal(persisted.projects[0].standingReleaseAuthorizationHistory.length, 2);
+    assert.equal(
+      persisted.projects[0].standingReleaseAuthorizationHistory[0].revocation.reasonCode,
+      "owner_requested",
+    );
+    assert.equal(
+      persisted.projects[0].standingReleaseAuthorizationHistory[1].authorizationId,
+      "authorization_02",
+    );
+    assert.equal(
+      persisted.projects[0].standingReleaseAuthorizationHistory[1].revocation,
+      null,
+    );
+    const releaseEvents = persisted.events.filter((event) => (
+      event.type.startsWith("standing_release_authorization_")
+      || event.type === "project_updated"
+    ));
+    assert.equal(releaseEvents.length, 6);
+    assert.equal(JSON.stringify(releaseEvents).includes("release.example.com"), false);
+    assert.equal(JSON.stringify(releaseEvents).includes("owner_actor"), false);
+    assert.equal(JSON.stringify(releaseEvents).includes("github.com"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("task dependencies stay project-local while operational capability blockers may cross projects", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operational-blockers-"));
+  try {
+    const state = baseState();
+    state.projects.push({ id: "project_2", key: "runtime", name: "Runtime" });
+    state.tasks.push({
+      id: "task_534",
+      projectId: "project_2",
+      title: "Govern release capability",
+      status: "architecture_ready",
+      dependsOnTaskIds: [],
+    });
+    await writeLegacyState(root, state);
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { addTask } from ${JSON.stringify(storeModuleUrl)};
+        await addTask({
+          project: "project_1",
+          title: "Invalid cross-project dependency",
+          dependsOnTaskIds: ["task_534"]
+        });
+      `),
+      /belongs to another project/,
+    );
+
+    await runStoreScript(root, `
+      import { addTask } from ${JSON.stringify(storeModuleUrl)};
+      await addTask({
+        project: "project_1",
+        title: "Release-aware product task",
+        status: "ready",
+        operationalCapabilityBlockers: [{
+          capabilityKey: "standing-production-release",
+          governingTaskId: "task_534"
+        }]
+      });
+    `);
+
+    const persisted = readPersistedState(root);
+    const created = persisted.tasks.find((task) => task.title === "Release-aware product task");
+    assert.deepEqual(created.dependsOnTaskIds, []);
+    assert.deepEqual(created.operationalCapabilityBlockers, [{
+      scope: "release",
+      capabilityKey: "standing-production-release",
+      governingTaskId: "task_534",
+    }]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
