@@ -596,6 +596,69 @@ test("github preflight validates credentials and remote access without using a r
   }
 });
 
+test("github preflight prefers verified inherited SSH and gh credentials over GitHub App auth", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-github-ssh-first-"));
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["remote", "add", "origin", "git@github.com:example/demo.git"]);
+    let inheritedCalls = 0;
+    let appCalls = 0;
+    const result = await preflightRun({
+      ...builderRun(),
+      project: { key: "demo", repoPath, workflowMode: "auto", defaultBranch: "main" },
+    }, {
+      checkInheritedGitHubCredentials: async () => { inheritedCalls += 1; },
+      prepareGitHubAppAuth: async () => {
+        appCalls += 1;
+        throw new Error("GitHub App auth must not run after inherited SSH succeeds.");
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.workflowMode, "github");
+    assert.equal(result.gitAuthStrategy, "inherited-ssh");
+    assert.equal(inheritedCalls, 1);
+    assert.equal(appCalls, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("github preflight falls back to GitHub App auth when inherited SSH or gh access fails", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-github-app-fallback-"));
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["remote", "add", "origin", "git@github.com:example/demo.git"]);
+    let inheritedCalls = 0;
+    let appCalls = 0;
+    let remoteCalls = 0;
+    const result = await preflightRun({
+      ...builderRun(),
+      project: { key: "demo", repoPath, workflowMode: "auto", defaultBranch: "main" },
+    }, {
+      checkInheritedGitHubCredentials: async () => {
+        inheritedCalls += 1;
+        throw new Error("No inherited access");
+      },
+      prepareGitHubAppAuth: async () => {
+        appCalls += 1;
+        return { token: "fake", askpassPath: "" };
+      },
+      checkGitHubRemote: async () => { remoteCalls += 1; },
+      cleanupGitHubAppAuth: async () => {},
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.workflowMode, "github");
+    assert.equal(result.gitAuthStrategy, "github-app");
+    assert.equal(inheritedCalls, 1);
+    assert.equal(appCalls, 1);
+    assert.equal(remoteCalls, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("preflight reports actionable repository, local ref, origin, remote, and credential codes", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-preflight-codes-"));
   try {
