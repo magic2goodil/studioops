@@ -168,6 +168,12 @@ test("standing release grants normalize exact non-sensitive release coordinates"
     })).healthPath,
     "/health/v1/status-check.json",
   );
+  assert.equal(
+    normalizeStandingReleaseAuthorizationGrant(validStandingReleaseGrant({
+      repository: "https://github.com/Example/StudioOps.git.git",
+    })).repository,
+    "example/studioops.git",
+  );
 });
 
 test("standing release grants fail closed on malformed identity and target bindings", () => {

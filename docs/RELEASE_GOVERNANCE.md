@@ -29,7 +29,9 @@ Grant authority with the existing local `PATCH /api/projects/:project` contract:
 }
 ```
 
-The repository is canonicalized to lowercase `owner/repository`. The hostname
+The repository is canonicalized to lowercase `owner/repository`; one terminal
+clone-transport `.git` suffix is removed without erasing a repository-name
+suffix. The hostname
 contains no scheme, port, wildcard, credentials, or path. Workflows, environment,
 artifact, health path, and rollback reference are bounded coordinates, not raw
 provider payloads. Every persisted coordinate rejects control characters,

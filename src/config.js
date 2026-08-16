@@ -143,7 +143,7 @@ export function normalizeGitHubRepository(value) {
   if (!match) {
     throw new Error("Standing release repository must be an exact GitHub owner/repository coordinate.");
   }
-  const repository = `${match[1]}/${match[2].replace(/\.git$/i, "")}`.toLowerCase();
+  const repository = `${match[1]}/${match[2]}`.toLowerCase();
   if (!GITHUB_REPOSITORY_PATTERN.test(repository)) {
     throw new Error("Standing release repository must be a valid GitHub owner/repository coordinate.");
   }
