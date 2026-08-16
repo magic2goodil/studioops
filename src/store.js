@@ -2590,6 +2590,18 @@ export function resetAutomationCircuitInState(state, input = {}) {
   if (target.automationCircuit?.state !== "open") {
     throw new Error(`${task ? task.id : project.id} does not have an open automation circuit.`);
   }
+  const operationalRepair = task ? activeOperationalRepair(task) : null;
+  if (operationalRepair) {
+    throw taskRelationshipError(
+      "repair_reference_active",
+      `Task ${task.id} automation circuit cannot be reset while operational repair ${operationalRepair.repairTaskId} is active.`,
+      {
+        sourceTaskId: task.id,
+        sourceProjectId: task.projectId,
+        repairTaskId: operationalRepair.repairTaskId,
+      },
+    );
+  }
   const previousCircuit = { ...target.automationCircuit };
   const expectedOpenedAt = String(input.expectedOpenedAt || "").trim();
   if (task && expectedOpenedAt && expectedOpenedAt !== String(previousCircuit.openedAt || "")) {

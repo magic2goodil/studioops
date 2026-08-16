@@ -7,6 +7,7 @@ import {
   claimDueGitHubRemoteRecoveryProbesInState,
   clearOperationalRepairInState,
   recordOperationalRepairInState,
+  resetAutomationCircuitInState,
   scheduleGitHubRemoteRecoveryProbeInState,
 } from "../src/store.js";
 
@@ -271,6 +272,59 @@ test("operational repair suppresses GitHub recovery claims and already-leased re
     }, { nowMs: nowMs + 180_001 }),
     { applied: false, reason: "probe_lease_mismatch" },
   );
+});
+
+test("an active operational repair prevents task circuit reset from resuming work", () => {
+  const openedAt = "2026-08-16T09:00:00.000Z";
+  const state = fixtureState({
+    automationBlocker: {
+      type: "transient",
+      reason: "runner_interrupted",
+      resumeStatus: "queued",
+    },
+    automationCircuit: {
+      state: "open",
+      openedAt,
+      generation: 1,
+    },
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "queued",
+  });
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => resetAutomationCircuitInState(state, {
+      task: "task_1",
+      expectedOpenedAt: openedAt,
+      reason: "Owner verified the prior runner failure.",
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationCircuit.state, "open");
+  assert.equal(state.tasks[0].automationBlocker.resumeStatus, "queued");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.equal(state.events.length, eventCount);
+  assert.ok(!createSupervisorReport(state).actions.some((action) => (
+    action.taskId === "task_1" && action.type === "start_builder"
+  )));
 });
 
 test("operational repair resume preserves an existing builder review candidate", async () => {
