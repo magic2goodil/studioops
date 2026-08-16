@@ -182,6 +182,50 @@ test("an incomplete operational repair cannot be cleared or replaced to resume w
   ].includes(event.type)));
 });
 
+test("an active operational repair suppresses transient blocker reconciliation", async () => {
+  const state = fixtureState({
+    automationBlocker: {
+      type: "transient",
+      reason: "runner_interrupted",
+      resumeStatus: "queued",
+      blockedAt: "2026-08-16T10:00:00.000Z",
+      recoveryCount: 0,
+    },
+  });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push({
+    id: "task_2",
+    projectId: "project_2",
+    title: "Repair workflow integrity",
+    status: "ready",
+    dependsOnTaskIds: [],
+  });
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "queued",
+  });
+
+  const tick = await automationTick({
+    state,
+    limit: 1,
+    nowMs: Date.parse("2026-08-16T10:10:00.000Z"),
+    transientRecoveryMs: 60_000,
+  });
+
+  assert.deepEqual(tick.actions, []);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].operationalRepair.resolvedAt, "");
+  assert.equal(state.tasks[0].automationBlocker.reason, "runner_interrupted");
+  assert.equal(state.tasks[0].lastAutomationRecoveryCount, undefined);
+  assert.ok(!state.events.some((event) => event.type === "transient_failure_recovered"));
+});
+
 test("operational repair suppresses GitHub recovery claims and already-leased results", async () => {
   const nowMs = Date.parse("2026-08-16T10:00:00.000Z");
   const state = fixtureState({

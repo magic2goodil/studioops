@@ -2430,6 +2430,7 @@ export function reconcileAutomationStateInState(state, input = {}) {
 
   for (const task of state.tasks || []) {
     if (input.project && task.projectId !== input.project.id) continue;
+    if (activeOperationalRepair(task)) continue;
 
     const blocker = task.automationBlocker;
     if (
