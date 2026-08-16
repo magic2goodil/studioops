@@ -27,6 +27,7 @@ import {
   expandLocalPath,
   studioOpsHome,
 } from "../src/runtime-paths.js";
+import { launchAgentPath } from "../src/launch-agent-environment.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(process.cwd());
@@ -176,8 +177,9 @@ async function restoreLaunchAgentFiles(snapshots) {
   }
 }
 
-async function setPlistEnvironment(target) {
+async function setPlistEnvironment(target, nodePath) {
   const values = {
+    PATH: launchAgentPath(nodePath),
     STUDIOOPS_HOME: studioOpsHome(),
     STUDIOOPS_ROOT: workingRoot,
     STUDIOOPS_CONFIG_ROOT: workingRoot,
@@ -491,7 +493,7 @@ async function install() {
       const target = targetPathForLabel(template.label);
       const rendered = renderTemplate(await readFile(template.source, "utf8"), stagedRuntime, canonicalSourceRoot, nodePath);
       await writeFile(target, rendered, "utf8");
-      await setPlistEnvironment(target);
+      await setPlistEnvironment(target, nodePath);
     }
     await activateRuntime(stagedRuntime, { prune: false });
     runtimeActivated = true;

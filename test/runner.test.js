@@ -659,6 +659,33 @@ test("github preflight falls back to GitHub App auth when inherited SSH or gh ac
   }
 });
 
+test("github preflight reports the inherited SSH or gh failure when App fallback also fails", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-github-dual-auth-failure-"));
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["remote", "add", "origin", "git@github.com:example/demo.git"]);
+    const result = await preflightRun({
+      ...builderRun(),
+      project: { key: "demo", repoPath, workflowMode: "auto", defaultBranch: "main" },
+    }, {
+      checkInheritedGitHubCredentials: async () => {
+        const error = new Error("spawn gh ENOENT");
+        error.code = "ENOENT";
+        throw error;
+      },
+      prepareGitHubAppAuth: async () => {
+        throw new Error("GitHub App is not installed");
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.match(result.message, /Inherited SSH\/gh preflight failed first: spawn gh ENOENT/);
+    assert.match(result.remediation, /installed worker PATH or inherited SSH\/gh authentication/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("preflight reports actionable repository, local ref, origin, remote, and credential codes", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-preflight-codes-"));
   try {
