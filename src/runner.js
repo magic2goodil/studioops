@@ -402,6 +402,44 @@ async function defaultGitHubRemoteCheck(run, authContext) {
   });
 }
 
+function isGitHubSshOrigin(originUrl) {
+  return /^git@github\.com:/i.test(String(originUrl || "").trim())
+    || /^ssh:\/\/git@github\.com\//i.test(String(originUrl || "").trim());
+}
+
+function inheritedGitHubEnv(baseEnv = process.env) {
+  return {
+    ...baseEnv,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_SSH_COMMAND: baseEnv.GIT_SSH_COMMAND || "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes",
+  };
+}
+
+async function defaultInheritedGitHubCredentialCheck(run) {
+  const repository = parseGitHubRepoUrl(run.preflightOriginUrl || run.project?.repoUrl);
+  if (!repository) throw new Error("The GitHub repository identity could not be resolved.");
+  const env = inheritedGitHubEnv(process.env);
+  await git(["ls-remote", "--exit-code", "origin", "HEAD"], {
+    cwd: run.project.repoPath,
+    env,
+    timeout: 60_000,
+  });
+  const result = await execFileAsync("gh", [
+    "api",
+    `repos/${repository.owner}/${repository.name}`,
+    "--jq",
+    ".permissions.push",
+  ], {
+    cwd: run.project.repoPath,
+    env,
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (String(result.stdout || "").trim() !== "true") {
+    throw new Error(`The active gh identity does not have push permission for ${repository.owner}/${repository.name}.`);
+  }
+}
+
 function githubCredentialFailure(error) {
   const notes = error?.message || String(error);
   return nonRetryableWorkspaceFailureReason(notes) || "github_credential_failure";
@@ -509,12 +547,28 @@ export async function preflightRun(run, input = {}) {
     );
   }
 
+  const githubRun = {
+    ...run,
+    workflowMode,
+    preflightOriginUrl: repositoryOriginUrl,
+    project: { ...project, workflowMode },
+  };
+  if (isGitHubSshOrigin(repositoryOriginUrl)) {
+    const checkInherited = input.checkInheritedGitHubCredentials || defaultInheritedGitHubCredentialCheck;
+    try {
+      await checkInherited(githubRun, input);
+      return { ok: true, workflowMode, originUrl: repositoryOriginUrl, gitAuthStrategy: "inherited-ssh" };
+    } catch {
+      // A role GitHub App remains the bounded fallback when the machine's SSH/gh identity is unavailable.
+    }
+  }
+
   const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
   const cleanupAuth = input.cleanupGitHubAppAuth || cleanupGitHubAppAuth;
   const checkRemote = input.checkGitHubRemote || defaultGitHubRemoteCheck;
   let authContext = null;
   try {
-    authContext = await prepareAuth({ ...run, workflowMode, project: { ...project, workflowMode } }, input);
+    authContext = await prepareAuth(githubRun, input);
   } catch (error) {
     const code = githubCredentialFailure(error);
     return preflightFailure(
@@ -524,7 +578,7 @@ export async function preflightRun(run, input = {}) {
     );
   }
   try {
-    await checkRemote({ ...run, workflowMode, project: { ...project, workflowMode } }, authContext, input);
+    await checkRemote(githubRun, authContext, input);
   } catch (error) {
     const repository = parseGitHubRepoUrl(repositoryOriginUrl);
     return preflightFailure(
@@ -540,7 +594,7 @@ export async function preflightRun(run, input = {}) {
   } finally {
     await cleanupAuth(authContext);
   }
-  return { ok: true, workflowMode, originUrl: repositoryOriginUrl };
+  return { ok: true, workflowMode, originUrl: repositoryOriginUrl, gitAuthStrategy: "github-app" };
 }
 
 async function localBranchExists(repoPath, branch) {
@@ -719,7 +773,7 @@ function withExecutionWorkspace(run, workspace) {
 }
 
 async function prepareRunAuth(run, input = {}) {
-  if (run.workflowMode === "local") return null;
+  if (run.workflowMode === "local" || run.gitAuthStrategy === "inherited-ssh") return null;
   const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
   return prepareAuth(run, input);
 }
@@ -799,6 +853,24 @@ export function planRunnableRuns(state, input = {}) {
   };
 }
 
+function githubWorkflowAuthForLog(run, authContext) {
+  if (run.gitAuthStrategy === "inherited-ssh") {
+    return "GitHub auth: verified inherited SSH transport and gh CLI identity\n";
+  }
+  return formatGitHubAppAuthForLog(authContext);
+}
+
+function githubWorkflowAuthForPrompt(run, authContext) {
+  if (run.gitAuthStrategy === "inherited-ssh") {
+    return `Existing GitHub SSH and gh authentication:
+- StudioOps verified the repository's SSH origin non-interactively before this run.
+- StudioOps verified that the active gh identity has push permission for the exact repository.
+- Use the configured SSH origin for git fetch/push and the existing gh session for pull-request operations.
+- Do not run gh auth login, print credential values, alter the repository remote, or copy credentials into files.`;
+  }
+  return formatGitHubAppAuthForPrompt(authContext);
+}
+
 function runnerPrompt(run, project, authContext = null) {
   const missionControlCli = path.join(MODULE_DIR, "mission-control-cli.js");
   const taskUrl = run.taskUrl || `http://127.0.0.1:4317/tasks/${run.taskId}`;
@@ -829,7 +901,7 @@ Run details:
 
 ${run.workflowMode === "local"
     ? "Local project workflow:\n- GitHub App authentication is disabled for this run.\n- Do not fetch an external remote, push commits, or open/update a pull request.\n- Work only in the isolated local workspace and preserve the resulting local branch and commits."
-    : formatGitHubAppAuthForPrompt(authContext)}
+    : githubWorkflowAuthForPrompt(run, authContext)}
 
 StudioOps CLI:
 \`node ${missionControlCli}\`
@@ -1253,6 +1325,7 @@ export async function claimRuns(input = {}) {
 
       run.status = "running";
       run.workflowMode = preflight.workflowMode;
+      run.gitAuthStrategy = preflight.gitAuthStrategy || (preflight.workflowMode === "local" ? "local" : "github-app");
       run.preflightOriginUrl = preflight.originUrl || "";
       run.preflightBaseRef = preflight.baseRef || "";
       run.preflightBaseCommit = preflight.baseCommit || "";
@@ -1566,7 +1639,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Model: ${run.model || input.model || DEFAULT_EXECUTION_POLICY.model}\n`);
     log.write(`Reasoning: ${run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort}\n`);
     authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
-    log.write(formatGitHubAppAuthForLog(authContext));
+    log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);
     const prompt = runnerPrompt(executionRun, executionRun.project, authContext);
@@ -1641,7 +1714,7 @@ async function runClaimedRunWithCli(run, input = {}) {
   let authContext = null;
   try {
     authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
-    log.write(formatGitHubAppAuthForLog(authContext));
+    log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionWorkspace(run, workspace);
     prompt = runnerPrompt(executionRun, executionRun.project, authContext);
