@@ -115,6 +115,63 @@ test("repository imports obey the executable component dependency direction", as
   assert.equal(result.ok, true);
 });
 
+test("repository dependency validation rejects prohibited side-effect imports", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-side-effect-import-"));
+  try {
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await writeFile(path.join(root, "src", "core.js"), "export const core = true;\n");
+    await writeFile(path.join(root, "src", "adapter.js"), 'import "./core.js";\n');
+    const fixtureManifest = {
+      schemaVersion: "studioops.component-ownership.v1",
+      fullRegressionCommands: ["npm run check"],
+      environmentContract: { id: "studioops.test.v1" },
+      components: {
+        adapter: {
+          owner: "Adapter owner",
+          classification: "bounded",
+          paths: ["src/adapter.js"],
+          entryAdapters: [],
+          workflowReleaseSurfaces: [],
+          ownedTests: [],
+          publicContracts: ["adapter"],
+          ownedData: [],
+          allowedDependencies: [],
+          impactEdges: [],
+          rollbackBoundary: "adapter rollback",
+          testLayers: ["unit"],
+          validationCommands: ["npm run check"],
+        },
+        core: {
+          owner: "Core owner",
+          classification: "bounded",
+          paths: ["src/core.js"],
+          entryAdapters: [],
+          workflowReleaseSurfaces: [],
+          ownedTests: [],
+          publicContracts: ["core"],
+          ownedData: [],
+          allowedDependencies: [],
+          impactEdges: [],
+          rollbackBoundary: "core rollback",
+          testLayers: ["unit"],
+          validationCommands: ["npm run check"],
+        },
+      },
+    };
+
+    const result = await validateRepositoryDependencies(root, fixtureManifest);
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.violations, [{
+      from: "adapter",
+      to: "core",
+      sourcePath: "src/adapter.js",
+      targetPath: "src/core.js",
+    }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("every tracked surface has exactly one executable owner", async () => {
   const result = await validateTrackedSurfaceCoverage(process.cwd(), manifest);
   assert.deepEqual(result.unowned, []);

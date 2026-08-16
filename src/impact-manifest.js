@@ -461,6 +461,7 @@ export async function validateRepositoryDependencies(repoPath, manifestInput) {
     const contents = await readFile(path.join(repoPath, sourcePath), "utf8");
     const importPatterns = [
       /\bfrom\s+["'](\.{1,2}\/[^"']+)["']/g,
+      /\bimport\s*["'](\.{1,2}\/[^"']+)["']/g,
       /\bimport\s*\(\s*["'](\.{1,2}\/[^"']+)["']\s*\)/g,
     ];
     for (const expression of importPatterns) {

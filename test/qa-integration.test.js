@@ -19,6 +19,7 @@ import {
   planQaIntegrations,
   projectPlanHasWork,
   qaResultFingerprint,
+  validationManifestBindingForTasks,
   verifyExactValidationWorkspace,
 } from "../src/qa-integration.js";
 import { readPersistedState } from "./state-database-helper.js";
@@ -486,6 +487,16 @@ test("candidate manifest validation commands require a trusted project allowlist
   assert.equal(rejected.ok, false);
   assert.equal(rejected.unauthorizedCommandCount, 1);
   assert.deepEqual(rejected.commands, ["npm run check"]);
+});
+
+test("a missing task manifest binding forces full regression even when another task is bound", () => {
+  assert.deepEqual(validationManifestBindingForTasks([
+    { impactEvidence: { manifestDigest: `sha256:${"a".repeat(64)}` } },
+    { impactEvidence: {} },
+  ]), {
+    expectedManifestDigests: [`sha256:${"a".repeat(64)}`],
+    fullRegressionReasons: ["missing_manifest_binding"],
+  });
 });
 
 test("exact validation workspace rejects tracked mutations and HEAD drift", async () => {

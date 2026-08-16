@@ -1154,6 +1154,18 @@ export function authorizeManifestValidationCommands(trustedCommands, requiredCom
   };
 }
 
+export function validationManifestBindingForTasks(tasks = []) {
+  const normalizedTasks = Array.isArray(tasks) ? tasks : [];
+  const manifestDigests = normalizedTasks
+    .map((task) => String(task?.impactEvidence?.manifestDigest || "").trim())
+    .filter(Boolean);
+  const missingManifestBinding = manifestDigests.length !== normalizedTasks.length;
+  return {
+    expectedManifestDigests: [...new Set(manifestDigests)],
+    fullRegressionReasons: missingManifestBinding ? ["missing_manifest_binding"] : [],
+  };
+}
+
 export async function verifyExactValidationWorkspace(repoPath, expectedSha, options = {}) {
   const [head, trackedStatus] = await Promise.all([
     git(repoPath, ["rev-parse", "--verify", "HEAD"], { ...options, allowFailure: true }),
@@ -1880,16 +1892,15 @@ async function integrateProject(projectPlan, options = {}) {
 
     const commit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
     result.commit = commit.output.trim();
-    const expectedManifestDigests = mergedTasks
-      .map((task) => task.impactEvidence?.manifestDigest || "")
-      .filter(Boolean);
+    const validationManifestBinding = validationManifestBindingForTasks(mergedTasks);
     result.impactClassification = await classifyGitImpact(
       executionRepoPath,
       result.baseSha,
       result.commit,
       {
-        expectedManifestDigests,
+        expectedManifestDigests: validationManifestBinding.expectedManifestDigests,
         requireExpectedManifestDigest: true,
+        fullRegressionReasons: validationManifestBinding.fullRegressionReasons,
         gitBin: options.gitBin,
       },
     );
