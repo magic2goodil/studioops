@@ -753,6 +753,21 @@ function activeOperationalRepair(task = {}) {
   return repair && !repair.resolvedAt ? repair : null;
 }
 
+function assertOperationalRepairCanBeRecorded(task, requestedRepairTaskId) {
+  const repair = activeOperationalRepair(task);
+  if (!repair) return;
+  throw taskRelationshipError(
+    "repair_reference_active",
+    `Task ${task.id} already has active operational repair ${repair.repairTaskId}; automation must resolve it before another repair can be recorded.`,
+    {
+      sourceTaskId: task.id,
+      sourceProjectId: task.projectId,
+      repairTaskId: repair.repairTaskId,
+      requestedRepairTaskId,
+    },
+  );
+}
+
 function normalizedOperationalRepairInput(state, task, input = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw taskRelationshipError(
@@ -1193,6 +1208,7 @@ function governedArchitectureParent(state, project, parentTaskId, architecturePa
 }
 
 function applyOperationalRepairRecordInState(state, task, normalized, options = {}) {
+  assertOperationalRepairCanBeRecorded(task, normalized.repairTaskId);
   const now = options.now || new Date().toISOString();
   const recordedBy = (String(options.author || "StudioOps Workflow").trim() || "StudioOps Workflow")
     .slice(0, 120);
@@ -1239,6 +1255,18 @@ export function clearOperationalRepairInState(state, taskId, options = {}) {
   const task = findTask(state, taskId);
   if (!task) throw new Error(`Unknown task: ${taskId}`);
   if (!task.operationalRepair) return task;
+  const activeRepair = activeOperationalRepair(task);
+  if (activeRepair) {
+    throw taskRelationshipError(
+      "repair_reference_active",
+      `Task ${task.id} operational repair ${activeRepair.repairTaskId} cannot be cleared before automation resolves it.`,
+      {
+        sourceTaskId: task.id,
+        sourceProjectId: task.projectId,
+        repairTaskId: activeRepair.repairTaskId,
+      },
+    );
+  }
   const now = options.now || new Date().toISOString();
   const repairTaskId = task.operationalRepair.repairTaskId;
   delete task.operationalRepair;
@@ -1405,6 +1433,9 @@ export async function updateTask(taskId, patch) {
     const requestedOperationalRepair = Object.prototype.hasOwnProperty.call(patch, "operationalRepair")
       ? normalizedOperationalRepairInput(state, task, patch.operationalRepair)
       : null;
+    if (requestedOperationalRepair) {
+      assertOperationalRepairCanBeRecorded(task, requestedOperationalRepair.repairTaskId);
+    }
     if (!requestedOperationalRepair) validatePersistedOperationalRepair(state, task);
     if (requestedOperationalRepair && patch.status && patch.status !== "blocked") {
       throw taskRelationshipError(
@@ -1669,6 +1700,7 @@ export function repairLegacyTaskRelationshipsInState(state, taskId, input = {}, 
     resumeStatus: input.resumeStatus,
   };
   const normalizedRepair = normalizedOperationalRepairInput(state, task, repairInput);
+  assertOperationalRepairCanBeRecorded(task, normalizedRepair.repairTaskId);
   const remainingDependencyIds = normalizeList(task.dependsOnTaskIds)
     .filter((dependencyId) => !removalIds.includes(dependencyId));
   validateTaskRelationships(

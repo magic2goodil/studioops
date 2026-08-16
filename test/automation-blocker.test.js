@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSupervisorReport } from "../src/supervisor.js";
-import { automationTick, recordOperationalRepairInState } from "../src/store.js";
+import {
+  automationTick,
+  clearOperationalRepairInState,
+  recordOperationalRepairInState,
+} from "../src/store.js";
 
 function fixtureState(taskPatch = {}) {
   return {
@@ -113,6 +117,65 @@ test("automation resolves operational repair references only after repair comple
   assert.equal(state.tasks[0].operationalRepair.resolvedBy, "StudioOps Automation");
   assert.equal(state.tasks[0].operationalRepair.resolutionStatus, "done");
   assert.ok(state.events.some((event) => event.type === "operational_repair_resolved"));
+});
+
+test("an incomplete operational repair cannot be cleared or replaced to resume workflow", async () => {
+  const state = fixtureState({ status: "lead_review" });
+  state.projects.push({
+    id: "project_2",
+    key: "studioops",
+    name: "StudioOps",
+    repoPath: "/tmp/studioops",
+  });
+  state.tasks.push(
+    {
+      id: "task_2",
+      projectId: "project_2",
+      title: "Incomplete workflow repair",
+      status: "ready",
+      dependsOnTaskIds: [],
+    },
+    {
+      id: "task_3",
+      projectId: "project_2",
+      title: "Unrelated completed repair",
+      status: "done",
+      dependsOnTaskIds: [],
+    },
+  );
+  recordOperationalRepairInState(state, "task_1", {
+    repairTaskId: "task_2",
+    reasonCode: "workflow_integrity",
+    resumeStatus: "lead_review",
+  }, {
+    now: "2026-08-16T10:00:00.000Z",
+    author: "StudioOps Workflow",
+  });
+  const recordedRepair = structuredClone(state.tasks[0].operationalRepair);
+  const eventCount = state.events.length;
+
+  assert.throws(
+    () => clearOperationalRepairInState(state, "task_1"),
+    (error) => error.code === "repair_reference_active",
+  );
+  assert.throws(
+    () => recordOperationalRepairInState(state, "task_1", {
+      repairTaskId: "task_3",
+      reasonCode: "workflow_integrity",
+      resumeStatus: "lead_review",
+    }),
+    (error) => error.code === "repair_reference_active",
+  );
+  assert.equal(state.events.length, eventCount);
+
+  const waiting = await automationTick({ state, limit: 10 });
+  assert.deepEqual(waiting.actions, []);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.deepEqual(state.tasks[0].operationalRepair, recordedRepair);
+  assert.ok(!state.events.some((event) => [
+    "operational_repair_cleared",
+    "operational_repair_replaced",
+  ].includes(event.type)));
 });
 
 test("operational repair resume preserves an existing builder review candidate", async () => {
