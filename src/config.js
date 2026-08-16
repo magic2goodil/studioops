@@ -10,6 +10,95 @@ export const LEGACY_CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "studioops.config.example.md";
 export const PROJECT_WORKFLOW_MODES = new Set(["auto", "local", "github"]);
 export const MODULAR_ARCHITECTURE_STANDARD = "standards/modular-architecture-and-scoped-validation.md";
+export const INSTALLED_AUTOMATION_CAPACITY = Object.freeze({
+  builderConcurrency: 3,
+  reviewerConcurrency: 3,
+  runnerLimit: 3,
+});
+
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function effectiveAutomationCapacity(config = {}) {
+  const dispatcher = {
+    ...(config?.defaults?.supervisor || {}),
+    ...(config?.defaults?.dispatcher || {}),
+    ...(config?.supervisor || {}),
+    ...(config?.dispatcher || {}),
+  };
+  const runner = {
+    ...(config?.defaults?.runner || {}),
+    ...(config?.runner || {}),
+  };
+  const runnerLimit = hasOwnValue(config?.runner, "limit")
+    ? config.runner.limit
+    : hasOwnValue(config?.runner, "maxRuns")
+      ? config.runner.maxRuns
+      : runner.limit ?? runner.maxRuns;
+  return {
+    builderConcurrency: positiveInteger(
+      dispatcher.builderConcurrency,
+      INSTALLED_AUTOMATION_CAPACITY.builderConcurrency,
+    ),
+    reviewerConcurrency: positiveInteger(
+      dispatcher.reviewerConcurrency,
+      INSTALLED_AUTOMATION_CAPACITY.reviewerConcurrency,
+    ),
+    runnerLimit: positiveInteger(
+      runnerLimit,
+      INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
+    ),
+  };
+}
+
+export function normalizeConfig(config = {}) {
+  const defaults = config.defaults || {};
+  const legacySupervisor = defaults.supervisor || {};
+  const dispatcher = defaults.dispatcher || {};
+  const runner = defaults.runner || {};
+  const topLevelRunner = config.runner || {};
+  const normalizedTopLevelRunner = (
+    hasOwnValue(topLevelRunner, "limit")
+    || hasOwnValue(topLevelRunner, "maxRuns")
+  ) ? {
+      ...topLevelRunner,
+      limit: positiveInteger(
+        topLevelRunner.limit ?? topLevelRunner.maxRuns,
+        INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
+      ),
+    } : topLevelRunner;
+  return {
+    ...config,
+    ...(hasOwnValue(config, "runner") ? { runner: normalizedTopLevelRunner } : {}),
+    defaults: {
+      ...defaults,
+      dispatcher: {
+        ...dispatcher,
+        builderConcurrency: positiveInteger(
+          hasOwnValue(dispatcher, "builderConcurrency")
+            ? dispatcher.builderConcurrency
+            : legacySupervisor.builderConcurrency,
+          INSTALLED_AUTOMATION_CAPACITY.builderConcurrency,
+        ),
+        reviewerConcurrency: positiveInteger(
+          hasOwnValue(dispatcher, "reviewerConcurrency")
+            ? dispatcher.reviewerConcurrency
+            : legacySupervisor.reviewerConcurrency,
+          INSTALLED_AUTOMATION_CAPACITY.reviewerConcurrency,
+        ),
+      },
+      runner: {
+        ...runner,
+        limit: positiveInteger(
+          runner.limit ?? runner.maxRuns,
+          INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
+        ),
+      },
+    },
+  };
+}
 
 export function withDefaultProjectStandards(value) {
   const standards = Array.isArray(value)
@@ -80,14 +169,14 @@ export async function loadConfig(rootDir = missionControlConfigRoot()) {
   const configPath = await fileExists(currentPath) ? currentPath : legacyPath;
   if (!(await fileExists(configPath))) return null;
   const markdown = await readFile(configPath, "utf8");
-  return extractConfigJson(markdown);
+  return normalizeConfig(extractConfigJson(markdown));
 }
 
 export async function writeConfig(config, rootDir = missionControlConfigRoot()) {
   await mkdir(rootDir, { recursive: true, mode: 0o700 });
   await chmod(rootDir, 0o700).catch(() => {});
   const configPath = path.join(rootDir, CONFIG_FILE);
-  await writeFile(configPath, renderConfigMarkdown(config), { encoding: "utf8", mode: 0o600 });
+  await writeFile(configPath, renderConfigMarkdown(normalizeConfig(config)), { encoding: "utf8", mode: 0o600 });
   await chmod(configPath, 0o600).catch(() => {});
   return configPath;
 }
@@ -145,6 +234,7 @@ export function projectFromConfig(rawProject, defaults = {}) {
       ...(defaults.promotion || {}),
       ...(rawProject.promotion || {}),
     },
+    deliveryPolicy: rawProject.deliveryPolicy || defaults.deliveryPolicy || {},
     localQaPreview: rawProject.localQaPreview || rawProject.qaIntegration?.localPreview || null,
     trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
     integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),

@@ -7,12 +7,14 @@ import {
   findTask,
   generatePrompt,
   mutateState,
+  readState,
   reviewStagesForTask,
   workflowSnapshotForTask,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
-import { assessCreditAdmission } from "./credit-policy.js";
+import { assessCreditAdmission, requestCodexCreditSnapshot } from "./credit-policy.js";
+import { INSTALLED_AUTOMATION_CAPACITY } from "./config.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_architecture",
@@ -41,9 +43,9 @@ const REVIEW_HANDOFF_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_
 const DEFAULTS = {
   provider: "prompt-outbox",
   maxDispatchesPerSweep: 6,
-  builderConcurrency: 3,
+  builderConcurrency: INSTALLED_AUTOMATION_CAPACITY.builderConcurrency,
   architectConcurrency: 1,
-  reviewerConcurrency: 3,
+  reviewerConcurrency: INSTALLED_AUTOMATION_CAPACITY.reviewerConcurrency,
   ownerConcurrency: 10,
 };
 
@@ -161,6 +163,26 @@ function activeCounts(state) {
   }, {});
 }
 
+function effectiveGroupCapacity(options, initialCounts, finalCounts) {
+  return Object.fromEntries(["architect", "builder", "reviewer", "owner"].map((group) => {
+    const limit = concurrencyLimitFor(group, options);
+    const active = Number(initialCounts[group] || 0);
+    const selected = Math.max(0, Number(finalCounts[group] || 0) - active);
+    return [group, {
+      configuredLimit: limit,
+      active,
+      selected,
+      available: Math.max(0, limit - active - selected),
+    }];
+  }));
+}
+
+function skippedConstraint(reason) {
+  if (String(reason || "").endsWith("_concurrency_limit")) return "concurrency_limit";
+  if (String(reason || "").startsWith("lane_conflict:")) return "lane_or_file_scope_conflict";
+  return "policy_or_state";
+}
+
 function activeLaneProfiles(state, selected = []) {
   const activeRuns = (state.runs || [])
     .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
@@ -202,7 +224,28 @@ function findLaneConflict(state, selected, action, task) {
   return conflict ? { conflict, profile } : { conflict: null, profile };
 }
 
-function dispatchSafetyReason(state, task, action, options) {
+function needsUnknownCreditSnapshotRetry(state, actions, options) {
+  if (options.dryRun) return false;
+  return (actions || []).some((action) => {
+    if (!DISPATCHABLE_ACTIONS.has(action.type) || runGroupFor(action) === "owner") return false;
+    if (!projectAllowed(action, options)) return false;
+    const task = findTask(state, action.taskId);
+    if (!task || task.automationCircuit?.state === "open") return false;
+    if (hasExistingDispatch(state, action, task)) return false;
+    if (action.taskStatus && task.status !== action.taskStatus) return false;
+    if (reviewDispatchSafetyReason(state, task, action)) return false;
+    if (preCreditDispatchSafetyReason(state, task, action, options)) return false;
+    const executionPolicy = resolveExecutionPolicy(task, action, options);
+    const admission = assessCreditAdmission(
+      options.creditSnapshot,
+      executionPolicy,
+      options.creditPolicy,
+    );
+    return admission.code === "credit_snapshot_unknown";
+  });
+}
+
+function preCreditDispatchSafetyReason(state, task, action, options) {
   const group = runGroupFor(action);
   if (group === "owner") return "";
   if (
@@ -216,6 +259,13 @@ function dispatchSafetyReason(state, task, action, options) {
   const project = findProject(state, task.projectId);
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";
   if (task.automationCircuit?.state === "open") return "task_circuit_open";
+  return "";
+}
+
+function dispatchSafetyReason(state, task, action, options) {
+  const preCreditReason = preCreditDispatchSafetyReason(state, task, action, options);
+  if (preCreditReason) return preCreditReason;
+  if (runGroupFor(action) === "owner") return "";
   const executionPolicy = resolveExecutionPolicy(task, action, options);
   const creditAdmission = assessCreditAdmission(
     options.creditSnapshot,
@@ -458,8 +508,9 @@ Local QA decision needed:
 - Visually test the task against its acceptance criteria and attached mockups.
 - Review all tasks in the QA Review list for this project before approving production.
 - If it fails local QA, move the task to needs_changes with concrete notes.
-- If it passes local QA, approve/merge according to the protected project release workflow.
-- Do not deploy production without explicit owner approval.
+- If it passes local QA, record that result against the immutable candidate manifest; this handoff does not merge, tag, release, or deploy.
+- Before production, make one separate explicit human release decision naming the full commit SHA, target host, candidate-manifest or artifact SHA-256 digest, successful exact-commit health-check time, and tested rollback commit or procedure.
+- Automation must not merge or deploy on the owner's behalf.
 `;
   }
 
@@ -476,8 +527,10 @@ ${action.reason}
 
 Human owner decision needed:
 - Review the task and PR.
-- Approve, request changes, merge, or deploy according to project rules.
-- Do not let automation merge or deploy on your behalf.
+- Approve, request changes, or perform the protected merge according to project rules.
+- Treat the immutable candidate manifest as release authority; task status and prose are not release approval.
+- Before production, make one separate explicit human release decision naming the full commit SHA, target host, candidate-manifest or artifact SHA-256 digest, successful exact-commit health-check time, and tested rollback commit or procedure.
+- Do not let automation merge, tag, release, or deploy on your behalf.
 `;
 }
 
@@ -510,13 +563,13 @@ Remediation expectations:
 
 function dispatchComment(run, action) {
   if (action.type === "notify_qa_review" || action.type === "qa_bundle_ready") {
-    return `Local QA review notification queued as dispatch ${run.id}. Trust Leads accepted the lead review decision; this task is ready for non-production visual QA.${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
+    return `Local QA review notification queued as dispatch ${run.id}. Trust Leads accepted the lead review decision; this task is ready for non-production visual QA. StudioOps did not merge or deploy it; production still requires the immutable candidate release packet and an explicit human decision.${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
   }
   if (action.type === "qa_integration_blocked") {
     return `QA integration remediation queued as dispatch ${run.id}. StudioOps found a blocker before owner QA and routed it back to a builder.${action.integrationStatus ? `\n\nIntegration status: ${action.integrationStatus}` : ""}${action.integrationBranch ? `\n\nIntegration branch: ${action.integrationBranch}` : ""}${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
   }
   if (action.type === "notify_owner") {
-    return `Owner review notification queued as dispatch ${run.id}. Task is ready for final human review.${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
+    return `Owner review notification queued as dispatch ${run.id}. Task is ready for final human review. StudioOps did not merge or deploy it; production requires a separate explicit human release decision bound to the immutable candidate packet.${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
   }
   return `Dispatched ${action.role || "worker"} work as ${run.id} using provider ${run.provider}. The prompt snapshot is stored on the run record.${action.promptCommand ? `\n\nPrompt command: \`${action.promptCommand}\`` : ""}`;
 }
@@ -597,6 +650,7 @@ function makeRun(state, task, action, options, now) {
 export function planDispatches(state, actions, input = {}) {
   const options = { ...DEFAULTS, ...input };
   const counts = activeCounts(state);
+  const initialCounts = { ...counts };
   const maxDispatches = Math.max(1, Number(options.maxDispatchesPerSweep || DEFAULTS.maxDispatchesPerSweep));
   const selected = [];
   const skipped = [];
@@ -645,7 +699,14 @@ export function planDispatches(state, actions, input = {}) {
     }
     const { conflict, profile } = findLaneConflict(state, selected, action, task);
     if (conflict) {
-      skipped.push({ action, reason: `lane_conflict:${profile.conflictGroup}:${conflict.taskId || conflict.id}` });
+      skipped.push({
+        action,
+        reason: `lane_conflict:${profile.conflictGroup}:${conflict.taskId || conflict.id}`,
+        lane: profile.lane,
+        conflictGroup: profile.conflictGroup,
+        fileScope: profile.fileScope,
+        conflictTaskId: conflict.taskId || "",
+      });
       continue;
     }
     selected.push({ action, task, group, profile });
@@ -653,6 +714,10 @@ export function planDispatches(state, actions, input = {}) {
   }
 
   return {
+    effectiveCapacity: {
+      maxDispatchesPerSweep: maxDispatches,
+      groups: effectiveGroupCapacity(options, initialCounts, counts),
+    },
     selected: selected.map(({ action, task, group, profile }) => ({
       action,
       taskId: task.id,
@@ -662,20 +727,31 @@ export function planDispatches(state, actions, input = {}) {
       conflictGroup: profile.conflictGroup,
       fileScope: profile.fileScope,
     })),
-    skipped: skipped.map(({ action, reason }) => ({
+    skipped: skipped.map(({ action, reason, ...details }) => ({
       actionId: action?.id || "",
       actionType: action?.type || "",
       taskId: action?.taskId || "",
       reason,
+      constraint: skippedConstraint(reason),
+      ...details,
     })),
   };
 }
 
 export async function dispatchSupervisorActions(actions, input = {}) {
+  const { state: inputState, ...initialDispatchInput } = input;
+  const dispatchInput = { ...initialDispatchInput };
+  const preflightOptions = { ...DEFAULTS, ...dispatchInput };
+  if (!preflightOptions.dryRun && preflightOptions.creditPolicy?.enabled) {
+    const preflightState = inputState || await readState();
+    if (needsUnknownCreditSnapshotRetry(preflightState, actions, preflightOptions)) {
+      const probe = input.creditSnapshotProbe || requestCodexCreditSnapshot;
+      dispatchInput.creditSnapshot = await probe(preflightOptions.creditPolicy);
+    }
+  }
   const mutate = input.state
     ? async (mutator) => mutator(input.state)
     : mutateState;
-  const { state: _inputState, ...dispatchInput } = input;
   return mutate(async (state) => {
     state.runs = state.runs || [];
     state.comments = state.comments || [];
@@ -691,6 +767,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         generatedAt: now,
         dryRun: true,
         runs,
+        effectiveCapacity: plan.effectiveCapacity,
         selected: plan.selected,
         skipped: plan.skipped,
       };
@@ -761,6 +838,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       generatedAt: now,
       dryRun: false,
       runs,
+      effectiveCapacity: plan.effectiveCapacity,
       selected,
       skipped,
     };
@@ -771,8 +849,22 @@ export function formatDispatchReport(report) {
   const lines = [
     `StudioOps dispatcher sweep (${report.generatedAt})`,
     `Created runs: ${report.runs.length}  Selected: ${report.selected.length}  Skipped: ${report.skipped.length}${report.dryRun ? "  DRY RUN" : ""}`,
-    "",
   ];
+
+  const groups = report.effectiveCapacity?.groups || {};
+  const capacityText = ["architect", "builder", "reviewer", "owner"]
+    .filter((group) => groups[group])
+    .map((group) => {
+      const capacity = groups[group];
+      return `${group} ${capacity.active}+${capacity.selected}/${capacity.configuredLimit} (${capacity.available} available)`;
+    })
+    .join("; ");
+  if (capacityText) {
+    lines.push(
+      `Effective capacity: ${capacityText}; sweep limit ${report.effectiveCapacity.maxDispatchesPerSweep}`,
+    );
+  }
+  lines.push("");
 
   if (!report.runs.length && !report.selected.length) {
     lines.push("No dispatchable work selected.");
@@ -804,6 +896,17 @@ export function formatDispatchReport(report) {
     .map(([reason, count]) => `${reason}: ${count}`)
     .join(", ");
   if (skippedText) lines.push(`Skipped: ${skippedText}`);
+
+  const constraintSummary = report.skipped.reduce((counts, item) => {
+    const constraint = item.constraint || skippedConstraint(item.reason);
+    counts[constraint] = (counts[constraint] || 0) + 1;
+    return counts;
+  }, {});
+  const concurrencySkips = constraintSummary.concurrency_limit || 0;
+  const conflictSkips = constraintSummary.lane_or_file_scope_conflict || 0;
+  if (concurrencySkips || conflictSkips) {
+    lines.push(`Capacity constraints: concurrency limits ${concurrencySkips}; lane/file-scope conflicts ${conflictSkips}.`);
+  }
 
   return lines.join("\n").trimEnd();
 }

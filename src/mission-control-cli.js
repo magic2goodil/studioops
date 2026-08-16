@@ -31,7 +31,9 @@ import { formatPromotionReport, planPromotions, runPromotion } from "./promotion
 import { formatSelfUpdateReport, runSelfUpdate } from "./self-update.js";
 import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
 import {
+  effectiveAutomationCapacity,
   expandHome,
+  INSTALLED_AUTOMATION_CAPACITY,
   loadConfig,
   MODULAR_ARCHITECTURE_STANDARD,
   projectFromConfig,
@@ -232,15 +234,15 @@ async function setup() {
           provider: "prompt-outbox",
           maxDispatchesPerSweep: 6,
           architectConcurrency: 1,
-          builderConcurrency: 3,
-          reviewerConcurrency: 3,
+          builderConcurrency: INSTALLED_AUTOMATION_CAPACITY.builderConcurrency,
+          reviewerConcurrency: INSTALLED_AUTOMATION_CAPACITY.reviewerConcurrency,
           ownerConcurrency: 10,
           requireHumanMerge: true,
           requireGitHubActionsDeploy: true,
         },
         runner: {
           intervalSeconds: 10,
-          limit: 3,
+          limit: INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
           provider: "codex-cli",
           model: "gpt-5.6-sol",
           modelReasoningEffort: "high",
@@ -954,6 +956,13 @@ Automation:
   if (command === "dispatcher" || command === "dispatch") {
     const state = await readState();
     const config = await loadConfig();
+    const dispatcherDefaults = {
+      ...(config?.defaults?.supervisor || {}),
+      ...(config?.defaults?.dispatcher || {}),
+      ...(config?.supervisor || {}),
+      ...(config?.dispatcher || {}),
+    };
+    const effectiveCapacity = effectiveAutomationCapacity(config || {});
     const supervisor = createSupervisorReport(state, {
       baseUrl: args["base-url"] || "http://127.0.0.1:4317",
       intervalSeconds: args.interval || args["interval-seconds"] || 10,
@@ -961,12 +970,12 @@ Automation:
     const options = {
       project: args.project || args.projects,
       dryRun: args["dry-run"] || args.dryRun,
-      provider: args.provider || "prompt-outbox",
-      maxDispatchesPerSweep: args.limit || args["max-dispatches"],
-      builderConcurrency: args["builder-concurrency"],
-      architectConcurrency: args["architect-concurrency"],
-      reviewerConcurrency: args["reviewer-concurrency"],
-      ownerConcurrency: args["owner-concurrency"],
+      provider: args.provider || dispatcherDefaults.provider || "prompt-outbox",
+      maxDispatchesPerSweep: args.limit || args["max-dispatches"] || dispatcherDefaults.maxDispatchesPerSweep,
+      builderConcurrency: args["builder-concurrency"] || effectiveCapacity.builderConcurrency,
+      architectConcurrency: args["architect-concurrency"] || dispatcherDefaults.architectConcurrency,
+      reviewerConcurrency: args["reviewer-concurrency"] || effectiveCapacity.reviewerConcurrency,
+      ownerConcurrency: args["owner-concurrency"] || dispatcherDefaults.ownerConcurrency,
       executionPolicy: {
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
@@ -983,6 +992,7 @@ Automation:
         generatedAt: supervisor.generatedAt,
         dryRun: true,
         runs: [],
+        effectiveCapacity: plan.effectiveCapacity,
         selected: plan.selected,
         skipped: plan.skipped,
       };
@@ -1002,9 +1012,10 @@ Automation:
       ...(config?.defaults?.runner || {}),
       ...(config?.runner || {}),
     };
+    const effectiveCapacity = effectiveAutomationCapacity(config || {});
     const options = {
       project: args.project || args.projects,
-      limit: args.limit || args["max-runs"],
+      limit: args.limit || args["max-runs"] || effectiveCapacity.runnerLimit,
       provider: args.provider || process.env.MISSION_CONTROL_RUNNER_PROVIDER || runnerDefaults.provider,
       codexBin: args["codex-bin"],
       model: args.model || process.env.MISSION_CONTROL_RUNNER_MODEL || runnerDefaults.model || "gpt-5.6-sol",

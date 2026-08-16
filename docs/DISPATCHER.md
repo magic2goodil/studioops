@@ -133,6 +133,12 @@ Default dispatcher limits:
 
 Queued and running runs count toward concurrency. Completed, failed, and cancelled runs do not.
 
+Both plan and live reports show effective capacity for every run group as
+active plus newly selected work over the configured limit, with remaining slots.
+Installed configurations normalize missing builder and reviewer limits to three;
+an explicit lower positive value remains authoritative and is reported as the
+configured limit. The sweep limit is separate from group concurrency.
+
 The dispatcher also deduplicates by task, role, action type, review cycle, and target status so the same task is not re-dispatched every five minutes.
 
 The dispatcher also attaches a work lane and file-scope hint to each builder/reviewer run. If a task does not explicitly set `lane` or `workAreas`, StudioOps infers the lane from task type, area, title, story, expected outcome, and reviewer role.
@@ -144,6 +150,13 @@ Lane conflict rules:
 - devops and project-wide work conflict with all same-project lanes
 - different projects can dispatch independently
 
+Capacity and collision denials are reported separately. A
+`*_concurrency_limit` means the effective configured group limit is full. A
+`lane_conflict` names the conflicting task and includes the candidate lane,
+conflict group, and file-scope hint. Raising concurrency never overrides lane or
+file-scope safety, and the runner's transactional claim remains the final
+authority before execution.
+
 Tasks can be scoped manually:
 
 ```bash
@@ -154,4 +167,10 @@ node src/mission-control-cli.js update-task task_1 --lane backend --work-area "s
 
 The dispatcher stops at the human owner gate.
 
-It may create an owner or QA handoff run, but it must not merge, deploy, or mark final approval. Production deployment still belongs to the human owner and the project-specific protected GitHub Actions workflow.
+It may create an owner or QA handoff run, but it must not merge, create a release
+tag, deploy, send an external notification, or mark final approval. The
+immutable candidate manifest remains the release authority. Production requires
+one explicit human decision bound to the full commit SHA, target host,
+candidate-manifest or artifact SHA-256 digest, successful exact-commit health
+check time, and a tested rollback commit or procedure. StudioOps does not create
+a parallel approval database or deployment worker for this packet.

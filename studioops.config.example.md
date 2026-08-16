@@ -227,6 +227,9 @@ The app reads the first fenced `json studioops-config` block in this file.
       "repoPath": "~/Development/example",
       "repoUrl": "git@github.com:your-github-user-or-org/example.git",
       "defaultBranch": "main",
+      "deliveryPolicy": {
+        "profile": "prototype-fast-lane"
+      },
       "trustLeadApprovals": false,
       "integrationBranch": "qa/integration",
       "qaIntegration": {
@@ -332,3 +335,12 @@ The app reads the first fenced `json studioops-config` block in this file.
   ]
 }
 ```
+
+`prototype-fast-lane` is an explicit project-level opt-in. Omit
+`projects[].deliveryPolicy` or use `{"profile":"standard"}` for the standard
+pipeline. A task's `deliveryMode`, labels, title, acceptance criteria, comments,
+or other prose cannot activate the fast lane. The profile may skip only
+capability-inapplicable specialist reviews; primary lead review, immutable
+candidate identity, local QA, and the human production release decision remain
+required. It never enables automatic merge, release tags, production deployment,
+or external notification.
