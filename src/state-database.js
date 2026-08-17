@@ -15,6 +15,7 @@ const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "ru
 const TABLE_NAME = { qaBundles: "qa_bundles" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "qaBundles", "candidates"]);
 const STATE_INTEGRITY_VERSION = 5;
+const LIFECYCLE_SCHEMA_VERSION = 1;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
@@ -155,6 +156,14 @@ function ensureLifecycleSchema(db) {
     db.exec("ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0)");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state_version ON tasks(id, state_version)");
+}
+
+function lifecycleSchemaIsCurrent(db, meta = {}) {
+  const taskColumns = new Set(db.prepare("PRAGMA table_info(tasks)").all().map((column) => column.name));
+  const taskIndexes = new Set(db.prepare("PRAGMA index_list(tasks)").all().map((index) => index.name));
+  return Number(meta.lifecycleMigration?.schemaVersion || 0) >= LIFECYCLE_SCHEMA_VERSION
+    && taskColumns.has("state_version")
+    && taskIndexes.has("idx_tasks_state_version");
 }
 
 function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
@@ -776,7 +785,11 @@ async function preMigrationBackup(db) {
 async function runStateIntegrityMigration(db) {
   if (integrityMigrated) return;
   const currentMeta = db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
-  if (Number(parsePayload(currentMeta?.payload, {}).stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION) {
+  const parsedMeta = parsePayload(currentMeta?.payload, {});
+  if (
+    Number(parsedMeta.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION
+    && lifecycleSchemaIsCurrent(db, parsedMeta)
+  ) {
     integrityMigrated = true;
     return;
   }
@@ -786,13 +799,18 @@ async function runStateIntegrityMigration(db) {
   const backupPath = await preMigrationBackup(db);
   db.exec("BEGIN IMMEDIATE");
   try {
-    ensureLifecycleSchema(db);
-    const state = readStateFromOpenDatabase(db);
-    if (Number(state?.meta?.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION) {
+    const lockedMetaRow = db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
+    const lockedMeta = parsePayload(lockedMetaRow?.payload, {});
+    if (
+      Number(lockedMeta.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION
+      && lifecycleSchemaIsCurrent(db, lockedMeta)
+    ) {
       db.exec("COMMIT");
       integrityMigrated = true;
       return;
     }
+    ensureLifecycleSchema(db);
+    const state = readStateFromOpenDatabase(db);
     const snapshot = mutationSnapshot(state);
     reconcileStateIntegrity(state);
     const now = new Date().toISOString();
@@ -801,9 +819,13 @@ async function runStateIntegrityMigration(db) {
     const archived = compactOperationalHistory(state);
     archiveOperationalHistory(db, archived, now);
     state.meta = state.meta || {};
-    state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
+    state.meta.stateIntegrityVersion = Math.max(
+      Number(state.meta.stateIntegrityVersion || 0),
+      STATE_INTEGRITY_VERSION,
+    );
     state.meta.lifecycleMigration = {
-      version: STATE_INTEGRITY_VERSION,
+      schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+      integrityVersion: STATE_INTEGRITY_VERSION,
       migratedAt: now,
       backupPath,
       backupVerified: true,
