@@ -3117,9 +3117,18 @@ export function workflowSnapshotForTask(task, overrides = {}) {
 export function taskAutomationCircuitIsCurrent(task = {}) {
   const circuit = task.automationCircuit;
   if (circuit?.state !== "open") return false;
-  if (task.status === "blocked" && task.automationBlocker?.type === "circuit") return true;
   if (!circuit.snapshot) return true;
-  return isDeepStrictEqual(circuit.snapshot, workflowSnapshotForTask(task));
+  const blockedByCircuit = task.status === "blocked" && task.automationBlocker?.type === "circuit";
+  const liveSnapshot = workflowSnapshotForTask(task, blockedByCircuit
+    ? {
+        status: circuit.snapshot.status ?? task.automationBlocker.resumeStatus ?? task.status,
+        assignedAgentRole: circuit.snapshot.assignedAgentRole ?? task.assignedAgentRole ?? "",
+      }
+    : {});
+  const comparableLiveSnapshot = Object.fromEntries(
+    Object.keys(circuit.snapshot).map((key) => [key, liveSnapshot[key]]),
+  );
+  return isDeepStrictEqual(circuit.snapshot, comparableLiveSnapshot);
 }
 
 export function supersedeStaleTaskCircuitInState(state, task, input = {}) {
