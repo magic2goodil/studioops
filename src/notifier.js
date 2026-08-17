@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mutateState, readState, findProject, findTask } from "./store.js";
+import { randomUUID } from "node:crypto";
+import { buildOwnerQaPacket, candidateCompletenessGate } from "./owner-inbox.js";
 
 const execFileAsync = promisify(execFile);
 const NOTIFIABLE_STATUSES = new Set(["notified", "failed"]);
@@ -11,6 +13,165 @@ const OWNER_NOTIFICATION_ACTIONS = new Set([
 ]);
 const MAX_NOTIFICATION_ATTEMPTS = 3;
 const NOTIFICATION_RETRY_MS = 5 * 60 * 1000;
+const CLAIM_LEASE_MS = 2 * 60 * 1000;
+const OUTBOX_STATUSES = new Set(["queued", "attempted", "delivered", "acknowledged", "deferred", "failed", "escalated"]);
+
+function nowIso() { return new Date().toISOString(); }
+
+function policyFor(project, input = {}) {
+  return {
+    channels: input.channels || project?.notificationPolicy?.channels || ["in_app", "macos"],
+    doNotDisturb: input.doNotDisturb ?? project?.notificationPolicy?.doNotDisturb ?? false,
+    acknowledgementTimeoutMs: Math.max(60_000, Number(input.acknowledgementTimeoutMs || project?.notificationPolicy?.acknowledgementTimeoutMs || 24 * 60 * 60 * 1000)),
+    maxAttempts: Math.max(1, Number(input.maxAttempts || project?.notificationPolicy?.maxAttempts || MAX_NOTIFICATION_ATTEMPTS)),
+  };
+}
+
+export function notificationStatusIsValid(status) { return OUTBOX_STATUSES.has(status); }
+
+/** Enqueue once per candidate/channel. The manifest digest is the idempotency key. */
+export function enqueueOwnerQaNotificationsInState(state, candidate, input = {}) {
+  const persistedCandidate = (state.candidates || []).find((item) => item.id === candidate.id);
+  if (!persistedCandidate) throw new Error(`Unknown persisted candidate: ${candidate.id}`);
+  const bundle = (state.qaBundles || []).find((item) => item.candidateId === persistedCandidate.id);
+  const gate = candidateCompletenessGate(persistedCandidate, state, bundle);
+  if (!gate.ready) throw new Error(`Candidate is not QA-ready: ${gate.reasons.join(", ")}`);
+  const project = findProject(state, persistedCandidate.projectId);
+  const packet = persistedCandidate.qaPacket || buildOwnerQaPacket(state, persistedCandidate, { ...input, bundle });
+  const notificationPolicy = policyFor(project, input);
+  const channels = [...new Set(notificationPolicy.channels.map((channel) => String(channel).trim()).filter(Boolean))];
+  state.notificationOutbox = state.notificationOutbox || [];
+  const created = [];
+  for (const channel of channels) {
+    const key = `${persistedCandidate.id}:${persistedCandidate.manifestDigest}:${channel}`;
+    let item = state.notificationOutbox.find((entry) => entry.idempotencyKey === key);
+    if (!item) {
+      const now = input.now || nowIso();
+      item = {
+        id: `notification_${randomUUID()}`,
+        idempotencyKey: key,
+        kind: "owner_qa",
+        projectId: persistedCandidate.projectId,
+        candidateId: persistedCandidate.id,
+        manifestDigest: persistedCandidate.manifestDigest,
+        channel,
+        status: "queued",
+        attempts: 0,
+        packet,
+        policy: notificationPolicy,
+        createdAt: now,
+        updatedAt: now,
+      };
+      state.notificationOutbox.push(item);
+    }
+    created.push(structuredClone(item));
+  }
+  persistedCandidate.qaPacket = packet;
+  return created;
+}
+
+export async function enqueueOwnerQaNotification(candidate, stateInput = null, input = {}) {
+  return mutateState(async (state) => {
+    if (stateInput && stateInput !== state) {
+      throw new Error("Notification enqueue must use the authoritative persisted state.");
+    }
+    return enqueueOwnerQaNotificationsInState(state, candidate, input);
+  });
+}
+
+export function claimNotificationOutboxInState(state, input = {}) {
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = new Date(nowMs).toISOString();
+  const limit = Math.max(1, Number(input.limit || 10));
+  const selectedIds = new Set((input.ids || []).map(String));
+  const claims = (state.notificationOutbox || []).filter((item) => {
+    if (selectedIds.size && !selectedIds.has(item.id)) return false;
+    const staleAttempt = item.status === "attempted" && Date.parse(item.claimExpiresAt || "") <= nowMs;
+    if (!["queued", "failed"].includes(item.status) && !staleAttempt) return false;
+    if (Number(item.attempts || 0) >= Number(item.policy?.maxAttempts || MAX_NOTIFICATION_ATTEMPTS)) return false;
+    const retryAt = Date.parse(item.retryNotBefore || "");
+    return !Number.isFinite(retryAt) || retryAt <= nowMs;
+  }).slice(0, limit);
+  for (const item of claims) {
+    item.status = "attempted";
+    item.claimToken = randomUUID();
+    item.claimedAt = now;
+    item.claimExpiresAt = new Date(nowMs + Math.max(10_000, Number(input.claimLeaseMs || CLAIM_LEASE_MS))).toISOString();
+    item.attempts = Number(item.attempts || 0) + 1;
+    item.updatedAt = now;
+  }
+  return structuredClone(claims);
+}
+
+/** Claim is atomic and stale claims are safely recoverable after the lease. */
+export async function claimNotificationOutbox(input = {}) {
+  return mutateState(async (state) => claimNotificationOutboxInState(state, input));
+}
+
+export async function updateNotificationOutbox(id, patch = {}) {
+  return mutateState(async (state) => {
+    const item = (state.notificationOutbox || []).find((entry) => entry.id === id);
+    if (!item) throw new Error(`Unknown notification outbox item: ${id}`);
+    const status = patch.status || item.status;
+    if (!notificationStatusIsValid(status)) throw new Error(`Invalid notification status: ${status}`);
+    if (patch.claimToken && patch.claimToken !== item.claimToken) {
+      throw new Error("Notification claim token no longer owns this delivery attempt.");
+    }
+    Object.assign(item, patch, { status, updatedAt: nowIso() });
+    delete item.claimToken;
+    delete item.claimExpiresAt;
+    if (status === "failed" && Number(item.attempts || 0) < Number(item.policy?.maxAttempts || MAX_NOTIFICATION_ATTEMPTS)) item.retryNotBefore = new Date(Date.now() + NOTIFICATION_RETRY_MS).toISOString();
+    if (status === "delivered") {
+      item.acknowledgementDueAt = new Date(Date.now() + Number(item.policy?.acknowledgementTimeoutMs || 24 * 60 * 60 * 1000)).toISOString();
+    }
+    return structuredClone(item);
+  });
+}
+
+export async function acknowledgeNotification(id, action, input = {}) {
+  if (!["pass", "fail", "request_changes", "defer", "open_candidate"].includes(action)) throw new Error(`Unsupported owner action: ${action}`);
+  return mutateState(async (state) => {
+    const item = (state.notificationOutbox || []).find((entry) => entry.id === id);
+    if (!item) throw new Error(`Unknown notification outbox item: ${id}`);
+    if (input.manifestDigest !== item.manifestDigest) throw new Error("Owner action is bound to a different manifest digest.");
+    if (action === "open_candidate") {
+      item.openedAt = nowIso();
+      item.updatedAt = item.openedAt;
+      return structuredClone(item);
+    }
+    item.status = action === "defer" ? "deferred" : "acknowledged";
+    item.ownerAction = action;
+    item.acknowledgedAt = nowIso();
+    item.acknowledgedBy = String(input.actor || "owner");
+    item.updatedAt = nowIso();
+    return structuredClone(item);
+  });
+}
+
+export async function escalateNotification(id, input = {}) {
+  return updateNotificationOutbox(id, { status: "escalated", escalationReason: input.reason || "Owner acknowledgement timeout." });
+}
+
+export function escalateDueNotificationsInState(state, input = {}) {
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = new Date(nowMs).toISOString();
+  const escalated = [];
+  for (const item of state.notificationOutbox || []) {
+    if (item.status !== "delivered") continue;
+    const dueAt = Date.parse(item.acknowledgementDueAt || "");
+    if (!Number.isFinite(dueAt) || dueAt > nowMs) continue;
+    item.status = "escalated";
+    item.escalationReason = "Owner acknowledgement timeout.";
+    item.escalatedAt = now;
+    item.updatedAt = now;
+    escalated.push(structuredClone(item));
+  }
+  return escalated;
+}
+
+export async function escalateDueNotifications(input = {}) {
+  return mutateState(async (state) => escalateDueNotificationsInState(state, input));
+}
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -99,6 +260,33 @@ export function notificationForBundle(bundle) {
   };
 }
 
+export function notificationForOwnerQaPacket(packet = {}) {
+  const sha = String(packet.integration?.sha || "");
+  const shortSha = sha ? sha.slice(0, 12) : "unknown";
+  return {
+    title: "StudioOps QA candidate ready",
+    subtitle: `${packet.projectKey || packet.projectId || "Project"} · ${packet.tasks?.length || 0} task(s)`,
+    body: `A local QA candidate is ready. Approval applies only to tested SHA ${shortSha}. Open StudioOps for the checklist.`,
+  };
+}
+
+export async function deliverNotificationOutboxItem(item, input = {}) {
+  const notification = notificationForOwnerQaPacket(item.packet);
+  if (item.channel === "macos") {
+    await (input.sendMac || sendMacNotification)(notification);
+    return;
+  }
+  if (item.channel === "email") {
+    if (typeof input.sendEmail !== "function") {
+      throw new Error("Email notification channel is configured without a delivery adapter.");
+    }
+    await input.sendEmail(item.packet, item);
+    return;
+  }
+  if (item.channel === "in_app") return;
+  throw new Error(`Unsupported notification channel: ${item.channel}`);
+}
+
 function appleScriptString(value) {
   return `"${String(value || "")
     .replaceAll("\\", "\\\\")
@@ -123,6 +311,18 @@ export async function planNotifications(input = {}) {
   const pending = [];
   const skipped = [];
   const limit = Math.max(1, Number(input.limit || input.maxNotifications || 10));
+  for (const item of state.notificationOutbox || []) {
+    if (!["queued", "failed"].includes(item.status) || !notificationRetryReady(item)) continue;
+    const project = findProject(state, item.projectId);
+    if (!projectAllowed(item, project, input)) continue;
+    if (item.policy?.doNotDisturb && !input.ignoreDoNotDisturb) continue;
+    if (pending.length >= limit) break;
+    pending.push({
+      ...item,
+      notificationType: "outbox",
+      notification: notificationForOwnerQaPacket(item.packet),
+    });
+  }
   for (const bundle of state.qaBundles || []) {
     const qaReady = bundle.status === "ready" && !bundle.notifiedAt;
     const promotionReady = bundle.status === "release_candidate_ready" && !bundle.promotionNotifiedAt;
@@ -224,9 +424,14 @@ export async function markNotificationAttempt(itemId, statusPatch, notificationT
 }
 
 export async function sendPendingNotifications(input = {}) {
+  if (!input.dryRun) await escalateDueNotifications();
   const plan = await planNotifications(input);
+  const outboxItems = plan.pending.filter((item) => item.notificationType === "outbox");
+  const claimed = input.dryRun
+    ? outboxItems
+    : await claimNotificationOutbox({ ids: outboxItems.map((item) => item.id), limit: outboxItems.length || 1 });
   const sent = [];
-  for (const item of plan.pending) {
+  for (const item of plan.pending.filter((entry) => entry.notificationType !== "outbox")) {
     if (input.dryRun) continue;
     try {
       await sendMacNotification(item.notification);
@@ -240,6 +445,15 @@ export async function sendPendingNotifications(input = {}) {
         notificationChannel: "macos",
         notificationError: error.message,
       }, item.notificationType));
+    }
+  }
+  for (const item of claimed) {
+    if (input.dryRun) continue;
+    try {
+      await deliverNotificationOutboxItem(item, input);
+      sent.push(await updateNotificationOutbox(item.id, { claimToken: item.claimToken, status: "delivered", deliveredAt: nowIso(), deliveryError: "" }));
+    } catch (error) {
+      sent.push(await updateNotificationOutbox(item.id, { claimToken: item.claimToken, status: "failed", deliveryError: error.message }));
     }
   }
   return {

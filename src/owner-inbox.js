@@ -3,6 +3,8 @@ import {
   findProject,
   findTask,
 } from "./store.js";
+import { createHash } from "node:crypto";
+import { canonicalJson } from "./candidate-manifest.js";
 import { projectUsesTrustLeadQa } from "./integration-policy.js";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
 
@@ -16,6 +18,87 @@ const CREDENTIAL_PATTERN = /\b(?:Bearer\s+[A-Za-z0-9._~-]{16,}|github_pat_[A-Za-
 const SECRET_ASSIGNMENT_PATTERN = /\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi;
 const LOCAL_PATH_PATTERN = /(^|[\s("'=])\/(?:Users|home|private|var\/folders|tmp|Volumes|opt|etc)\/[^\s"'<>)]*/g;
 const WINDOWS_PATH_PATTERN = /\b[A-Za-z]:\\(?:[^\\\s"'<>]+\\)*[^\\\s"'<>]*/g;
+
+const OWNER_QA_ACTIONS = Object.freeze(["pass", "fail", "request_changes", "defer", "open_candidate"]);
+
+function packetDigest(packet) {
+  return `sha256:${createHash("sha256").update(canonicalJson(packet)).digest("hex")}`;
+}
+
+function criterionSteps(task) {
+  return (task.acceptanceCriteria || []).map((criterion, index) => {
+    const value = typeof criterion === "string" ? { text: criterion } : criterion || {};
+    return {
+      order: index + 1,
+      criterion: String(value.text || value.criterion || value.description || criterion || "").trim(),
+      steps: Array.isArray(value.steps) && value.steps.length ? value.steps.map(String) : ["Open the candidate preview and exercise the criterion.", "Record observed evidence for this criterion."],
+      expected: String(value.expected || value.expectedResult || "The criterion is satisfied without console errors.").trim(),
+    };
+  }).filter((item) => item.criterion);
+}
+
+/**
+ * The single authoritative gate for owner QA. It deliberately fails closed on
+ * missing manifest, membership, checks, or preview identity evidence.
+ */
+export function candidateCompletenessGate(candidate, state = {}, bundle = null) {
+  const reasons = [];
+  let manifest;
+  try {
+    assertCandidateEnvelope(candidate);
+    manifest = candidate.manifest;
+  } catch (error) {
+    reasons.push(`invalid_manifest:${error.message}`);
+  }
+  if (!manifest) return { ready: false, reasons };
+  if (candidate.status !== "frozen" && candidate.status !== "qa_passed" && candidate.status !== "release_candidate_ready") reasons.push("candidate_not_frozen");
+  if (!candidate.manifestDigest) reasons.push("manifest_digest_missing");
+  if (!manifest.sources?.length) reasons.push("candidate_membership_empty");
+  const tasks = (manifest.sources || []).map((source) => findTask(state, source.taskId));
+  if (tasks.some((task) => !task)) reasons.push("candidate_membership_incomplete");
+  if (tasks.some((task) => task && task.projectId !== candidate.projectId)) reasons.push("candidate_cross_project_membership");
+  if ((manifest.checks || []).some((check) => check.outcome !== "passed" || check.subjectSha !== manifest.integration.sha)) reasons.push("required_gate_failed");
+  if (manifest.preview?.status !== "healthy" || manifest.preview?.commitSha !== manifest.integration.sha || manifest.preview?.attestation?.observedSha !== manifest.integration.sha) reasons.push("preview_not_verified_at_candidate_sha");
+  if (bundle && (bundle.candidateId !== candidate.id || bundle.manifestDigest !== candidate.manifestDigest)) reasons.push("bundle_manifest_mismatch");
+  return { ready: reasons.length === 0, reasons, taskIds: (manifest.sources || []).map((source) => source.taskId).sort() };
+}
+
+/** Create the immutable, owner-facing QA contract for a candidate. */
+export function buildOwnerQaPacket(state, candidate, input = {}) {
+  const gate = candidateCompletenessGate(candidate, state, input.bundle || null);
+  if (!gate.ready) throw new Error(`Candidate is not QA-ready: ${gate.reasons.join(", ")}`);
+  const project = findProject(state, candidate.projectId) || {};
+  const tasks = candidate.manifest.sources.map((source) => findTask(state, source.taskId));
+  const base = {
+    schemaVersion: "studioops.owner-qa-packet.v1",
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    projectId: candidate.projectId,
+    projectKey: project.key || "",
+    taskUrlBase: input.baseUrl ? String(input.baseUrl).replace(/\/+$/, "") : "",
+    candidateUrl: input.candidateUrl || "",
+    previewUrl: candidate.manifest.preview.url,
+    integration: { branch: candidate.manifest.integration.branch, sha: candidate.manifest.integration.sha },
+    tasks: tasks.map((task) => ({
+      id: task.id,
+      title: task.title,
+      taskUrl: taskUrl(input.baseUrl, task.id),
+      prUrl: task.prUrl || "",
+      affectedSurfaces: Array.isArray(task.affectedSurfaces) ? task.affectedSurfaces : (task.workAreas || []),
+      orderedTests: criterionSteps(task),
+      accountsOrFixtures: task.accountsOrFixtures || task.fixtures || [],
+      resetSteps: task.resetSteps || ["Reset the preview data or fixture state before the next criterion."],
+      evidence: task.evidence || task.verificationEvidence || [],
+      knownRisks: task.knownRisks || task.risks || [],
+      migrations: task.migrations || [],
+      featureFlags: task.featureFlags || [],
+      rollback: task.rollback || "Revert the candidate commit and disable its feature flag, if applicable.",
+    })),
+    actions: OWNER_QA_ACTIONS.map((action) => ({ action, candidateId: candidate.id, manifestDigest: candidate.manifestDigest })),
+    generatedAt: input.generatedAt || new Date().toISOString(),
+  };
+  return Object.freeze({ ...base, packetDigest: packetDigest(base) });
+}
 
 const GROUP_DEFINITIONS = {
   decisions: {

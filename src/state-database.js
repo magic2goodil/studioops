@@ -11,9 +11,9 @@ import {
   missionControlRoot,
 } from "./runtime-paths.js";
 
-const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates"];
-const TABLE_NAME = { qaBundles: "qa_bundles" };
-const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "qaBundles", "candidates"]);
+const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates", "notificationOutbox"];
+const TABLE_NAME = { qaBundles: "qa_bundles", notificationOutbox: "notification_outbox" };
+const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "qaBundles", "candidates", "notificationOutbox"]);
 const STATE_INTEGRITY_VERSION = 5;
 const LIFECYCLE_SCHEMA_VERSION = 1;
 export const COORDINATION_SCHEMA_VERSION = 2;
@@ -139,6 +139,15 @@ function openDatabase() {
       updated_at TEXT NOT NULL DEFAULT '',
       payload TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS notification_outbox (
+      id TEXT PRIMARY KEY,
+      sequence INTEGER NOT NULL,
+      project_id TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT '',
+      kind TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS operational_archive (
       entity_type TEXT NOT NULL,
       entity_id TEXT NOT NULL,
@@ -159,6 +168,7 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_qa_bundles_project_status ON qa_bundles(project_id, status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_candidates_project_status ON candidates(project_id, status, updated_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_manifest_digest ON candidates(manifest_digest);
+    CREATE INDEX IF NOT EXISTS idx_notification_outbox_status ON notification_outbox(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
   `);
   return database;
@@ -409,6 +419,7 @@ export function reconcileStateIntegrity(state) {
   state.tasks = Array.isArray(state.tasks) ? state.tasks : [];
   state.qaBundles = Array.isArray(state.qaBundles) ? state.qaBundles : [];
   state.candidates = Array.isArray(state.candidates) ? state.candidates : [];
+  state.notificationOutbox = Array.isArray(state.notificationOutbox) ? state.notificationOutbox : [];
 
   const projectIds = new Set(state.projects.map((project) => project.id));
   const tasksById = new Map(state.tasks.map((task) => [task.id, task]));
@@ -636,6 +647,16 @@ function upsertEntity(db, table, item, sequence) {
         item.updatedAt || "",
         payload,
       );
+    return;
+  }
+  if (table === "notificationOutbox") {
+    db.prepare(`
+      INSERT INTO notification_outbox(id, sequence, project_id, status, kind, updated_at, payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
+        status = excluded.status, kind = excluded.kind, updated_at = excluded.updated_at, payload = excluded.payload
+    `)
+      .run(item.id, sequence, item.projectId || "", item.status || "", item.kind || "", item.updatedAt || "", payload);
     return;
   }
   db.prepare(`
@@ -985,6 +1006,7 @@ async function initialState() {
     runs: [],
     qaBundles: [],
     candidates: [],
+    notificationOutbox: [],
   };
 }
 
