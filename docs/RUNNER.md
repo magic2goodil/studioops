@@ -192,6 +192,16 @@ data/run-outputs/<run_id>.log
 data/run-outputs/<run_id>.last-message.md
 ```
 
+Before claiming work, the runner performs a bounded retention sweep when the
+configured interval is due or either the state database volume or workspace
+volume is below its byte or percentage safety threshold. Cleanup reports keep
+the configured thresholds, byte and percentage-point shortfalls, logical and
+filesystem recovery evidence, and bounded exclusion reason counts. Under disk
+pressure, safe old terminal workspaces are measured before the store issues a
+size-verified deletion lease. Source repositories, active workspaces, candidate
+artifacts, unknown workspace layouts, and paths outside the configured local
+workspace root remain protected.
+
 List runs:
 
 ```bash

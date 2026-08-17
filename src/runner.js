@@ -80,6 +80,19 @@ const DEFAULT_RUNNER_PATH = [
 
 const WORKSPACE_CLEANUP_LIMIT = 25;
 
+function diskShortfall(report = {}) {
+  const bytes = Math.max(0, Number(report.minAvailableBytes || 0) - Number(report.availableBytes || 0));
+  const percentPoints = Math.max(
+    0,
+    Number(report.minAvailablePercent || 0) - Number(report.availablePercent || 0),
+  );
+  return {
+    pressure: report.pressure === true,
+    bytes,
+    percentPoints: Number(percentPoints.toFixed(2)),
+  };
+}
+
 function safeCleanupError(error) {
   return redactSecrets(error?.message || String(error), []).replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
 }
@@ -189,11 +202,42 @@ export async function runWorkspaceCleanup(input = {}) {
     sameVolume,
     initial: { data: initial.data, workspace: initial.workspace },
     after: null,
+    policy: {
+      enabled: policy.enabled,
+      sweepIntervalSeconds: policy.sweepIntervalSeconds,
+      maxDeletesPerSweep: policy.maxDeletesPerSweep,
+      maxRetainedBytes: policy.maxRetainedBytes,
+      pressureMinAgeHours: policy.pressureMinAgeHours,
+      retainForHours: { ...policy.retainForHours },
+      thresholds: {
+        data: {
+          minAvailableBytes: initial.data.minAvailableBytes,
+          minAvailablePercent: initial.data.minAvailablePercent,
+        },
+        workspace: {
+          minAvailableBytes: initial.workspace.minAvailableBytes,
+          minAvailablePercent: initial.workspace.minAvailablePercent,
+        },
+      },
+    },
+    selection: {
+      consideredCount: 0,
+      eligibleCount: 0,
+      selectedCount: 0,
+      excludedCount: 0,
+      excludedByReason: {},
+    },
     selected: [],
     skipped: [],
     logicalDeletedBytes: 0,
     actualAvailableByteDelta: 0,
-    remainingShortfall: 0,
+    remainingShortfall: {
+      pressure: false,
+      bytes: 0,
+      percentPoints: 0,
+      data: { pressure: false, bytes: 0, percentPoints: 0 },
+      workspace: { pressure: false, bytes: 0, percentPoints: 0 },
+    },
     selectedCount: 0,
     skippedCount: 0,
     failureCount: 0,
@@ -206,17 +250,22 @@ export async function runWorkspaceCleanup(input = {}) {
     return report;
   }
 
-  const snapshots = await (input.eligibleRunWorkspaceSnapshots
-    || (input.state ? eligibleRunWorkspaceSnapshotsInState : eligibleRunWorkspaceSnapshots))({
+  const snapshotReader = input.eligibleRunWorkspaceSnapshots
+    || (input.state
+      ? (args) => eligibleRunWorkspaceSnapshotsInState(input.state, args)
+      : eligibleRunWorkspaceSnapshots);
+  const snapshots = await snapshotReader({
     ...input,
     state,
     workspaceRoot,
     policy,
     pressure,
+    includeUnverifiedPressureCandidates: true,
     nowMs,
   });
+  const discoveredSnapshots = Array.isArray(snapshots) ? snapshots : snapshots.candidates || [];
   const verifiedWorkspaceBytes = {};
-  for (const snapshot of snapshots) {
+  for (const snapshot of discoveredSnapshots) {
     try {
       const measured = await logicalWorkspaceBytes(snapshot.workspacePath);
       verifiedWorkspaceBytes[snapshot.runId] = measured.bytes;
@@ -236,6 +285,7 @@ export async function runWorkspaceCleanup(input = {}) {
     limit: WORKSPACE_CLEANUP_LIMIT,
     nowMs,
   });
+  report.selection = claim.selectionReport || report.selection;
   for (const run of claim.candidates || []) {
     const claimStartedBytes = verifiedWorkspaceBytes[run.id] ?? 0;
     try {
@@ -270,13 +320,17 @@ export async function runWorkspaceCleanup(input = {}) {
   };
   report.actualAvailableByteDelta = Math.max(0, report.after.data.availableBytes - report.initial.data.availableBytes)
     + (sameVolume ? 0 : Math.max(0, report.after.workspace.availableBytes - report.initial.workspace.availableBytes));
-  report.remainingShortfall = Math.max(
-    0,
-    Math.max(initial.data.minAvailableBytes - report.after.data.availableBytes, 0),
-    Math.max(initial.workspace.minAvailableBytes - report.after.workspace.availableBytes, 0),
-  );
+  const dataShortfall = diskShortfall(report.after.data);
+  const workspaceShortfall = diskShortfall(report.after.workspace);
+  report.remainingShortfall = {
+    pressure: dataShortfall.pressure || workspaceShortfall.pressure,
+    bytes: Math.max(dataShortfall.bytes, sameVolume ? 0 : workspaceShortfall.bytes),
+    percentPoints: Math.max(dataShortfall.percentPoints, sameVolume ? 0 : workspaceShortfall.percentPoints),
+    data: dataShortfall,
+    workspace: workspaceShortfall,
+  };
   report.selectedCount = report.selected.length;
-  report.skippedCount = report.skipped.length;
+  report.skippedCount = report.skipped.length + Number(report.selection.excludedCount || 0);
   report.failureCount = report.failures.length;
   report.durationMs = Date.now() - startedMs;
   return report;

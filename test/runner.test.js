@@ -1389,6 +1389,65 @@ test("runner cleanup fails closed on a post-claim symlink swap, releases the lea
   }
 });
 
+test("runner cleanup reports percent pressure, thresholds, and bounded policy exclusions", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-runner-pressure-report-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const workspaceRoot = path.join(root, "workspaces");
+    const dataPath = path.join(root, "data");
+    const oldPath = path.join(workspaceRoot, "demo", "run_old-old");
+    await mkdir(oldPath, { recursive: true });
+    await writeFile(path.join(oldPath, "payload"), "measured before cleanup\n");
+    const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+    const state = {
+      meta: {},
+      projects: [{ id: "project_1", key: "demo", repoPath: path.join(root, "source") }],
+      runs: [
+        { id: "run_old", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "old", workspaceStrategy: "clone", workspacePath: oldPath, completedAt: new Date(nowMs - 48 * 3_600_000).toISOString() },
+        { id: "run_young", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "young", workspaceStrategy: "clone", workspacePath: path.join(workspaceRoot, "demo", "run_young-young"), completedAt: new Date(nowMs - 1 * 3_600_000).toISOString() },
+        { id: "run_active", projectId: "project_1", projectKey: "demo", status: "running", branchName: "active", workspaceStrategy: "clone", workspacePath: path.join(workspaceRoot, "demo", "run_active-active"), updatedAt: new Date(nowMs - 48 * 3_600_000).toISOString() },
+        { id: "run_artifact", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "artifact", workspaceStrategy: "clone", workspacePath: path.join(workspaceRoot, "candidates", "run_artifact-artifact"), completedAt: new Date(nowMs - 48 * 3_600_000).toISOString() },
+      ],
+    };
+    const percentPressure = async ({ path: target }) => ({
+      path: target,
+      availableBytes: 900_000,
+      totalBytes: 1_000_000,
+      availablePercent: 1,
+      minAvailableBytes: 100,
+      minAvailablePercent: 5,
+      pressure: true,
+    });
+
+    const report = await runWorkspaceCleanup({
+      state,
+      workspaceRoot,
+      dataPath,
+      sameVolume: true,
+      workspaceRetention: {
+        retainForHours: { failed: 336 },
+        pressureMinAgeHours: 24,
+      },
+      readDiskAvailability: percentPressure,
+      nowMs,
+    });
+
+    assert.equal(report.selectedCount, 1, JSON.stringify(report));
+    assert.equal(report.remainingShortfall.pressure, true);
+    assert.equal(report.remainingShortfall.bytes, 0);
+    assert.equal(report.remainingShortfall.percentPoints, 4);
+    assert.equal(report.policy.thresholds.data.minAvailablePercent, 5);
+    assert.equal(report.selection.selectedCount, 1);
+    assert.equal(report.selection.excludedByReason.minimum_age_not_reached, 1);
+    assert.equal(report.selection.excludedByReason.nonterminal_run, 1);
+    assert.equal(report.selection.excludedByReason.protected_candidate_artifact_path, 1);
+    assert.equal(report.skippedCount, 3);
+    await assert.rejects(() => lstat(oldPath), { code: "ENOENT" });
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("runner claims after recoverable pressure cleanup but pauses for persistent pressure or disk recovery", async () => {
   const state = { meta: {}, projects: [], runs: [] };
   const resolvedReports = [
