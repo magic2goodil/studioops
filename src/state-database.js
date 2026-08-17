@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
+import { lifecycleEvidenceChanged, positiveStateVersion } from "./lifecycle-policy.js";
 import { fileExists } from "./config.js";
 import {
   assertIsolatedTestEnvironment,
@@ -13,7 +14,7 @@ import {
 const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles", "candidates"]);
-const STATE_INTEGRITY_VERSION = 4;
+const STATE_INTEGRITY_VERSION = 5;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
@@ -66,6 +67,7 @@ function openDatabase() {
       sequence INTEGER NOT NULL,
       project_id TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT '',
+      state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0),
       assigned_role TEXT NOT NULL DEFAULT '',
       updated_at TEXT NOT NULL DEFAULT '',
       payload TEXT NOT NULL
@@ -145,6 +147,14 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
   `);
   return database;
+}
+
+function ensureLifecycleSchema(db) {
+  const taskColumns = new Set(db.prepare("PRAGMA table_info(tasks)").all().map((column) => column.name));
+  if (!taskColumns.has("state_version")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version > 0)");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state_version ON tasks(id, state_version)");
 }
 
 function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
@@ -307,6 +317,8 @@ export function reconcileStateIntegrity(state) {
   }
 
   for (const task of state.tasks) {
+    const version = Number(task.stateVersion);
+    task.stateVersion = Number.isSafeInteger(version) && version > 0 ? version : 1;
     const candidate = candidatesById.get(task.candidateId);
     const decision = candidate?.qaDecision;
     const hasTrustedApproval = Boolean(
@@ -456,11 +468,12 @@ function upsertEntity(db, table, item, sequence) {
   }
   if (table === "tasks") {
     db.prepare(`
-      INSERT INTO tasks(id, sequence, project_id, status, assigned_role, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tasks(id, sequence, project_id, status, state_version, assigned_role, updated_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, project_id = excluded.project_id,
-        status = excluded.status, assigned_role = excluded.assigned_role, updated_at = excluded.updated_at, payload = excluded.payload
+        status = excluded.status, state_version = excluded.state_version,
+        assigned_role = excluded.assigned_role, updated_at = excluded.updated_at, payload = excluded.payload
     `)
-      .run(item.id, sequence, item.projectId || "", item.status || "", item.assignedAgentRole || "", item.updatedAt || "", payload);
+      .run(item.id, sequence, item.projectId || "", item.status || "", Number(item.stateVersion || 1), item.assignedAgentRole || "", item.updatedAt || "", payload);
     return;
   }
   if (table === "comments") {
@@ -561,6 +574,42 @@ function mutationSnapshot(state) {
   return snapshot;
 }
 
+function normalizeTaskStateVersions(state, snapshot) {
+  const externalEvidenceTaskIds = new Set();
+  const previousReviewIds = snapshot.tables.reviews;
+  for (const review of state.reviews || []) {
+    if (!previousReviewIds.has(review.id)) externalEvidenceTaskIds.add(review.taskId);
+  }
+  for (const candidate of state.candidates || []) {
+    const prior = snapshot.tables.candidates.get(candidate.id);
+    if (prior?.payload === JSON.stringify(candidate)) continue;
+    for (const source of candidate.manifest?.sources || []) externalEvidenceTaskIds.add(source.taskId);
+  }
+  for (const task of state.tasks || []) {
+    const priorPayload = snapshot.tables.tasks.get(task.id)?.payload;
+    if (!priorPayload) {
+      task.stateVersion = 1;
+      continue;
+    }
+    const previous = JSON.parse(priorPayload);
+    const priorVersion = positiveStateVersion(previous.stateVersion);
+    const lifecycleOrEvidenceChanged = previous.status !== task.status
+      || lifecycleEvidenceChanged(previous, task)
+      || externalEvidenceTaskIds.has(task.id);
+    const suppliedVersion = positiveStateVersion(task.stateVersion);
+    if (lifecycleOrEvidenceChanged) {
+      if (suppliedVersion === priorVersion) task.stateVersion = priorVersion + 1;
+      else if (suppliedVersion !== priorVersion + 1) {
+        throw new Error(`Task ${task.id} stateVersion must increment exactly once for a lifecycle or evidence mutation.`);
+      }
+    } else if (suppliedVersion !== priorVersion) {
+      throw new Error(`Task ${task.id} stateVersion cannot change for a metadata-only mutation.`);
+    } else {
+      task.stateVersion = priorVersion;
+    }
+  }
+}
+
 function assertAppendOnlyCandidateFields(previousCandidate, candidate) {
   for (const field of ["invalidation", "qaDecision", "promotion"]) {
     if (
@@ -611,6 +660,7 @@ function assertValidTaskStatuses(state) {
 }
 
 function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
+  normalizeTaskStateVersions(state, snapshot);
   if (options.validateTaskStatuses !== false) {
     if (options.repairTaskId) {
       const repairTaskId = String(options.repairTaskId);
@@ -688,6 +738,18 @@ async function preMigrationBackup(db) {
   await mkdir(backupDir, { recursive: true, mode: 0o700 });
   await backup(db, outputPath);
   await chmod(outputPath, 0o600);
+  const verification = new DatabaseSync(outputPath, { readOnly: true });
+  try {
+    const integrity = verification.prepare("PRAGMA integrity_check").get();
+    if (integrity?.integrity_check !== "ok") throw new Error(`Pre-migration backup integrity check failed: ${integrity?.integrity_check || "unknown"}`);
+    for (const table of ["state_meta", ...ENTITY_TABLES.map((name) => TABLE_NAME[name] || name)]) {
+      const sourceCount = Number(db.prepare(`SELECT count(*) count FROM ${table}`).get()?.count || 0);
+      const backupCount = Number(verification.prepare(`SELECT count(*) count FROM ${table}`).get()?.count || 0);
+      if (sourceCount !== backupCount) throw new Error(`Pre-migration backup verification failed for ${table}.`);
+    }
+  } finally {
+    verification.close();
+  }
   return outputPath;
 }
 
@@ -704,6 +766,7 @@ async function runStateIntegrityMigration(db) {
   const backupPath = await preMigrationBackup(db);
   db.exec("BEGIN IMMEDIATE");
   try {
+    ensureLifecycleSchema(db);
     const state = readStateFromOpenDatabase(db);
     if (Number(state?.meta?.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION) {
       db.exec("COMMIT");
@@ -719,6 +782,12 @@ async function runStateIntegrityMigration(db) {
     archiveOperationalHistory(db, archived, now);
     state.meta = state.meta || {};
     state.meta.stateIntegrityVersion = STATE_INTEGRITY_VERSION;
+    state.meta.lifecycleMigration = {
+      version: STATE_INTEGRITY_VERSION,
+      migratedAt: now,
+      backupPath,
+      backupVerified: true,
+    };
     recordOperationalArchiveMetadata(state, archived, now, backupPath);
     state.meta.updatedAt = now;
     writeMutationToOpenDatabase(db, state, snapshot, { validateTaskStatuses: false });
@@ -849,8 +918,11 @@ export async function writeDatabaseState(state) {
   const db = await ensureStateDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
-    assertMaintenanceWriteAllowed(readStateFromOpenDatabase(db));
+    const previousState = readStateFromOpenDatabase(db);
+    assertMaintenanceWriteAllowed(previousState);
+    const snapshot = mutationSnapshot(previousState);
     reconcileStateIntegrity(state);
+    normalizeTaskStateVersions(state, snapshot);
     assertValidTaskStatuses(state);
     const archived = compactOperationalHistory(state);
     if (archivedItemCount(archived)) {

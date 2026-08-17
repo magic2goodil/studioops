@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
@@ -315,6 +315,9 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
     assert.equal(state.tasks[0].title, "Persist me");
     assert.equal(state.meta.storageBackend, "sqlite");
     assert.match(state.meta.migratedFrom, /mission-control\.json$/);
+    assert.equal(state.meta.stateIntegrityVersion, 5);
+    assert.equal(state.meta.lifecycleMigration.backupVerified, true);
+    assert.equal(state.tasks[0].stateVersion, 1);
 
     const dataMode = (await stat(path.join(root, "data"))).mode & 0o777;
     const databaseMode = (await stat(path.join(root, "data", "mission-control.sqlite3"))).mode & 0o777;
@@ -322,6 +325,15 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
     assert.equal(dataMode, 0o700);
     assert.equal(databaseMode, 0o600);
     assert.equal(legacyMode, 0o600);
+    assert.equal((await stat(state.meta.lifecycleMigration.backupPath)).mode & 0o777, 0o600);
+
+    const migratedDb = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
+    try {
+      assert.equal(migratedDb.prepare("SELECT state_version FROM tasks WHERE id = 'task_1'").get().state_version, 1);
+      assert.equal(migratedDb.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+    } finally {
+      migratedDb.close();
+    }
 
     const backupPath = path.join(root, "backups", "snapshot.sqlite3");
     await runStoreScript(root, `
@@ -329,6 +341,110 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
       await backupStateDatabase(${JSON.stringify(backupPath)});
     `);
     assert.equal((await stat(backupPath)).mode & 0o777, 0o600);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("task aggregate versions change only for lifecycle or evidence mutations", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-task-version-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import { readState, updateTask } from ${JSON.stringify(storeModuleUrl)};
+      await readState();
+      await updateTask("task_1", { labels: ["metadata-only"] });
+      await updateTask("task_1", { impactEvidence: { changedFiles: ["src/store.js"], impact: ["backend"] } });
+    `);
+    const state = readPersistedState(root);
+    assert.equal(state.tasks[0].stateVersion, 2);
+    assert.deepEqual(state.tasks[0].labels, ["metadata-only"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle integrity migration upgrades an existing v4 database once from a verified pre-migration backup", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-lifecycle-migration-replay-"));
+  try {
+    const dataDir = path.join(root, "data");
+    await mkdir(dataDir, { recursive: true });
+    const databasePath = path.join(dataDir, "mission-control.sqlite3");
+    const legacyDb = new DatabaseSync(databasePath);
+    try {
+      legacyDb.exec(`
+        CREATE TABLE state_meta (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          payload TEXT NOT NULL,
+          version INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY,
+          sequence INTEGER NOT NULL,
+          project_id TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT '',
+          assigned_role TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL DEFAULT '',
+          payload TEXT NOT NULL
+        );
+      `);
+      const state = baseState();
+      state.meta.stateIntegrityVersion = 4;
+      legacyDb.prepare("INSERT INTO state_meta VALUES (1, ?, 1, ?)")
+        .run(JSON.stringify(state.meta), "2026-08-17T00:00:00.000Z");
+      legacyDb.prepare("INSERT INTO tasks VALUES (?, 0, ?, ?, '', '', ?)")
+        .run("task_1", "project_1", "ready", JSON.stringify(state.tasks[0]));
+    } finally {
+      legacyDb.close();
+    }
+
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    let persisted = readPersistedState(root);
+    assert.equal(persisted.meta.stateIntegrityVersion, 5);
+    assert.equal(persisted.tasks[0].stateVersion, 1);
+    const backupPath = persisted.meta.lifecycleMigration.backupPath;
+    const backupDb = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      assert.equal(backupDb.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+      assert.equal(backupDb.prepare("PRAGMA table_info(tasks)").all().some((column) => column.name === "state_version"), false);
+      assert.equal(backupDb.prepare("SELECT count(*) count FROM tasks").get().count, 1);
+    } finally {
+      backupDb.close();
+    }
+    const backupsBeforeReplay = await readdir(path.join(dataDir, "backups"));
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].stateVersion, 1);
+    assert.deepEqual(await readdir(path.join(dataDir, "backups")), backupsBeforeReplay);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("compare-and-swap lifecycle commands serialize and reject stale replay without mutation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-lifecycle-cas-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    const source = `
+      import { transitionTask } from ${JSON.stringify(storeModuleUrl)};
+      await transitionTask({
+        action: "close_task",
+        taskId: "task_1",
+        expectedStateVersion: 1,
+        actorContext: { actorId: "owner-local", actorType: "owner", role: "owner", trusted: true },
+        evidence: { targetStatus: "closed" },
+      });
+    `;
+    const results = await Promise.allSettled([runStoreScript(root, source), runStoreScript(root, source)]);
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    const rejection = results.find((result) => result.status === "rejected");
+    assert.match(`${rejection.reason.stderr}\n${rejection.reason.message}`, /Stale lifecycle command/);
+    const state = readPersistedState(root);
+    assert.equal(state.tasks[0].status, "closed");
+    assert.equal(state.tasks[0].stateVersion, 2);
+    assert.equal(state.events.filter((event) => event.type === "lifecycle_transition").length, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

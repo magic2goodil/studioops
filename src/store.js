@@ -23,6 +23,11 @@ import {
 } from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
+  CANONICAL_LIFECYCLE_STATUSES,
+  evaluateLifecycleTransition,
+  positiveStateVersion,
+} from "./lifecycle-policy.js";
+import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
   ensureStateDatabase,
@@ -35,32 +40,7 @@ import {
 const DATA_DIR = missionControlDataDir();
 const DATA_FILE = LEGACY_DATA_FILE;
 
-const VALID_STATUSES = new Set([
-  "idea",
-  "architecture_pending",
-  "architecture_in_progress",
-  "architecture_ready",
-  "ready",
-  "queued",
-  "in_progress",
-  "blocked",
-  "builder_review",
-  "backend_review",
-  "frontend_review",
-  "accessibility_review",
-  "regression_review",
-  "lead_review",
-  "qa_review",
-  "approved_for_main",
-  "promotion_blocked",
-  "needs_changes",
-  "user_review",
-  "approved",
-  "merged",
-  "deployed",
-  "done",
-  "closed",
-]);
+const VALID_STATUSES = new Set(CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"));
 
 const VALID_REVIEW_OUTCOMES = new Set([
   "approved",
@@ -1477,6 +1457,7 @@ export async function addTask(input) {
       reviewCycle: 0,
       reviewSubjectSha: "",
       reviewSubjectCycle: 0,
+      stateVersion: 1,
       impactEvidence: normalizedImpactEvidence(input.impactEvidence || input),
       candidateIdentity: normalizeCandidateIdentity(input.candidateIdentity || {}, {
         branch: input.branchName,
@@ -1499,6 +1480,143 @@ export async function addTask(input) {
   });
 }
 
+function lifecycleInvalidationIds(state, task, decision) {
+  if (!decision.invalidates.length) return [];
+  const ids = [];
+  const invalidatedAt = decision.occurredAt;
+  if (decision.invalidates.includes("reviews")) {
+    for (const review of state.reviews || []) {
+      if (review.taskId === task.id && !review.invalidatedAt) ids.push(review.id);
+    }
+  }
+  if (decision.invalidates.includes("candidate")) {
+    for (const candidate of state.candidates || []) {
+      if (candidate.invalidation || !(candidate.manifest?.sources || []).some((source) => source.taskId === task.id)) continue;
+      invalidateCandidate(candidate, {
+        reason: `Lifecycle ${decision.action} invalidated candidate evidence for task ${task.id}.`,
+        expected: candidate.manifestDigest,
+        observed: decision.override?.reasonCode || decision.action,
+        invalidatedAt,
+      });
+      ids.push(candidate.id);
+      const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+      if (bundle) {
+        bundle.status = "invalidated";
+        bundle.updatedAt = invalidatedAt;
+        ids.push(bundle.id);
+      }
+    }
+  }
+  if (decision.invalidates.length) {
+    task.evidenceInvalidations = Array.isArray(task.evidenceInvalidations) ? task.evidenceInvalidations : [];
+    task.evidenceInvalidations.push({
+      action: decision.action,
+      reasonCode: decision.override?.reasonCode || decision.action,
+      reason: decision.override?.reason || "Lifecycle policy invalidation.",
+      risk: decision.override?.risk || "Existing evidence is incompatible with the new lifecycle state.",
+      invalidationIds: [...new Set(ids)],
+      invalidatedAt,
+    });
+    task.candidateId = "";
+    task.qaBundleId = "";
+    task.qaDecision = null;
+    task.integrationStatus = "";
+    task.promotionStatus = "";
+    task.promotionEvidence = null;
+  }
+  return [...new Set(ids)];
+}
+
+function appendLifecycleAuditEvent(state, task, decision, invalidationIds) {
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "lifecycle_transition",
+    projectId: task.projectId,
+    taskId: task.id,
+    action: decision.action,
+    fromStatus: decision.from,
+    toStatus: decision.to,
+    fromVersion: decision.fromVersion,
+    toVersion: decision.toVersion,
+    actor: {
+      id: decision.actor.actorId,
+      type: decision.actor.actorType,
+      role: decision.actor.role,
+    },
+    runId: decision.actor.runId,
+    leaseId: decision.actor.leaseId,
+    evidence: decision.evidence,
+    outcome: "applied",
+    invalidationIds,
+    reasonCode: decision.override?.reasonCode || "",
+    reason: decision.override?.reason || "",
+    risk: decision.override?.risk || "",
+    message: `${task.title}: ${decision.action} moved ${decision.from} to ${decision.to} at stateVersion ${decision.toVersion}`,
+    createdAt: decision.occurredAt,
+  });
+}
+
+export function applyLifecycleTransitionInState(state, command, input = {}) {
+  const task = findTask(state, command?.taskId);
+  if (!task) throw new Error(`Unknown task: ${command?.taskId || "(missing)"}`);
+  const result = evaluateLifecycleTransition(command, task, {
+    runs: state.runs || [],
+    candidates: state.candidates || [],
+    now: input.now,
+    nowMs: input.nowMs,
+  });
+  Object.assign(task, result.task);
+  const invalidationIds = lifecycleInvalidationIds(state, task, result.decision);
+  appendLifecycleAuditEvent(state, task, result.decision, invalidationIds);
+  return { task, decision: { ...result.decision, invalidationIds } };
+}
+
+export async function transitionTask(command, input = {}) {
+  if (!command || typeof command !== "object" || Array.isArray(command)) {
+    throw new Error("Lifecycle transition command envelope is required.");
+  }
+  const allowed = ["action", "taskId", "expectedStateVersion", "actorContext", "evidence"];
+  const unknown = Object.keys(command).filter((key) => !allowed.includes(key));
+  if (unknown.length) throw new Error(`Unknown lifecycle command fields: ${unknown.join(", ")}`);
+  return mutateState(async (state) => applyLifecycleTransitionInState(state, command, input));
+}
+
+export async function repairLegacyTaskStatus(taskId, status, input = {}) {
+  const targetStatus = String(status || "").trim();
+  if (!VALID_STATUSES.has(targetStatus)) throw new Error(`Invalid repair status: ${status || "(missing)"}`);
+  return mutateState(async (state) => {
+    const task = findTask(state, taskId);
+    if (!task) throw new Error(`Unknown task: ${taskId}`);
+    const priorStatus = typeof task.status === "string" ? task.status.trim() : "";
+    if (task.status === priorStatus && VALID_STATUSES.has(priorStatus)) {
+      throw new Error("Legacy repair is only available for a task with an invalid persisted status.");
+    }
+    task.status = "legacy_untrusted";
+    const result = applyLifecycleTransitionInState(state, {
+      action: "legacy_repair",
+      taskId,
+      expectedStateVersion: positiveStateVersion(task.stateVersion),
+      actorContext: {
+        actorId: String(input.actorId || "state-integrity-migration").trim(),
+        actorType: "migration",
+        role: "integrity-repair",
+        trusted: true,
+      },
+      evidence: { targetStatus },
+    }, input);
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "workflow_integrity_repaired",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `Task workflow status repaired from ${priorStatus || "(missing)"} to ${targetStatus}; historical evidence was preserved.`,
+      createdAt: result.decision.occurredAt,
+    });
+    return result.task;
+  }, { repairTaskId: taskId });
+}
+
 export async function updateTask(taskId, patch) {
   const ownsValidStatus = Object.prototype.hasOwnProperty.call(patch, "status")
     && typeof patch.status === "string"
@@ -1513,6 +1631,9 @@ export async function updateTask(taskId, patch) {
     const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
     const previousNormalizedStatus = typeof task.status === "string" ? task.status.trim() : "";
     const repairingLegacyStatus = ownsValidStatus && !VALID_STATUSES.has(previousNormalizedStatus);
+    if (repairingLegacyStatus) {
+      throw new Error("Invalid legacy status can only be changed by repairLegacyTaskStatus.");
+    }
     if (Object.prototype.hasOwnProperty.call(patch, "status")) {
       const normalizedStatus = typeof patch.status === "string" ? patch.status.trim() : "";
       if (!normalizedStatus || !VALID_STATUSES.has(normalizedStatus)) {
@@ -1703,7 +1824,15 @@ export async function updateTask(taskId, patch) {
         },
       );
     }
-    task.candidateIdentity = candidateIdentityForTask(task);
+    if ([
+      "subjectSha",
+      "candidateIdentity",
+      "impactEvidence",
+      "branchName",
+      "operationalLocalArtifactRef",
+    ].some((key) => Object.prototype.hasOwnProperty.call(patch, key))) {
+      task.candidateIdentity = candidateIdentityForTask(task);
+    }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
       && patch.status !== "blocked"
@@ -1720,18 +1849,8 @@ export async function updateTask(taskId, patch) {
       message: `Task updated: ${task.title}`,
       createdAt: task.updatedAt,
     });
-    if (repairingLegacyStatus) {
-      state.events.push({
-        id: nextId(state.events, "event"),
-        type: "workflow_integrity_repaired",
-        projectId: task.projectId,
-        taskId: task.id,
-        message: `Task workflow status repaired from ${previousNormalizedStatus || "(missing)"} to ${task.status}; review evidence was preserved.`,
-        createdAt: task.updatedAt,
-      });
-    }
     return task;
-  }, ownsValidStatus ? { repairTaskId: taskId } : {});
+  });
 }
 
 function missingArchitectureChildContractFields(child) {
@@ -2909,6 +3028,9 @@ function setTaskWorkflowState(state, task, patch, now) {
       Number(task.reviewSubjectCycle || 0) + 1,
       task.reviewCycle,
     );
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "status") && patch.status !== previousStatus) {
+    task.stateVersion = positiveStateVersion(task.stateVersion) + 1;
   }
   task.updatedAt = now;
   state.events.push({
