@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { integrationBranchName, trustLeadApprovalsEnabled } from "./integration-policy.js";
 import { missionControlConfigRoot } from "./runtime-paths.js";
+import { normalizeCreditPolicy } from "./credit-policy.js";
 
 export const CONFIG_FILE = "studioops.config.md";
 export const LEGACY_CONFIG_FILE = "mission-control.config.md";
@@ -15,6 +16,10 @@ export const INSTALLED_AUTOMATION_CAPACITY = Object.freeze({
   reviewerConcurrency: 3,
   runnerLimit: 3,
 });
+
+export function normalizeCreditPolicyConfig(value = {}) {
+  return normalizeCreditPolicy(value);
+}
 
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
@@ -69,11 +74,24 @@ export function normalizeConfig(config = {}) {
         INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
       ),
     } : topLevelRunner;
+  const hasDefaultCreditPolicy = hasOwnValue(defaults, "creditPolicy");
+  const hasTopLevelCreditPolicy = hasOwnValue(config, "creditPolicy");
+  const normalizedDefaultCreditPolicy = hasDefaultCreditPolicy
+    ? normalizeCreditPolicyConfig(defaults.creditPolicy)
+    : null;
+  const normalizedTopLevelCreditPolicy = hasTopLevelCreditPolicy
+    ? normalizeCreditPolicyConfig({
+        ...(defaults.creditPolicy || {}),
+        ...(config.creditPolicy || {}),
+      })
+    : null;
   return {
     ...config,
     ...(hasOwnValue(config, "runner") ? { runner: normalizedTopLevelRunner } : {}),
+    ...(hasTopLevelCreditPolicy ? { creditPolicy: normalizedTopLevelCreditPolicy } : {}),
     defaults: {
       ...defaults,
+      ...(hasDefaultCreditPolicy ? { creditPolicy: normalizedDefaultCreditPolicy } : {}),
       dispatcher: {
         ...dispatcher,
         builderConcurrency: positiveInteger(
@@ -154,6 +172,14 @@ Do not paste private keys, API tokens, passwords, customer data, or secrets into
 - StudioOps verifies GitHub access; it does not store private keys.
 - Keep this file local. It is ignored by Git.
 - Keep secrets in each project's normal secret manager or environment files.
+
+## Credit Admission Configuration
+
+The canonical degraded-telemetry contract is
+\`defaults.creditPolicy.degradedTelemetryFallback\`. It is versioned and keyed
+by stable execution risk tiers and explicit labels, never model IDs. Existing
+\`failClosedTiers\` and \`tierBudgets\` inputs remain readable for one compatibility
+release; newly generated configuration uses the canonical fallback contract.
 
 ## Machine-Readable Config
 

@@ -13,6 +13,7 @@ import {
 } from "../src/store.js";
 
 const SUBJECT_SHA = "a".repeat(40);
+const CREDIT_ADMISSION_MANIFEST = "docs/architecture/credit-admission-impact.json";
 
 function fixtureState(projectPatch = {}, taskPatch = {}) {
   return {
@@ -193,4 +194,91 @@ test("the shared contract is deterministic and treats unclassified changes as fu
   assert.match(contract, /base\/head diff plus an executable ownership and dependency manifest/i);
   assert.match(contract, /multi-component, ambiguous, or unclassified changes/i);
   assert.match(contract, /A selected failure or cancellation fails it/i);
+});
+
+function matchingPathRule(manifest, featurePath) {
+  return manifest.impactClassifier.pathRules.find((rule) => (
+    rule.pattern.endsWith("/**")
+      ? featurePath.startsWith(rule.pattern.slice(0, -2))
+      : featurePath === rule.pattern
+  ));
+}
+
+test("the credit-admission ownership manifest is complete, acyclic, and fail closed", async () => {
+  const manifest = JSON.parse(await readFile(CREDIT_ADMISSION_MANIFEST, "utf8"));
+  const expectedPaths = [
+    "src/credit-policy.js",
+    "src/config.js",
+    "src/dispatcher.js",
+    "src/store.js",
+    "src/owner-inbox.js",
+    "src/notifier.js",
+    "public/app.js",
+  ];
+  const componentIds = new Set(manifest.components.map((component) => component.id));
+
+  assert.equal(manifest.schemaVersion, 1);
+  assert.equal(manifest.policyAuthority, "credit-admission-policy");
+  assert.equal(manifest.publicContract.module, "src/credit-policy.js");
+  assert.equal(manifest.publicContract.copiedFallbackPolicyAllowed, false);
+  assert.equal(manifest.publicContract.modelIdPolicyAllowed, false);
+  assert.equal(manifest.impactClassifier.ambiguousPathSelection, "full_regression");
+  assert.equal(manifest.impactClassifier.unclassifiedPathSelection, "full_regression");
+  assert.equal(manifest.impactClassifier.newFeaturePathSelection, "full_regression");
+  assert.equal(manifest.impactClassifier.aggregateCommand, "npm run check");
+  assert.equal(manifest.impactClassifier.duplicateEquivalentWorkflowCount, 0);
+  assert.equal(matchingPathRule(manifest, "src/new-credit-feature.js"), undefined);
+
+  for (const featurePath of expectedPaths) {
+    const rule = matchingPathRule(manifest, featurePath);
+    assert.ok(rule, `${featurePath} must have an owning credit-admission component`);
+    assert.ok(componentIds.has(rule.component), `${featurePath} must reference a declared component`);
+    assert.equal(rule.selection, "full_regression");
+  }
+
+  const graph = new Map([...componentIds].map((id) => [id, []]));
+  for (const edge of manifest.dependencyEdges) {
+    assert.ok(componentIds.has(edge.from), `unknown dependency source ${edge.from}`);
+    assert.ok(componentIds.has(edge.to), `unknown dependency target ${edge.to}`);
+    graph.get(edge.from).push(edge.to);
+  }
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (component) => {
+    assert.equal(visiting.has(component), false, `dependency cycle includes ${component}`);
+    if (visited.has(component)) return;
+    visiting.add(component);
+    for (const dependency of graph.get(component)) visit(dependency);
+    visiting.delete(component);
+    visited.add(component);
+  };
+  for (const component of componentIds) visit(component);
+
+  for (const adapter of manifest.components.filter((component) => component.id !== manifest.policyAuthority)) {
+    assert.ok(
+      adapter.allowedDependencies.includes(manifest.policyAuthority),
+      `${adapter.id} must consume credit policy through its public authority`,
+    );
+  }
+  assert.match(manifest.rollback, /additive.*SQLite JSON payload/i);
+  assert.deepEqual(manifest.compatibility.legacyInputs, ["failClosedTiers", "tierBudgets"]);
+  assert.ok(manifest.exactShaEvidence.bindings.includes("manifestSha256"));
+
+  const policySource = await readFile("src/credit-policy.js", "utf8");
+  assert.doesNotMatch(policySource, /\bgpt-[\w.-]+|execution\.model\b/i);
+  const adapterSources = await Promise.all([
+    "src/config.js",
+    "src/dispatcher.js",
+    "src/store.js",
+    "src/owner-inbox.js",
+    "src/notifier.js",
+    "public/app.js",
+  ].map((sourcePath) => readFile(sourcePath, "utf8")));
+  for (const adapterSource of adapterSources) {
+    assert.doesNotMatch(
+      adapterSource,
+      /critical-bounded-v1|frontier-fail-closed-v1/,
+      "fallback rule definitions must not be copied outside the policy authority",
+    );
+  }
 });

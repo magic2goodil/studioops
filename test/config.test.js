@@ -6,12 +6,81 @@ import { promisify } from "node:util";
 import {
   effectiveAutomationCapacity,
   normalizeConfig,
+  normalizeCreditPolicyConfig,
   projectFromConfig,
+  renderConfigMarkdown,
   writeConfig,
 } from "../src/config.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 
 const execFileAsync = promisify(execFile);
+
+test("credit policy config emits the canonical versioned degraded-telemetry contract", () => {
+  const config = normalizeConfig({
+    defaults: {
+      creditPolicy: {
+        enabled: true,
+        failClosedTiers: ["critical", "frontier"],
+        tierBudgets: {
+          critical: { estimatedCredits: 50, minRemainingPercent: 25 },
+        },
+      },
+    },
+  });
+  const policy = config.defaults.creditPolicy;
+
+  assert.equal(policy.degradedTelemetryFallback.policyVersion, 1);
+  assert.equal(policy.degradedTelemetryFallback.rules.critical.mode, "fail_closed");
+  assert.equal(
+    policy.degradedTelemetryFallback.rules.critical.ruleId,
+    "legacy-critical-fail-closed-v1",
+  );
+  assert.equal(policy.tierBudgets.critical.estimatedCredits, 50);
+  assert.match(renderConfigMarkdown(config), /degradedTelemetryFallback/);
+  assert.match(renderConfigMarkdown(config), /never model IDs/);
+});
+
+test("canonical critical fallback remains bounded and top-level overrides retain default policy values", () => {
+  const defaults = normalizeCreditPolicyConfig({ enabled: true });
+  const config = normalizeConfig({
+    defaults: {
+      creditPolicy: {
+        enabled: true,
+        reserveCredits: 9,
+      },
+    },
+    creditPolicy: {
+      snapshotMaxAgeMs: 30_000,
+    },
+  });
+
+  assert.equal(defaults.degradedTelemetryFallback.rules.critical.mode, "bounded");
+  assert.equal(defaults.degradedTelemetryFallback.rules.frontier.mode, "fail_closed");
+  assert.equal(config.creditPolicy.reserveCredits, 9);
+  assert.equal(config.creditPolicy.snapshotMaxAgeMs, 30_000);
+  assert.equal(config.creditPolicy.degradedTelemetryFallback.rules.critical.maxAttempts, 1);
+});
+
+test("canonical missing or malformed fallback rules are preserved for fail-closed evaluation", () => {
+  const policy = normalizeCreditPolicyConfig({
+    enabled: true,
+    degradedTelemetryFallback: {
+      policyVersion: 1,
+      explicitFailClosedLabels: [],
+      rules: {
+        critical: {
+          ruleId: "invalid-critical",
+          mode: "bounded",
+          maxConcurrentRuns: 0,
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(Object.keys(policy.degradedTelemetryFallback.rules), ["critical"]);
+  assert.equal(policy.degradedTelemetryFallback.rules.critical.maxConcurrentRuns, 0);
+  assert.equal(policy.degradedTelemetryFallback.rules.critical.maxAttempts, undefined);
+});
 
 test("missing installed automation capacity normalizes to three builders, reviewers, and runners", () => {
   const config = normalizeConfig({ defaults: {} });
