@@ -253,14 +253,14 @@ export async function runWorkspaceCleanup(input = {}) {
       report.logicalDeletedBytes += claimStartedBytes;
     } catch (error) {
       const message = safeCleanupError(error);
-      await (input.releaseRunWorkspaceCleanup
+      await Promise.resolve((input.releaseRunWorkspaceCleanup
         || (input.state ? (runId, args) => releaseRunWorkspaceCleanupInState(input.state, runId, args) : releaseRunWorkspaceCleanup))(run.id, {
         ...input,
         leaseId: claim.leaseId,
         nowMs: Date.now(),
         logicalBytes: claimStartedBytes,
         error: message,
-      }).catch(() => {});
+      })).catch(() => {});
       report.failures.push({ runId: run.id, error: message });
     }
   }
@@ -2347,7 +2347,10 @@ export async function runQueuedRuns(input = {}) {
     state.meta?.diskRecovery?.awaitingWatchdogHealth
       || state.meta?.diskRecovery?.state === "awaiting_watchdog_health",
   );
-  if (cleanup.pressure || disk.pressure || diskRecoveryAwaitingHealth) {
+  const postCleanupPressure = Boolean(
+    cleanup.after?.data?.pressure || cleanup.after?.workspace?.pressure || disk.pressure,
+  );
+  if (postCleanupPressure || diskRecoveryAwaitingHealth) {
     return {
       generatedAt: new Date().toISOString(),
       disk,
