@@ -22,6 +22,9 @@ Use one JSON object with `project` and `task` keys.
     "area": "authentication",
     "lane": "backend",
     "workAreas": ["src/auth", "test/auth"],
+    "affectedSurfaces": ["account recovery API", "authentication persistence"],
+    "validationPlan": ["npm run check", "Run account-recovery integration tests"],
+    "riskClassification": "high",
     "userStory": "As a locked-out customer, I want to recover my account securely.",
     "expectedOutcome": "A customer can request and complete a time-limited recovery flow.",
     "acceptanceCriteria": [
@@ -31,6 +34,7 @@ Use one JSON object with `project` and `task` keys.
     ],
     "privacyNotes": "Minimize recovery telemetry and retention.",
     "securityNotes": "Rate-limit requests and hash stored tokens.",
+    "dependsOnTaskIds": [],
     "attachments": []
   }
 }

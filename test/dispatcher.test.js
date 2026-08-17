@@ -1198,3 +1198,106 @@ test("preview service failures route to infrastructure repair instead of rebuild
   assert.equal(action.role, "owner");
   assert.match(action.reason, /preview/i);
 });
+
+test("reviewers receive role-scoped threads and never reuse builder or peer reviewer threads", async () => {
+  const { state, action } = finalAttemptReviewFixture("completed");
+  state.runs = [];
+  state.tasks[1].reviewSubjectSha = "a".repeat(40);
+  state.tasks[1].reviewSubjectCycle = 1;
+  state.tasks[1].reviewCycle = 1;
+  state.tasks[1].assignedThreadId = "thread-builder";
+  state.tasks[1].reviewerThreadId = "thread-legacy";
+  state.tasks[1].reviewerThreadIds = {
+    "backend-reviewer": "thread-backend",
+    "frontend-reviewer": "thread-frontend",
+  };
+  state.reviews.push({
+    id: "review_backend_current",
+    taskId: "task_2",
+    stageKey: "backend",
+    role: "backend-reviewer",
+    outcome: "approved",
+    cycle: 1,
+    candidateCycle: 1,
+    subjectSha: "a".repeat(40),
+  }, {
+    id: "review_accessibility_current",
+    taskId: "task_2",
+    stageKey: "accessibility",
+    role: "accessibility-reviewer",
+    outcome: "skipped",
+    cycle: 1,
+    candidateCycle: 1,
+    subjectSha: "a".repeat(40),
+  });
+  const frontend = await dispatchSupervisorActions([action], { state });
+  assert.equal(frontend.runs[0].threadId, "thread-frontend");
+
+  state.runs = [];
+  state.tasks[1].status = "lead_review";
+  state.reviews.push({
+    id: "review_frontend_current",
+    taskId: "task_2",
+    stageKey: "frontend",
+    role: "frontend-reviewer",
+    outcome: "approved",
+    cycle: 1,
+    candidateCycle: 1,
+    subjectSha: "a".repeat(40),
+  });
+  const lead = await dispatchSupervisorActions([{
+    ...action,
+    id: "task_2:continue_review:lead-independent",
+    role: "lead-reviewer",
+    taskStatus: "lead_review",
+    nextStatus: "lead_review",
+    threadId: "thread-backend",
+  }], { state });
+  assert.equal(lead.runs[0].threadId, "");
+});
+
+test("estimated task cost budgets fail closed before model launch", async () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+    costBudget: 0.01,
+  };
+  const report = await dispatchSupervisorActions([{
+    id: "task_1:start_builder:budget",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_1",
+    taskTitle: "QA-ready task",
+    taskStatus: "ready",
+    priority: "high",
+    reason: "Ready to build.",
+    nextStatus: "in_progress",
+  }], {
+    state,
+    executionPolicy: {
+      modelTiers: { economy: { model: "gpt-5.6-luna", reasoningEffort: "medium" } },
+      tierRouting: { defaultTier: "economy" },
+    },
+    creditPolicy: {
+      enabled: true,
+      tierBudgets: { economy: { estimatedCredits: 8, minRemainingPercent: 5 } },
+    },
+    creditSnapshot: {
+      status: "available",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 80,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  });
+  assert.equal(report.runs.length, 0);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationBlocker.type, "circuit");
+  assert.equal(state.tasks[0].automationCircuit.reasonCode, "task_cost_budget_insufficient");
+});

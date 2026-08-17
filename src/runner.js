@@ -1292,6 +1292,66 @@ function applySuccessfulHandoff(state, run, task, now, options = {}) {
   }
 }
 
+function normalizedUsage(value = {}) {
+  const number = (item) => Number.isFinite(Number(item)) && Number(item) >= 0 ? Number(item) : 0;
+  const inputTokens = number(value.input_tokens ?? value.inputTokens);
+  const outputTokens = number(value.output_tokens ?? value.outputTokens);
+  const cachedInputTokens = number(value.cached_input_tokens ?? value.cachedInputTokens);
+  const reasoningOutputTokens = number(value.reasoning_output_tokens ?? value.reasoningOutputTokens);
+  const actualCreditsValue = value.actual_credits ?? value.actualCredits;
+  const actualCredits = Number.isFinite(Number(actualCreditsValue)) && Number(actualCreditsValue) >= 0
+    ? Number(actualCreditsValue)
+    : null;
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    reasoningOutputTokens,
+    actualTokens: inputTokens + outputTokens,
+    actualCredits,
+  };
+}
+
+function recordRunUsage(run, usage, now) {
+  const normalized = normalizedUsage(usage || {});
+  const tokenBudget = Math.max(0, Number(run.tokenBudget || run.costTelemetry?.tokenBudget || 0));
+  const costBudget = Math.max(0, Number(run.costBudget || 0));
+  const tokenExceeded = tokenBudget > 0 && normalized.actualTokens > tokenBudget;
+  const costExceeded = costBudget > 0
+    && normalized.actualCredits !== null
+    && normalized.actualCredits > costBudget;
+  run.costTelemetry = {
+    ...(run.costTelemetry || {}),
+    ...normalized,
+    tokenBudget,
+    costBudget,
+    tokenExceeded,
+    costExceeded,
+    creditTelemetryStatus: normalized.actualCredits === null ? "unavailable" : "recorded",
+    recordedAt: now,
+  };
+  return { tokenExceeded, costExceeded };
+}
+
+function applyBudgetExceededToTask(task, run, now) {
+  if (!task) return;
+  const resumeStatus = restoreTaskStatusForRun(run, task);
+  task.status = "blocked";
+  task.assignedAgentRole = "owner";
+  task.retryNotBefore = "";
+  task.lastAutomationFailure = run.exitCode;
+  task.lastAutomationFailureRunId = run.id;
+  task.automationBlocker = {
+    type: "budget",
+    reason: run.exitCode,
+    runId: run.id,
+    resumeStatus,
+    blockedAt: now,
+    telemetry: run.costTelemetry,
+  };
+  task.updatedAt = now;
+}
+
 export function applyFailedRunToTask(task, run, reason, now) {
   if (!task || task.automationBlocker?.type === "configuration") return { blocked: true, retryAt: "" };
   const attempt = Math.max(1, Number(run.attempt || 1));
@@ -1685,6 +1745,14 @@ export async function completeRun(runId, input = {}) {
     run.outputPath = input.outputPath || run.outputPath || "";
     run.lastMessagePath = input.lastMessagePath || run.lastMessagePath || "";
     run.notes = String(input.notes || run.notes || "").trim();
+    const budget = recordRunUsage(run, input.usage, now);
+    if (run.status === "completed" && (budget.tokenExceeded || budget.costExceeded)) {
+      run.status = "failed";
+      run.exitCode = budget.tokenExceeded ? "token_budget_exceeded" : "cost_budget_exceeded";
+      run.notes = [run.notes, `StudioOps stopped automatic continuation because ${run.exitCode}.`]
+        .filter(Boolean)
+        .join("\n\n");
+    }
 
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
@@ -1709,7 +1777,9 @@ export async function completeRun(runId, input = {}) {
     }
 
     let failureDisposition = null;
-    if (run.status === "failed") {
+    if (run.status === "failed" && ["token_budget_exceeded", "cost_budget_exceeded"].includes(run.exitCode)) {
+      applyBudgetExceededToTask(task, run, now);
+    } else if (run.status === "failed") {
       failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
     }
 
@@ -1843,7 +1913,10 @@ async function persistRunThread(run, threadId) {
     }
     const task = state.tasks.find((item) => item.id === run.taskId);
     if (task) {
-      if (run.group === "reviewer") task.reviewerThreadId = threadId;
+      if (run.group === "reviewer") {
+        task.reviewerThreadIds = { ...(task.reviewerThreadIds || {}), [run.role]: threadId };
+        task.reviewerThreadId = threadId;
+      }
       else task.assignedThreadId = threadId;
       task.updatedAt = now;
     }
@@ -1908,6 +1981,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
   let pauseReason = "";
   let executionRun = run;
   let authContext = null;
+  let usage = null;
 
   const timeout = setTimeout(() => {
     log.write(`\nRunner timeout after ${Math.round(timeoutMs / 1000)}s. Aborting Codex SDK turn.\n`);
@@ -1943,6 +2017,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
         await persistRunThread(run, event.thread_id);
       } else if (event.type === "item.completed" && event.item?.type === "agent_message") {
         finalResponse = event.item.text || "";
+      } else if (event.type === "turn.completed") {
+        usage = event.usage || null;
       } else if (event.type === "turn.failed") {
         throw new Error(event.error?.message || "Codex SDK turn failed");
       } else if (event.type === "error") {
@@ -1977,6 +2053,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     outputPath,
     lastMessagePath,
     notes,
+    usage,
     workspaceRoot: input.workspaceRoot,
   }, executionRun);
   if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);

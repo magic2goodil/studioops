@@ -60,6 +60,46 @@ test("epics and tasks with children never create builder actions or durable disp
   assert.equal(dispatches.selected.some((item) => ["task_epic", "task_parent"].includes(item.taskId)), false);
 });
 
+test("supervisor honors configured age promotion and project dispatch weight", () => {
+  const state = {
+    projects: [
+      { id: "project_1", key: "one", name: "One", repoPath: "/tmp/one", wipPolicy: { agePromotionMs: 1_000, weight: 1 } },
+      { id: "project_2", key: "two", name: "Two", repoPath: "/tmp/two", wipPolicy: { agePromotionMs: 60_000, weight: 4 } },
+    ],
+    tasks: [
+      { id: "task_old", projectId: "project_1", title: "Old", type: "feature", status: "ready", priority: "medium", createdAt: "2026-08-17T00:00:00.000Z", dependsOnTaskIds: [] },
+      { id: "task_weighted", projectId: "project_2", title: "Weighted", type: "feature", status: "ready", priority: "medium", createdAt: "2026-08-17T00:00:01.500Z", dependsOnTaskIds: [] },
+    ],
+    runs: [], reviews: [], comments: [], events: [],
+  };
+  const report = createSupervisorReport(state, { nowMs: Date.parse("2026-08-17T00:00:02.000Z") });
+  assert.equal(report.actions[0].taskId, "task_old");
+  assert.equal(report.actions[0].agePromotion, true);
+  assert.equal(report.actions[1].projectWeight, 4);
+});
+
+test("weighted fairness accounts for recent service without starving age-promoted work", () => {
+  const nowMs = Date.parse("2026-08-17T12:00:00.000Z");
+  const state = {
+    projects: [
+      { id: "project_busy", key: "busy", name: "Busy", repoPath: "/tmp/busy", wipPolicy: { agePromotionMs: 60_000, weight: 1 } },
+      { id: "project_waiting", key: "waiting", name: "Waiting", repoPath: "/tmp/waiting", wipPolicy: { agePromotionMs: 60_000, weight: 2 } },
+    ],
+    tasks: [
+      { id: "task_busy", projectId: "project_busy", title: "Busy", type: "feature", status: "ready", priority: "high", createdAt: "2026-08-17T11:59:30.000Z", dependsOnTaskIds: [] },
+      { id: "task_waiting", projectId: "project_waiting", title: "Waiting", type: "feature", status: "ready", priority: "medium", createdAt: "2026-08-17T11:59:30.000Z", dependsOnTaskIds: [] },
+    ],
+    runs: Array.from({ length: 4 }, (_, index) => ({ id: `run_busy_${index}`, projectId: "project_busy", createdAt: "2026-08-17T11:59:45.000Z" })),
+    reviews: [], comments: [], events: [],
+  };
+  const report = createSupervisorReport(state, { nowMs });
+  assert.equal(report.actions[0].taskId, "task_waiting");
+
+  state.tasks[0].createdAt = "2026-08-17T11:58:00.000Z";
+  const promoted = createSupervisorReport(state, { nowMs });
+  assert.equal(promoted.actions[0].taskId, "task_busy");
+});
+
 test("supervisor tracks protected QA PRs and routes failed checks back to a builder", () => {
   const state = {
     projects: [{

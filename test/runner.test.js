@@ -12,6 +12,7 @@ import {
   branchReuseSafetyReason,
   claimRuns,
   cloneFallbackSource,
+  completeRun,
   completeRunAfterExecution,
   performGitHubRemoteRecoveryProbe,
   planRunnableRuns,
@@ -26,6 +27,50 @@ import { materializeLocalCandidate } from "../src/workspace.js";
 import { eligibleRunWorkspaceSnapshotsInState } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
+
+test("authoritative provider usage blocks automatic retry when a run exceeds its token budget", async () => {
+  const state = {
+    projects: [{ id: "project_budget", key: "budget", workflowMode: "local" }],
+    tasks: [{
+      id: "task_budget",
+      projectId: "project_budget",
+      title: "Bounded run",
+      status: "in_progress",
+      assignedAgentRole: "builder",
+    }],
+    runs: [{
+      id: "run_budget",
+      taskId: "task_budget",
+      projectId: "project_budget",
+      group: "builder",
+      role: "builder",
+      actionType: "start_builder",
+      status: "running",
+      tokenBudget: 100,
+      costBudget: 2,
+      costTelemetry: { estimatedCredits: 1, tokenBudget: 100 },
+    }],
+    reviews: [], comments: [], events: [],
+  };
+  const run = await completeRun("run_budget", {
+    state,
+    status: "completed",
+    usage: {
+      input_tokens: 80,
+      cached_input_tokens: 20,
+      output_tokens: 30,
+      reasoning_output_tokens: 10,
+      actual_credits: 1.25,
+    },
+  });
+  assert.equal(run.status, "failed");
+  assert.equal(run.exitCode, "token_budget_exceeded");
+  assert.equal(run.costTelemetry.actualTokens, 110);
+  assert.equal(run.costTelemetry.actualCredits, 1.25);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationBlocker.type, "budget");
+  assert.equal(state.tasks[0].retryNotBefore, "");
+});
 
 async function git(repoPath, args) {
   const result = await execFileAsync("git", args, { cwd: repoPath });

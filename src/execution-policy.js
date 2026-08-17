@@ -100,10 +100,10 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const reasoningEffort = normalizedEffort(
     task.reasoningEffort
       || task.reasoningBudget?.reasoningEffort
+      || (escalated ? configured.ultraReasoningEffort : "")
       || tierPolicy.reasoningEffort
       || (systemsArchitect ? configured.architectReasoningEffort : "")
       || (lead ? configured.leadReasoningEffort : "")
-      || (escalated ? configured.ultraReasoningEffort : "")
       || (complex ? configured.complexReasoningEffort : "")
       || rolePolicy.reasoningEffort
       || configured.reasoningEffort,

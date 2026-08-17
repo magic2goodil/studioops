@@ -95,8 +95,11 @@ export const READINESS_FIELDS = Object.freeze([
   "securityNotes", "dependsOnTaskIds", "architectureDecision",
 ]);
 
-function nonEmpty(value) {
-  return Array.isArray(value) ? true : Boolean(String(value || "").trim());
+function readinessValuePresent(field, value) {
+  if (field === "dependsOnTaskIds") return Array.isArray(value);
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return Boolean(String(value || "").trim());
 }
 
 export function evaluateTaskReadiness(task = {}, state = null) {
@@ -109,7 +112,7 @@ export function evaluateTaskReadiness(task = {}, state = null) {
   };
   for (const field of READINESS_FIELDS) {
     const value = aliases[field] ?? task[field];
-    if (!nonEmpty(value)) missing.push(field);
+    if (!readinessValuePresent(field, value)) missing.push(field);
   }
   const dependencyErrors = state ? dependencyGraphErrors(state, task) : [];
   return {
@@ -121,7 +124,9 @@ export function evaluateTaskReadiness(task = {}, state = null) {
 
 export function dependencyGraphErrors(state = { tasks: [] }, task = {}) {
   const errors = [];
-  const tasks = state.tasks || [];
+  const tasks = task.id
+    ? [...(state.tasks || []).filter((item) => item.id !== task.id), task]
+    : state.tasks || [];
   const byId = new Map(tasks.map((item) => [item.id, item]));
   const visiting = new Set();
   const visited = new Set();
@@ -160,16 +165,27 @@ export function completionEvidenceForTask(state, task = {}) {
   const missingReviews = requiredStages.filter((stage) => !currentReviews.some((review) => (
     (review.stageKey === stage.key || review.status === stage.status) && ["approved", "skipped"].includes(review.outcome)
   ))).map((stage) => stage.key || stage.status);
-  const merge = task.mergeEvidence || task.mergedAt || task.mergeCommit || task.status === "merged";
-  const release = task.releaseEvidence || task.releaseAt || task.releaseId || task.status === "deployed";
-  const deployment = task.deploymentEvidence || task.deployedAt || task.deploymentId || task.status === "deployed";
-  const verification = task.verificationEvidence || task.verificationAt || task.verificationId || task.qaDecision === "passed";
+  const project = (state.projects || []).find((item) => item.id === task.projectId) || {};
+  const subjectSha = String(task.reviewSubjectSha || task.candidateIdentity?.commitSha || "").trim();
+  const exactReceipt = (value) => {
+    if (!value || typeof value !== "object" || !subjectSha) return false;
+    const boundSha = String(value.subjectSha || value.sourceSha || value.commitSha || "").trim();
+    return boundSha === subjectSha && Boolean(String(value.id || value.url || value.recordedAt || "").trim());
+  };
+  const localWorkflow = projectUsesLocalWorkflow(project);
+  const requiresRelease = task.type === "release" || task.completionPolicy?.releaseRequired === true;
+  const requiresDeployment = task.type === "deployment" || task.area === "deployment" || task.completionPolicy?.deploymentRequired === true;
+  const merge = localWorkflow || exactReceipt(task.mergeEvidence);
+  const release = !requiresRelease || exactReceipt(task.releaseEvidence);
+  const deployment = !requiresDeployment || exactReceipt(task.deploymentEvidence);
+  const verification = exactReceipt(task.verificationEvidence);
   return {
-    complete: missingReviews.length === 0 && Boolean(merge) && Boolean(release || deployment) && Boolean(verification),
+    complete: missingReviews.length === 0 && merge && release && deployment && verification,
     missingReviews,
     missing: [
       ...(merge ? [] : ["merge"]),
-      ...(release || deployment ? [] : ["release_or_deployment"]),
+      ...(release ? [] : ["release"]),
+      ...(deployment ? [] : ["deployment"]),
       ...(verification ? [] : ["verification"]),
     ],
   };
@@ -1328,7 +1344,6 @@ function capabilityForReviewStage(stage = {}) {
 export function capabilityRoutingForTask(project = {}, task = {}) {
   const policy = normalizeDeliveryPolicy(project.deliveryPolicy);
   const evidence = normalizedImpactEvidence(task.impactEvidence || task);
-  if (policy.profile !== "prototype-fast-lane") return { policy, evidence, required: [...CAPABILITY_KEYS], skipped: [] };
   const required = new Set(["lead"]);
   if (evidence.backendRequired) required.add("backend");
   if (evidence.unknown || evidence.frontend) required.add("frontend");
@@ -1671,6 +1686,9 @@ export async function addTask(input) {
       assignedAgentRole: String(input.assignedAgentRole || "").trim(),
       assignedThreadId: String(input.assignedThreadId || "").trim(),
       reviewerThreadId: String(input.reviewerThreadId || "").trim(),
+      reviewerThreadIds: input.reviewerThreadIds && typeof input.reviewerThreadIds === "object"
+        ? { ...input.reviewerThreadIds }
+        : {},
       reviewCycle: 0,
       reviewSubjectSha: "",
       reviewSubjectCycle: 0,
@@ -1791,11 +1809,15 @@ export function applyLifecycleTransitionInState(state, command, input = {}) {
   const task = findTask(state, command?.taskId);
   if (!task) throw new Error(`Unknown task: ${command?.taskId || "(missing)"}`);
   const project = findProject(state, task.projectId);
+  const completionEvidence = command.action === "finish_task"
+    ? completionEvidenceForTask(state, task)
+    : null;
   const result = evaluateLifecycleTransition(command, task, {
     runs: state.runs || [],
     candidates: state.candidates || [],
     reviews: state.reviews || [],
     reviewStages: project ? reviewStagesForTask(project, task) : [],
+    completionEvidence,
     allowCycleLimitLeadReview: Boolean(
       project
       && reviewPolicyForProject(project).leadOwnsFinalDecisionAtLimit
@@ -1946,7 +1968,7 @@ export async function updateTask(taskId, patch) {
       }
       patch = { ...patch, status: normalizedStatus };
       requestedStatus = normalizedStatus;
-      if (["ready", "queued"].includes(normalizedStatus)) {
+      if (["ready", "queued"].includes(normalizedStatus) && task.readinessEnforced === true) {
         const readiness = evaluateTaskReadiness({ ...task, ...patch }, state);
         if (!readiness.ready) {
           throw new Error(`Task is not ready for dispatch. Missing: ${readiness.missing.join(", ") || readiness.dependencyErrors.join("; ")}.`);

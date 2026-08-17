@@ -294,6 +294,10 @@ function dispatchSafetyReason(state, task, action, options) {
     executionPolicy,
     options.creditPolicy,
   );
+  if (
+    executionPolicy.costBudget > 0
+    && Number(creditAdmission.estimatedCredits || 0) > executionPolicy.costBudget
+  ) return "task_budget:estimated_cost_exceeds_budget";
   if (!creditAdmission.allowed) return `credit_gate:${creditAdmission.code}`;
   const attemptKey = executionAttemptKey(task, action);
   const attemptCount = executionAttemptCount(state, attemptKey);
@@ -304,7 +308,9 @@ function dispatchSafetyReason(state, task, action, options) {
 function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
   const openedTaskIds = new Set();
   for (const item of skipped || []) {
-    if (!String(item.reason || "").startsWith("credit_gate:") || openedTaskIds.has(item.taskId)) continue;
+    const creditGate = String(item.reason || "").startsWith("credit_gate:");
+    const taskBudgetGate = String(item.reason || "").startsWith("task_budget:");
+    if ((!creditGate && !taskBudgetGate) || openedTaskIds.has(item.taskId)) continue;
     const task = findTask(state, item.taskId);
     const action = skippedAction(actions, item);
     if (!task || !action || task.automationCircuit?.state === "open") continue;
@@ -319,10 +325,11 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
     task.status = "blocked";
     task.assignedAgentRole = "owner";
     task.retryNotBefore = "";
-    task.lastAutomationFailure = admission.code;
+    const blockerCode = taskBudgetGate ? String(item.reason).split(":")[1] : admission.code;
+    task.lastAutomationFailure = blockerCode;
     task.automationBlocker = {
       type: "circuit",
-      reason: admission.code,
+      reason: blockerCode,
       actionType: action.type,
       modelTier: admission.tier,
       estimatedCredits: admission.estimatedCredits,
@@ -334,16 +341,22 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
     task.automationCircuit = {
       state: "open",
       scope: "task",
-      reasonCode: "credit_budget_insufficient",
-      normalizedReason: `StudioOps did not start ${action.type} because the ${admission.tier} quality tier failed credit admission (${admission.code}).`,
-      failureFingerprint: `${task.id}:${action.type}:${admission.tier}:${admission.code}`,
+      reasonCode: taskBudgetGate ? "task_cost_budget_insufficient" : "credit_budget_insufficient",
+      normalizedReason: taskBudgetGate
+        ? `StudioOps did not start ${action.type} because its estimated ${admission.estimatedCredits}-credit cost exceeds the task budget ${executionPolicy.costBudget}.`
+        : `StudioOps did not start ${action.type} because the ${admission.tier} quality tier failed credit admission (${admission.code}).`,
+      failureFingerprint: `${task.id}:${action.type}:${admission.tier}:${blockerCode}`,
       attemptsConsumed: 0,
       maxAttempts: 0,
       snapshot,
       openedAt: now,
-      nextCheapProbe: "Check current Codex usage limits without launching a model run.",
-      resumeAction: `studioops circuit-reset --task ${task.id} --expected-opened-at ${now} --reason credits_verified`,
-      remediation: "Wait for quota reset, add credits, or update the configured budget after review; then reset this task circuit.",
+      nextCheapProbe: taskBudgetGate
+        ? "Review the task cost budget without launching a model run."
+        : "Check current Codex usage limits without launching a model run.",
+      resumeAction: `studioops circuit-reset --task ${task.id} --expected-opened-at ${now} --reason ${taskBudgetGate ? "budget_updated" : "credits_verified"}`,
+      remediation: taskBudgetGate
+        ? "Increase the task cost budget or reduce the approved execution tier after owner review, then reset this task circuit."
+        : "Wait for quota reset, add credits, or update the configured budget after review; then reset this task circuit.",
     };
     task.updatedAt = now;
     const remaining = Number.isFinite(admission.remainingPercent)
@@ -352,16 +365,20 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
     state.comments.push({
       id: nextId(state.comments, "comment"),
       taskId: task.id,
-      author: "StudioOps Credit Controller",
-      body: `Run suppressed before model launch. Required tier: ${admission.tier}. Admission result: ${admission.code}. Estimated run budget: ${admission.estimatedCredits} credits. Remaining quota headroom: ${remaining}. StudioOps did not downgrade the task. Verify credits or quota, then run \`${task.automationCircuit.resumeAction}\`.`,
+      author: "StudioOps Budget Controller",
+      body: taskBudgetGate
+        ? `Run suppressed before model launch. Estimated run budget: ${admission.estimatedCredits} credits. Task cost budget: ${executionPolicy.costBudget}. StudioOps did not silently exceed the task budget. Update the approved budget, then run \`${task.automationCircuit.resumeAction}\`.`
+        : `Run suppressed before model launch. Required tier: ${admission.tier}. Admission result: ${admission.code}. Estimated run budget: ${admission.estimatedCredits} credits. Remaining quota headroom: ${remaining}. StudioOps did not downgrade the task. Verify credits or quota, then run \`${task.automationCircuit.resumeAction}\`.`,
       createdAt: now,
     });
     state.events.push({
       id: nextId(state.events, "event"),
-      type: "credit_admission_blocked",
+      type: taskBudgetGate ? "task_budget_blocked" : "credit_admission_blocked",
       projectId: task.projectId,
       taskId: task.id,
-      message: `${task.title}: ${admission.tier} tier blocked by ${admission.code}`,
+      message: taskBudgetGate
+        ? `${task.title}: estimated cost exceeds task budget`
+        : `${task.title}: ${admission.tier} tier blocked by ${admission.code}`,
       createdAt: now,
     });
     openedTaskIds.add(task.id);
@@ -608,7 +625,16 @@ function makeRun(state, task, action, options, now) {
   const prompt = action.type === "qa_integration_blocked"
     ? qaIntegrationBlockedPrompt(action)
     : role === "owner" ? ownerPrompt(action) : generatePrompt(state, task.id, role);
-  const threadId = action.threadId || (group === "reviewer" ? task.reviewerThreadId : task.assignedThreadId) || "";
+  const roleThreadId = group === "reviewer" ? task.reviewerThreadIds?.[role] : "";
+  const requestedThreadId = action.threadId || roleThreadId || (group === "reviewer" ? "" : task.assignedThreadId) || "";
+  const reservedReviewerThreads = new Set(Object.entries(task.reviewerThreadIds || {})
+    .filter(([reviewerRole]) => reviewerRole !== role)
+    .map(([, thread]) => String(thread || ""))
+    .filter(Boolean));
+  const threadId = group === "reviewer"
+    && (requestedThreadId === task.assignedThreadId || reservedReviewerThreads.has(requestedThreadId))
+    ? ""
+    : requestedThreadId;
   const profile = laneProfile(task, action);
   const executionPolicy = resolveExecutionPolicy(task, action, options);
   const creditAdmission = assessCreditAdmission(

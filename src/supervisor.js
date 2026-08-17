@@ -157,6 +157,9 @@ export function workflowIntegrityFaults(state) {
 function actionBase(state, task, type, role, reason, options = {}) {
   const project = projectForTask(state, task);
   const integrationBranch = task.integrationBranch || options.integrationBranch || integrationBranchName(project);
+  const agePromotionMs = Math.max(1, Number(project?.wipPolicy?.agePromotionMs || 24 * 60 * 60 * 1000));
+  const nowMs = Number(options.nowMs || Date.now());
+  const projectWeight = Math.max(1, Number(project?.wipPolicy?.weight || project?.wipPolicy?.weights?.dispatch || 1));
   return {
     id: `${task.id}:${type}`,
     type,
@@ -170,7 +173,9 @@ function actionBase(state, task, type, role, reason, options = {}) {
     priority: task.priority || "medium",
     createdAt: task.createdAt || "",
     agePromotion: Number.isFinite(Date.parse(task.createdAt || ""))
-      && Date.now() - Date.parse(task.createdAt) >= 24 * 60 * 60 * 1000,
+      && nowMs - Date.parse(task.createdAt) >= agePromotionMs,
+    agePromotionMs,
+    projectWeight,
     reason,
     taskUrl: taskUrl(options.baseUrl, task),
     branchName: task.branchName || "",
@@ -574,24 +579,57 @@ function taskActions(state, task, options = {}) {
   return [];
 }
 
-function sortActions(actions) {
-  return actions.sort((a, b) => {
-    const ageWeight = (action) => {
-      const ageMs = Math.max(0, Date.now() - Date.parse(action.createdAt || action.updatedAt || ""));
-      const promotion = ageMs >= 24 * 60 * 60 * 1000 ? 1 : 0;
-      return promotion;
-    };
-    const promoted = ageWeight(b) - ageWeight(a);
+function sortActions(state, actions, options = {}) {
+  const nowMs = Number(options.nowMs || Date.now());
+  const historyWindowMs = Math.max(60_000, Number(options.fairnessWindowMs || 24 * 60 * 60 * 1_000));
+  const recentService = (state.runs || []).reduce((counts, run) => {
+    const timestamp = Date.parse(run.createdAt || run.startedAt || "");
+    if (Number.isFinite(timestamp) && nowMs - timestamp <= historyWindowMs) {
+      counts[run.projectId] = Number(counts[run.projectId] || 0) + 1;
+    }
+    return counts;
+  }, {});
+  const queues = new Map();
+  for (const action of actions) {
+    if (!queues.has(action.projectId)) queues.set(action.projectId, []);
+    queues.get(action.projectId).push(action);
+  }
+  const compareWithinProject = (a, b) => {
+    const promoted = Number(Boolean(b.agePromotion)) - Number(Boolean(a.agePromotion));
     if (promoted !== 0) return promoted;
     const priority = (PRIORITY_WEIGHT[a.priority] ?? 2) - (PRIORITY_WEIGHT[b.priority] ?? 2);
     if (priority !== 0) return priority;
-    return `${a.projectKey}:${a.taskId}:${a.type}`.localeCompare(`${b.projectKey}:${b.taskId}:${b.type}`);
-  });
+    return `${a.taskId}:${a.type}`.localeCompare(`${b.taskId}:${b.type}`);
+  };
+  for (const queue of queues.values()) queue.sort(compareWithinProject);
+
+  const result = [];
+  while ([...queues.values()].some((queue) => queue.length)) {
+    const available = [...queues.entries()].filter(([, queue]) => queue.length);
+    const promotedAvailable = available.filter(([, queue]) => queue[0].agePromotion);
+    const candidates = promotedAvailable.length ? promotedAvailable : available;
+    candidates.sort(([leftId, leftQueue], [rightId, rightQueue]) => {
+      const leftWeight = Math.max(1, Number(leftQueue[0].projectWeight || 1));
+      const rightWeight = Math.max(1, Number(rightQueue[0].projectWeight || 1));
+      const service = Number(recentService[leftId] || 0) / leftWeight
+        - Number(recentService[rightId] || 0) / rightWeight;
+      if (service !== 0) return service;
+      return compareWithinProject(leftQueue[0], rightQueue[0]) || leftId.localeCompare(rightId);
+    });
+    const [projectId, queue] = candidates[0];
+    result.push(queue.shift());
+    recentService[projectId] = Number(recentService[projectId] || 0) + 1;
+  }
+  return result;
 }
 
 export function createSupervisorReport(state, options = {}) {
   const integrityFaults = workflowIntegrityFaults(state);
-  const allActions = sortActions((state.tasks || []).flatMap((task) => taskActions(state, task, options)));
+  const allActions = sortActions(
+    state,
+    (state.tasks || []).flatMap((task) => taskActions(state, task, options)),
+    options,
+  );
   const passiveActionTypes = new Set([
     "waiting_on_architecture",
     "waiting_on_dependency",
