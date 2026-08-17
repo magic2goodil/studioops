@@ -59,8 +59,20 @@ function dependenciesForTask(state, task) {
     .filter(Boolean);
 }
 
+function isHardImplementationDependency(dependency) {
+  const type = String(dependency?.type || "feature").trim().toLowerCase();
+  const labels = new Set((Array.isArray(dependency?.labels) ? dependency.labels : []).map((label) => String(label).trim().toLowerCase()));
+  return type !== "epic"
+    && type !== "release"
+    && !labels.has("tracking")
+    && !labels.has("release-gate")
+    && dependency?.trackingOnly !== true;
+}
+
 function incompleteDependencies(state, task) {
-  return dependenciesForTask(state, task).filter((dependency) => !COMPLETE_STATUSES.has(dependency.status));
+  return dependenciesForTask(state, task)
+    .filter(isHardImplementationDependency)
+    .filter((dependency) => !COMPLETE_STATUSES.has(dependency.status));
 }
 
 function currentReviewCycle(task) {

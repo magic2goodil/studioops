@@ -247,16 +247,17 @@ function notificationFor(state, run) {
 }
 
 export function notificationForBundle(bundle) {
-  const taskSummary = (bundle.tasks || [])
+  const tasks = bundle.tasks || [];
+  const taskSummary = tasks
     .slice(0, 4)
-    .map((task) => `${task.id} ${task.title}`)
+    .map((task) => `${task.id} ${task.title || "Untitled change"}`)
     .join("; ");
-  const remainder = Math.max(0, (bundle.tasks || []).length - 4);
+  const remainder = Math.max(0, tasks.length - 4);
   const releaseCandidate = bundle.status === "release_candidate_ready";
   return {
     title: releaseCandidate ? "StudioOps release candidate ready" : "StudioOps QA bundle ready",
-    subtitle: `${bundle.projectKey || bundle.projectId} · ${bundle.tasks?.length || 0} task(s)`,
-    body: `${taskSummary}${remainder ? `; and ${remainder} more` : ""}${releaseCandidate ? ` · ${bundle.promotionPrUrl || bundle.promotionBranch || "PR ready"}` : bundle.previewUrl ? ` · ${bundle.previewUrl}` : ""}`,
+    subtitle: `${bundle.projectKey || bundle.projectId} · ${tasks.length} product change${tasks.length === 1 ? "" : "s"}`,
+    body: `${taskSummary || "A reviewed product change"}${remainder ? `; and ${remainder} more` : ""}. ${releaseCandidate ? `Release candidate ready: ${bundle.promotionPrUrl || bundle.promotionBranch || "PR ready"}.` : `QA preview: ${bundle.previewUrl || "open StudioOps for the ordered checklist"}.`}`,
   };
 }
 
@@ -266,7 +267,7 @@ export function notificationForOwnerQaPacket(packet = {}) {
   return {
     title: "StudioOps QA candidate ready",
     subtitle: `${packet.projectKey || packet.projectId || "Project"} · ${packet.tasks?.length || 0} task(s)`,
-    body: `A local QA candidate is ready. Approval applies only to tested SHA ${shortSha}. Open StudioOps for the checklist.`,
+    body: `Product QA is ready for ${packet.tasks?.[0]?.title || "the reviewed change"}${(packet.tasks?.length || 0) > 1 ? ` and ${packet.tasks.length - 1} related change${packet.tasks.length === 2 ? "" : "s"}` : ""}. Open StudioOps for the preview and ordered checklist. Approval applies only to tested SHA ${shortSha}.`,
   };
 }
 

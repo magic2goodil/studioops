@@ -1265,7 +1265,7 @@ function normalizedImpactEvidence(value = {}) {
       ? value.classifications
       : [];
   const explicit = explicitSource.map((item) => String(item).trim().toLowerCase());
-  const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system", "documentation"]);
+  const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system", "documentation", "configuration"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
   const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
   const pathCapabilities = files.map((file) => {
@@ -1277,6 +1277,14 @@ function normalizedImpactEvidence(value = {}) {
       || /\.mdx?$/i.test(normalizedFile)
     ) {
       capabilities.add("documentation");
+      return capabilities;
+    }
+    if (
+      /(^|\/)(config|configuration|settings)\//i.test(normalizedFile)
+      || /(^|\/)(studioops|mission-control)\.config\.[^/]+$/i.test(normalizedFile)
+      || /(^|\/)(?!package(?:-lock)?\.json$|tsconfig(?:\.[^/]*)?\.json$|vite\.config\.[^/]+$|webpack\.config\.[^/]+$)[^/]+\.(json|ya?ml|toml|ini)$/i.test(normalizedFile)
+    ) {
+      capabilities.add("configuration");
       return capabilities;
     }
     if (
