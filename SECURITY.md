@@ -23,14 +23,30 @@ If private reporting is unavailable, open a public issue that only asks the main
 
 ## Deployment And Exposure
 
-- The web server binds to `127.0.0.1` by default and does not currently provide internet-facing multi-user authentication.
+- The web server binds to `127.0.0.1` by default. Every API except the redacted health probe requires an owner session or a route-scoped service capability.
 - Do not expose the UI directly to the public internet.
-- Binding to `0.0.0.0` exposes task content to the reachable local network. Use it only on a trusted network with host firewall controls.
+- A non-loopback bind fails closed unless secured LAN mode is explicitly enabled with TLS, exact allowed hosts and origins, and a previously enrolled owner. A trusted network and host firewall remain required.
 - StudioOps must not be used as a public webhook endpoint without an authenticated gateway designed for that purpose.
+
+The default loopback control plane validates `Host` before URL construction and
+checks browser origin, Fetch Metadata, JSON media type, body limits, session
+authorization, and CSRF before parsing mutation bodies. Secured LAN mode is a
+separate configuration, not an `0.0.0.0` shortcut. It does not turn StudioOps
+into a public or multi-user service.
+
+Owner password hashes and recovery-code digests live in the owner-only local
+control-plane auth directory. Sessions, CSRF values, and two-minute
+reauthentication grants are never persisted by the server. The only plaintext
+server-side authentication secret written to disk is the first-run, single-use,
+short-lived bootstrap secret in the `0600` local operator log. It is invalidated
+by enrollment. Rotate the owner password or use one recovery code if compromise
+is suspected; both actions revoke every active session and grant.
 
 ## Secrets And PII
 
-Never store secrets, access tokens, private keys, passwords, customer records, or unnecessary PII in:
+Except for the deliberately isolated first-run bootstrap record described
+above, never store secrets, access tokens, private keys, passwords, customer
+records, or unnecessary PII in:
 
 - `studioops.config.md`
 - tasks, comments, acceptance criteria, or attachments
@@ -59,4 +75,9 @@ StudioOps intentionally does not authorize direct production deployment. Do not 
 
 ## Local State
 
-The SQLite database, WAL, shared-memory files, backups, heartbeats, local attachments, run outputs, and GitHub App credentials are runtime data and must remain outside version control. The default installer applies restrictive local file permissions, but workstation backups and filesystem access still need normal host security.
+The SQLite database, WAL, shared-memory files, backups, heartbeats, local attachments, run outputs, control-plane auth directory, operator log, and GitHub App credentials are runtime data and must remain outside version control. The default installer applies restrictive local file permissions, but workstation backups and filesystem access still need normal host security.
+
+Local attachment previews are limited to the managed `data/local-attachments`
+directory and additional roots explicitly registered through
+`STUDIOOPS_ATTACHMENT_ROOTS`. Authentication does not authorize arbitrary local
+filesystem reads.

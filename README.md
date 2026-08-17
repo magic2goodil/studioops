@@ -71,7 +71,11 @@ npm run setup
 npm run dev
 ```
 
-Open [http://127.0.0.1:4317](http://127.0.0.1:4317).
+On first start, StudioOps writes a single-use owner-enrollment secret to the
+owner-only local operator log and prints only that log's path. Enroll an owner,
+then open [http://127.0.0.1:4317](http://127.0.0.1:4317). Later restarts discard
+all sessions; sign in again with the durable local owner credential. See
+[Getting Started](docs/GETTING_STARTED.md#4-run-and-enroll-the-local-control-plane).
 
 The setup wizard writes a local `studioops.config.md`, registers an optional first project, and checks GitHub CLI and SSH readiness. Existing `mission-control.config.md` files remain supported during the rebrand. It never asks for or stores private SSH keys.
 
@@ -200,6 +204,8 @@ State files, backups, heartbeats, run output, local attachments, credentials, an
 By default, StudioOps:
 
 - binds the UI to `127.0.0.1`
+- requires an authenticated owner session or scoped service capability for every API except the redacted health probe
+- keeps opaque, expiring browser sessions and single-use reauthentication grants in memory only
 - stores state locally with restrictive file permissions
 - isolates builders and reviewers in workspaces
 - caps routine builder-review loops
@@ -218,7 +224,8 @@ Public policy and support information:
 ## Current Limitations
 
 - StudioOps is a local, single-owner control plane, not a hosted multi-user service.
-- The web UI does not provide internet-facing authentication. Do not expose it directly to the public internet.
+- Owner authentication protects the local control plane, but it is not an internet-facing multi-user identity service. Do not expose it directly to the public internet.
+- Secured LAN mode is an explicit TLS configuration with exact hosts and origins; public binding remains unsupported.
 - Always-on worker installation and local notifications currently use macOS LaunchAgents.
 - GitHub automation requires GitHub App installation and local credentials configured outside the repository.
 - A configured builder can edit code, execute project validation commands, push branches, and open PRs. Review project safety rules before enabling unattended runs.

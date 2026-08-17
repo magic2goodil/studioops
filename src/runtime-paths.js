@@ -63,6 +63,33 @@ export function missionControlConfigRoot() {
   ));
 }
 
+export function missionControlAuthDir() {
+  return path.resolve(expandLocalPath(
+    process.env.STUDIOOPS_CONTROL_PLANE_AUTH_DIR
+      || process.env.MISSION_CONTROL_AUTH_DIR
+      || path.join(missionControlRoot(), "control-plane-auth"),
+  ));
+}
+
+export function missionControlOperatorLogPath() {
+  return path.resolve(expandLocalPath(
+    process.env.STUDIOOPS_CONTROL_PLANE_OPERATOR_LOG
+      || path.join(missionControlDataDir(), "logs", "control-plane-operator.log"),
+  ));
+}
+
+export function missionControlAttachmentRoots() {
+  const configured = String(process.env.STUDIOOPS_ATTACHMENT_ROOTS || "")
+    .split(path.delimiter)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((value) => path.resolve(expandLocalPath(value)));
+  return [...new Set([
+    path.join(missionControlDataDir(), "local-attachments"),
+    ...configured,
+  ])];
+}
+
 function pathIsWithin(rootPath, candidatePath) {
   const relative = path.relative(rootPath, candidatePath);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
