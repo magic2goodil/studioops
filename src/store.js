@@ -1265,18 +1265,41 @@ function normalizedImpactEvidence(value = {}) {
       ? value.classifications
       : [];
   const explicit = explicitSource.map((item) => String(item).trim().toLowerCase());
-  const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system"]);
+  const known = new Set(["backend", "frontend", "accessibility", "auth", "privacy", "data", "security", "migration", "infrastructure", "deployment", "design-system", "documentation"]);
   const classifications = [...new Set(explicit.filter((item) => known.has(item)))].sort();
   const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
   const pathCapabilities = files.map((file) => {
+    const normalizedFile = file.replaceAll("\\", "/");
     const capabilities = new Set();
     if (
-      /(^|\/)(server|api|src\/(store|supervisor|dispatcher|lifecycle-policy|state-database)|migrations?|db|auth|security|deploy|infra)(\/|\.|$)/i.test(file)
-      || /^test\/.+\.test\.js$/i.test(file)
+      /(^|\/)(readme|changelog|contributing|license)(\.[^/]*)?$/i.test(normalizedFile)
+      || /(^|\/)docs\//i.test(normalizedFile)
+      || /\.mdx?$/i.test(normalizedFile)
+    ) {
+      capabilities.add("documentation");
+      return capabilities;
+    }
+    if (
+      /(^|\/)(public|frontend|client|web|ui|components?|pages?|views?|styles?|storybook|stories)(\/|$)/i.test(normalizedFile)
+      || /\.(css|scss|sass|less|jsx|tsx|vue|svelte|html)$/i.test(normalizedFile)
+      || /(^|\/)(playwright|e2e|browser|accessibility|a11y)([-_.\/]|$)/i.test(normalizedFile)
+    ) {
+      capabilities.add("frontend");
+      capabilities.add("accessibility");
+    }
+    if (
+      /(^|\/)(server|api|scripts?|bin|cli|workers?|jobs?|migrations?|db|database|auth|security|deploy|infra)(\/|\.|$)/i.test(normalizedFile)
+      || (/(^|\/)src\//i.test(normalizedFile) && !capabilities.has("frontend"))
+      || /(^|\/)tests?\/(?!.*(?:frontend|browser|e2e|playwright|accessibility|a11y|public|ui))[^/]+/i.test(normalizedFile)
     ) {
       capabilities.add("backend");
     }
-    if (/\.(css|scss|sass|less|jsx|tsx|vue|svelte|html)$/i.test(file)) {
+    if (
+      /(^|\/)(package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|tsconfig(?:\.[^/]*)?\.json|vite\.config\.[^/]+|webpack\.config\.[^/]+)$/i.test(normalizedFile)
+      || /(^|\/)\.github\/workflows\//i.test(normalizedFile)
+      || /(^|\/)(scripts?|deploy|infra)\/[^/]*(?:release|promotion|candidate|workflow)[^/]*$/i.test(normalizedFile)
+    ) {
+      capabilities.add("backend");
       capabilities.add("frontend");
       capabilities.add("accessibility");
     }

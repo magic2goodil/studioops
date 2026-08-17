@@ -142,6 +142,62 @@ test("standard delivery routes only applicable reviewer capabilities and fails c
   assert.deepEqual(backend.required, ["backend", "lead"]);
   assert.deepEqual(backend.skipped.map((item) => item.stageKey), ["frontend", "accessibility"]);
 
+  const backendModule = capabilityRoutingForTask(
+    { deliveryPolicy: { profile: "standard" } },
+    {
+      reviewSubjectSha: SHA,
+      reviewSubjectCycle: 1,
+      impactEvidence: {
+        changedFiles: ["src/qa-integration.js", "test/qa-integration.test.js"],
+        impact: ["backend"],
+      },
+    },
+  );
+  assert.equal(backendModule.evidence.unknown, false);
+  assert.deepEqual(backendModule.required, ["backend", "lead"]);
+
+  const publicUi = capabilityRoutingForTask(
+    { deliveryPolicy: { profile: "standard" } },
+    {
+      reviewSubjectSha: SHA,
+      reviewSubjectCycle: 1,
+      impactEvidence: {
+        changedFiles: ["public/app.js", "public/app.scss"],
+        impact: ["frontend"],
+      },
+    },
+  );
+  assert.equal(publicUi.evidence.unknown, false);
+  assert.deepEqual(publicUi.required, ["frontend", "accessibility", "lead"]);
+
+  const documentation = capabilityRoutingForTask(
+    { deliveryPolicy: { profile: "standard" } },
+    {
+      reviewSubjectSha: SHA,
+      reviewSubjectCycle: 1,
+      impactEvidence: {
+        changedFiles: ["README.md", "docs/operator-guide.md"],
+        impact: ["documentation"],
+      },
+    },
+  );
+  assert.equal(documentation.evidence.unknown, false);
+  assert.deepEqual(documentation.required, ["lead"]);
+
+  const sharedWorkflow = capabilityRoutingForTask(
+    { deliveryPolicy: { profile: "standard" } },
+    {
+      reviewSubjectSha: SHA,
+      reviewSubjectCycle: 1,
+      impactEvidence: {
+        changedFiles: [".github/workflows/check.yml", "scripts/create-release.mjs"],
+        impact: ["deployment"],
+      },
+    },
+  );
+  assert.equal(sharedWorkflow.evidence.unknown, false);
+  assert.deepEqual(sharedWorkflow.required, ["backend", "frontend", "accessibility", "lead"]);
+
   const unknown = capabilityRoutingForTask(
     { deliveryPolicy: { profile: "standard" } },
     { reviewSubjectSha: SHA, reviewSubjectCycle: 1, impactEvidence: { changedFiles: ["unclassified.xyz"], impact: [] } },
