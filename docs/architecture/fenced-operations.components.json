@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "workflowImpact": "full-regression",
+  "reason": "shared SQLite migration and public coordination contract",
+  "components": {
+    "fenced-coordination": {
+      "paths": ["src/coordination.js", "src/state-database.js", "test/coordination.test.js", "test/state-database.test.js"],
+      "owner": "backend-fenced-coordination",
+      "publicContracts": ["aggregate-bound claimResourceLease", "renewResourceLease", "abandonResourceLease", "releaseResourceLease", "aggregate-bound prepareExternalOperation", "authoritative-version terminalExternalOperation"],
+      "ownedData": ["coordination_fence_counters", "coordination_leases", "external_operations"],
+      "ownedMigrations": ["coordination schema v2 in src/state-database.js; verified pre-migration backup; v1 aggregate binding columns added without destructive rewrite"],
+      "ownedEvents": [],
+      "dependsOn": ["workflow-state"],
+      "allowedDependencyDirection": ["runner -> fenced-coordination", "provider-adapters -> fenced-coordination"],
+      "rollback": "stop new coordination callers; additive tables and tombstones remain readable and no existing workflow-state rows are changed",
+      "testLayers": ["unit", "contract", "persistence", "concurrency", "migration"]
+    },
+    "workflow-state": {
+      "paths": [],
+      "owner": "backend-workflow-state",
+      "publicContracts": ["aggregate stateVersion"],
+      "ownedData": ["tasks.state_version"],
+      "dependsOn": [],
+      "testLayers": ["contract"]
+    },
+    "architecture-validation": {
+      "paths": ["docs/architecture/fenced-operations.components.json"],
+      "owner": "shared-validation",
+      "publicContracts": ["deterministic ownership and dependency manifest"],
+      "ownedData": [],
+      "testLayers": ["composition"]
+    }
+  },
+  "dependencyEdges": [
+    { "from": "fenced-coordination", "to": "workflow-state" },
+    { "from": "runner", "to": "fenced-coordination" },
+    { "from": "provider-adapters", "to": "fenced-coordination" }
+  ],
+  "prohibited": ["second database", "dual-write", "dependency cycles", "raw adapter access to coordination tables", "credential or secret persistence"],
+  "impactClassifier": {
+    "input": "base/head diff plus this ownership and dependency manifest",
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "pathRules": [
+      { "pattern": "src/coordination.js", "component": "fenced-coordination", "selection": "full_regression" },
+      { "pattern": "src/state-database.js", "component": "fenced-coordination", "selection": "full_regression" },
+      { "pattern": "test/coordination.test.js", "component": "fenced-coordination", "selection": "full_regression" },
+      { "pattern": "test/state-database.test.js", "component": "fenced-coordination", "selection": "full_regression" },
+      { "pattern": "docs/architecture/fenced-operations.components.json", "component": "architecture-validation", "selection": "full_regression" }
+    ],
+    "fullRegressionTriggers": ["schema or migration change", "shared public contract", "manifest change", "ambiguous or unclassified path"],
+    "aggregateCommand": "npm run check"
+  },
+  "retention": { "leaseDetailDays": 30, "operationEvidenceDays": 90, "fenceCountersAndTombstones": "durable" }
+}
