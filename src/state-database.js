@@ -833,7 +833,7 @@ function normalizeTaskStateVersions(state, snapshot) {
 }
 
 function assertAppendOnlyCandidateFields(previousCandidate, candidate) {
-  for (const field of ["invalidation", "qaDecision", "promotion"]) {
+  for (const field of ["invalidation", "qaDecision", "promotion", "promotionMerge"]) {
     if (
       previousCandidate[field]
       && JSON.stringify(previousCandidate[field]) !== JSON.stringify(candidate[field])

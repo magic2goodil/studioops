@@ -15,7 +15,7 @@ import {
   invalidateCandidate,
 } from "./candidate-manifest.js";
 import { verifyCandidateRepositoryState } from "./candidate-repository.js";
-import { mutateState, readState } from "./store.js";
+import { applyLifecycleTransitionInState, mutateState, readState } from "./store.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -53,6 +53,21 @@ function nextId(items, prefix) {
     .filter(Number.isFinite)
     .reduce((highest, value) => Math.max(highest, value), 0);
   return `${prefix}_${max + 1}`;
+}
+
+function addUniqueComment(state, taskId, author, body, createdAt) {
+  const exists = (state.comments || []).some((comment) => (
+    comment.taskId === taskId && comment.author === author && comment.body === body
+  ));
+  if (exists) return false;
+  state.comments.push({
+    id: nextId(state.comments, "comment"),
+    taskId,
+    author,
+    body,
+    createdAt,
+  });
+  return true;
 }
 
 function normalizeList(value) {
@@ -429,7 +444,7 @@ function promotionBranchName(projectPlan) {
   return `qa/promotion-${project}-${Date.now()}`;
 }
 
-function candidateHasValidQaPass(candidate) {
+function candidateHasTrustedQaPass(candidate, allowedStatuses = ["qa_passed"]) {
   try {
     assertCandidateEnvelope(candidate);
   } catch {
@@ -437,7 +452,7 @@ function candidateHasValidQaPass(candidate) {
   }
   const decision = candidate.qaDecision;
   if (
-    candidate.status !== "qa_passed"
+    !allowedStatuses.includes(candidate.status)
     || candidate.invalidation
     || decision?.outcome !== "passed"
     || decision.candidateId !== candidate.id
@@ -452,6 +467,32 @@ function candidateHasValidQaPass(candidate) {
   const expectedTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
   const decidedTaskIds = normalizeList(decision.taskIds).sort();
   return JSON.stringify(expectedTaskIds) === JSON.stringify(decidedTaskIds);
+}
+
+function candidateHasValidQaPass(candidate) {
+  return candidateHasTrustedQaPass(candidate, ["qa_passed"]);
+}
+
+function candidateHasValidPromotionHandoff(candidate) {
+  if (!candidateHasTrustedQaPass(candidate, ["release_candidate_ready"])) return false;
+  const promotion = candidate.promotion;
+  return Boolean(
+    promotion
+    && /^https:\/\/github\.com\/.+\/pull\/\d+$/i.test(String(promotion.prUrl || ""))
+    && String(promotion.branch || "").trim()
+    && promotion.commitSha === candidate.manifest.integration.sha
+    && promotion.manifestDigest === candidate.manifestDigest
+  );
+}
+
+function candidateNeedsPromotionReconciliation(candidate) {
+  try {
+    assertCandidateEnvelope(candidate);
+  } catch {
+    return false;
+  }
+  return candidate.status === "release_candidate_ready"
+    && /^https:\/\/github\.com\/.+\/pull\/\d+$/i.test(String(candidate.promotion?.prUrl || ""));
 }
 
 function hasUnmetPromotionDependency(task, tasksById, selectedIds, completedIds) {
@@ -505,7 +546,7 @@ export function planPromotions(state, input = {}) {
       );
       return (state.candidates || [])
         .filter((candidate) => candidate.projectId === project.id)
-        .filter(candidateHasValidQaPass)
+        .filter((candidate) => candidateHasValidQaPass(candidate) || candidateNeedsPromotionReconciliation(candidate))
         .filter((candidate) => {
           const candidateFilter = normalizeList(input.candidate || input.candidates || input.candidateId);
           if (candidateFilter.length && !candidateFilter.includes(candidate.id)) return false;
@@ -530,6 +571,7 @@ export function planPromotions(state, input = {}) {
               ? `promotion target ${promotionTargetBranch(project)} does not match candidate base ${candidate.manifest.base.branch}; rebuild the candidate against the intended target.`
               : "",
           validationCommands: promotionValidationCommands(project),
+          mode: candidate.status === "release_candidate_ready" ? "reconcile" : "create",
           candidate,
           tasks: candidate.manifest.sources.map((source) => {
             const task = projectTasks.get(source.taskId);
@@ -652,6 +694,143 @@ async function checkoutExactCandidate(repoPath, projectPlan, options = {}) {
   if (!ancestry.ok) throw integrityFailure("Candidate integration commit does not descend from its recorded base.");
   await git(repoPath, ["checkout", "--detach", manifest.integration.sha], options);
   return manifest.integration.sha;
+}
+
+function reconciliationTaskResults(projectPlan, status, output) {
+  return allTaskResults(projectPlan.tasks, status, output);
+}
+
+async function reconcilePromotionProject(projectPlan, options = {}) {
+  const candidate = projectPlan.candidate;
+  const promotion = candidate.promotion || {};
+  const result = {
+    ...projectPlan,
+    tasks: [],
+    status: "reconciliation_unavailable",
+    output: "",
+    commit: candidate.manifest.integration.sha,
+    validation: [],
+    promotionBranch: promotion.branch || "",
+    prUrl: promotion.prUrl || "",
+    mergeCommit: "",
+    mergedAt: "",
+    sourceRepoPath: projectPlan.repoPath || "",
+    workspacePath: "",
+    workspaceStrategy: "reconciliation",
+  };
+
+  if (!projectPlan.enabled) {
+    result.status = "promotion_invalid";
+    result.output = projectPlan.skipReason;
+    result.tasks = reconciliationTaskResults(projectPlan, "promotion_invalid", result.output);
+    return result;
+  }
+  if (!path.isAbsolute(projectPlan.repoPath || "")) {
+    result.status = "promotion_invalid";
+    result.output = "Project repoPath must be an absolute local path before promotion reconciliation can run.";
+    result.tasks = reconciliationTaskResults(projectPlan, "promotion_invalid", result.output);
+    return result;
+  }
+  if (!candidateHasValidPromotionHandoff(candidate)) {
+    result.status = "promotion_invalid";
+    result.output = "Persisted promotion handoff is not bound to the exact immutable candidate.";
+    result.tasks = reconciliationTaskResults(projectPlan, "promotion_invalid", result.output);
+    return result;
+  }
+
+  const inspected = await runCommand("gh", [
+    "pr", "view", promotion.prUrl,
+    "--json", "state,baseRefName,headRefName,headRefOid,mergeCommit,url,mergedAt",
+  ], {
+    cwd: projectPlan.repoPath,
+    env: options.env,
+    secrets: options.secrets,
+    timeoutMs: 60_000,
+    allowFailure: true,
+  });
+  if (!inspected.ok) {
+    result.output = `Promotion PR could not be inspected; reconciliation will retry without changing task state.\n${truncateOutput(inspected.output)}`;
+    result.tasks = reconciliationTaskResults(projectPlan, "reconciliation_unavailable", result.output);
+    return result;
+  }
+
+  let pr;
+  try {
+    pr = JSON.parse(inspected.stdout || inspected.output);
+  } catch {
+    result.output = "Promotion PR inspection returned invalid JSON; reconciliation will retry without changing task state.";
+    result.tasks = reconciliationTaskResults(projectPlan, "reconciliation_unavailable", result.output);
+    return result;
+  }
+
+  const prState = String(pr.state || "").trim().toUpperCase();
+  const expectedSha = candidate.manifest.integration.sha;
+  if (pr.url !== promotion.prUrl || pr.baseRefName !== projectPlan.targetBranch || pr.headRefOid !== expectedSha) {
+    result.status = "promotion_invalid";
+    result.output = [
+      "Promotion PR no longer matches the immutable candidate.",
+      `Expected URL/base/head: ${promotion.prUrl} / ${projectPlan.targetBranch} / ${expectedSha}`,
+      `Observed URL/base/head: ${pr.url || "missing"} / ${pr.baseRefName || "missing"} / ${pr.headRefOid || "missing"}`,
+    ].join("\n");
+    result.tasks = reconciliationTaskResults(projectPlan, "promotion_invalid", result.output);
+    return result;
+  }
+  if (prState === "OPEN") {
+    result.status = "pending";
+    result.output = "Release-candidate PR remains open for the owner; no workflow state changed.";
+    result.tasks = reconciliationTaskResults(projectPlan, "pending", result.output);
+    return result;
+  }
+  if (prState !== "MERGED") {
+    result.status = "promotion_closed";
+    result.output = "Release-candidate PR was closed without merging. Owner action is required before promotion can continue.";
+    result.tasks = reconciliationTaskResults(projectPlan, "promotion_closed", result.output);
+    return result;
+  }
+
+  const mergeCommit = String(pr.mergeCommit?.oid || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(mergeCommit) || !Number.isFinite(Date.parse(pr.mergedAt || ""))) {
+    result.status = "promotion_invalid";
+    result.output = "Merged promotion PR is missing an immutable merge commit or merged timestamp.";
+    result.tasks = reconciliationTaskResults(projectPlan, "promotion_invalid", result.output);
+    return result;
+  }
+
+  const gitOptions = { env: options.env, secrets: options.secrets };
+  const fetched = await git(
+    projectPlan.repoPath,
+    ["fetch", "origin", `refs/heads/${projectPlan.targetBranch}:refs/remotes/origin/${projectPlan.targetBranch}`],
+    { ...gitOptions, allowFailure: true },
+  );
+  if (!fetched.ok) {
+    result.output = `Merged promotion target could not be fetched; reconciliation will retry without changing task state.\n${truncateOutput(fetched.output)}`;
+    result.tasks = reconciliationTaskResults(projectPlan, "reconciliation_unavailable", result.output);
+    return result;
+  }
+  const targetHead = await branchHead(projectPlan.repoPath, `refs/remotes/origin/${projectPlan.targetBranch}`, gitOptions);
+  const candidateReachable = await git(
+    projectPlan.repoPath,
+    ["merge-base", "--is-ancestor", expectedSha, targetHead],
+    { ...gitOptions, allowFailure: true },
+  );
+  const mergeReachable = await git(
+    projectPlan.repoPath,
+    ["merge-base", "--is-ancestor", mergeCommit, targetHead],
+    { ...gitOptions, allowFailure: true },
+  );
+  if (!candidateReachable.ok || !mergeReachable.ok) {
+    result.status = "promotion_invalid";
+    result.output = `Protected target ${projectPlan.targetBranch} at ${targetHead || "missing"} does not contain the exact candidate and recorded merge commit.`;
+    result.tasks = reconciliationTaskResults(projectPlan, "promotion_invalid", result.output);
+    return result;
+  }
+
+  result.status = "merged";
+  result.mergeCommit = mergeCommit;
+  result.mergedAt = pr.mergedAt;
+  result.output = `Verified ${promotion.prUrl} merged the exact candidate into ${projectPlan.targetBranch} at ${mergeCommit}.`;
+  result.tasks = reconciliationTaskResults(projectPlan, "merged", result.output);
+  return result;
 }
 
 async function promoteProject(projectPlan, options = {}) {
@@ -822,10 +1001,11 @@ async function promoteProject(projectPlan, options = {}) {
 
 function authFailureProjectResult(projectPlan, error) {
   const output = `GitHub App auth failed for promotion: ${error.message}`;
+  const reconciliation = projectPlan.mode === "reconcile";
   return {
     ...projectPlan,
-    tasks: allTaskResults(projectPlan.tasks, "blocked", output),
-    status: "blocked",
+    tasks: allTaskResults(projectPlan.tasks, reconciliation ? "reconciliation_unavailable" : "blocked", output),
+    status: reconciliation ? "reconciliation_unavailable" : "blocked",
     output: truncateOutput(output),
     commit: "",
     validation: [],
@@ -888,6 +1068,14 @@ function commentForTask(projectResult, taskResult) {
     return `Promotion waiting: ${taskResult.output}`;
   }
 
+  if (taskResult.status === "merged") {
+    return `Verified release-candidate merge for immutable candidate ${projectResult.candidate.id}.\n\nPR: ${projectResult.prUrl}\nMerge commit: ${projectResult.mergeCommit}\nTarget: ${projectResult.targetBranch}`;
+  }
+
+  if (["promotion_closed", "promotion_invalid"].includes(taskResult.status)) {
+    return `Promotion reconciliation requires owner action. No review was restarted and no replacement PR was created.\n\n${taskResult.output || projectResult.output}`;
+  }
+
   return `Promotion skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No promotion was attempted."}${workspaceLine}`;
 }
 
@@ -945,6 +1133,16 @@ function taskPatchForPromotion(projectResult, taskResult, now) {
     };
   }
 
+  if (["promotion_closed", "promotion_invalid"].includes(taskResult.status)) {
+    return {
+      ...patch,
+      status: "promotion_blocked",
+      assignedAgentRole: "owner",
+      reviewerThreadId: "",
+      promotionPrUrl: projectResult.prUrl || "",
+    };
+  }
+
   if (taskResult.status === "dependency_blocked") {
     return {
       ...patch,
@@ -981,33 +1179,79 @@ async function recordProjectResult(projectResult) {
       }
     }
     let promotedCount = 0;
+    let mergedCount = 0;
     const promotedTaskIds = new Set();
+    const mergedTaskIds = new Set();
 
     for (const taskResult of projectResult.tasks || []) {
       const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);
       if (!task) continue;
-      const patch = taskPatchForPromotion(projectResult, taskResult, now);
-      Object.assign(task, patch);
-      task.updatedAt = now;
+      if (["pending", "reconciliation_unavailable"].includes(taskResult.status)) continue;
+      if (taskResult.status === "merged") {
+        const source = candidate.manifest.sources.find((item) => item.taskId === task.id);
+        applyLifecycleTransitionInState(state, {
+          action: "record_merge",
+          taskId: task.id,
+          expectedStateVersion: task.stateVersion,
+          actorContext: {
+            actorId: "studioops-promotion-worker",
+            actorType: "worker",
+            role: "promotion-worker",
+            trusted: true,
+          },
+          evidence: {
+            candidateCycle: source?.candidateCycle,
+            subjectSha: source?.headSha,
+            candidateId: candidate.id,
+            manifestDigest: candidate.manifestDigest,
+            integrationSha: candidate.manifest.integration.sha,
+            mergeCommit: projectResult.mergeCommit,
+            prUrl: projectResult.prUrl,
+          },
+        }, { now });
+        task.assignedAgentRole = "";
+        task.reviewerThreadId = "";
+        task.promotionStatus = "merged";
+        task.promotionUpdatedAt = now;
+        task.mergeEvidence = {
+          id: `promotion:${candidate.id}:${task.id}`,
+          subjectSha: source?.headSha || task.reviewSubjectSha || "",
+          candidateId: candidate.id,
+          manifestDigest: candidate.manifestDigest,
+          integrationSha: candidate.manifest.integration.sha,
+          mergeCommit: projectResult.mergeCommit,
+          url: projectResult.prUrl,
+          recordedAt: now,
+        };
+        task.updatedAt = now;
+        mergedCount += 1;
+        mergedTaskIds.add(task.id);
+      } else {
+        const patch = taskPatchForPromotion(projectResult, taskResult, now);
+        Object.assign(task, patch);
+        task.updatedAt = now;
+      }
       if (taskResult.status === "pr_ready") {
         promotedCount += 1;
         promotedTaskIds.add(task.id);
       }
-      state.comments.push({
-        id: nextId(state.comments, "comment"),
-        taskId: task.id,
-        author: "StudioOps Promotion",
-        body: commentForTask(projectResult, taskResult),
-        createdAt: now,
-      });
-      state.events.push({
-        id: nextId(state.events, "event"),
-        type: `promotion_${taskResult.status}`,
-        projectId: task.projectId,
-        taskId: task.id,
-        message: `${task.title}: promotion ${taskResult.status}`,
-        createdAt: now,
-      });
+      const commentAdded = addUniqueComment(
+        state,
+        task.id,
+        "StudioOps Promotion",
+        commentForTask(projectResult, taskResult),
+        now,
+      );
+      if (commentAdded) {
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: `promotion_${taskResult.status}`,
+          projectId: task.projectId,
+          taskId: task.id,
+          message: `${task.title}: promotion ${taskResult.status}`,
+          createdAt: now,
+        });
+      }
     }
 
     if (promotedCount > 0) {
@@ -1048,6 +1292,35 @@ async function recordProjectResult(projectResult) {
         createdAt: now,
       });
     }
+    if (mergedCount > 0) {
+      const expectedTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
+      const actualTaskIds = [...mergedTaskIds].sort();
+      if (JSON.stringify(actualTaskIds) !== JSON.stringify(expectedTaskIds)) {
+        throw new Error(`Merged promotion result does not exactly match candidate ${candidate.id}.`);
+      }
+      const bundle = state.qaBundles.find((item) => item.id === candidate.qaBundleId);
+      if (bundle) {
+        bundle.status = "merged";
+        bundle.promotionMergedAt = projectResult.mergedAt || now;
+        bundle.promotionMergeCommit = projectResult.mergeCommit || "";
+        bundle.updatedAt = now;
+      }
+      candidate.status = "merged";
+      candidate.promotionMerge = {
+        mergeCommit: projectResult.mergeCommit || "",
+        mergedAt: projectResult.mergedAt || now,
+        reconciledAt: now,
+      };
+      candidate.updatedAt = now;
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "release_candidate_merged",
+        projectId: projectResult.projectId,
+        taskId: "",
+        message: `${projectResult.projectName || projectResult.projectKey}: verified release-candidate merge for ${mergedCount} task(s).`,
+        createdAt: now,
+      });
+    }
   }, { operationName: "promotion.record_result" });
 }
 
@@ -1067,11 +1340,14 @@ export async function runPromotion(input = {}) {
     try {
       authContext = await preparePromotionAuth(projectPlan, input);
       const secrets = normalizeSecrets(input.secrets, githubAppAuthSecrets(authContext));
-      result = await promoteProject(projectPlan, {
+      const options = {
         ...input,
         env: githubAppAuthEnv(authContext, input.env || {}),
         secrets,
-      });
+      };
+      result = projectPlan.mode === "reconcile"
+        ? await reconcilePromotionProject(projectPlan, options)
+        : await promoteProject(projectPlan, options);
     } catch (error) {
       result = authFailureProjectResult(projectPlan, error);
     } finally {

@@ -2635,10 +2635,16 @@ export async function recordQaBundleDecision(bundleId, input = {}) {
     if (!candidate || candidate.qaBundleId !== bundle.id) throw new Error(`QA bundle ${bundleId} has an invalid candidate link.`);
     const verified = await verifyCandidateForQaInState(state, candidate);
     if (!verified.ok) return verified;
+    const boundInput = {
+      ...input,
+      candidateId: input.candidateId || candidate.id,
+      manifestDigest: input.manifestDigest || candidate.manifestDigest,
+      integrationSha: input.integrationSha || candidate.manifest.integration.sha,
+    };
     return {
       ok: true,
       result: recordCandidateQaDecisionInState(state, candidate, {
-        ...input,
+        ...boundInput,
         repositoryVerifiedAt: verified.verification.verifiedAt,
       }),
     };

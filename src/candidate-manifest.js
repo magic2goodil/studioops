@@ -332,6 +332,7 @@ export function createCandidateEnvelope(input = {}) {
     invalidation: null,
     qaDecision: null,
     promotion: null,
+    promotionMerge: null,
   };
 }
 
