@@ -10,6 +10,7 @@ import {
 } from "../src/dispatcher.js";
 import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { fileScopesMayOverlap } from "../src/work-lanes.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 
 const execFileAsync = promisify(execFile);
@@ -697,7 +698,7 @@ test("reports make an explicit lower concurrency limit distinct from lane confli
   state.projects.push({ id: "project_2", key: "other", name: "Other" });
   state.tasks = [
     { id: "task_a", projectId: "project_1", title: "First API", status: "ready", lane: "backend", workAreas: ["src/a/**"] },
-    { id: "task_b", projectId: "project_2", title: "Second API", status: "ready", lane: "backend", workAreas: ["src/b/**"] },
+    { id: "task_b", projectId: "project_2", title: "Second API", status: "ready", lane: "backend", workAreas: ["src/a/generated/**"] },
   ];
   const actions = state.tasks.map((task) => ({
     id: `${task.id}:start_builder`, type: "start_builder", role: "builder",
@@ -716,13 +717,88 @@ test("reports make an explicit lower concurrency limit distinct from lane confli
   })), { builderConcurrency: 3 });
   assert.match(conflicting.skipped[0].reason, /^lane_conflict:backend:/);
   assert.equal(conflicting.skipped[0].constraint, "lane_or_file_scope_conflict");
-  assert.deepEqual(conflicting.skipped[0].fileScope, ["src/b/**"]);
+  assert.deepEqual(conflicting.skipped[0].fileScope, ["src/a/generated/**"]);
 
   const text = formatDispatchReport({
     generatedAt: new Date().toISOString(), dryRun: true, runs: [], ...conflicting,
   });
   assert.match(text, /Effective capacity:.*builder 0\+1\/3/);
   assert.match(text, /concurrency limits 0; lane\/file-scope conflicts 1/);
+});
+
+test("explicit disjoint same-lane scopes can use separate builder slots", () => {
+  const state = fixtureState();
+  state.tasks = [
+    { id: "task_a", projectId: "project_1", title: "Lifecycle", status: "ready", lane: "backend", workAreas: ["src/lifecycle/**", "test/lifecycle/**"] },
+    { id: "task_b", projectId: "project_1", title: "Retention", status: "ready", lane: "backend", workAreas: ["src/retention/**", "test/retention/**"] },
+  ];
+  const actions = state.tasks.map((task) => ({
+    id: `${task.id}:start_builder`, type: "start_builder", role: "builder",
+    projectId: task.projectId, taskId: task.id, taskTitle: task.title, taskStatus: "ready",
+  }));
+
+  const report = planDispatches(state, actions, { builderConcurrency: 2 });
+
+  assert.deepEqual(report.selected.map((item) => item.taskId), ["task_a", "task_b"]);
+  assert.equal(report.skipped.length, 0);
+  assert.equal(report.selected.every((item) => item.fileScopeExplicit), true);
+});
+
+test("explicit overlapping scopes serialize across lane labels", () => {
+  const state = fixtureState();
+  state.tasks = [
+    { id: "task_a", projectId: "project_1", title: "Server", status: "ready", lane: "backend", workAreas: ["src/server/**"] },
+    { id: "task_b", projectId: "project_1", title: "Deploy server", status: "ready", lane: "devops", workAreas: ["src/server/deploy.js"] },
+  ];
+  const actions = state.tasks.map((task) => ({
+    id: `${task.id}:start_builder`, type: "start_builder", role: "builder",
+    projectId: task.projectId, taskId: task.id, taskTitle: task.title, taskStatus: "ready",
+  }));
+
+  const report = planDispatches(state, actions, { builderConcurrency: 2 });
+
+  assert.equal(report.selected.length, 1);
+  assert.match(report.skipped[0].reason, /^lane_conflict:devops:task_a/);
+});
+
+test("devops and backend scopes run together only when explicitly disjoint", () => {
+  const state = fixtureState();
+  state.tasks = [
+    { id: "task_a", projectId: "project_1", title: "Lifecycle", status: "ready", lane: "backend", workAreas: ["src/lifecycle-policy.js"] },
+    { id: "task_b", projectId: "project_1", title: "Workflow", status: "ready", lane: "devops", workAreas: [".github/workflows/check.yml"] },
+  ];
+  const actions = state.tasks.map((task) => ({
+    id: `${task.id}:start_builder`, type: "start_builder", role: "builder",
+    projectId: task.projectId, taskId: task.id, taskTitle: task.title, taskStatus: "ready",
+  }));
+
+  const report = planDispatches(state, actions, { builderConcurrency: 2 });
+
+  assert.equal(report.selected.length, 2);
+  assert.deepEqual(report.selected.map((item) => item.conflictGroup), ["backend", "devops"]);
+});
+
+test("unknown same-lane scope stays serialized and glob overlap is conservative", () => {
+  const state = fixtureState();
+  state.tasks = [
+    { id: "task_a", projectId: "project_1", title: "Unknown API", status: "ready", lane: "backend" },
+    { id: "task_b", projectId: "project_1", title: "Known API", status: "ready", lane: "backend", workAreas: ["src/specific.js"] },
+  ];
+  const actions = state.tasks.map((task) => ({
+    id: `${task.id}:start_builder`, type: "start_builder", role: "builder",
+    projectId: task.projectId, taskId: task.id, taskTitle: task.title, taskStatus: "ready",
+  }));
+
+  const report = planDispatches(state, actions, { builderConcurrency: 2 });
+
+  assert.equal(report.selected.length, 1);
+  assert.match(report.skipped[0].reason, /^lane_conflict:backend:/);
+  assert.equal(fileScopesMayOverlap(["src/a/**"], ["src/a/generated/**"]), true);
+  assert.equal(fileScopesMayOverlap(["src/a/**"], ["src/b/**"]), false);
+  assert.equal(fileScopesMayOverlap(["package*.json"], ["package-lock.json"]), true);
+  assert.equal(fileScopesMayOverlap(["src/a.js"], ["src/b.js"]), false);
+  assert.equal(fileScopesMayOverlap(["packages/design"], ["packages/design/src/tokens.js"]), true);
+  assert.equal(fileScopesMayOverlap(["**/*"], ["docs/readme.md"]), true);
 });
 
 test("read-only architecture runs do not block independent mutating work", () => {
