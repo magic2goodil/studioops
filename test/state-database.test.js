@@ -316,6 +316,7 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
     assert.equal(state.meta.storageBackend, "sqlite");
     assert.match(state.meta.migratedFrom, /mission-control\.json$/);
     assert.equal(state.meta.stateIntegrityVersion, 5);
+    assert.equal(state.meta.lifecycleMigration.schemaVersion, 1);
     assert.equal(state.meta.lifecycleMigration.backupVerified, true);
     assert.equal(state.tasks[0].stateVersion, 1);
 
@@ -402,6 +403,7 @@ test("lifecycle integrity migration upgrades an existing v4 database once from a
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
     let persisted = readPersistedState(root);
     assert.equal(persisted.meta.stateIntegrityVersion, 5);
+    assert.equal(persisted.meta.lifecycleMigration.schemaVersion, 1);
     assert.equal(persisted.tasks[0].stateVersion, 1);
     const backupPath = persisted.meta.lifecycleMigration.backupPath;
     const backupDb = new DatabaseSync(backupPath, { readOnly: true });
@@ -417,6 +419,72 @@ test("lifecycle integrity migration upgrades an existing v4 database once from a
     persisted = readPersistedState(root);
     assert.equal(persisted.tasks[0].stateVersion, 1);
     assert.deepEqual(await readdir(path.join(dataDir, "backups")), backupsBeforeReplay);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle schema migration repairs a version-5 database that lacks the lifecycle column", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-lifecycle-version-collision-"));
+  try {
+    const dataDir = path.join(root, "data");
+    await mkdir(dataDir, { recursive: true });
+    const databasePath = path.join(dataDir, "mission-control.sqlite3");
+    const legacyDb = new DatabaseSync(databasePath);
+    try {
+      legacyDb.exec(`
+        CREATE TABLE state_meta (
+          singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+          payload TEXT NOT NULL,
+          version INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY,
+          sequence INTEGER NOT NULL,
+          project_id TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT '',
+          assigned_role TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL DEFAULT '',
+          payload TEXT NOT NULL
+        );
+      `);
+      const state = baseState();
+      state.meta.stateIntegrityVersion = 5;
+      legacyDb.prepare("INSERT INTO state_meta VALUES (1, ?, 1, ?)")
+        .run(JSON.stringify(state.meta), "2026-08-17T00:00:00.000Z");
+      legacyDb.prepare("INSERT INTO tasks VALUES (?, 0, ?, ?, '', '', ?)")
+        .run("task_1", "project_1", "ready", JSON.stringify(state.tasks[0]));
+    } finally {
+      legacyDb.close();
+    }
+
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.meta.stateIntegrityVersion, 5);
+    assert.equal(persisted.meta.lifecycleMigration.schemaVersion, 1);
+    assert.equal(persisted.meta.lifecycleMigration.backupVerified, true);
+    assert.equal(persisted.tasks[0].stateVersion, 1);
+
+    const migratedDb = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(migratedDb.prepare("SELECT state_version FROM tasks WHERE id = 'task_1'").get().state_version, 1);
+      assert.equal(
+        migratedDb.prepare("PRAGMA index_list(tasks)").all().some((index) => index.name === "idx_tasks_state_version"),
+        true,
+      );
+      assert.equal(migratedDb.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+    } finally {
+      migratedDb.close();
+    }
+
+    const backupDb = new DatabaseSync(persisted.meta.lifecycleMigration.backupPath, { readOnly: true });
+    try {
+      assert.equal(backupDb.prepare("PRAGMA table_info(tasks)").all().some((column) => column.name === "state_version"), false);
+      assert.equal(backupDb.prepare("SELECT count(*) count FROM tasks").get().count, 1);
+    } finally {
+      backupDb.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
