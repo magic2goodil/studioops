@@ -27,6 +27,7 @@ import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from 
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
+import { resolveQaIntegrationOptions } from "./qa-integration-options.js";
 import { formatPromotionReport, planPromotions, runPromotion } from "./promotion.js";
 import { formatSelfUpdateReport, runSelfUpdate } from "./self-update.js";
 import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
@@ -1071,20 +1072,8 @@ Automation:
   }
 
   if (command === "qa-integrate" || command === "qa-integration") {
-    const options = {
-      project: args.project || args.projects,
-      task: args.task || args.tasks || args["task-id"],
-      partialTasks: args["partial-tasks"],
-      partialActorId: args["partial-actor-id"],
-      partialReasonCode: args["partial-reason-code"],
-      dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
-      force: Boolean(args.force || args.reintegrate),
-      validationTimeoutMs: args["validation-timeout-ms"],
-      githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
-      githubAppCredentialsDir: args["github-apps-dir"],
-      githubAppRole: args["github-app-role"],
-      githubAppDefaultRole: args["github-app-default-role"],
-    };
+    const config = await loadConfig();
+    const options = resolveQaIntegrationOptions(args, config);
     if (args.plan || args["dry-run"] || args.dryRun) {
       const state = await readState();
       const plan = planQaIntegrations(state, options);

@@ -20,7 +20,8 @@ export const COORDINATION_SCHEMA_VERSION = 2;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
-const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
+const ACTIVE_MACHINE_COMMENTS_PER_TASK = 12;
+const ACTIVE_TERMINAL_RUNS_PER_WORKFLOW_ACTION = 3;
 const SQLITE_BUSY_TIMEOUT_MS = 250;
 const DEFAULT_MUTATION_RETRIES = 4;
 const MAX_MUTATION_RETRIES = 8;
@@ -377,7 +378,8 @@ function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
     const key = groupKey(item);
     const count = counts.get(key) || 0;
     counts.set(key, count + 1);
-    if (count >= limit) {
+    const itemLimit = typeof limit === "function" ? Math.max(1, Number(limit(item) || 1)) : limit;
+    if (count >= itemLimit) {
       keep[index] = false;
       archived.push(item);
     }
@@ -390,45 +392,56 @@ function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
 
 export function compactOperationalHistory(state, input = {}) {
   const commentLimit = Math.max(1, Number(input.commentLimit || ACTIVE_QA_COMMENTS_PER_TASK));
-  const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
-  const staleReviewRunLimit = Math.max(
+  const machineCommentLimit = Math.max(
     1,
-    Number(input.staleReviewRunLimit || ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH),
+    Number(input.machineCommentLimit || ACTIVE_MACHINE_COMMENTS_PER_TASK),
   );
+  const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
   const qaEventEvidence = new Set((Array.isArray(state.events) ? state.events : [])
     .filter((event) => /^qa_integration_/.test(event.type || ""))
     .map((event) => `${event.taskId || ""}|${event.createdAt || ""}`));
+  const isQaIntegrationComment = (comment) => (
+    (comment.systemGenerated === true && comment.kind === "qa_integration")
+    || (
+      QA_COMMENT_AUTHORS.has(comment.author)
+      && /^QA integration\b/.test(comment.body || "")
+      && qaEventEvidence.has(`${comment.taskId || ""}|${comment.createdAt || ""}`)
+    )
+  );
   const comments = archiveOldestBeyondLimit(
     Array.isArray(state.comments) ? state.comments : [],
     (comment) => (
-      (comment.systemGenerated === true && comment.kind === "qa_integration")
+      isQaIntegrationComment(comment)
       || (
-        QA_COMMENT_AUTHORS.has(comment.author)
-        && /^QA integration\b/.test(comment.body || "")
-        && qaEventEvidence.has(`${comment.taskId || ""}|${comment.createdAt || ""}`)
+        comment.systemGenerated === true
+        && comment.kind !== "qa_integration"
       )
     ),
-    (comment) => comment.taskId || "unassigned",
-    commentLimit,
+    (comment) => isQaIntegrationComment(comment)
+      ? `qa:${comment.taskId || "unassigned"}`
+      : `machine:${comment.taskId || "unassigned"}`,
+    (comment) => isQaIntegrationComment(comment) ? commentLimit : machineCommentLimit,
   );
   const events = archiveOldestBeyondLimit(
     Array.isArray(state.events) ? state.events : [],
-    (event) => /^qa_(?:integration|bundle)_/.test(event.type || ""),
-    (event) => event.taskId || `${event.projectId || "unassigned"}:${event.type || "qa"}`,
+    (event) => (
+      event.machineGenerated !== false
+    ),
+    (event) => event.executionKey
+      || event.attemptKey
+      || event.dispatchKey
+      || `${event.taskId || event.projectId || "unassigned"}:${event.type || "machine"}`,
     eventLimit,
   );
   const runs = archiveOldestBeyondLimit(
     Array.isArray(state.runs) ? state.runs : [],
-    (run) => (
-      run.status === "cancelled"
-      && run.actionType === "continue_review"
-      && (
-        String(run.exitCode || "").startsWith("task_status_changed:")
-        || String(run.notes || "").includes("dispatch-loop incident")
-      )
+    (run) => ["completed", "failed", "cancelled"].includes(run.status),
+    (run) => `${run.taskId || "unassigned"}:${run.actionType || "run"}:${run.role || "worker"}`,
+    (run) => Math.max(
+      1,
+      Number(input.terminalRunLimit || ACTIVE_TERMINAL_RUNS_PER_WORKFLOW_ACTION),
+      Number(run.maxAttempts || 0) + 1,
     ),
-    (run) => run.dispatchKey || `${run.taskId || "unassigned"}:${run.role || "reviewer"}`,
-    staleReviewRunLimit,
   );
   state.comments = comments.active;
   state.events = events.active;
@@ -484,7 +497,8 @@ function recordOperationalArchiveMetadata(state, archived, now, backupPath = "")
     runs: Number(previous.runs || 0) + (archived.runs || []).length,
     activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
     activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
-    activeStaleReviewRunsPerDispatch: ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH,
+    activeMachineCommentsPerTask: ACTIVE_MACHINE_COMMENTS_PER_TASK,
+    activeTerminalRunsPerWorkflowAction: ACTIVE_TERMINAL_RUNS_PER_WORKFLOW_ACTION,
   };
 }
 
