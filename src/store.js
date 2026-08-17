@@ -2235,7 +2235,9 @@ export async function updateTask(taskId, patch) {
     ) {
       delete task.automationBlocker;
     }
-    task.updatedAt = new Date().toISOString();
+    const now = new Date().toISOString();
+    supersedeStaleAutomationCircuitInState(state, task, now);
+    task.updatedAt = now;
     state.events.push({
       id: nextId(state.events, "event"),
       type: "task_updated",
@@ -3110,6 +3112,51 @@ export function workflowSnapshotForTask(task, overrides = {}) {
       : null,
     branchName: task.branchName || "",
   };
+}
+
+export function automationCircuitIsStale(task = {}) {
+  const circuit = task.automationCircuit;
+  if (circuit?.state !== "open" || !circuit.snapshot) return false;
+  return !isDeepStrictEqual(circuit.snapshot, workflowSnapshotForTask(task));
+}
+
+function supersedeStaleAutomationCircuitInState(state, task, now) {
+  if (!automationCircuitIsStale(task)) return false;
+  const previousCircuit = task.automationCircuit;
+  const reason = "Task workflow advanced beyond the automation circuit snapshot.";
+  task.automationCircuit = {
+    ...previousCircuit,
+    state: "superseded",
+    closedAt: now,
+    closedBy: "task.update",
+    closeReason: reason,
+    supersededAt: now,
+    supersededBy: "task.update",
+  };
+  delete task.automationBlocker;
+  state.comments = state.comments || [];
+  addAutomationComment(
+    state,
+    task,
+    "Superseded stale automation circuit after the task advanced beyond its dispatch snapshot. Original failure evidence remains preserved on the circuit.",
+    now,
+    "StudioOps Automation",
+  );
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "automation_circuit_superseded",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.id} automation circuit superseded after workflow advancement beyond its snapshot.`,
+    createdAt: now,
+    metadata: {
+      closeReason: reason,
+      supersededBy: "task.update",
+      originalCircuit: structuredClone(previousCircuit),
+    },
+  });
+  return true;
 }
 
 export function reconcileAutomationStateInState(state, input = {}) {

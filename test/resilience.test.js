@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   applyGitHubRemoteRecoveryProbeResultInState,
+  automationCircuitIsStale,
   automationTick,
   claimDueGitHubRemoteRecoveryProbesInState,
   resetAutomationCircuitInState,
@@ -204,6 +205,26 @@ test("transient recovery opens a circuit instead of looping after the recovery b
   assert.equal(state.tasks[0].automationCircuit.state, "open");
   assert.equal(state.tasks[0].automationCircuit.snapshot.status, "queued");
   assert.equal(state.tasks[0].automationBlocker.type, "circuit");
+});
+
+test("automation circuit matching is snapshot-bound and detects objective workflow drift", () => {
+  const snapshot = workflowSnapshotForTask(stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+  }).tasks[0], { status: "queued", assignedAgentRole: "builder" });
+  const state = stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+    automationCircuit: { state: "open", snapshot },
+  });
+
+  assert.equal(automationCircuitIsStale(state.tasks[0]), true);
+  state.tasks[0] = {
+    ...state.tasks[0],
+    ...snapshot,
+    automationCircuit: { state: "open", snapshot },
+  };
+  assert.equal(automationCircuitIsStale(state.tasks[0]), false);
 });
 
 test("operator pause prevents automation state advancement", async () => {

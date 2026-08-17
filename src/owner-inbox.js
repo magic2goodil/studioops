@@ -1,4 +1,5 @@
 import {
+  automationCircuitIsStale,
   candidateReviewEvidenceForTask,
   findProject,
   findTask,
@@ -760,8 +761,11 @@ export function buildOwnerInbox(state, input = {}) {
 
   for (const task of state.tasks || []) {
     const project = findProject(state, task.projectId);
-    const blocked = task.automationCircuit?.state === "open"
-      || (task.status === "blocked" && Boolean(task.automationBlocker));
+    const staleCircuit = automationCircuitIsStale(task);
+    const blocked = !staleCircuit && (
+      task.automationCircuit?.state === "open"
+      || (task.status === "blocked" && Boolean(task.automationBlocker))
+    );
     if (blocked) {
       groupedItems.operations.push(operationTaskItem(state, task, input));
       continue;

@@ -321,6 +321,34 @@ test("open circuits and operator pauses remain operational without becoming owne
   assert.doesNotMatch(operation.nextAction, /code review/i);
 });
 
+test("a stale task circuit is omitted after the task advances to current QA", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "qa_review",
+    integrationStatus: "ready",
+    automationBlocker: { type: "circuit", reason: "credit_gate" },
+    automationCircuit: {
+      state: "open",
+      normalizedReason: "An earlier dispatch snapshot exhausted credit admission.",
+      snapshot: {
+        status: "blocked",
+        assignedAgentRole: "owner",
+        reviewCycle: 0,
+        reviewSubjectCycle: 0,
+        reviewSubjectSha: "",
+        candidateIdentity: null,
+        branchName: "",
+      },
+    },
+  };
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 1);
+  assert.equal(group(inbox, "decisions").items[0].kind, "qa_review");
+  assert.equal(inbox.groups.find((item) => item.id === "operations").count, 0);
+});
+
 test("project circuits remain visibly resettable in Operations", () => {
   const state = fixtureState();
   state.tasks[0].status = "ready";
