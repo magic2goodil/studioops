@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -143,6 +144,91 @@ test("status without a value and show-task leave the task unchanged", async () =
       comments: [],
       events: [],
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("worker environment rejects generic status paths and accepts the named capability handoff once", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-worker-capability-cli-"));
+  try {
+    const secret = "test-workflow-capability-1234567890abcdef";
+    const state = builderReviewStatusState("local", "");
+    state.tasks[0].stateVersion = 2;
+    state.tasks[0].reviewSubjectSha = "";
+    state.tasks[0].assignedAgentRole = "builder";
+    state.runs = [{
+      id: "run_1",
+      taskId: "task_1",
+      projectId: "project_1",
+      group: "builder",
+      role: "builder",
+      actionType: "start_builder",
+      status: "running",
+      workflowMode: "local",
+      workflowLease: {
+        id: "lease_1",
+        claimedAt: "2026-08-17T12:00:00.000Z",
+        expiresAt: "2099-08-17T14:00:00.000Z",
+      },
+      workflowCapability: {
+        hash: createHash("sha256").update(secret).digest("hex"),
+        scopes: ["builder.handoff", "worker.recover"],
+        taskId: "task_1",
+        role: "builder",
+        assignment: "builder",
+        runId: "run_1",
+        leaseId: "lease_1",
+        stateVersion: 2,
+        candidateCycle: 0,
+        subjectSha: "",
+        issuedAt: "2026-08-17T12:00:00.000Z",
+        expiresAt: "2099-08-17T14:00:00.000Z",
+        actor: { mode: "local", runId: "run_1" },
+        consumedAt: "",
+        consumedScope: "",
+      },
+    }];
+    await writeLegacyState(root, state);
+    const env = {
+      ...await environmentForTestControlRoot(root),
+      STUDIOOPS_WORKFLOW_CAPABILITY: secret,
+    };
+
+    await assert.rejects(
+      execFileAsync(process.execPath, [cliPath, "status", "task_1", "--status", "builder_review"], { cwd: root, env }),
+      /cannot use generic status/,
+    );
+    await assert.rejects(
+      execFileAsync(process.execPath, [cliPath, "update-task", "task_1", "--status", "builder_review"], { cwd: root, env }),
+      /cannot mutate status through update-task/,
+    );
+
+    await execFileAsync(process.execPath, [
+      cliPath,
+      "builder-handoff",
+      "task_1",
+      "--subject-sha",
+      "b".repeat(40),
+      "--branch",
+      "codex/task-1",
+    ], { cwd: root, env });
+    const persisted = await readPersistedState(root, env);
+    assert.equal(persisted.tasks[0].status, "builder_review");
+    assert.equal(persisted.tasks[0].stateVersion, 3);
+    assert.equal(persisted.runs[0].workflowCapability.consumedScope, "builder.handoff");
+    await assert.rejects(
+      execFileAsync(process.execPath, [
+        cliPath,
+        "builder-handoff",
+        "task_1",
+        "--subject-sha",
+        "c".repeat(40),
+        "--branch",
+        "codex/task-1",
+      ], { cwd: root, env }),
+      /already consumed/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

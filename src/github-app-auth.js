@@ -380,6 +380,19 @@ export function githubAppAuthSecrets(auth) {
   return auth ? [auth.token, auth.jwt].filter(Boolean) : [];
 }
 
+export function githubAppActorIdentity(auth) {
+  if (!auth) return null;
+  return {
+    mode: "github",
+    transport: "github-app",
+    role: String(auth.role || ""),
+    appId: String(auth.app?.appId || ""),
+    appSlug: String(auth.app?.slug || auth.app?.key || ""),
+    appName: String(auth.app?.name || ""),
+    installationId: String(auth.installationId || ""),
+  };
+}
+
 export function redactSecrets(value, secrets = []) {
   let text = String(value ?? "");
   for (const secret of unique(secrets).sort((a, b) => b.length - a.length)) {
@@ -484,8 +497,9 @@ export async function prepareGitHubAppAuth(run, input = {}) {
       || githubApps.credentialsDir,
     DEFAULT_CREDENTIALS_DIR,
   );
-  const roleMap = input.githubAppRoleMap || githubApps.roleMap || {};
-  const defaultRole = input.githubAppDefaultRole || githubApps.defaultRole || "default";
+  const explicitCredentialsDir = Boolean(input.githubAppCredentialsDir);
+  const roleMap = input.githubAppRoleMap || (explicitCredentialsDir ? {} : githubApps.roleMap) || {};
+  const defaultRole = input.githubAppDefaultRole || (explicitCredentialsDir ? "default" : githubApps.defaultRole) || "default";
   const repo = await resolveRunRepository(run);
   const app = await loadConfiguredApp(credentialsDir, role, { roleMap, defaultRole });
   const jwt = createGitHubAppJwt(app.appId, app.privateKey);

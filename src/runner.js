@@ -4,12 +4,14 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import {
   cleanupGitHubAppAuth,
   createSecretRedactor,
   formatGitHubAppAuthForLog,
   formatGitHubAppAuthForPrompt,
+  githubAppActorIdentity,
   githubAppAuthEnv,
   githubAppAuthSecrets,
   parseGitHubRepoUrl,
@@ -20,6 +22,7 @@ import { withGitRepositoryLock } from "./git-lock.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   applyGitHubRemoteRecoveryProbeResult,
+  applyLifecycleTransitionInState,
   architectureIsCompleteInState,
   claimDueGitHubRemoteRecoveryProbes,
   currentReviewCandidateCycle,
@@ -35,6 +38,7 @@ import {
   DATA_DIR,
   findProject,
   findTask,
+  issueWorkflowCapabilityInState,
   mutateState,
   readState,
   renewGitHubRemoteRecoveryProbeLease,
@@ -829,10 +833,28 @@ export async function preflightRun(run, input = {}) {
     const checkInherited = input.checkInheritedGitHubCredentials || defaultInheritedGitHubCredentialCheck;
     try {
       await checkInherited(githubRun, input);
-      return { ok: true, workflowMode, originUrl: repositoryOriginUrl, gitAuthStrategy: "inherited-ssh" };
+      const prepareIdentity = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
+      const cleanupIdentity = input.cleanupGitHubAppAuth || cleanupGitHubAppAuth;
+      let identityAuth = null;
+      try {
+        identityAuth = await prepareIdentity(githubRun, input);
+        const actorIdentity = githubAppActorIdentity(identityAuth);
+        if (!actorIdentity?.appId || !actorIdentity?.installationId) {
+          throw new Error("GitHub App and installation identity are required for worker workflow capabilities.");
+        }
+        return {
+          ok: true,
+          workflowMode,
+          originUrl: repositoryOriginUrl,
+          gitAuthStrategy: "inherited-ssh",
+          actorIdentity: { ...actorIdentity, transport: "inherited-ssh" },
+        };
+      } finally {
+        await cleanupIdentity(identityAuth);
+      }
     } catch (error) {
       inheritedCredentialFailure = error;
-      // A role GitHub App remains the bounded fallback when the machine's SSH/gh identity is unavailable.
+      // The same role GitHub App remains the bounded auth and actor-identity fallback.
     }
   }
 
@@ -874,7 +896,21 @@ export async function preflightRun(run, input = {}) {
   } finally {
     await cleanupAuth(authContext);
   }
-  return { ok: true, workflowMode, originUrl: repositoryOriginUrl, gitAuthStrategy: "github-app" };
+  const actorIdentity = githubAppActorIdentity(authContext);
+  if (!actorIdentity?.appId || !actorIdentity?.installationId) {
+    return preflightFailure(
+      "github_app_identity_missing",
+      "GitHub workflow capability issuance requires non-secret App and installation identity.",
+      "Configure and install the role GitHub App for this repository, then retry the run.",
+    );
+  }
+  return {
+    ok: true,
+    workflowMode,
+    originUrl: repositoryOriginUrl,
+    gitAuthStrategy: "github-app",
+    actorIdentity,
+  };
 }
 
 async function localBranchExists(repoPath, branch) {
@@ -1185,6 +1221,11 @@ ${run.workflowMode === "local"
 
 StudioOps CLI:
 \`node ${missionControlCli}\`
+
+Run-scoped workflow authority:
+- StudioOps injected a short-lived one-time capability into this child process only.
+- Use the named \`builder-handoff\`, \`architecture-complete\`, or \`review\` command required by this run; worker use of generic \`status\` and status-bearing \`update-task\` is rejected.
+- Do not print, copy, persist, or pass the capability on the command line. The CLI reads it from the child environment.
 
 Automation rules:
 - This run is ${run.group === "architect" ? "a systems-architecture pass: inspect the repository and supplied assets, create/update StudioOps tasks, and record the architecture decision; do not edit product code or create a feature branch/PR" : "an implementation or review pass governed by the task prompt"}.
@@ -1590,7 +1631,7 @@ export async function claimRuns(input = {}) {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
-    const now = new Date().toISOString();
+    const now = new Date(Number(input.nowMs ?? Date.now())).toISOString();
     const activeCount = state.runs.filter((run) => (
       ACTIVE_STATUSES.has(run.status) && !activeRunStaleReason(run, input)
     )).length;
@@ -1670,6 +1711,10 @@ export async function claimRuns(input = {}) {
       run.preflightOriginUrl = preflight.originUrl || "";
       run.preflightBaseRef = preflight.baseRef || "";
       run.preflightBaseCommit = preflight.baseCommit || "";
+      run.actorIdentity = preflight.actorIdentity || {
+        mode: preflight.workflowMode === "github" ? "github" : "local",
+        runId: run.id,
+      };
       if (preflight.candidateIdentity) run.candidateIdentity = { ...preflight.candidateIdentity };
       const profile = laneProfile(findTask(state, run.taskId) || {}, run);
       run.lane = run.lane || profile.lane;
@@ -1686,6 +1731,11 @@ export async function claimRuns(input = {}) {
       run.maxAttempts = Math.max(1, Number(run.maxAttempts || executionPolicy.maxAttempts));
       run.retryBackoffMs = Math.max(1_000, Number(run.retryBackoffMs || executionPolicy.retryBackoffMs));
       run.staleRunMs = Math.max(60_000, Number(run.staleRunMs || executionPolicy.staleRunMs));
+      run.workflowLease = {
+        id: randomUUID(),
+        claimedAt: now,
+        expiresAt: new Date(Date.parse(now) + Math.max(run.staleRunMs, Number(input.capabilityTtlMs || 0), 60_000)).toISOString(),
+      };
       run.startedAt = now;
       run.completedAt = "";
       run.exitCode = "";
@@ -1698,15 +1748,51 @@ export async function claimRuns(input = {}) {
       run.runnerPid = String(process.pid);
       run.outputPath = path.join(RUN_OUTPUT_DIR, `${run.id}.log`);
       run.lastMessagePath = path.join(RUN_OUTPUT_DIR, `${run.id}.last-message.md`);
-      if (task && run.group === "architect") {
-        task.status = "architecture_in_progress";
+      if (task) {
         task.assignedAgentRole = run.role;
-        task.updatedAt = now;
-      } else if (task && run.group === "builder" && run.actionType !== "qa_integration_blocked") {
-        task.status = "in_progress";
-        task.assignedAgentRole = run.role;
+        if (run.group === "architect" && task.status === "architecture_pending") {
+          applyLifecycleTransitionInState(state, {
+            action: "start_architecture",
+            taskId: task.id,
+            expectedStateVersion: Number(task.stateVersion || 1),
+            actorContext: {
+              actorId: `studioops-run:${run.id}`,
+              actorType: "worker",
+              role: run.role,
+              runId: run.id,
+              leaseId: run.workflowLease.id,
+              trusted: true,
+            },
+            evidence: { targetStatus: "architecture_in_progress" },
+          }, { now, nowMs: Date.parse(now) });
+        } else if (
+          run.group === "builder"
+          && run.actionType !== "qa_integration_blocked"
+          && ["queued", "needs_changes"].includes(task.status)
+        ) {
+          applyLifecycleTransitionInState(state, {
+            action: "start_builder",
+            taskId: task.id,
+            expectedStateVersion: Number(task.stateVersion || 1),
+            actorContext: {
+              actorId: `studioops-run:${run.id}`,
+              actorType: "worker",
+              role: run.role,
+              runId: run.id,
+              leaseId: run.workflowLease.id,
+              trusted: true,
+            },
+            evidence: { targetStatus: "in_progress" },
+          }, { now, nowMs: Date.parse(now) });
+        }
         task.updatedAt = now;
       }
+
+      const workflowCapabilitySecret = issueWorkflowCapabilityInState(state, run, {
+        nowMs: Date.parse(now),
+        ttlMs: input.capabilityTtlMs,
+        actor: run.actorIdentity,
+      });
 
       state.events.push({
         id: nextId(state.events, "event"),
@@ -1720,6 +1806,7 @@ export async function claimRuns(input = {}) {
       claimed.push({
         ...run,
         project,
+        workflowCapabilitySecret,
       });
       plannedRuns.push(run);
     }
@@ -1956,6 +2043,9 @@ export function sdkClientOptions(input = {}, authContext = null) {
     STUDIOOPS_CONFIG_ROOT: process.env.STUDIOOPS_CONFIG_ROOT || missionControlRoot(),
     MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || missionControlRoot(),
     MISSION_CONTROL_DATA_DIR: DATA_DIR,
+    ...(input.workflowCapabilitySecret
+      ? { STUDIOOPS_WORKFLOW_CAPABILITY: input.workflowCapabilitySecret }
+      : {}),
   });
   if (!booleanOption(input.allowApiKeyAuth, false)) {
     delete env.OPENAI_API_KEY;
@@ -2004,7 +2094,15 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
 
     const { Codex } = await import("@openai/codex-sdk");
-    const codex = new Codex(sdkClientOptions({ ...input, workflowMode: run.workflowMode }, authContext));
+    const capabilitySecrets = [
+      ...githubAppAuthSecrets(authContext),
+      run.workflowCapabilitySecret,
+    ].filter(Boolean);
+    const codex = new Codex(sdkClientOptions({
+      ...input,
+      workflowMode: run.workflowMode,
+      workflowCapabilitySecret: run.workflowCapabilitySecret,
+    }, authContext));
     const options = sdkThreadOptions(executionRun, input);
     const thread = run.threadId
       ? codex.resumeThread(run.threadId, options)
@@ -2012,7 +2110,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
 
     for await (const event of events) {
-      log.write(`${redactSecrets(JSON.stringify(event), githubAppAuthSecrets(authContext))}\n`);
+      log.write(`${redactSecrets(JSON.stringify(event), capabilitySecrets)}\n`);
       if (event.type === "thread.started") {
         await persistRunThread(run, event.thread_id);
       } else if (event.type === "item.completed" && event.item?.type === "agent_message") {
@@ -2027,11 +2125,14 @@ async function runClaimedRunWithSdk(run, input = {}) {
     }
 
     if (thread.id) await persistRunThread(run, thread.id);
-    notes = redactSecrets(finalResponse.trim(), githubAppAuthSecrets(authContext));
+    notes = redactSecrets(finalResponse.trim(), capabilitySecrets);
     await writeFile(lastMessagePath, notes, "utf8");
   } catch (error) {
     status = "failed";
-    notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
+    notes = redactSecrets(error?.message || String(error), [
+      ...githubAppAuthSecrets(authContext),
+      run.workflowCapabilitySecret,
+    ]);
     pauseReason = nonRetryableWorkspaceFailureReason(notes);
     exitCode = pauseReason || (error?.name === "AbortError" ? "timeout" : "sdk_error");
     log.write(`\nCodex SDK runner error: ${notes}\n`);
@@ -2078,7 +2179,10 @@ async function runClaimedRunWithCli(run, input = {}) {
     executionRun = withExecutionWorkspace(run, workspace);
     prompt = runnerPrompt(executionRun, executionRun.project, authContext);
   } catch (error) {
-    const notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
+    const notes = redactSecrets(error?.message || String(error), [
+      ...githubAppAuthSecrets(authContext),
+      run.workflowCapabilitySecret,
+    ]);
     log.write(`\nWorkspace preparation failed: ${notes}\n`);
     log.end();
     await cleanupGitHubAppAuth(authContext);
@@ -2114,7 +2218,7 @@ async function runClaimedRunWithCli(run, input = {}) {
 
   return new Promise((resolve) => {
     let settled = false;
-    const secrets = githubAppAuthSecrets(authContext);
+    const secrets = [...githubAppAuthSecrets(authContext), run.workflowCapabilitySecret].filter(Boolean);
     const stdoutRedactor = createSecretRedactor(secrets);
     const stderrRedactor = createSecretRedactor(secrets);
     log.write(`StudioOps Runner started ${run.id} at ${new Date().toISOString()}\n`);
@@ -2142,6 +2246,7 @@ async function runClaimedRunWithCli(run, input = {}) {
         MISSION_CONTROL_DATA_DIR: DATA_DIR,
         MISSION_CONTROL_RUN_MODEL: run.model || input.model || DEFAULT_EXECUTION_POLICY.model,
         MISSION_CONTROL_RUN_REASONING_EFFORT: run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort,
+        STUDIOOPS_WORKFLOW_CAPABILITY: run.workflowCapabilitySecret,
       }),
     });
 

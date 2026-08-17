@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   cleanupGitHubAppAuth,
+  githubAppActorIdentity,
   prepareGitHubAppAuth,
 } from "../src/github-app-auth.js";
 
@@ -193,6 +194,15 @@ test("accessibility reviewer GitHub App credentials resolve as a reviewer role",
 
     assert.equal(auth.app.key, "accessibility-reviewer");
     assert.equal(auth.role, "accessibility-reviewer");
+    assert.deepEqual(githubAppActorIdentity(auth), {
+      mode: "github",
+      transport: "github-app",
+      role: "accessibility-reviewer",
+      appId: "12345",
+      appSlug: "accessibility-reviewer",
+      appName: "accessibility-reviewer",
+      installationId: "98765",
+    });
   } finally {
     globalThis.fetch = originalFetch;
     await cleanupGitHubAppAuth(auth);

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -37,6 +37,114 @@ import {
   readDatabaseStateReadOnly,
   writeDatabaseState,
 } from "./state-database.js";
+
+const WORKFLOW_CAPABILITY_TTL_MS = 2 * 60 * 60 * 1000;
+
+function workflowCapabilityHash(secret) {
+  return createHash("sha256").update(String(secret || ""), "utf8").digest("hex");
+}
+
+function workflowCapabilityScopes(run = {}) {
+  if (run.group === "architect") return ["architecture.complete"];
+  if (run.group === "reviewer") return ["review.record"];
+  if (run.group === "builder" && run.actionType === "qa_integration_blocked") return ["worker.recover"];
+  if (run.group === "builder") return ["builder.handoff", "worker.recover"];
+  return [];
+}
+
+export function issueWorkflowCapabilityInState(state, run, input = {}) {
+  const task = findTask(state, run?.taskId);
+  if (!task) throw new Error(`Cannot issue workflow capability for missing task ${run?.taskId || "(missing)"}.`);
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const secret = String(input.secret || randomBytes(32).toString("base64url"));
+  if (secret.length < 32) throw new Error("Workflow capability secret must contain at least 32 characters.");
+  const lease = run.workflowLease;
+  if (!lease?.id || !Number.isFinite(Date.parse(lease.expiresAt || ""))) {
+    throw new Error("Workflow capability issuance requires the claimed run's current workflow lease.");
+  }
+  const actor = input.actor || run.actorIdentity || {
+    mode: run.workflowMode === "github" ? "github" : "local",
+    runId: run.id,
+  };
+  run.workflowCapability = {
+    hash: workflowCapabilityHash(secret),
+    scopes: workflowCapabilityScopes(run),
+    taskId: task.id,
+    role: run.role,
+    assignment: String(task.assignedAgentRole || ""),
+    runId: run.id,
+    leaseId: lease.id,
+    stateVersion: positiveStateVersion(task.stateVersion),
+    candidateCycle: currentReviewCandidateCycle(task),
+    subjectSha: String(task.reviewSubjectSha || "").trim().toLowerCase(),
+    issuedAt: new Date(nowMs).toISOString(),
+    expiresAt: new Date(Math.min(
+      Date.parse(lease.expiresAt),
+      nowMs + Math.max(60_000, Number(input.ttlMs || WORKFLOW_CAPABILITY_TTL_MS)),
+    )).toISOString(),
+    actor: structuredClone(actor),
+    consumedAt: "",
+    consumedScope: "",
+  };
+  return secret;
+}
+
+function safeHashMatches(expected, actual) {
+  const left = Buffer.from(String(expected || ""), "hex");
+  const right = Buffer.from(String(actual || ""), "hex");
+  return left.length === 32 && right.length === 32 && timingSafeEqual(left, right);
+}
+
+export function authorizeWorkflowCapabilityInState(state, input = {}) {
+  const secret = String(input.secret || "");
+  if (!secret) throw new Error("A run-scoped workflow capability is required.");
+  const digest = workflowCapabilityHash(secret);
+  const matches = (state.runs || []).filter((run) => safeHashMatches(run.workflowCapability?.hash, digest));
+  if (matches.length !== 1) throw new Error("Workflow capability is invalid or has already been rotated.");
+  const run = matches[0];
+  const capability = run.workflowCapability;
+  const task = findTask(state, capability.taskId);
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const fail = (reason) => { throw new Error(`Workflow capability rejected: ${reason}.`); };
+  if (!task) fail("bound task is missing");
+  if (capability.consumedAt) fail("capability was already consumed");
+  if (!capability.scopes.includes(String(input.scope || ""))) fail("scope is not authorized");
+  if (input.taskId && input.taskId !== capability.taskId) fail("task binding mismatch");
+  if (run.id !== capability.runId || run.taskId !== capability.taskId) fail("run binding mismatch");
+  if (run.status !== "running") fail("run is no longer active");
+  if (run.role !== capability.role || task.assignedAgentRole !== capability.assignment || capability.role !== capability.assignment) {
+    fail("role or assignment binding mismatch");
+  }
+  if (run.workflowLease?.id !== capability.leaseId) fail("workflow lease binding mismatch");
+  if (Date.parse(run.workflowLease?.expiresAt || "") <= nowMs) fail("workflow lease expired");
+  if (Date.parse(capability.expiresAt || "") <= nowMs) fail("capability expired");
+  if (positiveStateVersion(task.stateVersion) !== Number(capability.stateVersion)) fail("task stateVersion changed");
+  if (currentReviewCandidateCycle(task) !== Number(capability.candidateCycle)) fail("candidate cycle changed");
+  if (String(task.reviewSubjectSha || "").trim().toLowerCase() !== capability.subjectSha) fail("subject SHA changed");
+  if (input.role && String(input.role) !== capability.role) fail("caller role mismatch");
+  if (input.runId && String(input.runId) !== capability.runId) fail("caller run mismatch");
+  if (input.leaseId && String(input.leaseId) !== capability.leaseId) fail("caller lease mismatch");
+  return {
+    run,
+    task,
+    capability,
+    actorContext: {
+      actorId: capability.actor?.mode === "github"
+        ? `github-app:${capability.actor.appId || capability.actor.appSlug || "unknown"}:installation:${capability.actor.installationId || "unknown"}:run:${run.id}`
+        : `studioops-run:${run.id}`,
+      actorType: "worker",
+      role: capability.role,
+      runId: run.id,
+      leaseId: capability.leaseId,
+      trusted: true,
+    },
+  };
+}
+
+function consumeWorkflowCapability(authorization, scope, now) {
+  authorization.capability.consumedAt = now;
+  authorization.capability.consumedScope = scope;
+}
 import {
   createRemediationHandoff,
   currentRemediationHandoff,
@@ -1948,6 +2056,76 @@ export async function transitionTask(command, input = {}) {
   });
 }
 
+export function submitBuilderHandoffInState(state, taskId, input = {}) {
+    const authorization = authorizeWorkflowCapabilityInState(state, {
+      secret: input.capabilitySecret,
+      scope: "builder.handoff",
+      taskId,
+      role: input.role,
+      runId: input.runId,
+      leaseId: input.leaseId,
+      nowMs: input.nowMs,
+    });
+    const { task, capability, actorContext } = authorization;
+    const project = findProject(state, task.projectId);
+    if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
+    const subjectSha = normalizeGitSha(input.subjectSha || input.sha, "review subject SHA");
+    const branchName = String(input.branchName || input.branch || task.branchName || "").trim();
+    const prUrl = String(input.prUrl || input.pr || task.prUrl || "").trim();
+    if (!branchName) throw new Error("Builder handoff requires the feature branch.");
+    if (normalizeProjectWorkflowMode(project.workflowMode) === "github" && !prUrl) {
+      throw new Error("GitHub builder handoff requires the pull request URL.");
+    }
+    const candidateCycle = Math.max(
+      Number(capability.candidateCycle || 0) + 1,
+      Number(task.reviewCycle || 0) + 1,
+    );
+    task.branchName = branchName;
+    task.prUrl = prUrl;
+    if (input.impactEvidence) task.impactEvidence = normalizedImpactEvidence(input.impactEvidence);
+    task.candidateIdentity = normalizeCandidateIdentity({
+      ...(task.candidateIdentity || {}),
+      ...(input.candidateIdentity || {}),
+      commitSha: subjectSha,
+      branch: branchName,
+      candidateCycle,
+      impactEvidence: task.impactEvidence,
+    });
+    const nowMs = Number(input.nowMs ?? Date.now());
+    const now = input.now || new Date(nowMs).toISOString();
+    const result = applyLifecycleTransitionInState(state, {
+      action: "submit_builder_review",
+      taskId,
+      expectedStateVersion: capability.stateVersion,
+      actorContext,
+      evidence: {
+        targetStatus: "builder_review",
+        candidateCycle,
+        subjectSha,
+      },
+    }, { now, nowMs });
+    consumeWorkflowCapability(authorization, "builder.handoff", now);
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "builder_handoff_recorded",
+      projectId: task.projectId,
+      taskId,
+      runId: capability.runId,
+      message: `${task.title}: exact builder evidence recorded for ${subjectSha}`,
+      createdAt: now,
+    });
+    return result.task;
+}
+
+export async function submitBuilderHandoff(taskId, input = {}) {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => submitBuilderHandoffInState(state, taskId, input), {
+    operationName: "task.submit_builder_handoff",
+  });
+}
+
 export async function repairLegacyTaskStatus(taskId, status, input = {}) {
   const targetStatus = String(status || "").trim();
   if (!VALID_STATUSES.has(targetStatus)) throw new Error(`Invalid repair status: ${status || "(missing)"}`);
@@ -2373,6 +2551,17 @@ function completedArchitectureGraphIsValid(state, parent) {
 export function completeArchitectureInState(state, taskId, input = {}) {
   const task = findTask(state, taskId);
   if (!task) throw new Error(`Unknown task: ${taskId}`);
+  const authorization = input.capabilitySecret
+    ? authorizeWorkflowCapabilityInState(state, {
+      secret: input.capabilitySecret,
+      scope: "architecture.complete",
+      taskId,
+      role: input.role,
+      runId: input.runId,
+      leaseId: input.leaseId,
+      nowMs: input.nowMs,
+    })
+    : null;
   const summary = String(input.body || input.summary || "").trim();
   if (summary.length < 120) {
     throw new Error("Architecture completion requires a substantive summary of at least 120 characters.");
@@ -2407,18 +2596,31 @@ export function completeArchitectureInState(state, taskId, input = {}) {
   assertArchitectureDependencyGraph(state, task, childTasks);
 
   const now = new Date().toISOString();
-  const author = String(input.author || "StudioOps Systems Architect").trim();
+  const author = authorization
+    ? authorization.actorContext.actorId
+    : String(input.author || "StudioOps Systems Architect").trim();
   task.architectureRequired = true;
   task.architectureStatus = "completed";
   task.architectureSummary = summary;
   task.architectureDecisionTaskIds = decisionTaskIds;
   task.architectureCompletedAt = now;
   task.architectureCompletedBy = author;
+  if (authorization) {
+    applyLifecycleTransitionInState(state, {
+      action: "complete_architecture",
+      taskId,
+      expectedStateVersion: authorization.capability.stateVersion,
+      actorContext: authorization.actorContext,
+      evidence: { targetStatus: "architecture_ready" },
+    }, { now, nowMs: input.nowMs });
+    consumeWorkflowCapability(authorization, "architecture.complete", now);
+  } else {
+    applyStoreLifecycleTransition(state, task, "architecture_ready", {
+      action: "record_architecture_completion",
+      now,
+    });
+  }
   task.assignedAgentRole = "";
-  applyStoreLifecycleTransition(state, task, "architecture_ready", {
-    action: "record_architecture_completion",
-    now,
-  });
 
   for (const child of childTasks) {
     child.architectureStatus = "inherited";
@@ -2709,6 +2911,17 @@ export async function addComment(taskId, body, author = "user") {
 export function recordReviewInState(state, taskId, input = {}) {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
+    const authorization = input.capabilitySecret
+      ? authorizeWorkflowCapabilityInState(state, {
+        secret: input.capabilitySecret,
+        scope: "review.record",
+        taskId,
+        role: input.role,
+        runId: input.runId,
+        leaseId: input.leaseId,
+        nowMs: input.nowMs,
+      })
+      : null;
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     const stages = reviewStagesForTask(project, task);
@@ -2749,6 +2962,15 @@ export function recordReviewInState(state, taskId, input = {}) {
       );
     }
     const now = new Date().toISOString();
+    if (authorization && outcome !== "changes_requested") {
+      applyLifecycleTransitionInState(state, {
+        action: "record_review_approval",
+        taskId,
+        expectedStateVersion: authorization.capability.stateVersion,
+        actorContext: authorization.actorContext,
+        evidence: { targetStatus: task.status, candidateCycle, subjectSha },
+      }, { now, nowMs: input.nowMs });
+    }
     const review = {
       id: nextId(state.reviews, "review"),
       taskId,
@@ -2760,7 +2982,9 @@ export function recordReviewInState(state, taskId, input = {}) {
       status: stage.status,
       role: stage.role,
       outcome,
-      author: String(input.author || stage.role || "reviewer").trim(),
+      author: authorization
+        ? authorization.actorContext.actorId
+        : String(input.author || stage.role || "reviewer").trim(),
       body: String(input.body || "").trim(),
       createdAt: now,
     };
@@ -2780,7 +3004,31 @@ export function recordReviewInState(state, taskId, input = {}) {
           .filter((item) => reviewMatchesCurrentCandidate(task, item)),
         now,
       );
-      const actions = routeChangesRequestedInState(state, task, project, stage, now, "StudioOps Automation", []);
+      let actions;
+      if (authorization && !shouldEscalateChangesToLead(project, task, stage)) {
+        applyLifecycleTransitionInState(state, {
+          action: "request_changes",
+          taskId,
+          expectedStateVersion: authorization.capability.stateVersion,
+          actorContext: authorization.actorContext,
+          evidence: { targetStatus: "needs_changes", candidateCycle, subjectSha },
+        }, { now, nowMs: input.nowMs });
+        task.assignedAgentRole = "builder";
+        task.reviewerThreadId = "";
+        actions = [`${task.id}: returned to builder after ${stage.key} review`];
+      } else {
+        if (authorization) {
+          applyLifecycleTransitionInState(state, {
+            action: "record_review_approval",
+            taskId,
+            expectedStateVersion: authorization.capability.stateVersion,
+            actorContext: authorization.actorContext,
+            evidence: { targetStatus: task.status, candidateCycle, subjectSha },
+          }, { now, nowMs: input.nowMs });
+        }
+        actions = routeChangesRequestedInState(state, task, project, stage, now, "StudioOps Automation", []);
+      }
+      if (authorization) consumeWorkflowCapability(authorization, "review.record", now);
       state.events.push({
         id: nextId(state.events, "event"),
         type: "review_changes_requested",
@@ -2796,6 +3044,7 @@ export function recordReviewInState(state, taskId, input = {}) {
       author: "StudioOps Automation",
       reason: `${stage.key} review ${outcome}`,
     });
+    if (authorization) consumeWorkflowCapability(authorization, "review.record", now);
     state.events.push({
       id: nextId(state.events, "event"),
       type: "review_recorded",
@@ -4553,7 +4802,7 @@ Modular architecture and impact-scoped validation contract:
 ${modularArchitectureAndValidationContract()}
 
 Builder instructions:
-- Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Use 'status ${task.id} --status builder_review --subject-sha <full-head-sha>' for the builder handoff so the exact SHA is persisted atomically; use 'status ${task.id} --status <canonical-status>' for other intentional status mutations; never omit '--status'.
+- Use 'show-task ${task.id}' (or '--json') for read-only task inspection. Submit builder evidence with the named 'builder-handoff ${task.id} --subject-sha <full-head-sha> --branch <branch> --pr-url <url>' command; it consumes the issued run capability and persists the exact transition atomically. The legacy worker form 'status ${task.id} --status builder_review --subject-sha <full-head-sha>' is explicitly rejected, as is status-bearing update-task.
 - Create or switch to the feature branch.
 - For UI or bug tasks, inspect referenced images, screenshots, and mockups before editing.
 - For UI tasks, implement and verify mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.
@@ -4569,7 +4818,7 @@ Builder instructions:
 - Commit and push only if the user/project workflow asks for that.
 - Link the feature branch and pull request on the task when available.
 - Add a task comment with changed files, validation results, known gaps, PR link, and next review step.
-- Move the task to \`builder_review\` only after the branch, exact full head SHA, validation notes, and builder comment are present. Use \`status ${task.id} --status builder_review --subject-sha <full-head-sha>\` so the SHA is persisted atomically with the transition. GitHub workflows also require the PR URL; local workflows must leave the PR URL empty.
+- Move the task to \`builder_review\` only after the branch, exact full head SHA, validation notes, and builder comment are present. Use \`builder-handoff ${task.id} --subject-sha <full-head-sha> --branch <branch> --pr-url <url>\` so the issued run capability and SHA are consumed atomically with the transition. Omit \`--pr-url\` for local workflows.
 `;
 }
 
