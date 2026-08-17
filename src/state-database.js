@@ -201,7 +201,7 @@ function boundedOperationName(value) {
 }
 
 function mutationRetryPolicy(options = {}) {
-  const idempotent = options.idempotent !== false;
+  const idempotent = options.idempotent === true;
   const requested = Number(options.maxBusyRetries ?? DEFAULT_MUTATION_RETRIES);
   return {
     idempotent,

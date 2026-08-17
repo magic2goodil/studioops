@@ -715,7 +715,9 @@ export async function writeState(state) {
 }
 
 export async function mutateState(mutator, options = {}) {
-  return mutateDatabaseState(mutator, options);
+  // This public state-transform API is retry-safe by contract. Callers that
+  // perform any non-repeatable work must opt out or use a fenced operation.
+  return mutateDatabaseState(mutator, { idempotent: true, ...options });
 }
 
 function boundedRecoveryDiagnostic(value) {
