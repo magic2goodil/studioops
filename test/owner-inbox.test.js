@@ -321,6 +321,76 @@ test("open circuits and operator pauses remain operational without becoming owne
   assert.doesNotMatch(operation.nextAction, /code review/i);
 });
 
+test("a stale circuit does not duplicate a current QA decision as an Operations failure", () => {
+  const state = fixtureState();
+  addCurrentBundle(state);
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "qa_review",
+    candidateId: state.candidates[0].id,
+    automationCircuit: {
+      state: "open",
+      openedAt: "2026-07-23T14:00:00.000Z",
+      snapshot: {
+        status: "queued",
+        assignedAgentRole: "",
+        reviewCycle: 0,
+        reviewSubjectCycle: 0,
+        reviewSubjectSha: "",
+        candidateIdentity: null,
+        branchName: "",
+      },
+    },
+  };
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(group(inbox, "decisions").items[0].kind, "qa_bundle");
+  assert.equal(group(inbox, "operations").items.some((item) => item.taskId === state.tasks[0].id), false);
+});
+
+test("a blocked circuit with candidate drift is not reported as a current Operations failure", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "blocked",
+    assignedAgentRole: "owner",
+    reviewSubjectSha: "f".repeat(40),
+    candidateIdentity: {
+      commitSha: "f".repeat(40),
+      treeSha: "e".repeat(40),
+      baseSha: BASE_SHA,
+      branch: "codex/dollos-task_7",
+      candidateCycle: 2,
+    },
+    automationBlocker: {
+      type: "circuit",
+      reason: "attempt_budget_exhausted",
+      resumeStatus: "backend_review",
+    },
+    automationCircuit: {
+      state: "open",
+      snapshot: {
+        status: "backend_review",
+        assignedAgentRole: "backend-reviewer",
+        reviewCycle: 1,
+        reviewSubjectCycle: 1,
+        reviewSubjectSha: SUBJECT_SHA,
+        candidateIdentity: {
+          commitSha: SUBJECT_SHA,
+          treeSha: "e".repeat(40),
+          baseSha: BASE_SHA,
+          branch: "codex/dollos-task_7",
+          candidateCycle: 1,
+        },
+        branchName: "codex/dollos-task_7",
+      },
+    },
+  };
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(group(inbox, "operations").items.some((item) => item.taskId === state.tasks[0].id), false);
+});
+
 test("project circuits remain visibly resettable in Operations", () => {
   const state = fixtureState();
   state.tasks[0].status = "ready";

@@ -778,7 +778,7 @@ function recoverySuppressionReason(state, task, input = {}) {
   if (activeSelfUpdateLease(state, input)) return "self_update_in_progress";
   const project = findProject(state, task?.projectId);
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";
-  if (task?.automationCircuit?.state === "open") return "task_circuit_open";
+  if (taskAutomationCircuitIsCurrent(task)) return "task_circuit_open";
   return "";
 }
 
@@ -2235,7 +2235,9 @@ export async function updateTask(taskId, patch) {
     ) {
       delete task.automationBlocker;
     }
-    task.updatedAt = new Date().toISOString();
+    const updatedAt = new Date().toISOString();
+    supersedeStaleTaskCircuitInState(state, task, { now: updatedAt, author: "StudioOps Workflow" });
+    task.updatedAt = updatedAt;
     state.events.push({
       id: nextId(state.events, "event"),
       type: "task_updated",
@@ -3112,6 +3114,54 @@ export function workflowSnapshotForTask(task, overrides = {}) {
   };
 }
 
+export function taskAutomationCircuitIsCurrent(task = {}) {
+  const circuit = task.automationCircuit;
+  if (circuit?.state !== "open") return false;
+  if (!circuit.snapshot) return true;
+  const blockedByCircuit = task.status === "blocked" && task.automationBlocker?.type === "circuit";
+  const liveSnapshot = workflowSnapshotForTask(task, blockedByCircuit
+    ? {
+        status: circuit.snapshot.status ?? task.automationBlocker.resumeStatus ?? task.status,
+        assignedAgentRole: circuit.snapshot.assignedAgentRole ?? task.assignedAgentRole ?? "",
+      }
+    : {});
+  const comparableLiveSnapshot = Object.fromEntries(
+    Object.keys(circuit.snapshot).map((key) => [key, liveSnapshot[key]]),
+  );
+  return isDeepStrictEqual(circuit.snapshot, comparableLiveSnapshot);
+}
+
+export function supersedeStaleTaskCircuitInState(state, task, input = {}) {
+  if (!task?.automationCircuit || taskAutomationCircuitIsCurrent(task)) return false;
+  if (task.automationCircuit.state !== "open") return false;
+  const now = input.now || new Date().toISOString();
+  task.automationCircuit = {
+    ...task.automationCircuit,
+    state: "superseded",
+    closedAt: now,
+    closedBy: String(input.author || "StudioOps Resilience").trim(),
+    closeReason: "Objective workflow state advanced beyond the blocked circuit snapshot.",
+    supersededBy: {
+      status: task.status,
+      reviewSubjectSha: task.reviewSubjectSha || "",
+      candidateId: task.candidateId || "",
+    },
+  };
+  if (task.automationBlocker?.type === "circuit") delete task.automationBlocker;
+  task.retryNotBefore = "";
+  task.updatedAt = now;
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "automation_circuit_superseded",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.id} advanced to ${task.status}; its obsolete automation circuit remains as superseded audit evidence.`,
+    createdAt: now,
+  });
+  return true;
+}
+
 export function reconcileAutomationStateInState(state, input = {}) {
   const nowMs = Number(input.nowMs || Date.now());
   const now = input.now || new Date(nowMs).toISOString();
@@ -3120,6 +3170,10 @@ export function reconcileAutomationStateInState(state, input = {}) {
 
   for (const task of state.tasks || []) {
     if (input.project && task.projectId !== input.project.id) continue;
+
+    if (supersedeStaleTaskCircuitInState(state, task, { now })) {
+      actions.push(`${task.id}: superseded stale automation circuit after workflow recovery`);
+    }
 
     const blocker = task.automationBlocker;
     if (
