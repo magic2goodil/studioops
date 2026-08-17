@@ -16,6 +16,7 @@ const TABLE_NAME = { qaBundles: "qa_bundles" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "qaBundles", "candidates"]);
 const STATE_INTEGRITY_VERSION = 5;
 const LIFECYCLE_SCHEMA_VERSION = 1;
+export const COORDINATION_SCHEMA_VERSION = 1;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
@@ -148,6 +149,65 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
   `);
   return database;
+}
+
+function ensureCoordinationSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS coordination_fence_counters (
+      resource_key TEXT PRIMARY KEY,
+      last_fence INTEGER NOT NULL CHECK (last_fence > 0),
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS coordination_leases (
+      lease_id TEXT PRIMARY KEY,
+      resource_key TEXT NOT NULL,
+      fence INTEGER NOT NULL CHECK (fence > 0),
+      owner_process_identity TEXT NOT NULL,
+      expected_state_version INTEGER NOT NULL CHECK (expected_state_version > 0),
+      status TEXT NOT NULL CHECK (status IN ('active', 'expired', 'abandoned', 'released')),
+      acquired_at TEXT NOT NULL,
+      heartbeat_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      terminal_at TEXT NOT NULL DEFAULT '',
+      detail_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_coordination_leases_resource_expiry
+      ON coordination_leases(resource_key, status, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_coordination_leases_expiry
+      ON coordination_leases(status, expires_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_coordination_leases_active_resource
+      ON coordination_leases(resource_key) WHERE status = 'active';
+    CREATE TABLE IF NOT EXISTS external_operations (
+      operation_key TEXT PRIMARY KEY,
+      operation_id TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL,
+      request_digest TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      expected_remote_state TEXT NOT NULL,
+      lease_id TEXT NOT NULL,
+      fence INTEGER NOT NULL CHECK (fence > 0),
+      owner_process_identity TEXT NOT NULL,
+      expected_state_version INTEGER NOT NULL CHECK (expected_state_version > 0),
+      status TEXT NOT NULL CHECK (status IN ('prepared', 'succeeded', 'quarantined')),
+      prepared_at TEXT NOT NULL,
+      terminal_at TEXT NOT NULL DEFAULT '',
+      evidence_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_operations_status_prepared
+      ON external_operations(status, prepared_at);
+    CREATE INDEX IF NOT EXISTS idx_external_operations_due
+      ON external_operations(status, terminal_at, prepared_at);
+    CREATE INDEX IF NOT EXISTS idx_external_operations_lease
+      ON external_operations(lease_id, fence, expected_state_version);
+  `);
+}
+
+function coordinationSchemaIsCurrent(db, meta = {}) {
+  const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+  return Number(meta.coordinationMigration?.schemaVersion || 0) >= COORDINATION_SCHEMA_VERSION
+    && tables.has("coordination_fence_counters")
+    && tables.has("coordination_leases")
+    && tables.has("external_operations");
 }
 
 function ensureLifecycleSchema(db) {
@@ -789,6 +849,7 @@ async function runStateIntegrityMigration(db) {
   if (
     Number(parsedMeta.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION
     && lifecycleSchemaIsCurrent(db, parsedMeta)
+    && coordinationSchemaIsCurrent(db, parsedMeta)
   ) {
     integrityMigrated = true;
     return;
@@ -804,12 +865,14 @@ async function runStateIntegrityMigration(db) {
     if (
       Number(lockedMeta.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION
       && lifecycleSchemaIsCurrent(db, lockedMeta)
+      && coordinationSchemaIsCurrent(db, lockedMeta)
     ) {
       db.exec("COMMIT");
       integrityMigrated = true;
       return;
     }
     ensureLifecycleSchema(db);
+    ensureCoordinationSchema(db);
     const state = readStateFromOpenDatabase(db);
     const snapshot = mutationSnapshot(state);
     reconcileStateIntegrity(state);
@@ -826,6 +889,12 @@ async function runStateIntegrityMigration(db) {
     state.meta.lifecycleMigration = {
       schemaVersion: LIFECYCLE_SCHEMA_VERSION,
       integrityVersion: STATE_INTEGRITY_VERSION,
+      migratedAt: now,
+      backupPath,
+      backupVerified: true,
+    };
+    state.meta.coordinationMigration = {
+      schemaVersion: COORDINATION_SCHEMA_VERSION,
       migratedAt: now,
       backupPath,
       backupVerified: true,
