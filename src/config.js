@@ -29,11 +29,21 @@ export const DEFAULT_WORKSPACE_RETENTION = Object.freeze({
 const WORKSPACE_RETENTION_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 function finiteNonNegative(value, fallback) {
+  if (
+    value === null
+    || typeof value === "boolean"
+    || (typeof value === "string" && !value.trim())
+  ) return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function positiveFinite(value, fallback) {
+  if (
+    value === null
+    || typeof value === "boolean"
+    || (typeof value === "string" && !value.trim())
+  ) return fallback;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }

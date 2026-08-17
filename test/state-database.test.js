@@ -168,6 +168,21 @@ test("workspace cleanup leases are exclusive, expire for retry, and finalize ide
   assert.equal(releaseRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_b" }).state, "completed");
 });
 
+test("workspace cleanup refuses malformed persisted lease expiries", () => {
+  const state = baseState();
+  state.runs = [{
+    id: "run_malformed_lease",
+    status: "failed",
+    workspaceCleanup: { state: "claimed", leaseId: "lease_malformed", leaseExpiresAt: "not-a-timestamp" },
+  }];
+
+  assert.equal(finalizeRunWorkspaceCleanupInState(state, "run_malformed_lease", {
+    leaseId: "lease_malformed",
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+  }), null);
+  assert.equal(state.runs[0].workspaceCleanup.state, "claimed");
+});
+
 test("workspace capacity pressure uses only verified sizes and preserves failed cleanup evidence", () => {
   const root = "/tmp/studioops-run-workspaces";
   const state = baseState();

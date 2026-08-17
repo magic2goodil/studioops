@@ -145,4 +145,20 @@ test("workspace retention defaults and invalid values fail safe deterministicall
   });
   assert.equal(normalizeWorkspaceRetention({ terminalStatuses: ["running"] }).enabled, false);
   assert.equal(normalizeWorkspaceRetention({ maxRetainedBytes: -1, cleanupLeaseSeconds: Infinity }).maxRetainedBytes, 53687091200);
+  assert.deepEqual(normalizeWorkspaceRetention({
+    retainForHours: { completed: null, failed: " ", cancelled: true },
+    pressureMinAgeHours: null,
+    maxRetainedBytes: "",
+    maxDeletesPerSweep: true,
+    sweepIntervalSeconds: null,
+    cleanupLeaseSeconds: false,
+  }), {
+    enabled: true,
+    retainForHours: { completed: 168, failed: 336, cancelled: 168 },
+    pressureMinAgeHours: 24,
+    maxRetainedBytes: 53687091200,
+    maxDeletesPerSweep: 25,
+    sweepIntervalSeconds: 600,
+    cleanupLeaseSeconds: 900,
+  });
 });

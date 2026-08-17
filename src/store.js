@@ -471,7 +471,8 @@ export function finalizeRunWorkspaceCleanupInState(state, runId, input = {}) {
   const cleanup = run.workspaceCleanup || {};
   if (cleanup.state === "completed") return structuredClone(cleanup);
   if (cleanup.leaseId !== String(input.leaseId || "").trim()) return null;
-  if (Date.parse(cleanup.leaseExpiresAt || "") <= Number(input.nowMs ?? Date.now())) return null;
+  const leaseExpiresAt = Date.parse(cleanup.leaseExpiresAt || "");
+  if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= Number(input.nowMs ?? Date.now())) return null;
   const evidence = cleanupEvidence(run, input, input.success === false ? { error: input.error } : {});
   run.workspaceCleanup = { ...evidence, state: input.success === false ? "released" : "completed" };
   return structuredClone(run.workspaceCleanup);
