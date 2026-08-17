@@ -6,6 +6,7 @@ import {
   applyGitHubRemoteRecoveryProbeResultInState,
   automationTick,
   claimDueGitHubRemoteRecoveryProbesInState,
+  reconcileAutomationStateInState,
   resetAutomationCircuitInState,
   resumeOperatorAutomationInState,
   scheduleGitHubRemoteRecoveryProbeInState,
@@ -278,6 +279,56 @@ test("task circuit reset preserves evidence and starts a fresh dispatch epoch", 
   assert.equal(reset.automationBlocker, undefined);
   assert.ok(state.comments.some((comment) => /New execution epoch 1/.test(comment.body)));
   assert.ok(state.events.some((event) => event.type === "automation_circuit_reset"));
+});
+
+test("automation reconciliation supersedes a circuit after objective workflow advancement", () => {
+  const state = stateWith({
+    status: "qa_review",
+    reviewCycle: 1,
+    reviewSubjectCycle: 1,
+    reviewSubjectSha: "a".repeat(40),
+    candidateId: "candidate_1",
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: {
+      state: "open",
+      openedAt: "2026-07-21T10:00:00.000Z",
+      snapshot: {
+        status: "queued",
+        assignedAgentRole: "",
+        reviewCycle: 0,
+        reviewSubjectCycle: 0,
+        reviewSubjectSha: "",
+        candidateIdentity: null,
+        branchName: "",
+      },
+    },
+  });
+
+  const result = reconcileAutomationStateInState(state, { now: "2026-07-21T12:00:00.000Z" });
+  const task = state.tasks[0];
+  assert.equal(task.status, "qa_review");
+  assert.equal(task.automationCircuit.state, "superseded");
+  assert.equal(task.automationBlocker, undefined);
+  assert.equal(task.automationCircuit.supersededBy.candidateId, "candidate_1");
+  assert.ok(result.some((action) => /superseded stale automation circuit/.test(action)));
+  assert.ok(state.events.some((event) => event.type === "automation_circuit_superseded"));
+});
+
+test("automation reconciliation preserves a matching blocked circuit", () => {
+  const state = stateWith({
+    status: "blocked",
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: {
+      state: "open",
+      openedAt: "2026-07-21T10:00:00.000Z",
+      snapshot: { status: "queued" },
+    },
+  });
+
+  const result = reconcileAutomationStateInState(state, { now: "2026-07-21T12:00:00.000Z" });
+  assert.equal(state.tasks[0].automationCircuit.state, "open");
+  assert.equal(state.tasks[0].automationBlocker.type, "circuit");
+  assert.equal(result.some((action) => /superseded stale/.test(action)), false);
 });
 
 test("task circuit reset compare-and-set rejects live drift without overwriting candidate state", () => {

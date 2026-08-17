@@ -2,6 +2,7 @@ import {
   candidateReviewEvidenceForTask,
   findProject,
   findTask,
+  taskAutomationCircuitIsCurrent,
 } from "./store.js";
 import { createHash } from "node:crypto";
 import { canonicalJson } from "./candidate-manifest.js";
@@ -760,7 +761,7 @@ export function buildOwnerInbox(state, input = {}) {
 
   for (const task of state.tasks || []) {
     const project = findProject(state, task.projectId);
-    const blocked = task.automationCircuit?.state === "open"
+    const blocked = taskAutomationCircuitIsCurrent(task)
       || (task.status === "blocked" && Boolean(task.automationBlocker));
     if (blocked) {
       groupedItems.operations.push(operationTaskItem(state, task, input));
