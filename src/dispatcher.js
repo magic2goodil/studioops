@@ -196,6 +196,8 @@ function activeLaneProfiles(state, selected = []) {
         projectId: run.projectId || task.projectId,
         lane: profile.lane,
         conflictGroup: profile.conflictGroup,
+        fileScope: profile.fileScope,
+        fileScopeExplicit: profile.fileScopeExplicit,
       };
     })
     .filter(Boolean);
@@ -206,6 +208,8 @@ function activeLaneProfiles(state, selected = []) {
     projectId: item.task.projectId,
     lane: item.profile.lane,
     conflictGroup: item.profile.conflictGroup,
+    fileScope: item.profile.fileScope,
+    fileScopeExplicit: item.profile.fileScopeExplicit,
   }));
 
   return [...activeRuns, ...selectedRuns];
@@ -219,6 +223,8 @@ function findLaneConflict(state, selected, action, task) {
     projectId: task.projectId,
     lane: profile.lane,
     conflictGroup: profile.conflictGroup,
+    fileScope: profile.fileScope,
+    fileScopeExplicit: profile.fileScopeExplicit,
   };
   const conflict = activeLaneProfiles(state, selected).find((item) => laneProfilesConflict(current, item));
   return conflict ? { conflict, profile } : { conflict: null, profile };
@@ -608,6 +614,7 @@ function makeRun(state, task, action, options, now) {
     lane: profile.lane,
     conflictGroup: profile.conflictGroup,
     fileScope: profile.fileScope,
+    fileScopeExplicit: profile.fileScopeExplicit,
     provider: task.preferredRunnerProvider || options.provider || DEFAULTS.provider,
     model: executionPolicy.model,
     modelTier: executionPolicy.modelTier,
@@ -726,6 +733,7 @@ export function planDispatches(state, actions, input = {}) {
       lane: profile.lane,
       conflictGroup: profile.conflictGroup,
       fileScope: profile.fileScope,
+      fileScopeExplicit: profile.fileScopeExplicit,
     })),
     skipped: skipped.map(({ action, reason, ...details }) => ({
       actionId: action?.id || "",

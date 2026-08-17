@@ -135,6 +135,92 @@ test("active builder runs created by dispatch remain runnable after task status 
   assert.equal(report.skipped.length, 0);
 });
 
+test("runner starts queued same-project builders with explicit disjoint scopes", () => {
+  const state = fixtureState(
+    {
+      id: "task_a",
+      status: "queued",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+      lane: "backend",
+      workAreas: ["src/lifecycle/**"],
+    },
+    {
+      id: "run_a",
+      taskId: "task_a",
+      actionType: "start_builder",
+      status: "queued",
+      integrationStatus: "",
+      lane: "backend",
+      fileScope: ["src/lifecycle/**"],
+      fileScopeExplicit: true,
+    },
+  );
+  state.tasks.push({
+    id: "task_b",
+    projectId: "project_1",
+    title: "Retention",
+    status: "queued",
+    assignedAgentRole: "builder",
+    lane: "backend",
+    workAreas: ["src/retention/**"],
+  });
+  state.runs.push({
+    ...state.runs[0],
+    id: "run_b",
+    taskId: "task_b",
+    fileScope: ["src/retention/**"],
+  });
+
+  const report = planRunnableRuns(state, { limit: 2 });
+
+  assert.deepEqual(report.runnable.map((run) => run.id), ["run_a", "run_b"]);
+  assert.equal(report.skipped.length, 0);
+});
+
+test("runner serializes queued builders whose explicit scopes overlap", () => {
+  const state = fixtureState(
+    {
+      id: "task_a",
+      status: "queued",
+      integrationStatus: "",
+      assignedAgentRole: "builder",
+      lane: "backend",
+      workAreas: ["src/shared/**"],
+    },
+    {
+      id: "run_a",
+      taskId: "task_a",
+      actionType: "start_builder",
+      status: "queued",
+      integrationStatus: "",
+      lane: "backend",
+      fileScope: ["src/shared/**"],
+      fileScopeExplicit: true,
+    },
+  );
+  state.tasks.push({
+    id: "task_b",
+    projectId: "project_1",
+    title: "Shared child",
+    status: "queued",
+    assignedAgentRole: "builder",
+    lane: "backend",
+    workAreas: ["src/shared/child.js"],
+  });
+  state.runs.push({
+    ...state.runs[0],
+    id: "run_b",
+    taskId: "task_b",
+    fileScope: ["src/shared/child.js"],
+  });
+
+  const report = planRunnableRuns(state, { limit: 2 });
+
+  assert.deepEqual(report.runnable.map((run) => run.id), ["run_a"]);
+  assert.equal(report.skipped[0].reason, "lane_conflict:task_a");
+});
+
 test("runner claim is the transition from queued to in progress", async () => {
   const state = fixtureState(
     {

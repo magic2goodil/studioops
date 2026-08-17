@@ -142,6 +142,7 @@ function runLaneContext(state, run) {
     lane: profile.lane,
     conflictGroup: profile.conflictGroup,
     fileScope: profile.fileScope,
+    fileScopeExplicit: profile.fileScopeExplicit,
   };
 }
 
@@ -1343,6 +1344,7 @@ export async function claimRuns(input = {}) {
       run.lane = run.lane || profile.lane;
       run.conflictGroup = run.conflictGroup || profile.conflictGroup;
       run.fileScope = Array.isArray(run.fileScope) && run.fileScope.length ? run.fileScope : profile.fileScope;
+      run.fileScopeExplicit = run.fileScopeExplicit === true || profile.fileScopeExplicit;
       run.provider = normalizeProvider(input.provider || run.provider);
       const executionPolicy = resolveExecutionPolicy(findTask(state, run.taskId) || {}, run, input);
       run.model = run.model || executionPolicy.model || input.model;
