@@ -24,6 +24,7 @@ import {
   readState,
 } from "./store.js";
 import { buildOwnerQaPacket, candidateCompletenessGate } from "./owner-inbox.js";
+import { enqueueOwnerQaNotificationsInState } from "./notifier.js";
 import {
   createCandidateEnvelope,
   invalidateCandidate,
@@ -2421,6 +2422,7 @@ async function recordProjectResult(projectResult) {
           projectResult.candidate.qaPacket = buildOwnerQaPacket(state, projectResult.candidate, { bundle });
           bundle.qaPacket = projectResult.candidate.qaPacket;
           bundle.packetDigest = projectResult.candidate.qaPacket.packetDigest;
+          enqueueOwnerQaNotificationsInState(state, projectResult.candidate, { now });
         }
         bundle.updatedAt = now;
         state.events.push({
