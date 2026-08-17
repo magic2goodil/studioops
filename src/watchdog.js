@@ -1,8 +1,24 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { automationTick, readState } from "./store.js";
-import { missionControlDataDir, missionControlRoot } from "./runtime-paths.js";
+import {
+  automationTick,
+  diskPressureIncidentIsActive,
+  openDiskPressureIncident,
+  openDiskPressureIncidentInState,
+  readState,
+  recoverDiskPressureIncident,
+  recoverDiskPressureIncidentInState,
+  updateDiskPressureIncident,
+  updateDiskPressureIncidentInState,
+} from "./store.js";
+import { runWorkspaceCleanup } from "./runner.js";
+import { loadConfig } from "./config.js";
+import {
+  defaultStudioOpsWorkspaceRoot,
+  missionControlDataDir,
+  missionControlRoot,
+} from "./runtime-paths.js";
 import {
   readDiskAvailability,
   readWorkerHeartbeats,
@@ -43,6 +59,10 @@ export function planWatchdogActions(state, heartbeats, input = {}) {
   }
   const actions = staleWorkerNames(heartbeats, WORKERS, input)
     .map((worker) => ({ type: "restart_worker", worker, reason: "heartbeat_stale_or_missing" }));
+  for (const unhealthy of input.unhealthyWorkers || []) {
+    if (!WORKERS.includes(unhealthy.worker) || actions.some((item) => item.worker === unhealthy.worker)) continue;
+    actions.push({ type: "restart_worker", worker: unhealthy.worker, reason: unhealthy.reason });
+  }
   const scheduled = new Set(actions.map((item) => item.worker));
   const workWaitMs = Math.max(15_000, Number(input.workWaitMs || DEFAULT_WORK_WAIT_MS));
   const queuedRunWaiting = (state.runs || []).some((run) => run.status === "queued" && ageMs(run.createdAt, nowMs) > workWaitMs);
@@ -68,6 +88,61 @@ export function planWatchdogActions(state, heartbeats, input = {}) {
     actions.push({ type: "restart_worker", worker: "dispatcher", reason: "dispatchable_task_waiting" });
   }
   return actions;
+}
+
+export function managedWorkerHealth(heartbeats, input = {}) {
+  const nowMs = Number(input.nowMs || Date.now());
+  const staleAfterMs = Math.max(60_000, Number(input.staleAfterMs || 3 * 60 * 1000));
+  const expectedDataDir = path.resolve(input.dataDir || missionControlDataDir());
+  const workers = (input.workers || WORKERS).map((worker) => {
+    const heartbeat = (heartbeats || []).find((item) => item.worker === worker);
+    let reason = "";
+    if (!heartbeat) reason = "heartbeat_missing";
+    else if (heartbeat.invalid) reason = "heartbeat_invalid";
+    else if (!Number.isFinite(Date.parse(heartbeat.updatedAt || ""))) reason = "heartbeat_timestamp_invalid";
+    else if (nowMs - Date.parse(heartbeat.updatedAt) > staleAfterMs) reason = "heartbeat_stale";
+    else if (!["idle", "busy"].includes(heartbeat.status)) reason = "worker_status_unhealthy";
+    else if (path.resolve(String(heartbeat.dataDir || ".")) !== expectedDataDir) reason = "worker_data_root_mismatch";
+    return {
+      worker,
+      ok: !reason,
+      reason,
+      status: String(heartbeat?.status || "missing").slice(0, 40),
+      updatedAt: String(heartbeat?.updatedAt || ""),
+    };
+  });
+  return {
+    ok: workers.every((worker) => worker.ok),
+    checkedAt: new Date(nowMs).toISOString(),
+    workers,
+  };
+}
+
+async function readDiskPair(input = {}) {
+  if (input.readDiskPair) return input.readDiskPair(input);
+  const readDisk = input.readDiskAvailability || readDiskAvailability;
+  const dataPath = path.resolve(input.dataDir || missionControlDataDir());
+  const workspacePath = path.resolve(input.workspaceRoot || defaultStudioOpsWorkspaceRoot("run"));
+  const [data, workspace] = await Promise.all([
+    readDisk({ ...input, path: dataPath }),
+    readDisk({ ...input, path: workspacePath }),
+  ]);
+  return { data, workspace };
+}
+
+function diskPairHealthy(pair) {
+  return Boolean(pair && pair.data?.pressure !== true && pair.workspace?.pressure !== true);
+}
+
+function recoveryRemediation(cleanup, health, disksHealthy) {
+  if (!disksHealthy) {
+    const reasons = Object.keys(cleanup?.selection?.excludedByReason || {}).slice(0, 8).join(", ");
+    return reasons
+      ? `Disk remains below threshold. Cleanup exclusions: ${reasons}. Free local disk space or adjust verified retention policy.`
+      : "Disk remains below threshold. Free local disk space or inspect protected and unaged workspaces.";
+  }
+  const unhealthy = (health.workers || []).filter((worker) => !worker.ok).map((worker) => worker.worker).join(", ");
+  return unhealthy ? `Waiting for healthy managed-worker heartbeats: ${unhealthy}.` : "Waiting for recovery verification.";
 }
 
 async function installedWorkerRoot(worker, input = {}) {
@@ -97,20 +172,132 @@ export async function restartWorker(worker, input = {}) {
 }
 
 export async function runWatchdog(input = {}) {
-  const startedAt = new Date().toISOString();
-  const disk = input.disk || await readDiskAvailability({
-    ...input,
-    path: input.dataDir || missionControlDataDir(),
-  });
-  await writeWorkerHeartbeat("watchdog", { status: "busy", lastSweepStartedAt: startedAt }, { ...input, disk })
+  const nowMs = Number(input.nowMs || Date.now());
+  const startedAt = new Date(nowMs).toISOString();
+  const initial = input.diskPair || (input.disk
+    ? { data: input.disk, workspace: input.workspaceDisk || input.disk }
+    : await readDiskPair(input));
+  const initialPressure = !diskPairHealthy(initial);
+  const stateReader = input.readState || (() => input.state ? Promise.resolve(input.state) : readState());
+  const initialState = await stateReader();
+  const activeIncident = initialState.meta?.diskPressureIncident;
+  const heartbeatWriter = input.writeWorkerHeartbeat || writeWorkerHeartbeat;
+  await heartbeatWriter("watchdog", { status: "busy", lastSweepStartedAt: startedAt }, { ...input, disk: initial.data })
     .catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
-  const reconciliation = disk.pressure
-    ? { actions: [], paused: true, reason: "disk_space_below_safety_threshold" }
-    : await automationTick({ ...input, limit: input.limit || 100 });
-  const [state, heartbeats] = await Promise.all([readState(), readWorkerHeartbeats(input)]);
-  const actions = planWatchdogActions(state, heartbeats, { ...input, disk });
+  if (!initialPressure && !diskPressureIncidentIsActive(activeIncident)) {
+    const reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
+    const [state, heartbeats] = await Promise.all([stateReader(), (input.readWorkerHeartbeats || readWorkerHeartbeats)(input)]);
+    const actions = planWatchdogActions(state, heartbeats, { ...input, disk: initial.data });
+    const results = [];
+    for (const action of actions) {
+      try {
+        results.push({ ...action, ok: true, output: await restartWorker(action.worker, input) });
+      } catch (error) {
+        results.push({ ...action, ok: false, output: error?.message || String(error) });
+      }
+    }
+    await heartbeatWriter("watchdog", {
+      status: "idle",
+      lastError: results.filter((item) => !item.ok).map((item) => item.output).join("; "),
+      lastSweepCompletedAt: new Date().toISOString(),
+      lastSuccessAt: results.every((item) => item.ok) ? new Date().toISOString() : "",
+    }, { ...input, disk: initial.data }).catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
+    return { generatedAt: new Date().toISOString(), disk: initial.data, disks: initial, reconciliation, actions: results };
+  }
+
+  const openIncident = input.openDiskPressureIncident || (input.state
+    ? (args) => openDiskPressureIncidentInState(input.state, args)
+    : openDiskPressureIncident);
+  const updateIncident = input.updateDiskPressureIncident || (input.state
+    ? (args) => updateDiskPressureIncidentInState(input.state, args)
+    : updateDiskPressureIncident);
+  const recoverIncident = input.recoverDiskPressureIncident || (input.state
+    ? (args) => recoverDiskPressureIncidentInState(input.state, args)
+    : recoverDiskPressureIncident);
+  let incident = initialPressure
+    ? await openIncident({ ...input, nowMs, data: initial.data, workspace: initial.workspace })
+    : activeIncident;
+  let workspaceRetention = input.workspaceRetention;
+  if (!workspaceRetention && !input.state) {
+    try {
+      const config = await loadConfig();
+      workspaceRetention = config?.defaults?.runner?.workspaceRetention || config?.runner?.workspaceRetention;
+    } catch {
+      workspaceRetention = undefined;
+    }
+  }
+  const cleanup = await (input.runWorkspaceCleanup || runWorkspaceCleanup)({
+    ...input,
+    state: input.state,
+    workspaceRoot: input.workspaceRoot || defaultStudioOpsWorkspaceRoot("run"),
+    workspaceRetention,
+  });
+  const postCleanup = cleanup.after || initial;
+  let databaseHealth;
+  let state;
+  try {
+    state = await stateReader();
+    databaseHealth = {
+      ok: true,
+      checkedAt: new Date().toISOString(),
+      projectCount: (state.projects || []).length,
+      taskCount: (state.tasks || []).length,
+      runCount: (state.runs || []).length,
+    };
+  } catch (error) {
+    state = initialState;
+    databaseHealth = { ok: false, checkedAt: new Date().toISOString(), reason: "complete_state_read_failed" };
+  }
+  const heartbeats = await (input.readWorkerHeartbeats || readWorkerHeartbeats)(input).catch(() => []);
+  const workerHealth = managedWorkerHealth(heartbeats, { ...input, nowMs });
+  const final = await readDiskPair(input);
+  const disksHealthy = diskPairHealthy(postCleanup) && diskPairHealthy(final);
+  const health = {
+    database: databaseHealth,
+    workers: workerHealth,
+    disksHealthy,
+    diskRecovery: {
+      recoveredWithoutCleanup: disksHealthy && Number(cleanup.selectedCount || 0) === 0,
+      sameVolume: cleanup.sameVolume !== false,
+    },
+  };
+  if (disksHealthy && databaseHealth.ok && workerHealth.ok) {
+    const recovered = await recoverIncident({
+      ...input,
+      incidentId: incident.id,
+      expectedGeneration: incident.generation,
+      nowMs,
+      data: final.data,
+      workspace: final.workspace,
+      cleanup,
+      health,
+    });
+    const reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
+    await heartbeatWriter("watchdog", {
+      status: "idle",
+      lastError: "",
+      lastSweepCompletedAt: new Date().toISOString(),
+      lastSuccessAt: new Date().toISOString(),
+    }, { ...input, disk: final.data }).catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
+    return {
+      generatedAt: new Date().toISOString(),
+      disk: final.data,
+      disks: { initial, postCleanup, final },
+      cleanup,
+      incident: recovered,
+      reconciliation,
+      actions: [],
+    };
+  }
+
+  const alreadyRestarted = new Set(incident.restartedWorkers || []);
+  const unhealthyWorkers = workerHealth.workers.filter((worker) => !worker.ok && !alreadyRestarted.has(worker.worker));
+  const planned = disksHealthy
+    ? planWatchdogActions(state, heartbeats, { ...input, disk: final.data, unhealthyWorkers })
+    : planWatchdogActions(state, heartbeats, { ...input, disk: { ...final.data, pressure: true } });
   const results = [];
-  for (const action of actions) {
+  const restartAttempts = [];
+  for (const action of planned) {
     if (action.type === "report_disk_pressure") {
       results.push({
         ...action,
@@ -119,17 +306,44 @@ export async function runWatchdog(input = {}) {
       });
       continue;
     }
+    restartAttempts.push(action.worker);
     try {
       results.push({ ...action, ok: true, output: await restartWorker(action.worker, input) });
     } catch (error) {
       results.push({ ...action, ok: false, output: error?.message || String(error) });
     }
   }
-  await writeWorkerHeartbeat("watchdog", {
+  incident = await updateIncident({
+    ...input,
+    incidentId: incident.id,
+    expectedGeneration: incident.generation,
+    state: databaseHealth.ok ? "awaiting_health" : "degraded",
+    nowMs,
+    data: final.data,
+    workspace: final.workspace,
+    cleanup,
+    health,
+    restartedWorkers: restartAttempts,
+    remediation: recoveryRemediation(cleanup, workerHealth, disksHealthy),
+  });
+  await heartbeatWriter("watchdog", {
     status: "idle",
     lastError: results.filter((item) => !item.ok).map((item) => item.output).join("; "),
     lastSweepCompletedAt: new Date().toISOString(),
     lastSuccessAt: results.every((item) => item.ok) ? new Date().toISOString() : "",
-  }, { ...input, disk }).catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
-  return { generatedAt: new Date().toISOString(), disk, reconciliation, actions: results };
+  }, { ...input, disk: final.data }).catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
+  return {
+    generatedAt: new Date().toISOString(),
+    disk: final.data,
+    disks: { initial, postCleanup, final },
+    cleanup,
+    incident,
+    reconciliation: {
+      actions: [],
+      paused: true,
+      reason: "disk_recovery_in_progress",
+      pauseReason: "disk_recovery_in_progress",
+    },
+    actions: results,
+  };
 }

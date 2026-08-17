@@ -2,6 +2,7 @@ import {
   architectureIsCompleteInState,
   cycleLimitLeadReviewApplies,
   currentReviewCandidateCycle,
+  diskPressureIncidentIsActive,
   earliestIncompleteRequiredReviewStage,
   findProject,
   findTask,
@@ -261,6 +262,9 @@ function preCreditDispatchSafetyReason(state, task, action, options) {
   ) return "architecture_handoff_invalid";
   if (state.meta?.operatorPause?.active && !options.ignoreOperatorPause) {
     return "operator_pause";
+  }
+  if (diskPressureIncidentIsActive(state.meta?.diskPressureIncident) && !options.ignoreDiskPressureIncident) {
+    return "disk_recovery_in_progress";
   }
   const project = findProject(state, task.projectId);
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";

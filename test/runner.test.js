@@ -1496,4 +1496,18 @@ test("runner claims after recoverable pressure cleanup but pauses for persistent
   });
   assert.equal(recovery.pauseReason, "disk_recovery_awaiting_watchdog_health");
   assert.equal(recoveryState.meta.operatorPause.active, true);
+
+  const incidentState = { ...state, meta: { diskPressureIncident: { id: "disk_incident_1", state: "awaiting_health", generation: 2 } } };
+  const incident = await runQueuedRuns({
+    state: incidentState,
+    workspaceRoot: "/tmp/workspaces",
+    dataPath: "/tmp/data",
+    workspaceRetention: { enabled: true },
+    disk: { availableBytes: 100, availablePercent: 10, minAvailableBytes: 1, minAvailablePercent: 1, pressure: false },
+    reconcileStaleRuns: async () => [],
+    claimRuns: async () => { throw new Error("claim must not run"); },
+    runGitHubRemoteRecoveryProbes: async () => [],
+  });
+  assert.equal(incident.paused, true);
+  assert.equal(incident.pauseReason, "disk_recovery_in_progress");
 });

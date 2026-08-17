@@ -1162,6 +1162,31 @@ test("operator pause also suppresses dependency-unblock builder dispatches", () 
   assert.equal(report.skipped[0].reason, "operator_pause");
 });
 
+test("active disk recovery blocks worker dispatches but preserves owner handoffs", () => {
+  const state = fixtureState();
+  state.meta = { diskPressureIncident: { id: "disk_incident_1", state: "awaiting_health", generation: 2 } };
+  const builder = planDispatches(state, [{
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+  }]);
+  const owner = planDispatches(state, [{
+    id: "task_2:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+  }]);
+
+  assert.equal(builder.selected.length, 0);
+  assert.equal(builder.skipped[0].reason, "disk_recovery_in_progress");
+  assert.equal(owner.selected.length, 1);
+});
+
 test("preview service failures route to infrastructure repair instead of rebuilding feature code", () => {
   const state = fixtureState();
   state.projects[0].reviewPolicy = { trustLeadApprovals: true, integrationBranch: "qa/demo" };

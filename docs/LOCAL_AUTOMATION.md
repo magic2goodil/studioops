@@ -37,7 +37,11 @@ Long-running workers write atomic heartbeats under `data/heartbeats/` every 30 s
 - wakes the runner when queued durable runs have waited too long
 - wakes the dispatcher when dispatchable tasks have waited too long
 - records the worker data root and disk availability with every heartbeat
-- pauses new claims and reports disk pressure instead of repeatedly restarting workers when free space is below the safety threshold
+- opens one durable disk-pressure incident and blocks new claims while either the database or run-workspace volume is below its byte or percentage threshold
+- calls the runner's public retention adapter once per pass; it never duplicates path eligibility or deletes an unverified workspace itself
+- requires two healthy post-cleanup disk observations, a complete SQLite read plus atomic incident transition, and fresh root-matching `idle` or `busy` heartbeats before recovery
+- attempts at most one root-verified restart per unhealthy managed worker during an incident, and never restarts workers while disk pressure remains
+- records bounded cleanup totals, exclusion reasons, database and worker evidence, recovery duration, and operator remediation without appending duplicate events on every pass
 - refuses to restart a LaunchAgent whose installed working root does not match the watchdog's current StudioOps root
 - returns a non-epic `in_progress` task to the queue when it has no queued or running durable run
 - automatically releases transient SDK, process, timeout, and orphan-run blockers after a bounded recovery delay
@@ -58,6 +62,7 @@ studioops automation-resume --reason "Backup, integrity, and worker health verif
 ```
 
 An operator pause suppresses new builder and reviewer claims while still allowing owner-review notifications to reach the persistent inbox.
+Disk recovery never clears an operator pause, task or project circuit, configuration blocker, review gate, or owner approval. If no workspace is safely eligible, inspect the incident's bounded exclusion reasons and free local disk space; do not delete source checkouts, active workspaces, or candidate artifacts manually. A `degraded` or `awaiting_health` incident remains fail-closed until a later watchdog pass proves every recovery condition.
 
 ## Tiered model routing
 
