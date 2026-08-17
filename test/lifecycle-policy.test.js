@@ -5,7 +5,7 @@ import {
   evaluateLifecycleTransition,
 } from "../src/lifecycle-policy.js";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
-import { applyLifecycleTransitionInState } from "../src/store.js";
+import { applyLifecycleTransitionInState, capabilityRoutingForTask, reviewMatchesCurrentCandidate } from "../src/store.js";
 
 const NOW = Date.parse("2026-08-17T12:00:00.000Z");
 const SHA = "a".repeat(40);
@@ -102,6 +102,23 @@ test("the action matrix is explicit and every status participates in a fail-clos
     assert.equal(typeof entry.subjectBinding, "string");
     assert.ok(Array.isArray(entry.invalidates));
   }
+});
+
+test("lifecycle source, persistence, and test paths classify deterministically as backend impact", () => {
+  const routing = capabilityRoutingForTask({}, {
+    impactEvidence: {
+      changedFiles: [
+        "src/lifecycle-policy.js",
+        "src/store.js",
+        "src/state-database.js",
+        "test/lifecycle-policy.test.js",
+        "test/state-database.test.js",
+      ],
+      impact: ["backend", "security", "migration"],
+    },
+  });
+  assert.equal(routing.evidence.unknown, false);
+  assert.equal(routing.evidence.backendRequired, true);
 });
 
 test("a valid transition is pure and increments the aggregate version exactly once", () => {
@@ -201,6 +218,41 @@ test("QA transitions require the exact immutable candidate digest", () => {
   assert.equal(task.stateVersion, 6);
 });
 
+test("review routing cannot skip an incomplete required gate for the exact candidate", () => {
+  const task = {
+    id: "task_1", projectId: "project_1", status: "builder_review", stateVersion: 4,
+    assignedAgentRole: "", reviewCycle: 1, reviewSubjectCycle: 1, reviewSubjectSha: SHA,
+  };
+  const command = {
+    action: "route_review",
+    taskId: task.id,
+    expectedStateVersion: 4,
+    actorContext: { actorId: "workflow-engine", actorType: "system", role: "workflow-engine", trusted: true },
+    evidence: { targetStatus: "lead_review", candidateCycle: 1, subjectSha: SHA },
+  };
+  const reviewStages = [
+    { key: "backend", label: "Backend Review", status: "backend_review", role: "backend-reviewer", required: true },
+    { key: "frontend", label: "Frontend Review", status: "frontend_review", role: "frontend-reviewer", required: true },
+    { key: "lead", label: "Lead Review", status: "lead_review", role: "lead-reviewer", required: true },
+  ];
+  assert.throws(
+    () => evaluateLifecycleTransition(command, task, { reviewStages, reviews: [], candidates: [], nowMs: NOW }),
+    /Backend Review must be complete/,
+  );
+  const reviews = [
+    { id: "review_backend", taskId: task.id, stageKey: "backend", outcome: "approved", candidateCycle: 1, subjectSha: SHA },
+  ];
+  assert.throws(
+    () => evaluateLifecycleTransition(command, task, { reviewStages, reviews, candidates: [], nowMs: NOW }),
+    /Frontend Review must be complete/,
+  );
+  reviews.push({ id: "review_frontend", taskId: task.id, stageKey: "frontend", outcome: "skipped", candidateCycle: 1, subjectSha: SHA });
+  assert.equal(
+    evaluateLifecycleTransition(command, task, { reviewStages, reviews, candidates: [], nowMs: NOW }).task.status,
+    "lead_review",
+  );
+});
+
 test("owner override requires bounded justification and invalidates incompatible evidence without deleting history", () => {
   const candidate = candidateFixture();
   const state = {
@@ -240,6 +292,8 @@ test("owner override requires bounded justification and invalidates incompatible
   assert.equal(result.task.status, "needs_changes");
   assert.equal(result.task.stateVersion, 9);
   assert.equal(state.reviews.length, 1);
+  assert.equal(Boolean(state.reviews[0].invalidatedAt), true);
+  assert.equal(reviewMatchesCurrentCandidate(result.task, state.reviews[0]), false);
   assert.equal(state.candidates[0].status, "invalidated");
   assert.equal(state.qaBundles[0].status, "invalidated");
   assert.equal(result.task.candidateId, "");

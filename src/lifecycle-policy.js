@@ -14,6 +14,7 @@ export const CANONICAL_LIFECYCLE_STATUSES = Object.freeze([
 const REVIEW_STATUSES = [
   "backend_review", "frontend_review", "accessibility_review", "regression_review", "lead_review",
 ];
+const REVIEW_COMPLETE_OUTCOMES = new Set(["approved", "skipped"]);
 
 function rule(from, to, options = {}) {
   const edges = options.edges || from.flatMap((source) => to.map((target) => [source, target]));
@@ -48,14 +49,19 @@ export const LIFECYCLE_ACTION_MATRIX = Object.freeze({
   submit_definition: rule(["idea"], ["ready", "architecture_pending"], { actorTypes: ["owner"], roles: ["owner"] }),
   start_architecture: rule(["architecture_pending"], ["architecture_in_progress"], { actorTypes: ["worker"], roles: ["systems-architect"], assignment: "required", activeRun: true, workflowLease: true }),
   complete_architecture: rule(["architecture_in_progress"], ["architecture_ready"], { actorTypes: ["worker"], roles: ["systems-architect"], assignment: "required", activeRun: true, workflowLease: true }),
-  release_architecture_children: rule(["architecture_pending"], ["ready"], { actorTypes: ["system"], roles: ["workflow-engine"] }),
+  release_architecture_children: rule(["idea", "architecture_pending"], ["ready"], { actorTypes: ["system"], roles: ["workflow-engine"] }),
   queue_task: rule(["ready", "blocked", "needs_changes"], ["queued"], { actorTypes: ["system", "owner"], roles: ["workflow-engine", "owner"] }),
   start_builder: rule(["queued", "needs_changes"], ["in_progress"], { actorTypes: ["worker"], roles: ["builder"], assignment: "required", activeRun: true, workflowLease: true }),
   submit_builder_review: rule(["in_progress", "needs_changes"], ["builder_review"], { actorTypes: ["worker"], roles: ["builder"], assignment: "required", activeRun: true, workflowLease: true, candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
+  record_builder_handoff: rule(["in_progress", "needs_changes"], ["builder_review"], { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   route_review: rule(reviewRoutingSources, REVIEW_STATUSES, { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", edges: forwardReviewEdges }),
+  restart_review: rule([...REVIEW_STATUSES, "needs_changes"], REVIEW_STATUSES, { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   record_review_approval: rule(REVIEW_STATUSES, REVIEW_STATUSES, { actorTypes: ["worker"], roles: ["assigned-reviewer"], assignment: "required", activeRun: true, workflowLease: true, candidateCycle: true, subjectBinding: "sha", edges: REVIEW_STATUSES.map((status) => [status, status]) }),
+  record_review_evidence: rule(REVIEW_STATUSES, REVIEW_STATUSES, { actorTypes: ["system"], roles: ["review-recorder"], candidateCycle: true, subjectBinding: "sha", edges: REVIEW_STATUSES.map((status) => [status, status]) }),
   request_changes: rule([...reviewRoutingSources, "qa_review", "promotion_blocked"], ["needs_changes"], { actorTypes: ["worker", "owner", "system"], roles: ["assigned-reviewer", "owner", "workflow-engine"], candidateCycle: true, subjectBinding: "candidate_or_sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
+  reject_builder_intake: rule(["builder_review"], ["needs_changes"], { actorTypes: ["system"], roles: ["workflow-engine"], invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   request_owner_review: rule(REVIEW_STATUSES, ["user_review"], { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha" }),
+  escalate_cycle_limit_owner_review: rule(["lead_review"], ["user_review"], { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha" }),
   request_qa_review: rule(REVIEW_STATUSES.concat("user_review"), ["qa_review"], { actorTypes: ["system", "owner"], roles: ["workflow-engine", "owner"], candidateCycle: true, subjectBinding: "sha" }),
   approve_owner_review: rule(["user_review"], ["approved"], { actorTypes: ["owner"], roles: ["owner"], candidateCycle: true, subjectBinding: "sha" }),
   pass_qa: rule(["qa_review"], ["approved_for_main"], { actorTypes: ["owner"], roles: ["owner"], candidateCycle: true, subjectBinding: "candidate" }),
@@ -67,11 +73,17 @@ export const LIFECYCLE_ACTION_MATRIX = Object.freeze({
   close_task: rule(CANONICAL_LIFECYCLE_STATUSES.filter((status) => !["closed", "legacy_untrusted"].includes(status)), ["closed"], { actorTypes: ["owner"], roles: ["owner"] }),
   block_workflow: rule(CANONICAL_LIFECYCLE_STATUSES.filter((status) => !["blocked", "closed", "done", "legacy_untrusted"].includes(status)), ["blocked"], { actorTypes: ["system"], roles: ["workflow-engine"] }),
   resume_workflow: rule(["blocked"], CANONICAL_LIFECYCLE_STATUSES.filter((status) => !["idea", "blocked", "legacy_untrusted"].includes(status)), { actorTypes: ["system", "owner"], roles: ["workflow-engine", "owner"] }),
+  recover_workflow: rule(["blocked", "in_progress"], CANONICAL_LIFECYCLE_STATUSES.filter((status) => !["idea", "blocked", "legacy_untrusted"].includes(status)), { actorTypes: ["system"], roles: ["resilience-engine"] }),
+  require_architecture: rule(["idea", "ready", "queued"], ["architecture_pending"], { actorTypes: ["system", "owner"], roles: ["workflow-engine", "owner"] }),
+  record_architecture_completion: rule(["architecture_pending", "architecture_in_progress"], ["architecture_ready"], { actorTypes: ["system"], roles: ["architecture-recorder"] }),
+  mutate_assignment: rule(CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"), CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"), { actorTypes: ["system", "owner"], roles: ["workflow-engine", "owner"], edges: CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted").map((status) => [status, status]) }),
+  mutate_evidence: rule(CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"), CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"), { actorTypes: ["system", "owner"], roles: ["workflow-engine", "owner"], edges: CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted").map((status) => [status, status]), invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   owner_override: rule(CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"), CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"), { actorTypes: ["owner"], roles: ["owner"], invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   legacy_repair: rule(["legacy_untrusted"], CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"), { actorTypes: ["migration"], roles: ["integrity-repair"] }),
 });
 
 export const LIFECYCLE_EVIDENCE_FIELDS = Object.freeze([
+  "assignedAgentRole", "assignedThreadId", "reviewerThreadId", "workflowLease",
   "reviewCycle", "reviewSubjectSha", "reviewSubjectCycle", "impactEvidence", "candidateIdentity", "candidateId",
   "qaBundleId", "qaDecision", "integrationStatus", "promotionStatus", "promotionEvidence",
   "evidenceInvalidations", "architectureStatus", "architectureSummary", "architectureDecisionTaskIds",
@@ -121,19 +133,79 @@ function activeRunFor(context, taskId, actor) {
   ));
 }
 
+function reviewIsCurrent(review, aggregate) {
+  if (!review || review.invalidatedAt || review.invalidation) return false;
+  return review.taskId === aggregate.id
+    && Number(review.candidateCycle || 0) === Number(aggregate.reviewSubjectCycle || aggregate.reviewCycle || 0)
+    && String(review.subjectSha || "").toLowerCase() === String(aggregate.reviewSubjectSha || "").toLowerCase();
+}
+
+function assertReviewGates(action, aggregate, evidence = {}, context = {}) {
+  if (!["route_review", "record_review_evidence", "request_owner_review", "request_qa_review", "escalate_cycle_limit_owner_review"].includes(action)) return;
+  const stages = Array.isArray(context.reviewStages) ? context.reviewStages : [];
+  if (!stages.length) throw new Error(`Lifecycle action ${action} requires the project's explicit review-stage contract.`);
+  const targetStatus = String(evidence.targetStatus || "").trim();
+  const targetIndex = stages.findIndex((stage) => stage.status === targetStatus);
+  const reviewStageIndex = action === "record_review_evidence"
+    ? stages.findIndex((stage) => stage.status === aggregate.status)
+    : targetIndex;
+  if (["route_review", "record_review_evidence"].includes(action) && reviewStageIndex < 0) {
+    throw new Error(`Lifecycle action ${action} targets a status outside the project's review-stage contract.`);
+  }
+  const required = stages
+    .map((stage, index) => ({ ...stage, index }))
+    .filter((stage) => stage.required !== false)
+    .filter((stage) => (
+      action === "route_review" || action === "record_review_evidence"
+        ? stage.index < reviewStageIndex
+        : true
+    ));
+  const currentReviews = (context.reviews || []).filter((review) => reviewIsCurrent(review, aggregate));
+  if (action === "escalate_cycle_limit_owner_review") {
+    const currentLeadChange = currentReviews.some((review) => (
+      review.outcome === "changes_requested"
+      && (review.stageKey === "lead" || review.status === "lead_review" || review.role === "lead-reviewer")
+    ));
+    if (!context.allowCycleLimitLeadReview || !currentLeadChange) {
+      throw new Error("Cycle-limit owner escalation requires a current lead changes-requested decision.");
+    }
+    return;
+  }
+  const missing = required.find((stage) => !currentReviews.some((review) => (
+    (review.stageKey === stage.key || (!review.stageKey && review.status === stage.status))
+    && REVIEW_COMPLETE_OUTCOMES.has(review.outcome)
+  )));
+  if (!missing) return;
+  const cycleLimitOverride = action === "route_review"
+    && evidence.gateOverride === "cycle_limit_lead_decision"
+    && stages[reviewStageIndex]?.role === "lead-reviewer"
+    && context.allowCycleLimitLeadReview === true
+    && currentReviews.some((review) => review.outcome === "changes_requested");
+  if (!cycleLimitOverride) {
+    throw new Error(`${missing.label || missing.key || missing.status} must be complete for the exact current candidate before ${action}.`);
+  }
+}
+
 function assertBoundEvidence(action, ruleValue, aggregate, evidence = {}, context = {}) {
+  const candidate = (context.candidates || []).find((item) => item.id === (evidence.candidateId || aggregate.candidateId));
+  const candidateSource = candidate?.manifest?.sources?.find((source) => source.taskId === aggregate.id);
   if (ruleValue.candidateCycle) {
-    const current = Number(aggregate.reviewSubjectCycle || aggregate.candidateIdentity?.candidateCycle || 0);
-    const expected = action === "submit_builder_review"
-      ? Math.max(current + 1, Number(aggregate.reviewCycle || 0) + 1)
+    const current = Number(
+      aggregate.reviewSubjectCycle
+      || aggregate.reviewCycle
+      || aggregate.candidateIdentity?.candidateCycle
+      || candidateSource?.candidateCycle
+      || 0
+    );
+    const expected = ["submit_builder_review", "record_builder_handoff"].includes(action)
+      ? Math.max(Number(aggregate.reviewSubjectCycle || 0) + 1, Number(aggregate.reviewCycle || 0) + 1)
       : current;
     if (!Number.isSafeInteger(Number(evidence.candidateCycle)) || Number(evidence.candidateCycle) !== expected || expected < 1) {
       throw new Error(`Candidate cycle ${evidence.candidateCycle ?? "(missing)"} does not match current cycle ${expected}.`);
     }
   }
   const exactSha = String(evidence.subjectSha || "").trim().toLowerCase();
-  const aggregateSha = String(aggregate.reviewSubjectSha || aggregate.candidateIdentity?.commitSha || "").trim().toLowerCase();
-  const candidate = (context.candidates || []).find((item) => item.id === (evidence.candidateId || aggregate.candidateId));
+  const aggregateSha = String(aggregate.reviewSubjectSha || aggregate.candidateIdentity?.commitSha || candidateSource?.headSha || "").trim().toLowerCase();
   const candidateMatches = Boolean(
     candidate
     && !candidate.invalidation
@@ -148,7 +220,7 @@ function assertBoundEvidence(action, ruleValue, aggregate, evidence = {}, contex
   );
   if (["sha", "candidate_or_sha"].includes(ruleValue.subjectBinding)) {
     const shaMatches = SHA_PATTERN.test(exactSha)
-      && (action === "submit_builder_review" || exactSha === aggregateSha);
+      && (["submit_builder_review", "record_builder_handoff"].includes(action) || exactSha === aggregateSha);
     if (!shaMatches && !(ruleValue.subjectBinding === "candidate_or_sha" && candidateMatches)) {
       throw new Error("Lifecycle evidence is not bound to the exact current subject SHA.");
     }
@@ -215,6 +287,7 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
     }
   }
   assertBoundEvidence(action, ruleValue, aggregate, command.evidence || {}, context);
+  assertReviewGates(action, aggregate, command.evidence || {}, context);
   const override = action === "owner_override" ? validateOwnerOverride(command.evidence) : null;
   const now = context.now || new Date(Number(context.nowMs ?? Date.now())).toISOString();
   const nextTask = {
@@ -223,7 +296,7 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
       stateVersion: currentStateVersion + 1,
       updatedAt: now,
   };
-  if (action === "submit_builder_review") {
+  if (["submit_builder_review", "record_builder_handoff"].includes(action)) {
     nextTask.reviewCycle = Number(command.evidence.candidateCycle);
     nextTask.reviewSubjectCycle = Number(command.evidence.candidateCycle);
     nextTask.reviewSubjectSha = String(command.evidence.subjectSha).trim().toLowerCase();

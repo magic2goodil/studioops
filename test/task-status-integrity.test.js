@@ -174,6 +174,11 @@ for (const [workflowMode, prUrl] of [
       assert.equal(task.reviewSubjectSha, subjectSha);
       assert.equal(task.reviewCycle, 1);
       assert.equal(task.reviewSubjectCycle, 1);
+      assert.equal(task.stateVersion, 2);
+      const lifecycleEvent = state.events.find((event) => event.type === "lifecycle_transition");
+      assert.equal(lifecycleEvent?.action, "record_builder_handoff");
+      assert.equal(lifecycleEvent?.fromVersion, 1);
+      assert.equal(lifecycleEvent?.toVersion, 2);
       const report = createSupervisorReport(state);
       assert.equal(report.actions[0].type, "start_review");
       assert.equal(report.actions[0].reviewSubjectSha, subjectSha);

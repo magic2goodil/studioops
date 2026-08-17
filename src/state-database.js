@@ -13,7 +13,7 @@ import {
 
 const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates"];
 const TABLE_NAME = { qaBundles: "qa_bundles" };
-const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "runs", "qaBundles", "candidates"]);
+const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "qaBundles", "candidates"]);
 const STATE_INTEGRITY_VERSION = 5;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
@@ -578,7 +578,8 @@ function normalizeTaskStateVersions(state, snapshot) {
   const externalEvidenceTaskIds = new Set();
   const previousReviewIds = snapshot.tables.reviews;
   for (const review of state.reviews || []) {
-    if (!previousReviewIds.has(review.id)) externalEvidenceTaskIds.add(review.taskId);
+    const prior = previousReviewIds.get(review.id);
+    if (!prior || prior.payload !== JSON.stringify(review)) externalEvidenceTaskIds.add(review.taskId);
   }
   for (const candidate of state.candidates || []) {
     const prior = snapshot.tables.candidates.get(candidate.id);
@@ -638,6 +639,22 @@ function assertCandidateTransition(previousCandidate, candidate) {
     throw new Error(`Candidate ${candidate.id} manifest is immutable.`);
   }
   assertAppendOnlyCandidateFields(previousCandidate, candidate);
+}
+
+function assertReviewTransition(previousReview, review) {
+  const mutable = new Set(["invalidatedAt", "invalidation"]);
+  for (const key of new Set([...Object.keys(previousReview), ...Object.keys(review)])) {
+    if (mutable.has(key)) continue;
+    if (JSON.stringify(previousReview[key]) !== JSON.stringify(review[key])) {
+      throw new Error(`Review ${previousReview.id} history is immutable.`);
+    }
+  }
+  if (previousReview.invalidatedAt && JSON.stringify(previousReview) !== JSON.stringify(review)) {
+    throw new Error(`Review ${previousReview.id} invalidation is append-only.`);
+  }
+  if (review.invalidatedAt && !review.invalidation) {
+    throw new Error(`Review ${review.id} invalidation metadata is incomplete.`);
+  }
 }
 
 function assertFullCandidateHistoryPreserved(db, candidates) {
@@ -713,6 +730,9 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
           assertCandidateTransition(previousCandidate, item);
         }
       }
+      if (table === "reviews" && prior) {
+        assertReviewTransition(JSON.parse(prior.payload), item);
+      }
       const changed = !prior
         || prior.sequence !== sequence
         || (MUTABLE_ENTITY_TABLES.has(table) && prior.payload !== JSON.stringify(item));
@@ -721,7 +741,7 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
     const tableName = TABLE_NAME[table] || table;
     for (const id of previousItems.keys()) {
       if (!currentIds.has(id)) {
-        if (table === "candidates") throw new Error(`Candidate ${id} cannot be deleted.`);
+        if (["candidates", "reviews"].includes(table)) throw new Error(`${table === "candidates" ? "Candidate" : "Review"} ${id} cannot be deleted.`);
         db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
       }
     }

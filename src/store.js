@@ -25,6 +25,7 @@ import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   CANONICAL_LIFECYCLE_STATUSES,
   evaluateLifecycleTransition,
+  lifecycleEvidenceChanged,
   positiveStateVersion,
 } from "./lifecycle-policy.js";
 import {
@@ -825,12 +826,12 @@ export function applyGitHubRemoteRecoveryProbeResultInState(state, claim, result
   const probeCount = Math.max(0, Number(probe.probeCount || 0)) + 1;
   if (result?.ok) {
     const resumeStatus = probe.resumeStatus;
-    task.status = resumeStatus;
     task.assignedAgentRole = "";
     task.retryNotBefore = "";
     task.lastAutomationFailure = "";
     task.updatedAt = now;
     delete task.automationBlocker;
+    applyStoreLifecycleTransition(state, task, resumeStatus, { action: "recover_workflow", now, nowMs });
     state.comments = state.comments || [];
     state.events = state.events || [];
     addAutomationComment(
@@ -1050,7 +1051,10 @@ function normalizedImpactEvidence(value = {}) {
   const hasUnknownExplicitClassification = explicit.some((item) => !known.has(item));
   const pathCapabilities = files.map((file) => {
     const capabilities = new Set();
-    if (/(^|\/)(server|api|src\/(store|supervisor|dispatcher)|migrations?|db|auth|security|deploy|infra)(\/|\.|$)/i.test(file)) {
+    if (
+      /(^|\/)(server|api|src\/(store|supervisor|dispatcher|lifecycle-policy|state-database)|migrations?|db|auth|security|deploy|infra)(\/|\.|$)/i.test(file)
+      || /^test\/.+\.test\.js$/i.test(file)
+    ) {
       capabilities.add("backend");
     }
     if (/\.(css|scss|sass|less|jsx|tsx|vue|svelte|html)$/i.test(file)) {
@@ -1486,7 +1490,14 @@ function lifecycleInvalidationIds(state, task, decision) {
   const invalidatedAt = decision.occurredAt;
   if (decision.invalidates.includes("reviews")) {
     for (const review of state.reviews || []) {
-      if (review.taskId === task.id && !review.invalidatedAt) ids.push(review.id);
+      if (review.taskId !== task.id || review.invalidatedAt) continue;
+      review.invalidatedAt = invalidatedAt;
+      review.invalidation = {
+        action: decision.action,
+        reasonCode: decision.override?.reasonCode || decision.action,
+        invalidatedAt,
+      };
+      ids.push(review.id);
     }
   }
   if (decision.invalidates.includes("candidate")) {
@@ -1560,9 +1571,17 @@ function appendLifecycleAuditEvent(state, task, decision, invalidationIds) {
 export function applyLifecycleTransitionInState(state, command, input = {}) {
   const task = findTask(state, command?.taskId);
   if (!task) throw new Error(`Unknown task: ${command?.taskId || "(missing)"}`);
+  const project = findProject(state, task.projectId);
   const result = evaluateLifecycleTransition(command, task, {
     runs: state.runs || [],
     candidates: state.candidates || [],
+    reviews: state.reviews || [],
+    reviewStages: project ? reviewStagesForTask(project, task) : [],
+    allowCycleLimitLeadReview: Boolean(
+      project
+      && reviewPolicyForProject(project).leadOwnsFinalDecisionAtLimit
+      && currentReviewCycle(task) >= reviewPolicyForProject(project).maxBuilderReviewCycles
+    ),
     now: input.now,
     nowMs: input.nowMs,
   });
@@ -1570,6 +1589,64 @@ export function applyLifecycleTransitionInState(state, command, input = {}) {
   const invalidationIds = lifecycleInvalidationIds(state, task, result.decision);
   appendLifecycleAuditEvent(state, task, result.decision, invalidationIds);
   return { task, decision: { ...result.decision, invalidationIds } };
+}
+
+function lifecycleEvidenceForTask(state, task, targetStatus, evidence = {}) {
+  const candidate = (state.candidates || []).find((item) => item.id === (evidence.candidateId || task.candidateId));
+  const candidateSource = candidate?.manifest?.sources?.find((source) => source.taskId === task.id);
+  return {
+    targetStatus,
+    candidateCycle: Number(evidence.candidateCycle || currentReviewCandidateCycle(task) || candidateSource?.candidateCycle || 0),
+    subjectSha: String(evidence.subjectSha || task.reviewSubjectSha || candidateSource?.headSha || "").trim().toLowerCase(),
+    candidateId: String(evidence.candidateId || task.candidateId || "").trim(),
+    manifestDigest: String(evidence.manifestDigest || candidate?.manifestDigest || "").trim(),
+    ...evidence,
+  };
+}
+
+function defaultLifecycleAction(task, targetStatus) {
+  if (targetStatus === task.status) return "mutate_evidence";
+  if (targetStatus === "architecture_pending") return "require_architecture";
+  if (targetStatus === "architecture_ready") return "record_architecture_completion";
+  if (targetStatus === "builder_review") return "record_builder_handoff";
+  if (["backend_review", "frontend_review", "accessibility_review", "regression_review", "lead_review"].includes(targetStatus)) return "route_review";
+  if (targetStatus === "needs_changes") return task.status === "builder_review" && !task.reviewSubjectSha
+    ? "reject_builder_intake"
+    : "request_changes";
+  if (targetStatus === "user_review") return "request_owner_review";
+  if (targetStatus === "qa_review") return "request_qa_review";
+  if (targetStatus === "blocked") return "block_workflow";
+  if (targetStatus === "queued") {
+    if (task.status === "blocked") return "resume_workflow";
+    if (task.status === "in_progress") return "recover_workflow";
+    return "queue_task";
+  }
+  return "owner_override";
+}
+
+function actorForLifecycleAction(action) {
+  if (action === "record_architecture_completion") return { actorId: "architecture-store-adapter", actorType: "system", role: "architecture-recorder", trusted: true };
+  if (action === "recover_workflow") return { actorId: "resilience-store-adapter", actorType: "system", role: "resilience-engine", trusted: true };
+  if (action === "owner_override") return { actorId: "local-owner-store-adapter", actorType: "owner", role: "owner", trusted: true };
+  return { actorId: "workflow-store-adapter", actorType: "system", role: "workflow-engine", trusted: true };
+}
+
+function applyStoreLifecycleTransition(state, task, targetStatus, input = {}) {
+  if (targetStatus === task.status && input.force !== true) return null;
+  const action = input.action || defaultLifecycleAction(task, targetStatus);
+  const evidence = lifecycleEvidenceForTask(state, task, targetStatus, input.evidence);
+  if (action === "owner_override") {
+    evidence.reasonCode = evidence.reasonCode || "local_adapter_transition";
+    evidence.reason = evidence.reason || `The local compatibility adapter requested ${task.status} to ${targetStatus}.`;
+    evidence.risk = evidence.risk || "The caller remains subject to the control-plane authentication migration.";
+  }
+  return applyLifecycleTransitionInState(state, {
+    action,
+    taskId: task.id,
+    expectedStateVersion: positiveStateVersion(task.stateVersion),
+    actorContext: input.actorContext || actorForLifecycleAction(action),
+    evidence,
+  }, { now: input.now, nowMs: input.nowMs });
 }
 
 export async function transitionTask(command, input = {}) {
@@ -1627,6 +1704,7 @@ export async function updateTask(taskId, patch) {
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
+    const aggregateBeforePatch = structuredClone(task);
     const candidateIdentityBeforePatch = candidateIdentityForTask(task);
     const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
     const previousNormalizedStatus = typeof task.status === "string" ? task.status.trim() : "";
@@ -1634,12 +1712,14 @@ export async function updateTask(taskId, patch) {
     if (repairingLegacyStatus) {
       throw new Error("Invalid legacy status can only be changed by repairLegacyTaskStatus.");
     }
+    let requestedStatus = task.status;
     if (Object.prototype.hasOwnProperty.call(patch, "status")) {
       const normalizedStatus = typeof patch.status === "string" ? patch.status.trim() : "";
       if (!normalizedStatus || !VALID_STATUSES.has(normalizedStatus)) {
         throw new Error(`Invalid status: ${patch.status ?? "(missing)"}`);
       }
       patch = { ...patch, status: normalizedStatus };
+      requestedStatus = normalizedStatus;
     }
     const architectureCompletionFields = [
       "architectureStatus",
@@ -1661,7 +1741,6 @@ export async function updateTask(taskId, patch) {
     const allowed = [
       "title",
       "description",
-      "status",
       "priority",
       "type",
       "area",
@@ -1745,17 +1824,17 @@ export async function updateTask(taskId, patch) {
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
-      && ["ready", "queued"].includes(task.status)
+      && ["ready", "queued"].includes(requestedStatus)
       && task.architectureRequired
       && !architectureIsCompleteInState(state, task)
     ) {
-      task.status = "architecture_pending";
+      requestedStatus = "architecture_pending";
     }
     if (
       normalizeBoolean(patch.architectureApproved, false)
-      && ["ready", "queued"].includes(task.status)
+      && ["ready", "queued"].includes(requestedStatus)
     ) {
-      task.status = "architecture_pending";
+      requestedStatus = "architecture_pending";
     }
     // A status repair restores an invalid legacy record to the workflow; it must
     // not be treated as a new builder submission, which would discard the
@@ -1773,16 +1852,18 @@ export async function updateTask(taskId, patch) {
       && candidateIdentityIsComplete(candidateIdentityAfterPatch)
       && candidateMaterialMatches(candidateIdentityBeforePatch, candidateIdentityAfterPatch);
     const startedBuilderReviewCycle = !repairingLegacyStatus
-      && patch.status === "builder_review"
+      && requestedStatus === "builder_review"
       && previousStatus !== "builder_review"
       && !unchangedCandidateTree;
     if (startedBuilderReviewCycle) {
-      task.reviewCycle = Number(task.reviewCycle || 0) + 1;
-      task.reviewSubjectSha = "";
-      task.reviewSubjectCycle = Math.max(
+      const candidateCycle = Math.max(
         Number(task.reviewSubjectCycle || 0) + 1,
-        task.reviewCycle,
+        Number(task.reviewCycle || 0) + 1,
       );
+      applyStoreLifecycleTransition(state, task, requestedStatus, {
+        action: "record_builder_handoff",
+        evidence: { candidateCycle, subjectSha: patchedSubjectSha },
+      });
     }
     if (Object.prototype.hasOwnProperty.call(patch, "subjectSha")) {
       const subjectSha = patchedSubjectSha;
@@ -1835,7 +1916,25 @@ export async function updateTask(taskId, patch) {
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
-      && patch.status !== "blocked"
+      && requestedStatus !== task.status
+      && positiveStateVersion(task.stateVersion) === positiveStateVersion(aggregateBeforePatch.stateVersion)
+    ) {
+      applyStoreLifecycleTransition(state, task, requestedStatus);
+    } else if (
+      !startedBuilderReviewCycle
+      && lifecycleEvidenceChanged(aggregateBeforePatch, task)
+      && positiveStateVersion(task.stateVersion) === positiveStateVersion(aggregateBeforePatch.stateVersion)
+    ) {
+      const candidateEvidenceMutation = ["subjectSha", "candidateIdentity", "impactEvidence", "branchName", "operationalLocalArtifactRef"]
+        .some((key) => Object.prototype.hasOwnProperty.call(patch, key));
+      applyStoreLifecycleTransition(state, task, task.status, {
+        action: candidateEvidenceMutation ? "mutate_evidence" : "mutate_assignment",
+        force: true,
+      });
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "status")
+      && requestedStatus !== "blocked"
       && task.automationBlocker
     ) {
       delete task.automationBlocker;
@@ -1993,13 +2092,17 @@ export function completeArchitectureInState(state, taskId, input = {}) {
   task.architectureCompletedAt = now;
   task.architectureCompletedBy = author;
   task.assignedAgentRole = "";
-  task.status = "architecture_ready";
-  task.updatedAt = now;
+  applyStoreLifecycleTransition(state, task, "architecture_ready", {
+    action: "record_architecture_completion",
+    now,
+  });
 
   for (const child of childTasks) {
     child.architectureStatus = "inherited";
-    child.status = "ready";
-    child.updatedAt = now;
+    applyStoreLifecycleTransition(state, child, "ready", {
+      action: "release_architecture_children",
+      now,
+    });
   }
 
   state.comments = state.comments || [];
@@ -2068,7 +2171,11 @@ function applyTaskQaOutcome(state, task, project, outcome, input, now) {
       promotionStatus: "queued",
       promotionTargetBranch: project.defaultBranch || "main",
       promotionUpdatedAt: now,
-    }, now);
+    }, now, {
+      action: "pass_qa",
+      actorContext: { actorId: author, actorType: "owner", role: "owner", trusted: true },
+      evidence: { candidateId: input.candidateId, manifestDigest: input.manifestDigest },
+    });
     addAutomationComment(
       state,
       task,
@@ -2093,7 +2200,11 @@ function applyTaskQaOutcome(state, task, project, outcome, input, now) {
     reviewerThreadId: "",
     promotionStatus: "",
     promotionUpdatedAt: now,
-  }, now);
+  }, now, {
+    action: "request_changes",
+    actorContext: { actorId: author, actorType: "owner", role: "owner", trusted: true },
+    evidence: { candidateId: input.candidateId, manifestDigest: input.manifestDigest },
+  });
   addAutomationComment(
     state,
     task,
@@ -2526,7 +2637,6 @@ export function reconcileAutomationStateInState(state, input = {}) {
       }
       const resumeStatus = VALID_STATUSES.has(blocker.resumeStatus) ? blocker.resumeStatus : "queued";
       const recoveryCount = completedRecoveries + 1;
-      task.status = resumeStatus;
       task.assignedAgentRole = "";
       task.assignedThreadId = "";
       task.reviewerThreadId = "";
@@ -2535,6 +2645,7 @@ export function reconcileAutomationStateInState(state, input = {}) {
       task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
       task.updatedAt = now;
       delete task.automationBlocker;
+      applyStoreLifecycleTransition(state, task, resumeStatus, { action: "recover_workflow", now, nowMs });
       recordRecovery(
         state,
         task,
@@ -2551,12 +2662,12 @@ export function reconcileAutomationStateInState(state, input = {}) {
     const updatedAt = Date.parse(task.updatedAt || task.createdAt || "");
     if (Number.isFinite(updatedAt) && nowMs - updatedAt < orphanGraceMs) continue;
 
-    task.status = "queued";
     task.assignedAgentRole = "";
     task.assignedThreadId = "";
     task.reviewerThreadId = "";
     task.retryNotBefore = "";
     task.updatedAt = now;
+    applyStoreLifecycleTransition(state, task, "queued", { action: "recover_workflow", now, nowMs });
     recordRecovery(
       state,
       task,
@@ -2682,10 +2793,13 @@ export function resetAutomationCircuitInState(state, input = {}) {
       : VALID_STATUSES.has(task.automationBlocker?.resumeStatus)
         ? task.automationBlocker.resumeStatus
         : "queued";
-    task.status = resumeStatus;
     task.assignedAgentRole = actual?.assignedAgentRole || "";
     task.retryNotBefore = "";
     delete task.automationBlocker;
+    applyStoreLifecycleTransition(state, task, resumeStatus, {
+      action: task.status === "blocked" ? "resume_workflow" : "recover_workflow",
+      now,
+    });
     state.comments = state.comments || [];
     addAutomationComment(
       state,
@@ -2860,6 +2974,9 @@ export function currentReviewCandidateCycle(task) {
 }
 
 export function reviewMatchesCurrentCandidate(task, review) {
+  if (review?.invalidatedAt || review?.invalidation) return false;
+  const invalidatedIds = new Set((task.evidenceInvalidations || []).flatMap((entry) => entry.invalidationIds || []));
+  if (invalidatedIds.has(review?.id)) return false;
   const reviewCycle = currentReviewCycle(task);
   if (Number(review?.cycle || 0) !== reviewCycle) return false;
   if (!task.reviewSubjectSha) {
@@ -3016,21 +3133,26 @@ function addAutomationComment(state, task, body, now, author = "StudioOps Automa
   return true;
 }
 
-function setTaskWorkflowState(state, task, patch, now) {
+function setTaskWorkflowState(state, task, patch, now, options = {}) {
+  const aggregateBeforePatch = structuredClone(task);
   const previousStatus = task.status;
   for (const [key, value] of Object.entries(patch)) {
+    if (key === "status") continue;
     task[key] = value;
   }
-  if (patch.status === "builder_review" && previousStatus !== "builder_review") {
-    task.reviewCycle = Number(task.reviewCycle || 0) + 1;
-    task.reviewSubjectSha = "";
-    task.reviewSubjectCycle = Math.max(
-      Number(task.reviewSubjectCycle || 0) + 1,
-      task.reviewCycle,
-    );
-  }
   if (Object.prototype.hasOwnProperty.call(patch, "status") && patch.status !== previousStatus) {
-    task.stateVersion = positiveStateVersion(task.stateVersion) + 1;
+    applyStoreLifecycleTransition(state, task, patch.status, {
+      ...options,
+      now,
+      evidence: { ...(options.evidence || {}), targetStatus: patch.status },
+    });
+  } else if (lifecycleEvidenceChanged(aggregateBeforePatch, task)) {
+    applyStoreLifecycleTransition(state, task, task.status, {
+      action: options.action || "mutate_assignment",
+      now,
+      force: true,
+      evidence: options.evidence,
+    });
   }
   task.updatedAt = now;
   state.events.push({
@@ -3091,7 +3213,7 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
       status: firstRequiredStage.status,
       assignedAgentRole: firstRequiredStage.role,
       reviewerThreadId: "",
-    }, now);
+    }, now, { action: "restart_review" });
   }
   for (const run of state.runs || []) {
     if (
@@ -3124,13 +3246,13 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
   });
 }
 
-function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLabel = "ready for owner review") {
+function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLabel = "ready for owner review", transitionOptions = {}) {
   if (task.status !== "user_review" || task.assignedAgentRole !== "owner") {
     setTaskWorkflowState(state, task, {
       status: "user_review",
       assignedAgentRole: "owner",
       reviewerThreadId: "",
-    }, now);
+    }, now, transitionOptions);
   }
   addAutomationComment(state, task, body, now, author);
   state.events.push({
@@ -3209,7 +3331,10 @@ function routeChangesRequestedInState(state, task, project, stage, now, author, 
         status: leadStage.status,
         assignedAgentRole: leadStage.role,
         reviewerThreadId: "",
-      }, now);
+      }, now, {
+        action: "route_review",
+        evidence: { gateOverride: "cycle_limit_lead_decision" },
+      });
       addAutomationComment(
         state,
         task,
@@ -3230,6 +3355,7 @@ function routeChangesRequestedInState(state, task, project, stage, now, author, 
         `${stageLabel} requested changes after the configured ${policy.maxBuilderReviewCycles}-cycle builder review limit. Human owner review is required for the final call; this was not auto-approved.`,
         actions,
         "lead requested human owner decision after review limit",
+        { action: "escalate_cycle_limit_owner_review" },
       );
     }
   }
@@ -3316,7 +3442,7 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
         status: "needs_changes",
         assignedAgentRole: "builder",
         reviewerThreadId: "",
-      }, now);
+      }, now, { action: "reject_builder_intake" });
       const intakeMessage = exactSubjectMissing
         ? "Builder review failed intake: task needs a feature branch and exact full subject SHA before reviewers can start."
         : requiresVerifiedCandidateIdentity
