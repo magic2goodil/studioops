@@ -1,4 +1,5 @@
 import {
+  applyLifecycleTransitionInState,
   architectureIsCompleteInState,
   cycleLimitLeadReviewApplies,
   currentReviewCandidateCycle,
@@ -105,6 +106,40 @@ function taskStatusFor(action) {
     return "queued";
   }
   return action.nextStatus || "";
+}
+
+function applyDispatchLifecycle(state, task, action, targetStatus, now) {
+  if (!targetStatus || targetStatus === task.status) return true;
+  // Imported pre-lifecycle review fixtures can lack the immutable subject that
+  // the authoritative matrix requires. Preserve that narrow compatibility
+  // path; every versioned/current review route goes through the matrix below.
+  if (REVIEW_ACTIONS.has(action.type) && (!task.reviewSubjectSha || !currentReviewCandidateCycle(task))) {
+    return false;
+  }
+  const lifecycleAction = action.type === "unblock_task"
+    ? "resume_workflow"
+    : action.type === "start_architecture"
+      ? "require_architecture"
+      : REVIEW_ACTIONS.has(action.type)
+        ? "route_review"
+        : "queue_task";
+  applyLifecycleTransitionInState(state, {
+    action: lifecycleAction,
+    taskId: task.id,
+    expectedStateVersion: Number(task.stateVersion || 1),
+    actorContext: {
+      actorId: "studioops-dispatcher",
+      actorType: "system",
+      role: "workflow-engine",
+      trusted: true,
+    },
+    evidence: {
+      targetStatus,
+      candidateCycle: currentReviewCandidateCycle(task),
+      subjectSha: task.reviewSubjectSha || "",
+    },
+  }, { now, nowMs: Date.parse(now) });
+  return true;
 }
 
 function dispatchKeyFor(task, action) {
@@ -941,7 +976,9 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       runs.push(run);
 
       const nextStatus = taskStatusFor(item.action);
-      if (nextStatus) task.status = nextStatus;
+      if (!applyDispatchLifecycle(state, task, item.action, nextStatus, now) && nextStatus) {
+        task.status = nextStatus;
+      }
       task.assignedAgentRole = run.role;
       task.retryNotBefore = "";
       task.updatedAt = now;

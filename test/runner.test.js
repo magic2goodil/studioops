@@ -22,9 +22,10 @@ import {
   runGitHubRemoteRecoveryProbes,
   runWorkspaceCleanup,
   runQueuedRuns,
+  sdkClientOptions,
 } from "../src/runner.js";
 import { materializeLocalCandidate } from "../src/workspace.js";
-import { eligibleRunWorkspaceSnapshotsInState } from "../src/store.js";
+import { eligibleRunWorkspaceSnapshotsInState, submitBuilderHandoff } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -142,6 +143,16 @@ function builderRun(patch = {}) {
     branchName: "codex/demo-task",
     prUrl: "https://github.com/example/repo/pull/12",
     ...patch,
+  };
+}
+
+function fakeGitHubAppAuth() {
+  return {
+    token: "fake",
+    askpassPath: "",
+    role: "builder",
+    app: { appId: "12345", slug: "studioops-builder", name: "StudioOps Builder" },
+    installationId: "98765",
   };
 }
 
@@ -296,6 +307,101 @@ test("runner claim is the transition from queued to in progress", async () => {
   assert.equal(claimed.length, 1);
   assert.equal(state.runs[0].status, "running");
   assert.equal(state.tasks[0].status, "in_progress");
+  assert.equal(state.tasks[0].stateVersion, 2);
+  assert.equal(state.events.find((event) => event.type === "lifecycle_transition")?.action, "start_builder");
+  assert.ok(claimed[0].workflowCapabilitySecret.length >= 32);
+  assert.match(state.runs[0].workflowCapability.hash, /^[0-9a-f]{64}$/);
+  assert.deepEqual(state.runs[0].workflowCapability.scopes, ["builder.handoff", "worker.recover"]);
+  assert.equal(JSON.stringify(state).includes(claimed[0].workflowCapabilitySecret), false);
+});
+
+async function claimedBuilderCapability() {
+  const state = fixtureState({
+    status: "queued",
+    integrationStatus: "",
+    assignedAgentRole: "builder",
+    stateVersion: 1,
+  }, {
+    actionType: "start_builder",
+    integrationStatus: "",
+  });
+  state.projects[0].workflowMode = "local";
+  const [claim] = await claimRuns({
+    state,
+    limit: 1,
+    nowMs: Date.parse("2026-08-17T12:00:00.000Z"),
+    capabilityTtlMs: 60 * 60 * 1000,
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "local",
+      originUrl: "",
+      baseRef: "HEAD",
+      baseCommit: "test-commit",
+    }),
+  });
+  return { state, claim };
+}
+
+test("builder capability is one-time and bound to task, role, assignment, run, lease, version, cycle, SHA, and expiry", async () => {
+  const attacks = [
+    ["wrong task", ({ input }) => { input.taskId = "task_other"; }],
+    ["wrong role", ({ input }) => { input.role = "backend-reviewer"; }],
+    ["wrong run", ({ input }) => { input.runId = "run_other"; }],
+    ["stale lease", ({ input }) => { input.leaseId = "lease_other"; }],
+    ["reassigned", ({ state }) => { state.tasks[0].assignedAgentRole = "backend-reviewer"; }],
+    ["stale version", ({ state }) => { state.tasks[0].stateVersion += 1; }],
+    ["wrong cycle", ({ state }) => { state.tasks[0].reviewSubjectCycle = 7; }],
+    ["wrong SHA", ({ state }) => { state.tasks[0].reviewSubjectSha = "b".repeat(40); }],
+    ["expired token", ({ state }) => { state.runs[0].workflowCapability.expiresAt = "2026-08-17T11:59:59.000Z"; }],
+  ];
+
+  for (const [label, attack] of attacks) {
+    const { state, claim } = await claimedBuilderCapability();
+    const input = {
+      state,
+      capabilitySecret: claim.workflowCapabilitySecret,
+      taskId: "task_1",
+      subjectSha: "a".repeat(40),
+      branchName: "codex/task-1",
+      nowMs: Date.parse("2026-08-17T12:01:00.000Z"),
+    };
+    attack({ state, input });
+    const before = structuredClone(state);
+    await assert.rejects(
+      submitBuilderHandoff(input.taskId, input),
+      /Workflow capability rejected|Unknown task/,
+      label,
+    );
+    assert.deepEqual(state, before, `${label} must not mutate state`);
+  }
+
+  const { state, claim } = await claimedBuilderCapability();
+  const input = {
+    state,
+    capabilitySecret: claim.workflowCapabilitySecret,
+    subjectSha: "a".repeat(40),
+    branchName: "codex/task-1",
+    nowMs: Date.parse("2026-08-17T12:01:00.000Z"),
+  };
+  const task = await submitBuilderHandoff("task_1", input);
+  assert.equal(task.status, "builder_review");
+  assert.equal(task.stateVersion, 3);
+  assert.equal(state.runs[0].workflowCapability.consumedScope, "builder.handoff");
+  const afterSuccess = structuredClone(state);
+  await assert.rejects(submitBuilderHandoff("task_1", input), /already consumed/);
+  assert.deepEqual(state, afterSuccess, "replay must not mutate state");
+});
+
+test("SDK child environment receives the workflow capability without persisting it in options metadata", () => {
+  const secret = "workflow-capability-secret-value-1234567890";
+  const options = sdkClientOptions({
+    workflowMode: "local",
+    workflowCapabilitySecret: secret,
+    allowApiKeyAuth: false,
+  });
+  assert.equal(options.env.STUDIOOPS_WORKFLOW_CAPABILITY, secret);
+  assert.equal(options.env.OPENAI_API_KEY, undefined);
+  assert.equal(options.env.CODEX_API_KEY, undefined);
 });
 
 test("an SDK infrastructure error fails over to codex-cli without waiting for owner repair", () => {
@@ -713,7 +819,7 @@ test("github preflight validates credentials and remote access without using a r
     }, {
       prepareGitHubAppAuth: async () => {
         authCalls += 1;
-        return { token: "fake", askpassPath: "" };
+        return fakeGitHubAppAuth();
       },
       checkGitHubRemote: async () => { remoteCalls += 1; },
       cleanupGitHubAppAuth: async () => { cleanupCalls += 1; },
@@ -729,7 +835,7 @@ test("github preflight validates credentials and remote access without using a r
   }
 });
 
-test("github preflight prefers verified inherited SSH and gh credentials over GitHub App auth", async () => {
+test("github preflight preserves inherited SSH transport while binding GitHub App actor identity", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-github-ssh-first-"));
   try {
     const repoPath = await createRepository(root);
@@ -743,15 +849,18 @@ test("github preflight prefers verified inherited SSH and gh credentials over Gi
       checkInheritedGitHubCredentials: async () => { inheritedCalls += 1; },
       prepareGitHubAppAuth: async () => {
         appCalls += 1;
-        throw new Error("GitHub App auth must not run after inherited SSH succeeds.");
+        return fakeGitHubAppAuth();
       },
+      cleanupGitHubAppAuth: async () => {},
     });
 
     assert.equal(result.ok, true);
     assert.equal(result.workflowMode, "github");
     assert.equal(result.gitAuthStrategy, "inherited-ssh");
     assert.equal(inheritedCalls, 1);
-    assert.equal(appCalls, 0);
+    assert.equal(appCalls, 1);
+    assert.equal(result.actorIdentity.appId, "12345");
+    assert.equal(result.actorIdentity.installationId, "98765");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -775,7 +884,7 @@ test("github preflight falls back to GitHub App auth when inherited SSH or gh ac
       },
       prepareGitHubAppAuth: async () => {
         appCalls += 1;
-        return { token: "fake", askpassPath: "" };
+        return fakeGitHubAppAuth();
       },
       checkGitHubRemote: async () => { remoteCalls += 1; },
       cleanupGitHubAppAuth: async () => {},

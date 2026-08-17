@@ -18,6 +18,7 @@ import {
   resetAutomationCircuit,
   resumeOperatorAutomation,
   setOperatorPause,
+  submitBuilderHandoff,
   updateProject,
   updateTask,
   updateRun,
@@ -50,6 +51,12 @@ import {
 } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
+
+function workflowCapability() {
+  const secret = String(process.env.STUDIOOPS_WORKFLOW_CAPABILITY || "");
+  if (!secret) throw new Error("This worker action requires the issued run-scoped workflow capability.");
+  return secret;
+}
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -423,7 +430,8 @@ Commands:
                                 Idempotently add required StudioOps standards
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
-  status TASK_ID --status       Mutate task status (builder_review also requires --subject-sha FULL_SHA)
+  status TASK_ID --status       Owner/operator lifecycle override; unavailable inside worker runs
+  builder-handoff TASK_ID       Submit exact builder evidence using the issued run capability
   comment TASK_ID --body        Add a builder/reviewer comment
   architecture-complete TASK   Record the architecture decision and implementation task graph
   review TASK_ID --stage        Record approved, skipped, or changes_requested
@@ -484,7 +492,7 @@ Automation:
   studioops automation-pause --reason "Incident investigation"
   studioops automation-resume --reason "Database and workers verified"
   studioops circuit-reset --task task_101 --expected-opened-at 2026-01-01T00:00:00.000Z --reason "Credentials verified"
-  studioops status task_1 --status builder_review --subject-sha SHA --tree-sha TREE --base-sha BASE --branch feature/x --impact-files src/x.js
+  studioops builder-handoff task_1 --subject-sha SHA --tree-sha TREE --base-sha BASE --branch feature/x --pr-url URL --impact-files src/x.js
   studioops supervisor --json
   studioops dispatcher --plan
   studioops runner --plan
@@ -796,6 +804,9 @@ Automation:
   if (command === "update-task") {
     const taskId = args._[1];
     const patch = {};
+    if (process.env.STUDIOOPS_WORKFLOW_CAPABILITY && Object.prototype.hasOwnProperty.call(args, "status")) {
+      throw new Error("Worker runs cannot mutate status through update-task; use the named run-scoped action command.");
+    }
     if (Object.prototype.hasOwnProperty.call(args, "status")) patch.status = args.status;
     if (Object.prototype.hasOwnProperty.call(args, "branch")) patch.branchName = args.branch;
     if (Object.prototype.hasOwnProperty.call(args, "branch-name")) patch.branchName = args["branch-name"];
@@ -849,6 +860,9 @@ Automation:
   }
 
   if (command === "status") {
+    if (process.env.STUDIOOPS_WORKFLOW_CAPABILITY) {
+      throw new Error("Worker runs cannot use generic status; use builder-handoff, architecture-complete, or review.");
+    }
     const taskId = args._[1];
     if (!taskId || !Object.prototype.hasOwnProperty.call(args, "status") || typeof args.status !== "string" || !args.status.trim()) {
       throw new Error("Usage: status TASK_ID --status CANONICAL_STATUS (status is a mutation; use show-task TASK_ID for read-only inspection)");
@@ -883,6 +897,27 @@ Automation:
     return;
   }
 
+  if (command === "builder-handoff") {
+    const taskId = args._[1];
+    if (!taskId) throw new Error("Usage: builder-handoff TASK_ID --subject-sha FULL_SHA --branch BRANCH [--pr-url URL]");
+    const candidateIdentity = {};
+    if (Object.prototype.hasOwnProperty.call(args, "tree-sha")) candidateIdentity.treeSha = args["tree-sha"];
+    if (Object.prototype.hasOwnProperty.call(args, "base-sha")) candidateIdentity.baseSha = args["base-sha"];
+    const task = await submitBuilderHandoff(taskId, {
+      capabilitySecret: workflowCapability(),
+      subjectSha: args["subject-sha"] || args.sha,
+      branchName: args.branch || args["branch-name"],
+      prUrl: args.pr || args["pr-url"],
+      candidateIdentity,
+      impactEvidence: {
+        changedFiles: normalizeList(args["impact-files"]),
+        impact: normalizeList(args.impact),
+      },
+    });
+    console.log(`${task.id} -> ${task.status} at ${task.reviewSubjectSha}`);
+    return;
+  }
+
   if (command === "comment") {
     const taskId = args._[1];
     const comment = await addComment(taskId, args.body, args.author || "Codex Builder");
@@ -896,6 +931,7 @@ Automation:
       body: args.body || args.summary,
       taskIds: args["task-ids"] || args.tasks,
       author: args.author,
+      capabilitySecret: workflowCapability(),
     });
     console.log(`Architecture completed for ${task.id}: ${task.status}`);
     return;
@@ -910,6 +946,7 @@ Automation:
       author: args.author,
       subjectSha: args["subject-sha"] || args.sha,
       candidateCycle: args["candidate-cycle"] || args.cycle,
+      capabilitySecret: workflowCapability(),
     });
     console.log(`Recorded review ${result.review.id}: ${result.review.stageKey} -> ${result.review.outcome}`);
     for (const action of result.actions || []) console.log(`- ${action}`);
