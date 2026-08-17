@@ -1078,6 +1078,75 @@ label {
   text-transform: uppercase;
 }
 
+.remediation-section {
+  margin-bottom: 16px;
+  border-color: rgba(255, 190, 92, 0.24);
+  background: rgba(255, 190, 92, 0.055);
+}
+
+.remediation-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  color: var(--muted);
+}
+
+.remediation-meta code,
+.remediation-history code {
+  overflow-wrap: anywhere;
+}
+
+.remediation-findings {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0 0;
+  padding-left: 24px;
+}
+
+.remediation-finding {
+  padding: 12px 14px;
+  border-left: 3px solid rgba(255, 190, 92, 0.72);
+  border-radius: 0 12px 12px 0;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.remediation-finding.severity-critical,
+.remediation-finding.severity-high {
+  border-left-color: var(--coral);
+}
+
+.remediation-finding > div {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 12px;
+}
+
+.remediation-finding strong {
+  text-transform: uppercase;
+}
+
+.remediation-finding span,
+.remediation-history {
+  color: var(--muted);
+}
+
+.remediation-finding p {
+  margin-bottom: 0;
+  white-space: pre-wrap;
+}
+
+.remediation-history {
+  margin-top: 16px;
+}
+
+.remediation-history ul {
+  display: grid;
+  gap: 8px;
+  padding-left: 22px;
+}
+
 .section-heading {
   display: flex;
   justify-content: space-between;
