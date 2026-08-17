@@ -637,6 +637,20 @@ test("slow mutation preparation does not hold the SQLite write lock", async () =
     const state = readPersistedState(root);
     assert.equal(state.meta.slowMutationCompleted, true);
     assert.equal(state.comments.some((comment) => comment.body === "fast writer"), true);
+    const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
+    try {
+      const timing = db.prepare(`
+        SELECT wait_ms, duration_ms
+        FROM database_contention_events
+        WHERE operation_name = 'test.slow_prepare'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get();
+      assert.ok(Number(timing.duration_ms) >= 700);
+      assert.ok(Number(timing.wait_ms) < 600, `lock wait incorrectly included ${timing.wait_ms}ms of preparation`);
+    } finally {
+      db.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

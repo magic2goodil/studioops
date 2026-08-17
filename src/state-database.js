@@ -168,6 +168,7 @@ function openDatabase() {
       operation_name TEXT NOT NULL,
       outcome TEXT NOT NULL,
       wait_ms INTEGER NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
       retry_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
@@ -185,6 +186,12 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_database_contention_created ON database_contention_events(created_at);
   `);
+  const contentionColumns = new Set(
+    database.prepare("PRAGMA table_info(database_contention_events)").all().map((column) => column.name),
+  );
+  if (!contentionColumns.has("duration_ms")) {
+    database.exec("ALTER TABLE database_contention_events ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0");
+  }
   return database;
 }
 
@@ -223,13 +230,14 @@ function sleep(milliseconds) {
 function recordContentionEvent(db, input = {}) {
   const createdAt = new Date().toISOString();
   db.prepare(`
-    INSERT INTO database_contention_events(id, operation_name, outcome, wait_ms, retry_count, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO database_contention_events(id, operation_name, outcome, wait_ms, duration_ms, retry_count, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     randomUUID(),
     boundedOperationName(input.operationName),
     String(input.outcome || "committed").slice(0, 40),
     Math.max(0, Math.round(Number(input.waitMs) || 0)),
+    Math.max(0, Math.round(Number(input.durationMs) || 0)),
     Math.max(0, Math.floor(Number(input.retryCount) || 0)),
     createdAt,
   );
@@ -1209,6 +1217,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
   const retryPolicy = mutationRetryPolicy(options);
   const startedAt = Date.now();
   let retryCount = 0;
+  let lockWaitMs = 0;
 
   while (true) {
     const { state, version: expectedVersion } = readStateSnapshot(db);
@@ -1230,7 +1239,12 @@ export async function mutateDatabaseState(mutator, options = {}) {
 
     let transactionStarted = false;
     try {
-      db.exec("BEGIN IMMEDIATE");
+      const lockAttemptStartedAt = Date.now();
+      try {
+        db.exec("BEGIN IMMEDIATE");
+      } finally {
+        lockWaitMs += Date.now() - lockAttemptStartedAt;
+      }
       transactionStarted = true;
       const currentVersion = Number(
         db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
@@ -1252,7 +1266,8 @@ export async function mutateDatabaseState(mutator, options = {}) {
       recordContentionEvent(db, {
         operationName,
         outcome: "committed",
-        waitMs: Date.now() - startedAt,
+        waitMs: lockWaitMs,
+        durationMs: Date.now() - startedAt,
         retryCount,
       });
       db.exec("COMMIT");
@@ -1283,12 +1298,14 @@ export async function databaseContentionHealth(input = {}) {
       coalesce(sum(retry_count), 0) AS retry_count,
       coalesce(max(wait_ms), 0) AS max_wait_ms,
       coalesce(round(avg(wait_ms)), 0) AS average_wait_ms,
+      coalesce(max(duration_ms), 0) AS max_duration_ms,
+      coalesce(round(avg(duration_ms)), 0) AS average_duration_ms,
       max(created_at) AS last_operation_at
     FROM database_contention_events
     WHERE created_at >= ?
   `).get(cutoff);
   const recent = db.prepare(`
-    SELECT operation_name, outcome, wait_ms, retry_count, created_at
+    SELECT operation_name, outcome, wait_ms, duration_ms, retry_count, created_at
     FROM database_contention_events
     WHERE created_at >= ? AND (retry_count > 0 OR wait_ms >= ?)
     ORDER BY created_at DESC
@@ -1300,11 +1317,14 @@ export async function databaseContentionHealth(input = {}) {
     retryCount: Number(aggregate.retry_count || 0),
     maxWaitMs: Number(aggregate.max_wait_ms || 0),
     averageWaitMs: Number(aggregate.average_wait_ms || 0),
+    maxDurationMs: Number(aggregate.max_duration_ms || 0),
+    averageDurationMs: Number(aggregate.average_duration_ms || 0),
     lastOperationAt: aggregate.last_operation_at || "",
     recent: recent.map((event) => ({
       operation: event.operation_name,
       outcome: event.outcome,
       waitMs: Number(event.wait_ms || 0),
+      durationMs: Number(event.duration_ms || 0),
       retries: Number(event.retry_count || 0),
       createdAt: event.created_at,
     })),
