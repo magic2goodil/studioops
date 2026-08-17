@@ -7,7 +7,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { maintenanceWriteBlocker } from "../src/state-database.js";
+import { compactOperationalHistory, maintenanceWriteBlocker } from "../src/state-database.js";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
 import { readPersistedState } from "./state-database-helper.js";
@@ -59,6 +59,23 @@ function baseState() {
     qaBundles: [],
   };
 }
+
+test("terminal run retention preserves configured attempt-budget evidence", () => {
+  const state = baseState();
+  state.runs = Array.from({ length: 7 }, (_, index) => ({
+    id: `run_budget_${index + 1}`,
+    taskId: "task_1",
+    actionType: "start_builder",
+    role: "builder",
+    status: "failed",
+    maxAttempts: 5,
+  }));
+
+  const archived = compactOperationalHistory(state);
+  assert.equal(state.runs.length, 6);
+  assert.equal(archived.runs.length, 1);
+  assert.equal(state.runs.every((run) => run.maxAttempts === 5), true);
+});
 
 test("workspace retention eligibility is age bounded, ordered, and protects active or unsafe paths", () => {
   const root = "/tmp/studioops-run-workspaces";
@@ -1078,6 +1095,15 @@ test("SQLite archives excess machine QA history without compacting human comment
       createdAt: new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
     }));
     state.comments = [...machineComments];
+    state.comments.push(...Array.from({ length: 18 }, (_, index) => ({
+      id: `comment_runner_${index + 1}`,
+      taskId: "task_1",
+      author: "StudioOps Runner",
+      systemGenerated: true,
+      kind: "run_update",
+      body: `Runner update ${index + 1}`,
+      createdAt: new Date(Date.UTC(2026, 6, 1, 3, index)).toISOString(),
+    })));
     state.comments.splice(5, 0, {
       id: "comment_human",
       taskId: "task_1",
@@ -1148,7 +1174,8 @@ test("SQLite archives excess machine QA history without compacting human comment
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
 
     let persisted = readPersistedState(root);
-    assert.equal(persisted.comments.filter((item) => item.id !== "comment_human").length, 20);
+    assert.equal(persisted.comments.filter((item) => item.id !== "comment_human").length, 32);
+    assert.equal(persisted.comments.filter((item) => item.kind === "run_update").length, 12);
     assert.equal(persisted.comments.filter((item) => item.id === "comment_human").length, 1);
     assert.equal(persisted.events.filter((item) => item.type === "qa_integration_blocked").length, 40);
     assert.equal(persisted.runs.filter((item) => item.status === "cancelled").length, 2);
@@ -1160,7 +1187,7 @@ test("SQLite archives excess machine QA history without compacting human comment
     assert.equal((await stat(backupPath)).mode & 0o777, 0o600);
     const backupDb = new DatabaseSync(backupPath, { readOnly: true });
     try {
-      assert.equal(backupDb.prepare("SELECT count(*) count FROM comments").get().count, 31);
+      assert.equal(backupDb.prepare("SELECT count(*) count FROM comments").get().count, 49);
       assert.equal(backupDb.prepare("SELECT count(*) count FROM events").get().count, 50);
     } finally {
       backupDb.close();
@@ -1192,7 +1219,9 @@ test("SQLite archives excess machine QA history without compacting human comment
       });
     `);
     persisted = readPersistedState(root);
-    assert.equal(persisted.comments.filter((item) => item.id !== "comment_human").length, 20);
+    assert.equal(persisted.comments.filter((item) => item.kind === "qa_integration").length, 5);
+    assert.equal(persisted.comments.filter((item) => item.kind === "run_update").length, 12);
+    assert.equal(persisted.comments.filter((item) => item.id !== "comment_human" && item.id.startsWith("comment_") && !item.kind).length, 15);
     assert.equal(persisted.comments.filter((item) => item.id === "comment_human").length, 1);
     assert.equal(persisted.events.filter((item) => item.type === "qa_integration_blocked").length, 40);
 
@@ -1202,7 +1231,7 @@ test("SQLite archives excess machine QA history without compacting human comment
         .all()
         .map((row) => ({ ...row }));
       assert.deepEqual(archived, [
-        { entity_type: "comments", count: 15 },
+        { entity_type: "comments", count: 21 },
         { entity_type: "events", count: 15 },
         { entity_type: "runs", count: 8 },
       ]);
