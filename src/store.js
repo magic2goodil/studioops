@@ -352,7 +352,6 @@ export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
       completedAt: run.completedAt || run.updatedAt,
       ageHours,
       logicalBytes: verifiedBytes ?? 0,
-      sortBytes: verifiedBytes ?? (Number(run.workspaceBytes || run.logicalBytes || 0) || 0),
       verified: verifiedBytes !== null,
       retentionEligible,
       pressureEligible,
@@ -362,10 +361,7 @@ export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
     });
   }
   return candidates.sort((a, b) => (
-    (capacityPressure || pressure
-      ? (b.verified ? b.logicalBytes : 0) - (a.verified ? a.logicalBytes : 0)
-      : a.sortBytes - b.sortBytes)
-    || a.completedAt.localeCompare(b.completedAt)
+    a.completedAt.localeCompare(b.completedAt)
     || a.runId.localeCompare(b.runId)
   ));
 }
@@ -419,10 +415,10 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
       remainingExcess = Math.max(0, remainingExcess - item.logicalBytes);
     }
   }
-  const ids = new Set(selected.slice(0, maximumClaims).map((item) => item.runId));
   const candidates = [];
-  for (const run of state.runs || []) {
-    if (!ids.has(run.id)) continue;
+  for (const snapshot of selected.slice(0, maximumClaims)) {
+    const run = (state.runs || []).find((item) => item.id === snapshot.runId);
+    if (!run) continue;
     run.workspaceCleanup = { state: "claimed", leaseId, claimedAt: now, leaseExpiresAt: expiresAt };
     candidates.push(structuredClone(run));
   }
