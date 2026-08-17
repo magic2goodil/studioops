@@ -7,6 +7,8 @@ const MAX_TEXT = 512;
 const DEFAULT_LEASE_TTL_MS = 30_000;
 const MIN_LEASE_TTL_MS = 1_000;
 const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1_000;
+const MIN_LEASE_DETAIL_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const MIN_OPERATION_EVIDENCE_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 const SECRET_PATTERN = /\b(?:authorization|bearer|password|passwd|secret|token|api[_-]?key|private[-_ ]?key)\s*[:=]/i;
 const SENSITIVE_KEY_PATTERN = /(?:authorization|bearer|password|passwd|secret|token|api[_-]?key|private[-_ ]?key)/i;
 
@@ -76,6 +78,14 @@ function boundedTtl(value) {
     throw new Error(`leaseTtlMs must be between ${MIN_LEASE_TTL_MS} and ${MAX_LEASE_TTL_MS}.`);
   }
   return ttl;
+}
+
+function boundedRetention(value, minimum, label) {
+  const retention = Number(value ?? minimum);
+  if (!Number.isSafeInteger(retention) || retention < minimum) {
+    throw new Error(`${label} must be at least ${minimum} milliseconds.`);
+  }
+  return retention;
 }
 
 function assertSafeEvidence(value, path = "evidence") {
@@ -337,8 +347,18 @@ export const releaseLease = releaseResourceLease;
 
 export async function compactCoordinationHistory(input = {}) {
   const nowMs = coordinatorNow();
-  const leaseCutoff = iso(nowMs - Number(input.leaseDetailRetentionMs ?? 30 * 24 * 60 * 60 * 1_000));
-  const operationCutoff = iso(nowMs - Number(input.operationEvidenceRetentionMs ?? 90 * 24 * 60 * 60 * 1_000));
+  const leaseRetentionMs = boundedRetention(
+    input.leaseDetailRetentionMs,
+    MIN_LEASE_DETAIL_RETENTION_MS,
+    "leaseDetailRetentionMs",
+  );
+  const operationRetentionMs = boundedRetention(
+    input.operationEvidenceRetentionMs,
+    MIN_OPERATION_EVIDENCE_RETENTION_MS,
+    "operationEvidenceRetentionMs",
+  );
+  const leaseCutoff = iso(nowMs - leaseRetentionMs);
+  const operationCutoff = iso(nowMs - operationRetentionMs);
   return transaction((db) => {
     const leases = db.prepare("UPDATE coordination_leases SET detail_json = '{}' WHERE status <> 'active' AND terminal_at <> '' AND terminal_at < ? AND detail_json <> '{}' ").run(leaseCutoff);
     const operations = db.prepare("UPDATE external_operations SET evidence_json = '{}' WHERE status <> 'prepared' AND terminal_at <> '' AND terminal_at < ? AND evidence_json <> '{}' ").run(operationCutoff);

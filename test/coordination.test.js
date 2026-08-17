@@ -341,3 +341,63 @@ test("coordination migration rolls schema and metadata back after an injected fa
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("coordination history compaction enforces audit retention floors", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-coordination-retention-"));
+  try {
+    await seedAggregate(root);
+    const initialClock = Date.parse("2026-01-01T00:00:00.000Z");
+    const created = JSON.parse((await run(root, `
+      import { claimLease, prepareExternalOperation, completeExternalOperation, releaseLease } from ${JSON.stringify(coordinationUrl)};
+      import { ensureStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+      const base = ${JSON.stringify(args(root))};
+      const lease = (await claimLease(base)).lease;
+      const operation = await prepareExternalOperation({ ...base, ...lease, operationKey: "retained", kind: "write", requestDigest: "sha256:retained", subject: "subject-1", expectedRemoteState: "etag-1" });
+      await completeExternalOperation({ ...base, ...lease, operationKey: operation.operationKey, requestDigest: operation.requestDigest, evidence: { remoteState: "etag-2" } });
+      await releaseLease({ ...base, ...lease });
+      const db = await ensureStateDatabase();
+      db.prepare("UPDATE coordination_leases SET detail_json = ? WHERE lease_id = ?").run(JSON.stringify({ reason: "released" }), lease.leaseId);
+      console.log(JSON.stringify({ leaseId: lease.leaseId }));
+    `, initialClock)).stdout.trim());
+
+    const tooEarly = JSON.parse((await run(root, `
+      import { compactCoordinationHistory } from ${JSON.stringify(coordinationUrl)};
+      import { ensureStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+      let leaseFloorError = "";
+      let operationFloorError = "";
+      try { await compactCoordinationHistory({ leaseDetailRetentionMs: 0 }); } catch (error) { leaseFloorError = error.message; }
+      try { await compactCoordinationHistory({ operationEvidenceRetentionMs: -1 }); } catch (error) { operationFloorError = error.message; }
+      const db = await ensureStateDatabase();
+      console.log(JSON.stringify({
+        leaseFloorError,
+        operationFloorError,
+        result: await compactCoordinationHistory(),
+        leaseDetail: db.prepare("SELECT detail_json FROM coordination_leases WHERE lease_id = ?").get(${JSON.stringify(created.leaseId)}).detail_json,
+        operationEvidence: db.prepare("SELECT evidence_json FROM external_operations WHERE operation_key = 'retained'").get().evidence_json,
+      }));
+    `, initialClock + 29 * 24 * 60 * 60 * 1_000)).stdout.trim());
+    assert.match(tooEarly.leaseFloorError, /at least/);
+    assert.match(tooEarly.operationFloorError, /at least/);
+    assert.deepEqual(tooEarly.result, { compactedLeases: 0, compactedOperations: 0 });
+    assert.notEqual(tooEarly.leaseDetail, "{}");
+    assert.notEqual(tooEarly.operationEvidence, "{}");
+
+    const leaseEligible = JSON.parse((await run(root, `
+      import { compactCoordinationHistory } from ${JSON.stringify(coordinationUrl)};
+      console.log(JSON.stringify(await compactCoordinationHistory()));
+    `, initialClock + 31 * 24 * 60 * 60 * 1_000)).stdout.trim());
+    assert.deepEqual(leaseEligible, { compactedLeases: 1, compactedOperations: 0 });
+
+    const operationEligible = JSON.parse((await run(root, `
+      import { compactCoordinationHistory } from ${JSON.stringify(coordinationUrl)};
+      import { ensureStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+      const result = await compactCoordinationHistory();
+      const db = await ensureStateDatabase();
+      console.log(JSON.stringify({ result, evidence: db.prepare("SELECT evidence_json FROM external_operations WHERE operation_key = 'retained'").get().evidence_json }));
+    `, initialClock + 91 * 24 * 60 * 60 * 1_000)).stdout.trim());
+    assert.deepEqual(operationEligible.result, { compactedLeases: 0, compactedOperations: 1 });
+    assert.equal(operationEligible.evidence, "{}");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
