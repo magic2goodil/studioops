@@ -2206,7 +2206,9 @@ export async function updateTask(taskId, patch) {
         );
       }
     }
-    const candidateIdentityMateriallyChanged = previousReviewSubjectSha
+    const candidateIdentityMateriallyChanged = !startedBuilderReviewCycle
+      && !["in_progress", "needs_changes"].includes(previousStatus)
+      && previousReviewSubjectSha
       && previousReviewSubjectSha === task.reviewSubjectSha
       && candidateIdentityIsComplete(candidateIdentityBeforePatch)
       && !candidateMaterialMatches(candidateIdentityBeforePatch, candidateIdentityAfterPatch);
