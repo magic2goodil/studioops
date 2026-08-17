@@ -183,6 +183,7 @@ The app reads the first fenced `json studioops-config` block in this file.
     "qaIntegration": {
       "intervalSeconds": 300,
       "validationTimeoutMs": 600000,
+      "githubAppFallbackToLocalAuth": false,
       "syncDefaultBranchIntoIntegration": false,
       "localPreview": {
         "enabled": false,

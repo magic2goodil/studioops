@@ -1207,7 +1207,10 @@ export function planQaIntegrations(state, input = {}) {
       const eligibleTasks = (state.tasks || [])
         .filter((task) => task.projectId === project.id)
         .filter((task) => task.status === "qa_review")
-        .filter((task) => input.force || task.integrationStatus !== "ready");
+        .filter((task) => {
+          if (task.integrationStatus !== "ready") return true;
+          return input.force && explicitTaskFilter.includes(task.id);
+        });
       const taskScoped = eligibleTasks.filter((task) => taskMatches(task, input));
       if (
         !partialRequest
@@ -2079,6 +2082,31 @@ function authFailureProjectResult(projectPlan, error) {
   };
 }
 
+export function githubAppLocalFallbackEnabled(input = {}) {
+  return booleanOption(
+    input.githubAppFallbackToLocalAuth
+      ?? process.env.MISSION_CONTROL_QA_GITHUB_APP_LOCAL_FALLBACK,
+    false,
+  );
+}
+
+export function isGitHubAppPermissionError(error) {
+  return /resource not accessible by integration|installation token.*permission|github app.*permission/i
+    .test(String(error?.message || error || ""));
+}
+
+function localFallbackResultNote(result) {
+  const note = "GitHub App inspection lacked the required read scope; StudioOps retried once with the configured local GitHub identity and no installation-token environment.";
+  return {
+    ...result,
+    output: appendOutput(note, result.output),
+    tasks: (result.tasks || []).map((task) => ({
+      ...task,
+      output: appendOutput(note, task.output),
+    })),
+  };
+}
+
 function validationSummary(result) {
   if (!result.validation?.length) return "";
   return result.validation
@@ -2487,7 +2515,28 @@ export async function runQaIntegration(input = {}) {
         secrets,
       });
     } catch (error) {
-      result = authFailureProjectResult(projectPlan, error);
+      const canFallback = authContext
+        && githubAppLocalFallbackEnabled(input)
+        && isGitHubAppPermissionError(error);
+      if (!canFallback) {
+        result = authFailureProjectResult(projectPlan, error);
+      } else {
+        await cleanupGitHubAppAuth(authContext);
+        authContext = null;
+        try {
+          result = localFallbackResultNote(await integrateProject(projectPlan, {
+            ...input,
+            githubAppAuth: false,
+            env: { ...(input.env || {}) },
+            secrets: normalizeSecrets(input.secrets),
+          }));
+        } catch (fallbackError) {
+          result = authFailureProjectResult(
+            projectPlan,
+            new Error(`GitHub App permission fallback also failed: ${fallbackError.message}`),
+          );
+        }
+      }
     } finally {
       await cleanupGitHubAppAuth(authContext);
     }

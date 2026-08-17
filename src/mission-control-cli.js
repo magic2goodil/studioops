@@ -1015,6 +1015,11 @@ Automation:
       workspaceRoot: args["workspace-root"],
       timeoutMs: args["timeout-ms"],
       githubAppAuth: args["no-github-app-auth"] ? false : args["github-app-auth"],
+      githubAppFallbackToLocalAuth: args["github-app-local-fallback"]
+        ? true
+        : args["no-github-app-local-fallback"]
+          ? false
+          : undefined,
       githubAppCredentialsDir: args["github-apps-dir"],
     };
     if (args.plan || args["dry-run"] || args.dryRun) {

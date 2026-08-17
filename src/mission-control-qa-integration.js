@@ -52,6 +52,11 @@ async function optionsFrom(args) {
     validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
     qaWorkspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
     githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || defaults.githubAppAuth),
+    githubAppFallbackToLocalAuth: args["github-app-local-fallback"]
+      ? true
+      : args["no-github-app-local-fallback"]
+        ? false
+        : defaults.githubAppFallbackToLocalAuth,
     githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir,
     githubAppRole: args["github-app-role"] || defaults.githubAppRole,
     githubAppDefaultRole: args["github-app-default-role"] || defaults.githubAppDefaultRole,

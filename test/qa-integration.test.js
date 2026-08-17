@@ -15,6 +15,8 @@ import {
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
 import {
+  githubAppLocalFallbackEnabled,
+  isGitHubAppPermissionError,
   planQaIntegrations,
   projectPlanHasWork,
   qaResultFingerprint,
@@ -372,7 +374,7 @@ test("review policy Trust Leads settings override stale top-level mirrors", () =
   assert.equal(imported.reviewPolicy.integrationBranch, "qa/imported");
 });
 
-test("QA integration skips already-ready tasks unless forced", () => {
+test("QA integration skips already-ready tasks unless explicitly forced", () => {
   const state = {
     projects: [{
       id: "project_1",
@@ -395,7 +397,12 @@ test("QA integration skips already-ready tasks unless forced", () => {
   };
 
   assert.equal(planQaIntegrations(state, { project: "demo" }).taskCount, 0);
-  assert.equal(planQaIntegrations(state, { project: "demo", force: true }).taskCount, 1);
+  assert.equal(planQaIntegrations(state, { project: "demo", force: true }).taskCount, 0);
+  assert.equal(planQaIntegrations(state, {
+    project: "demo",
+    task: "task_1",
+    force: true,
+  }).taskCount, 1);
 });
 
 test("QA integration honors retry windows for unchanged blocked work", () => {
@@ -466,6 +473,60 @@ test("atomic QA planning cannot silently omit filtered or retry-delayed tasks", 
   assert.equal(deferred.taskCount, 0);
   assert.equal(deferred.projects[0].deferredTaskCount, 2);
   assert.equal(projectPlanHasWork(deferred.projects[0]), false);
+});
+
+test("project-level force does not re-integrate already-ready QA tasks", () => {
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath: "/tmp/demo",
+      defaultBranch: "main",
+      reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/demo" },
+    }],
+    tasks: [
+      {
+        id: "task_ready",
+        projectId: "project_1",
+        title: "Already assembled",
+        status: "qa_review",
+        integrationStatus: "ready",
+        branchName: "codex/ready",
+      },
+      {
+        id: "task_retry",
+        projectId: "project_1",
+        title: "Needs reconciliation",
+        status: "qa_review",
+        integrationStatus: "pr_waiting",
+        branchName: "codex/retry",
+      },
+    ],
+  };
+
+  const projectForce = planQaIntegrations(state, { project: "demo", force: true });
+  assert.deepEqual(projectForce.projects[0].tasks.map((task) => task.id), ["task_retry"]);
+
+  const explicitForce = planQaIntegrations({
+    ...state,
+    tasks: [state.tasks[0]],
+  }, {
+    project: "demo",
+    task: "task_ready",
+    force: true,
+  });
+  assert.deepEqual(explicitForce.projects[0].tasks.map((task) => task.id), ["task_ready"]);
+});
+
+test("GitHub App local fallback is opt-in and limited to permission failures", () => {
+  assert.equal(githubAppLocalFallbackEnabled({}), false);
+  assert.equal(githubAppLocalFallbackEnabled({ githubAppFallbackToLocalAuth: true }), true);
+  assert.equal(
+    isGitHubAppPermissionError(new Error("GraphQL: Resource not accessible by integration")),
+    true,
+  );
+  assert.equal(isGitHubAppPermissionError(new Error("repository validation failed")), false);
 });
 
 test("QA integration plans only an explicitly authorized partial candidate subset", () => {
@@ -1101,6 +1162,7 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
       const report = await runQaIntegration({
         force: true,
+        task: "task_1",
         workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))}
       });
       console.log(JSON.stringify(report));
@@ -1136,6 +1198,7 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
       const report = await runQaIntegration({
         force: true,
+        task: "task_1",
         workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))}
       });
       console.log(JSON.stringify(report));
