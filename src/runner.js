@@ -1,5 +1,5 @@
 import { createWriteStream, existsSync } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, lstat, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,14 @@ import {
   architectureIsCompleteInState,
   claimDueGitHubRemoteRecoveryProbes,
   currentReviewCandidateCycle,
+  claimRunWorkspaceCandidates,
+  claimRunWorkspaceCandidatesInState,
+  eligibleRunWorkspaceSnapshots,
+  eligibleRunWorkspaceSnapshotsInState,
+  finalizeRunWorkspaceCleanup,
+  finalizeRunWorkspaceCleanupInState,
+  releaseRunWorkspaceCleanup,
+  releaseRunWorkspaceCleanupInState,
   DATA_DIR,
   findProject,
   findTask,
@@ -32,6 +40,7 @@ import {
   scheduleGitHubRemoteRecoveryProbeInState,
   taskHasExactReviewSubject,
 } from "./store.js";
+import { loadConfig, normalizeWorkspaceRetention } from "./config.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
@@ -68,6 +77,210 @@ const DEFAULT_RUNNER_PATH = [
   "/usr/local/bin",
   process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
 ].join(":");
+
+const WORKSPACE_CLEANUP_LIMIT = 25;
+
+function safeCleanupError(error) {
+  return redactSecrets(error?.message || String(error), []).replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+async function diskReport(target, input) {
+  return (input.readDiskAvailability || readDiskAvailability)({
+    ...input,
+    path: target,
+  });
+}
+
+async function sameFilesystem(left, right) {
+  try {
+    const [leftStat, rightStat] = await Promise.all([stat(left), stat(right)]);
+    return Number(leftStat.dev) === Number(rightStat.dev);
+  } catch {
+    return path.resolve(left) === path.resolve(right);
+  }
+}
+
+async function logicalWorkspaceBytes(target) {
+  let info;
+  try {
+    info = await lstat(target);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { bytes: 0, missing: true };
+    throw error;
+  }
+  if (info.isSymbolicLink()) throw new Error("workspace_target_is_symlink");
+  if (!info.isDirectory()) return { bytes: Number(info.size || 0), missing: false };
+  let bytes = 0;
+  for (const name of await readdir(target)) {
+    const child = path.join(target, name);
+    const childInfo = await lstat(child);
+    if (childInfo.isSymbolicLink()) throw new Error(`workspace_contains_symlink:${name}`);
+    const measured = await logicalWorkspaceBytes(child);
+    bytes += measured.bytes;
+  }
+  return { bytes, missing: false };
+}
+
+async function verifyWorkspacePath(root, target) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  const relative = path.relative(resolvedRoot, resolvedTarget);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("workspace_path_escape");
+  const ancestors = [];
+  for (let current = resolvedTarget; current !== resolvedRoot; current = path.dirname(current)) ancestors.push(current);
+  ancestors.push(resolvedRoot);
+  for (const ancestor of ancestors.reverse()) {
+    let info;
+    try {
+      info = await lstat(ancestor);
+    } catch (error) {
+      if (error?.code === "ENOENT" && ancestor !== resolvedTarget) throw new Error("workspace_ancestor_missing");
+      if (error?.code === "ENOENT") return { missing: true, path: resolvedTarget };
+      throw error;
+    }
+    if (info.isSymbolicLink()) throw new Error("workspace_path_symlink_race");
+  }
+  return { missing: false, path: resolvedTarget };
+}
+
+async function removeClaimedWorkspace(run, input, workspaceRoot) {
+  const target = String(run.workspacePath || "");
+  const project = run.project || input.state?.projects?.find((item) => item.id === run.projectId || item.key === run.projectKey) || {};
+  const sourceRepo = project.repoPath || run.sourceRepoPath;
+  const verify = () => verifyWorkspacePath(workspaceRoot, target);
+  const git = input.git || ((args, options = {}) => execFileAsync("git", args, options));
+  if (run.workspaceStrategy === "worktree") {
+    return withGitRepositoryLock(sourceRepo, async () => {
+      const checked = await verify();
+      if (!checked.missing) {
+        await git(["worktree", "remove", "--force", target], { cwd: sourceRepo });
+      }
+      await verify();
+      await git(["worktree", "prune"], { cwd: sourceRepo });
+    }, input.gitLock || {});
+  }
+  if (run.workspaceStrategy === "clone" || run.workspaceStrategy === "local-clone") {
+    const checked = await verify();
+    if (!checked.missing) await rm(target, { recursive: true, force: true });
+    await verify();
+    return;
+  }
+  throw new Error("unexpected_workspace_strategy");
+}
+
+export async function runWorkspaceCleanup(input = {}) {
+  const startedMs = Date.now();
+  const workspaceRoot = path.resolve(input.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  const dataPath = path.resolve(input.dataPath || DATA_DIR);
+  const initial = {
+    data: await diskReport(dataPath, input),
+    workspace: await diskReport(workspaceRoot, input),
+  };
+  const sameVolume = input.sameVolume ?? await sameFilesystem(dataPath, workspaceRoot);
+  const state = input.state || await readState();
+  const policy = normalizeWorkspaceRetention(input.workspaceRetention || input.policy || {});
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const lastSweepMs = Date.parse(state.meta?.workspaceRetention?.lastSweepAt || "");
+  const due = !Number.isFinite(lastSweepMs) || nowMs - lastSweepMs >= policy.sweepIntervalSeconds * 1000;
+  const pressure = initial.data.pressure || initial.workspace.pressure;
+  const report = {
+    attempted: Boolean(policy.enabled && (due || pressure)),
+    pressure,
+    sameVolume,
+    initial: { data: initial.data, workspace: initial.workspace },
+    after: null,
+    selected: [],
+    skipped: [],
+    logicalDeletedBytes: 0,
+    actualAvailableByteDelta: 0,
+    remainingShortfall: 0,
+    selectedCount: 0,
+    skippedCount: 0,
+    failureCount: 0,
+    failures: [],
+    durationMs: 0,
+  };
+  if (!report.attempted) {
+    report.after = report.initial;
+    report.durationMs = Date.now() - startedMs;
+    return report;
+  }
+
+  const snapshots = await (input.eligibleRunWorkspaceSnapshots
+    || (input.state ? eligibleRunWorkspaceSnapshotsInState : eligibleRunWorkspaceSnapshots))({
+    ...input,
+    state,
+    workspaceRoot,
+    policy,
+    pressure,
+    nowMs,
+  });
+  const verifiedWorkspaceBytes = {};
+  for (const snapshot of snapshots) {
+    try {
+      const measured = await logicalWorkspaceBytes(snapshot.workspacePath);
+      verifiedWorkspaceBytes[snapshot.runId] = measured.bytes;
+    } catch (error) {
+      report.skipped.push({ runId: snapshot.runId, reason: safeCleanupError(error) });
+    }
+  }
+  const claim = await (input.claimRunWorkspaceCandidates
+    || (input.state ? (args) => claimRunWorkspaceCandidatesInState(input.state, args) : claimRunWorkspaceCandidates))({
+    ...input,
+    state,
+    workspaceRoot,
+    policy,
+    pressure,
+    pressureReason: pressure ? "disk_pressure" : "scheduled_sweep",
+    verifiedWorkspaceBytes,
+    limit: WORKSPACE_CLEANUP_LIMIT,
+    nowMs,
+  });
+  for (const run of claim.candidates || []) {
+    const claimStartedBytes = verifiedWorkspaceBytes[run.id] ?? 0;
+    try {
+      await removeClaimedWorkspace(run, { ...input, state }, workspaceRoot);
+      await (input.finalizeRunWorkspaceCleanup
+        || (input.state ? (runId, args) => finalizeRunWorkspaceCleanupInState(input.state, runId, args) : finalizeRunWorkspaceCleanup))(run.id, {
+        ...input,
+        leaseId: claim.leaseId,
+        nowMs: Date.now(),
+        logicalBytes: claimStartedBytes,
+        filesystemReclaimedBytes: claimStartedBytes,
+        success: true,
+      });
+      report.selected.push({ runId: run.id, logicalBytes: claimStartedBytes, reason: run.workspaceCleanup?.reason || "retention_sweep" });
+      report.logicalDeletedBytes += claimStartedBytes;
+    } catch (error) {
+      const message = safeCleanupError(error);
+      await (input.releaseRunWorkspaceCleanup
+        || (input.state ? (runId, args) => releaseRunWorkspaceCleanupInState(input.state, runId, args) : releaseRunWorkspaceCleanup))(run.id, {
+        ...input,
+        leaseId: claim.leaseId,
+        nowMs: Date.now(),
+        logicalBytes: claimStartedBytes,
+        error: message,
+      }).catch(() => {});
+      report.failures.push({ runId: run.id, error: message });
+    }
+  }
+  report.after = {
+    data: await diskReport(dataPath, input),
+    workspace: await diskReport(workspaceRoot, input),
+  };
+  report.actualAvailableByteDelta = Math.max(0, report.after.data.availableBytes - report.initial.data.availableBytes)
+    + (sameVolume ? 0 : Math.max(0, report.after.workspace.availableBytes - report.initial.workspace.availableBytes));
+  report.remainingShortfall = Math.max(
+    0,
+    Math.max(initial.data.minAvailableBytes - report.after.data.availableBytes, 0),
+    Math.max(initial.workspace.minAvailableBytes - report.after.workspace.availableBytes, 0),
+  );
+  report.selectedCount = report.selected.length;
+  report.skippedCount = report.skipped.length;
+  report.failureCount = report.failures.length;
+  report.durationMs = Date.now() - startedMs;
+  return report;
+}
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -2106,26 +2319,53 @@ export async function runGitHubRemoteRecoveryProbes(input = {}) {
 }
 
 export async function runQueuedRuns(input = {}) {
-  const disk = input.disk || await readDiskAvailability({
+  const configuredWorkspaceRoot = path.resolve(input.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
+  let configuredRetention = input.workspaceRetention || input.policy;
+  if (!configuredRetention && !input.state) {
+    try {
+      const config = await loadConfig();
+      configuredRetention = config?.defaults?.runner?.workspaceRetention || config?.runner?.workspaceRetention;
+    } catch {
+      configuredRetention = undefined;
+    }
+  }
+  const diskReader = input.readDiskAvailability || (input.disk
+    ? async ({ path: target }) => path.resolve(target) === path.resolve(DATA_DIR)
+      ? input.disk
+      : (input.workspaceDisk || input.disk)
+    : readDiskAvailability);
+  const cleanup = await runWorkspaceCleanup({
     ...input,
-    path: DATA_DIR,
+    state: input.state,
+    workspaceRoot: configuredWorkspaceRoot,
+    readDiskAvailability: diskReader,
+    workspaceRetention: configuredRetention,
   });
-  if (disk.pressure) {
+  const disk = cleanup.after?.data || cleanup.initial.data;
+  const state = input.state || await readState();
+  const diskRecoveryAwaitingHealth = Boolean(
+    state.meta?.diskRecovery?.awaitingWatchdogHealth
+      || state.meta?.diskRecovery?.state === "awaiting_watchdog_health",
+  );
+  if (cleanup.pressure || disk.pressure || diskRecoveryAwaitingHealth) {
     return {
       generatedAt: new Date().toISOString(),
       disk,
+      cleanup,
       paused: true,
-      pauseReason: "disk_space_below_safety_threshold",
+      pauseReason: diskRecoveryAwaitingHealth
+        ? "disk_recovery_awaiting_watchdog_health"
+        : "disk_space_below_safety_threshold",
       recovered: [],
       claimed: [],
       results: [],
     };
   }
-  const state = input.state || await readState();
   if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
     return {
       generatedAt: new Date().toISOString(),
       disk,
+      cleanup,
       paused: true,
       pauseReason: state.meta.operatorPause.reason || "operator_pause",
       recovered: [],
@@ -2145,6 +2385,7 @@ export async function runQueuedRuns(input = {}) {
   return {
     generatedAt: new Date().toISOString(),
     disk,
+    cleanup,
     recovered,
     recoveryProbes,
     claimed: claimed.map((run) => run.id),

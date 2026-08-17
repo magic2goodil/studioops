@@ -161,6 +161,15 @@ The app reads the first fenced `json studioops-config` block in this file.
       "modelReasoningEffort": "high",
       "useWorkspaces": true,
       "workspaceRoot": "~/.codex/studioops/run-workspaces",
+      "workspaceRetention": {
+        "enabled": true,
+        "retainForHours": { "completed": 168, "failed": 336, "cancelled": 168 },
+        "pressureMinAgeHours": 24,
+        "maxRetainedBytes": 53687091200,
+        "maxDeletesPerSweep": 25,
+        "sweepIntervalSeconds": 600,
+        "cleanupLeaseSeconds": 900
+      },
       "timeoutMs": 7200000,
       "githubAppAuth": true,
       "githubAppCredentialsDir": "~/.codex/studioops/credentials/github-apps",

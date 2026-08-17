@@ -58,6 +58,19 @@ Each workflow action gets two worker-launch attempts by default with a 30-second
 
 Before claiming work, the runner checks the data volume used for SQLite state and run output. The default safety floor is 5 GiB or 2% free, whichever is stricter. Existing builders are not killed by this check; new claims pause until capacity is restored, and the watchdog records the reason instead of entering a restart loop.
 
+Before that claim gate, the runner performs the configured terminal-workspace
+retention sweep when its interval is due, and immediately when either the data
+or workspace volume is below its threshold. Retention eligibility, pressure
+age, retained-byte accounting, the 25-item bound, and cleanup leases are owned
+by the store contract; the runner only measures and removes filesystem
+artifacts. Evidence includes both volume reports before and after cleanup,
+whether they share a volume, selected/skipped reasons, logical bytes, the
+actual available-byte delta, failures, and any remaining shortfall. Worktree
+removal is serialized with the source repository Git lock and uses local
+`git worktree remove --force`/`prune`; clone and local-clone workspaces use
+guarded recursive removal. Path and symlink checks are repeated immediately
+before each destructive operation.
+
 ## Run Continuously
 
 ```bash
