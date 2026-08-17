@@ -1279,26 +1279,33 @@ async function recordProjectResult(projectResult) {
       if (["pending", "reconciliation_unavailable"].includes(taskResult.status)) continue;
       if (taskResult.status === "merged") {
         const source = candidate.manifest.sources.find((item) => item.taskId === task.id);
-        applyLifecycleTransitionInState(state, {
-          action: "record_merge",
-          taskId: task.id,
-          expectedStateVersion: task.stateVersion,
-          actorContext: {
-            actorId: "studioops-promotion-worker",
-            actorType: "worker",
-            role: "promotion-worker",
-            trusted: true,
-          },
-          evidence: {
-            candidateCycle: source?.candidateCycle,
-            subjectSha: source?.headSha,
-            candidateId: candidate.id,
-            manifestDigest: candidate.manifestDigest,
-            integrationSha: candidate.manifest.integration.sha,
-            mergeCommit: projectResult.mergeCommit,
-            prUrl: projectResult.prUrl,
-          },
-        }, { now });
+        const terminalStatus = ["merged", "deployed", "done"].includes(task.status);
+        if (terminalStatus) {
+          if (task.candidateId !== candidate.id || task.reviewSubjectSha !== source?.headSha) {
+            throw new Error(`Terminal task ${task.id} does not match reconciled candidate ${candidate.id}.`);
+          }
+        } else {
+          applyLifecycleTransitionInState(state, {
+            action: "record_merge",
+            taskId: task.id,
+            expectedStateVersion: task.stateVersion,
+            actorContext: {
+              actorId: "studioops-promotion-worker",
+              actorType: "worker",
+              role: "promotion-worker",
+              trusted: true,
+            },
+            evidence: {
+              candidateCycle: source?.candidateCycle,
+              subjectSha: source?.headSha,
+              candidateId: candidate.id,
+              manifestDigest: candidate.manifestDigest,
+              integrationSha: candidate.manifest.integration.sha,
+              mergeCommit: projectResult.mergeCommit,
+              prUrl: projectResult.prUrl,
+            },
+          }, { now });
+        }
         task.assignedAgentRole = "";
         task.reviewerThreadId = "";
         task.promotionStatus = "merged";
