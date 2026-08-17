@@ -591,7 +591,17 @@ export function planPromotions(state, input = {}) {
           mergedCandidates: (state.candidates || [])
             .filter((item) => item.projectId === project.id)
             .filter((item) => item.id !== candidate.id)
-            .filter(candidateHasTrustedMerge),
+            .filter(candidateHasTrustedMerge)
+            .map((item) => ({
+              id: item.id,
+              manifestDigest: item.manifestDigest,
+              manifest: {
+                base: item.manifest.base,
+                integration: item.manifest.integration,
+              },
+              promotion: { prUrl: item.promotion.prUrl },
+              promotionMerge: item.promotionMerge,
+            })),
           tasks: candidate.manifest.sources.map((source) => {
             const task = projectTasks.get(source.taskId);
             return {
@@ -727,7 +737,12 @@ async function reconcileSupersededCandidate(projectPlan, result, options = {}) {
     ["fetch", "origin", `refs/heads/${projectPlan.targetBranch}:refs/remotes/origin/${projectPlan.targetBranch}`],
     { ...gitOptions, allowFailure: true },
   );
-  if (!fetched.ok) return null;
+  if (!fetched.ok) {
+    result.status = "reconciliation_unavailable";
+    result.output = `Protected promotion target could not be fetched while checking for a superseding merge; reconciliation will retry without changing task state.\n${truncateOutput(fetched.output)}`;
+    result.tasks = reconciliationTaskResults(projectPlan, "reconciliation_unavailable", result.output);
+    return result;
+  }
   const targetHead = await branchHead(
     projectPlan.repoPath,
     `refs/remotes/origin/${projectPlan.targetBranch}`,
