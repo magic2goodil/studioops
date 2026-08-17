@@ -139,7 +139,7 @@ test("status without a value and show-task leave the task unchanged", async () =
       comments: persisted.comments,
       events: persisted.events,
     }, {
-      task: before,
+      task: { ...before, stateVersion: 1 },
       comments: [],
       events: [],
     });
@@ -174,6 +174,11 @@ for (const [workflowMode, prUrl] of [
       assert.equal(task.reviewSubjectSha, subjectSha);
       assert.equal(task.reviewCycle, 1);
       assert.equal(task.reviewSubjectCycle, 1);
+      assert.equal(task.stateVersion, 2);
+      const lifecycleEvent = state.events.find((event) => event.type === "lifecycle_transition");
+      assert.equal(lifecycleEvent?.action, "record_builder_handoff");
+      assert.equal(lifecycleEvent?.fromVersion, 1);
+      assert.equal(lifecycleEvent?.toVersion, 2);
       const report = createSupervisorReport(state);
       assert.equal(report.actions[0].type, "start_review");
       assert.equal(report.actions[0].reviewSubjectSha, subjectSha);
@@ -288,10 +293,18 @@ test("explicit repair atomically fixes one invalid task while preserving another
     });
     await writeLegacyState(root, state);
     const env = await environmentForTestControlRoot(root);
+    await assert.rejects(
+      execFileAsync(process.execPath, [
+        "--input-type=module",
+        "-e",
+        `import { updateTask } from ${JSON.stringify(path.resolve("src/store.js"))}; await updateTask("task_1", { status: "backend_review" });`,
+      ], { cwd: root, env }),
+      /only be changed by repairLegacyTaskStatus/,
+    );
     await execFileAsync(process.execPath, [
       "--input-type=module",
       "-e",
-      `import { updateTask } from ${JSON.stringify(path.resolve("src/store.js"))}; await updateTask("task_1", { status: "backend_review" });`,
+      `import { repairLegacyTaskStatus } from ${JSON.stringify(path.resolve("src/store.js"))}; await repairLegacyTaskStatus("task_1", "backend_review");`,
     ], { cwd: root, env });
 
     const persisted = await readPersistedState(root, env);
@@ -317,7 +330,7 @@ test("a builder-review status repair preserves the current review subject and cy
     await execFileAsync(process.execPath, [
       "--input-type=module",
       "-e",
-      `import { updateTask } from ${JSON.stringify(path.resolve("src/store.js"))}; await updateTask("task_1", { status: "builder_review" });`,
+      `import { repairLegacyTaskStatus } from ${JSON.stringify(path.resolve("src/store.js"))}; await repairLegacyTaskStatus("task_1", "builder_review");`,
     ], { cwd: root, env });
 
     const task = (await readPersistedState(root, env)).tasks[0];

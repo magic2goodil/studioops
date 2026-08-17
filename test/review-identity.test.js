@@ -112,6 +112,7 @@ test("reviews require the exact current candidate cycle and subject SHA", async 
   assert.equal(evidence.subjectSha, SUBJECT_SHA);
   assert.equal(evidence.candidateCycle, 1);
   assert.deepEqual(evidence.reviews.map((review) => review.stageKey), ["backend", "lead"]);
+  assert.ok(updated.stateVersion > 1, "review evidence mutations advance the aggregate version");
 });
 
 test("reviewer commits restart required lanes without consuming a builder review cycle", async () => {
