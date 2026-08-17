@@ -197,26 +197,55 @@ export function expectedRunWorkspacePath(workspaceRoot, projectKey, runId, branc
   return path.join(root, project, `${run}-${branch}`);
 }
 
+function canonicalPathIdentity(value) {
+  const resolved = path.resolve(String(value || ""));
+  const missingSegments = [];
+  let current = resolved;
+  while (true) {
+    try {
+      return {
+        resolved,
+        canonical: path.join(realpathSync(current), ...missingSegments),
+        exists: missingSegments.length === 0,
+        error: "",
+      };
+    } catch (error) {
+      if (error?.code !== "ENOENT") return { resolved, canonical: "", exists: false, error: "path_resolution_failed" };
+      const parent = path.dirname(current);
+      if (parent === current) return { resolved, canonical: "", exists: false, error: "path_resolution_failed" };
+      missingSegments.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function pathIdentitiesOverlap(left, right) {
+  const overlaps = (a, b) => a === b || a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`);
+  return overlaps(left.resolved, right.resolved) || overlaps(left.canonical, right.canonical);
+}
+
 export function workspacePathProtectionReason(run = {}, input = {}) {
   const workspaceRoot = String(input.workspaceRoot || "").trim();
   const candidate = String(run.workspacePath || "").trim();
   if (!workspaceRoot || !candidate) return "missing_workspace_path";
-  const root = path.resolve(workspaceRoot);
-  const resolved = path.resolve(candidate);
+  const rootIdentity = canonicalPathIdentity(workspaceRoot);
+  const candidateIdentity = canonicalPathIdentity(candidate);
+  if (rootIdentity.error) return "unresolvable_workspace_root";
+  if (candidateIdentity.error) return "unresolvable_workspace_path";
+  const root = rootIdentity.resolved;
+  const resolved = candidateIdentity.resolved;
   const relative = path.relative(root, resolved);
   if (!relative || relative.startsWith("..")) return "outside_workspace_root";
   for (let current = resolved; current !== root && current.startsWith(`${root}${path.sep}`); current = path.dirname(current)) {
     try {
       if (lstatSync(current).isSymbolicLink()) return "symlinked_workspace_ancestor";
-    } catch {
+    } catch (error) {
       // A not-yet-created path is verified by the filesystem adapter at deletion time.
+      if (error?.code !== "ENOENT") return "unresolvable_workspace_path";
     }
   }
-  try {
-    if (realpathSync(root) !== root) return "symlinked_workspace_root";
-  } catch {
-    // The adapter will fail closed if the root cannot be resolved.
-  }
+  if (rootIdentity.exists && rootIdentity.canonical !== root) return "symlinked_workspace_root";
+  if (candidateIdentity.exists && candidateIdentity.canonical !== resolved) return "symlinked_workspace_ancestor";
   if (relative.split(path.sep).includes("candidates")) return "candidate_artifact_path";
   if (run.workspaceStrategy !== "worktree" && run.workspaceStrategy !== "clone" && run.workspaceStrategy !== "local-clone") {
     return "unexpected_workspace_strategy";
@@ -226,13 +255,9 @@ export function workspacePathProtectionReason(run = {}, input = {}) {
     .map((item) => String(item || "").trim())
     .filter(Boolean);
   for (const sourceRepoPath of sourceRepoPaths) {
-    const sourceResolved = path.resolve(sourceRepoPath);
-    if (sourceResolved === resolved) return "source_repository_path";
-    try {
-      if (realpathSync(sourceResolved) === realpathSync(resolved)) return "source_repository_path";
-    } catch {
-      // Missing paths cannot currently alias an existing source checkout.
-    }
+    const sourceIdentity = canonicalPathIdentity(sourceRepoPath);
+    if (sourceIdentity.error) return "unresolvable_source_repository_path";
+    if (pathIdentitiesOverlap(sourceIdentity, candidateIdentity)) return "source_repository_path";
   }
   const expected = expectedRunWorkspacePath(root, project.key || run.projectKey, run.id, run.branchName || run.branch);
   if (!expected || expected !== resolved) return "workspace_identity_mismatch";
@@ -274,22 +299,35 @@ function verifiedWorkspaceBytes(run, input = {}) {
   return Number.isFinite(bytes) && bytes >= 0 ? bytes : null;
 }
 
-function activeRunWorkspacePaths(state) {
-  return new Set((state.runs || [])
+function activeRunWorkspaceReferences(state) {
+  const references = [];
+  let ambiguous = false;
+  for (const value of (state.runs || [])
     .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
-    .flatMap((run) => [run.workspacePath, run.executionRepoPath])
-    .map((item) => String(item || "").trim())
-    .filter(Boolean)
-    .map((item) => path.resolve(item)));
+    .flatMap((run) => [run.workspacePath, run.executionRepoPath])) {
+    if (!String(value || "").trim()) continue;
+    const identity = canonicalPathIdentity(value);
+    if (identity.error) ambiguous = true;
+    else references.push(identity);
+  }
+  return { references, ambiguous };
 }
 
-function verifiedRetainedWorkspaceBytesInState(state, input, root, activePaths) {
+function activeReferenceProtectsPath(activeReferences, workspacePath) {
+  if (activeReferences.ambiguous) return true;
+  const candidateIdentity = canonicalPathIdentity(workspacePath);
+  return candidateIdentity.error || activeReferences.references.some((reference) => (
+    pathIdentitiesOverlap(reference, candidateIdentity)
+  ));
+}
+
+function verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferences) {
   const sourceRepoPaths = (state.projects || []).map((project) => project.repoPath).filter(Boolean);
   return (state.runs || []).reduce((total, run) => {
     if (!WORKSPACE_TERMINAL_STATUSES.has(run.status)) return total;
     if (run.workspaceCleanup?.state === "completed") return total;
     const project = (state.projects || []).find((item) => item.id === run.projectId || item.key === run.projectKey);
-    if (activePaths.has(path.resolve(String(run.workspacePath || "")))) return total;
+    if (activeReferenceProtectsPath(activeReferences, run.workspacePath)) return total;
     if (workspacePathProtectionReason(run, { workspaceRoot: root, project, sourceRepoPaths })) return total;
     const bytes = verifiedWorkspaceBytes(run, input);
     return bytes === null ? total : total + bytes;
@@ -302,9 +340,10 @@ export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
   const nowMs = Number(input.nowMs ?? Date.now());
   const pressure = input.pressure === true;
   const root = String(input.workspaceRoot || "");
-  const activePaths = activeRunWorkspacePaths(state);
+  const activeReferences = activeRunWorkspaceReferences(state);
+  if (activeReferences.ambiguous) return [];
   const sourceRepoPaths = (state.projects || []).map((project) => project.repoPath).filter(Boolean);
-  const verifiedRetainedBytes = verifiedRetainedWorkspaceBytesInState(state, input, root, activePaths);
+  const verifiedRetainedBytes = verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferences);
   const capacityPressure = verifiedRetainedBytes > policy.maxRetainedBytes;
   const candidates = [];
   for (const run of state.runs || []) {
@@ -316,8 +355,7 @@ export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
     const project = (state.projects || []).find((item) => item.id === run.projectId || item.key === run.projectKey);
     const protection = workspacePathProtectionReason(run, { workspaceRoot: root, project, sourceRepoPaths });
     if (protection) continue;
-    const resolved = path.resolve(run.workspacePath);
-    if (activePaths.has(resolved)) continue;
+    if (activeReferenceProtectsPath(activeReferences, run.workspacePath)) continue;
     const verifiedBytes = verifiedWorkspaceBytes(run, input);
     const retentionEligible = ageHours >= policy.retainForHours[run.status];
     const pressureEligible = verifiedBytes !== null
@@ -365,8 +403,8 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
   const expiresAt = new Date(nowMs + policy.cleanupLeaseSeconds * 1000).toISOString();
   const snapshots = eligibleRunWorkspaceSnapshotsInState(state, input);
   const root = String(input.workspaceRoot || "");
-  const activePaths = activeRunWorkspacePaths(state);
-  const verifiedRetainedBytes = verifiedRetainedWorkspaceBytesInState(state, input, root, activePaths);
+  const activeReferences = activeRunWorkspaceReferences(state);
+  const verifiedRetainedBytes = verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferences);
   const capacityPressure = verifiedRetainedBytes > policy.maxRetainedBytes;
   const maximumClaims = Math.min(
     policy.maxDeletesPerSweep,

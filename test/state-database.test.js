@@ -111,7 +111,7 @@ test("workspace retention protects roots, sources, unknown strategies, active re
     const project = { id: "project_1", key: "demo", repoPath: path.join(root, "demo", "run_source-source") };
     const safeRun = { id: "run_safe", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "safe", workspaceStrategy: "clone", workspacePath: path.join(root, "demo", "run_safe-safe"), completedAt: "2026-08-01T00:00:00.000Z" };
     assert.equal(workspacePathProtectionReason({ ...safeRun, workspacePath: root }, { workspaceRoot: root, project }), "outside_workspace_root");
-    assert.equal(workspacePathProtectionReason({ ...safeRun, workspacePath: path.join(root, "demo") }, { workspaceRoot: root, project }), "workspace_identity_mismatch");
+    assert.equal(workspacePathProtectionReason({ ...safeRun, workspacePath: path.join(root, "demo") }, { workspaceRoot: root, project }), "source_repository_path");
     assert.equal(workspacePathProtectionReason({ ...safeRun, id: "run_source", branchName: "source", workspacePath: project.repoPath }, { workspaceRoot: root, project }), "source_repository_path");
     assert.equal(workspacePathProtectionReason({ ...safeRun, workspaceStrategy: "source-checkout" }, { workspaceRoot: root, project }), "unexpected_workspace_strategy");
 
@@ -126,6 +126,19 @@ test("workspace retention protects roots, sources, unknown strategies, active re
     state.runs = [
       safeRun,
       { ...safeRun, id: "run_active", status: "running", branchName: "active", workspacePath: "", executionRepoPath: safeRun.workspacePath },
+    ];
+    assert.deepEqual(eligibleRunWorkspaceSnapshotsInState(state, {
+      workspaceRoot: root,
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+      policy: { retainForHours: { failed: 1 } },
+    }), []);
+
+    await mkdir(safeRun.workspacePath, { recursive: true });
+    const activeAlias = path.join(root, "active-workspace-alias");
+    await symlink(safeRun.workspacePath, activeAlias);
+    state.runs = [
+      safeRun,
+      { ...safeRun, id: "run_active_alias", status: "running", branchName: "active-alias", workspacePath: "", executionRepoPath: activeAlias },
     ];
     assert.deepEqual(eligibleRunWorkspaceSnapshotsInState(state, {
       workspaceRoot: root,
