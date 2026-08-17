@@ -125,6 +125,19 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
   return candidate;
 }
 
+function releaseCandidateFixture({ baseSha, sourceSha, integrationSha, prUrl }) {
+  const candidate = candidateFixture({ baseSha, sourceSha, integrationSha, status: "qa_passed" });
+  candidate.status = "release_candidate_ready";
+  candidate.promotion = {
+    branch: "qa/promotion-demo",
+    prUrl,
+    commitSha: integrationSha,
+    manifestDigest: candidate.manifestDigest,
+    readyAt: "2026-07-25T12:40:00.000Z",
+  };
+  return candidate;
+}
+
 test("promotion planning requires a complete candidate-level QA pass, not a status label", () => {
   const fixture = {
     baseSha: "a".repeat(40),
@@ -155,12 +168,122 @@ test("promotion planning requires a complete candidate-level QA pass, not a stat
   assert.match(redirected.skipReason, /does not match candidate base/);
 });
 
+test("promotion planning retains persisted release candidates for reconciliation", () => {
+  const prUrl = "https://github.com/example/demo/pull/42";
+  const candidate = releaseCandidateFixture({
+    baseSha: "a".repeat(40),
+    sourceSha: "b".repeat(40),
+    integrationSha: "b".repeat(40),
+    prUrl,
+  });
+  const state = baseState({
+    projects: [{
+      id: "project_1", key: "demo", name: "Demo", repoPath: "/tmp/demo", defaultBranch: "main",
+    }],
+    tasks: [{ id: "task_1", projectId: "project_1", title: "Task", status: "user_review" }],
+    candidates: [candidate],
+  });
+
+  const plan = planPromotions(state);
+  assert.equal(plan.projects.length, 1);
+  assert.equal(plan.projects[0].mode, "reconcile");
+  assert.equal(plan.projects[0].candidate.promotion.prUrl, prUrl);
+});
+
 async function writeState(root, state) {
   await mkdir(path.join(root, "data"), { recursive: true });
   await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
-test("owner QA pass queues a task for main promotion", async () => {
+async function reconciliationFixture(prState = "OPEN", overrides = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-promotion-reconcile-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  const fakeBin = path.join(root, "bin");
+  const prUrl = "https://github.com/example/demo/pull/42";
+
+  await git(root, ["init", "--bare", remotePath]);
+  await git(root, ["clone", remotePath, repoPath]);
+  await configureRepo(repoPath);
+  await git(repoPath, ["checkout", "-b", "main"]);
+  await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+  await git(repoPath, ["add", "app.txt"]);
+  await git(repoPath, ["commit", "-m", "base"]);
+  const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+  await git(repoPath, ["push", "-u", "origin", "main"]);
+  await git(repoPath, ["checkout", "-b", "feature/task"]);
+  await writeFile(path.join(repoPath, "feature.txt"), "feature\n", "utf8");
+  await git(repoPath, ["add", "feature.txt"]);
+  await git(repoPath, ["commit", "-m", "feature"]);
+  const sourceSha = await git(repoPath, ["rev-parse", "HEAD"]);
+  await git(repoPath, ["push", "-u", "origin", "feature/task"]);
+  await git(repoPath, ["branch", "qa/candidate-demo"]);
+  await git(repoPath, ["push", "origin", "qa/candidate-demo"]);
+
+  let mergeCommit = null;
+  let mergedAt = null;
+  if (prState === "MERGED") {
+    await git(repoPath, ["checkout", "main"]);
+    await git(repoPath, ["merge", "--no-ff", sourceSha, "-m", "merge release candidate"]);
+    mergeCommit = await git(repoPath, ["rev-parse", "HEAD"]);
+    mergedAt = "2026-07-25T13:00:00.000Z";
+    await git(repoPath, ["push", "origin", "main"]);
+  }
+
+  const candidate = releaseCandidateFixture({ baseSha, sourceSha, integrationSha: sourceSha, prUrl });
+  await writeState(root, baseState({
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath,
+      defaultBranch: "main",
+      promotion: { enabled: true, targetBranch: "main" },
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Feature task",
+      status: "user_review",
+      stateVersion: 1,
+      reviewCycle: 1,
+      reviewSubjectCycle: 1,
+      reviewSubjectSha: sourceSha,
+      branchName: "feature/task",
+      candidateId: candidate.id,
+      qaBundleId: "qa_bundle_1",
+      promotionStatus: "pr_ready",
+      promotionPrUrl: prUrl,
+    }],
+    qaBundles: [{
+      id: "qa_bundle_1",
+      projectId: "project_1",
+      projectKey: "demo",
+      status: "release_candidate_ready",
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      promotionPrUrl: prUrl,
+      tasks: [{ id: "task_1", title: "Feature task" }],
+    }],
+    candidates: [candidate],
+  }));
+
+  await mkdir(fakeBin, { recursive: true });
+  const pr = {
+    state: prState,
+    baseRefName: overrides.baseRefName || "main",
+    headRefName: "qa/promotion-demo",
+    headRefOid: overrides.headRefOid || sourceSha,
+    mergeCommit: mergeCommit ? { oid: mergeCommit } : null,
+    url: prUrl,
+    mergedAt,
+  };
+  await writeFile(fakeBin + "/gh", `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(pr)}'\n`, "utf8");
+  await chmod(fakeBin + "/gh", 0o755);
+  return { root, repoPath, fakeBin, candidate, sourceSha, mergeCommit };
+}
+
+test("owner QA bundle pass binds browser-shaped input to the immutable candidate", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-decision-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
@@ -251,14 +374,11 @@ test("owner QA pass queues a task for main promotion", async () => {
     assert.equal(readPersistedState(root).tasks[0].status, "qa_review");
 
     const script = `
-      import { recordQaDecision } from ${JSON.stringify(storeModuleUrl)};
-      const result = await recordQaDecision("task_1", {
+      import { recordQaBundleDecision } from ${JSON.stringify(storeModuleUrl)};
+      const result = await recordQaBundleDecision("qa_bundle_1", {
         outcome: "passed",
         author: "Owner QA",
-        body: "Preview looked good.",
-        candidateId: ${JSON.stringify(candidate.id)},
-        manifestDigest: ${JSON.stringify(candidate.manifestDigest)},
-        integrationSha: ${JSON.stringify(sourceSha)}
+        body: "Preview looked good."
       });
       console.log(JSON.stringify(result.decisions[0].task));
     `;
@@ -554,6 +674,93 @@ test("promotion creates a validated release-candidate PR without updating main",
     assert.equal(state.events.some((event) => event.type === "release_candidate_ready"), true);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion reconciliation records an exact merged candidate once", async () => {
+  const fixture = await reconciliationFixture("MERGED");
+  try {
+    const script = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        env: { PATH: ${JSON.stringify(`${fixture.fakeBin}:/usr/local/bin:/usr/bin:/bin`)} }
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root });
+    const report = JSON.parse(runResult.stdout.trim());
+    const state = readPersistedState(fixture.root);
+
+    assert.equal(report.projects[0].status, "merged");
+    assert.equal(state.tasks[0].status, "merged");
+    assert.equal(state.tasks[0].promotionStatus, "merged");
+    assert.equal(state.tasks[0].mergeEvidence.integrationSha, fixture.sourceSha);
+    assert.equal(state.tasks[0].mergeEvidence.mergeCommit, fixture.mergeCommit);
+    assert.equal(state.qaBundles[0].status, "merged");
+    assert.equal(state.candidates[0].status, "merged");
+    assert.equal(state.events.filter((event) => event.type === "release_candidate_merged").length, 1);
+
+    const second = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root });
+    assert.equal(JSON.parse(second.stdout.trim()).projects.length, 0);
+    assert.equal(readPersistedState(fixture.root).comments.length, state.comments.length);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("promotion reconciliation leaves open PRs stable without duplicate evidence", async () => {
+  const fixture = await reconciliationFixture("OPEN");
+  try {
+    const script = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        env: { PATH: ${JSON.stringify(`${fixture.fakeBin}:/usr/local/bin:/usr/bin:/bin`)} }
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const first = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    const second = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    const state = readPersistedState(fixture.root);
+
+    assert.equal(first.projects[0].status, "pending");
+    assert.equal(second.projects[0].status, "pending");
+    assert.equal(state.tasks[0].status, "user_review");
+    assert.equal(state.comments.length, 0);
+    assert.equal(state.events.length, 0);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("promotion reconciliation bounds closed and drifted PRs without restarting review", async (t) => {
+  for (const scenario of [
+    { name: "closed", state: "CLOSED", overrides: {}, expected: "promotion_closed" },
+    { name: "target mismatch", state: "OPEN", overrides: { baseRefName: "release" }, expected: "promotion_invalid" },
+    { name: "head mismatch", state: "OPEN", overrides: { headRefOid: "f".repeat(40) }, expected: "promotion_invalid" },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const fixture = await reconciliationFixture(scenario.state, scenario.overrides);
+      try {
+        const script = `
+          import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+          const report = await runPromotion({
+            githubAppAuth: false,
+            env: { PATH: ${JSON.stringify(`${fixture.fakeBin}:/usr/local/bin:/usr/bin:/bin`)} }
+          });
+          console.log(JSON.stringify(report));
+        `;
+        const report = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+        const state = readPersistedState(fixture.root);
+        assert.equal(report.projects[0].status, scenario.expected);
+        assert.equal(state.tasks[0].status, "promotion_blocked");
+        assert.equal(state.tasks[0].reviewCycle, 1);
+        assert.equal(state.comments.length, 1);
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    });
   }
 });
 
