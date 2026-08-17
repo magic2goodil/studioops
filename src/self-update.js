@@ -7,7 +7,7 @@ import {
   DEFAULT_SELF_UPDATE_LEASE_MS,
 } from "./self-update-lease.js";
 import { mutateState, readState } from "./store.js";
-import { deployRuntime } from "./runtime-install.js";
+import { deployRuntime, verifyStudioOpsIdentity } from "./runtime-install.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -311,8 +311,59 @@ async function inspectGitRepository(input = {}) {
   };
 }
 
+async function inspectRuntimeDeployment(gitPlan, input = {}) {
+  if (input.deployRuntime === false) {
+    return {
+      runtimeChecked: false,
+      runtimeUpdateAvailable: false,
+      runtimeCommit: "",
+      runtimeProvenanceValid: null,
+      runtimeReason: "Runtime deployment is disabled for this update.",
+    };
+  }
+
+  let verification;
+  try {
+    verification = input.runtimeVerification || await verifyStudioOpsIdentity({
+      sourceRoot: gitPlan.repoPath,
+      runtimeRoot: input.runtimeRoot
+        || process.env.STUDIOOPS_RUNTIME_ROOT
+        || process.env.MISSION_CONTROL_RUNTIME_ROOT,
+    });
+  } catch (error) {
+    return {
+      runtimeChecked: true,
+      runtimeUpdateAvailable: true,
+      runtimeCommit: "",
+      runtimeProvenanceValid: false,
+      runtimeReason: `Active runtime identity could not be verified: ${truncate(error.message, 300)}`,
+    };
+  }
+
+  const runtimeCommit = String(verification?.runtime?.commit || "").trim();
+  const runtimeProvenanceValid = verification?.provenance?.valid === true;
+  const runtimeUpdateAvailable = runtimeCommit !== gitPlan.localCommit || !runtimeProvenanceValid;
+  let runtimeReason = "Active runtime provenance matches local source main.";
+  if (!runtimeCommit) runtimeReason = "No trusted active runtime commit was found.";
+  else if (runtimeCommit !== gitPlan.localCommit) {
+    runtimeReason = `Active runtime ${shortCommit(runtimeCommit)} does not match local source ${shortCommit(gitPlan.localCommit)}.`;
+  } else if (!runtimeProvenanceValid) {
+    runtimeReason = `Active runtime ${shortCommit(runtimeCommit)} has missing or invalid provenance.`;
+  }
+
+  return {
+    runtimeChecked: true,
+    runtimeUpdateAvailable,
+    runtimeCommit,
+    runtimeProvenanceValid,
+    runtimeReason,
+  };
+}
+
 function applySafetyDecision(gitPlan, activeRuns) {
-  if (!gitPlan.updateAvailable) {
+  const sourceUpdateAvailable = Boolean(gitPlan.sourceUpdateAvailable);
+  const runtimeUpdateAvailable = Boolean(gitPlan.runtimeUpdateAvailable);
+  if (!sourceUpdateAvailable && !runtimeUpdateAvailable) {
     if (gitPlan.localAhead > 0 || gitPlan.remoteAhead > 0) {
       return {
         ...gitPlan,
@@ -324,6 +375,15 @@ function applySafetyDecision(gitPlan, activeRuns) {
     return {
       ...gitPlan,
       canUpdate: false,
+    };
+  }
+
+  if (!sourceUpdateAvailable && (gitPlan.localAhead > 0 || gitPlan.remoteAhead > 0)) {
+    return {
+      ...gitPlan,
+      status: "blocked_non_fast_forward",
+      canUpdate: false,
+      reason: `Local ${gitPlan.branch} cannot safely publish a runtime while it diverges from ${gitPlan.remoteRef}: local ahead ${gitPlan.localAhead || 0}, remote ahead ${gitPlan.remoteAhead || 0}.`,
     };
   }
 
@@ -358,12 +418,32 @@ function applySafetyDecision(gitPlan, activeRuns) {
     ...gitPlan,
     status: "ready",
     canUpdate: true,
+    reason: sourceUpdateAvailable && runtimeUpdateAvailable
+      ? `${gitPlan.reason} ${gitPlan.runtimeReason}`
+      : sourceUpdateAvailable
+        ? gitPlan.reason
+        : gitPlan.runtimeReason,
   };
 }
 
 export async function planSelfUpdate(input = {}) {
   const state = input.state || await readState();
-  const gitPlan = await inspectGitRepository(input);
+  const sourcePlan = await inspectGitRepository(input);
+  const runtimePlan = sourcePlan.localCommit
+    ? await inspectRuntimeDeployment(sourcePlan, input)
+    : {
+      runtimeChecked: false,
+      runtimeUpdateAvailable: false,
+      runtimeCommit: "",
+      runtimeProvenanceValid: null,
+      runtimeReason: "Source identity is unavailable, so runtime drift was not evaluated.",
+    };
+  const gitPlan = {
+    ...sourcePlan,
+    ...runtimePlan,
+    sourceUpdateAvailable: Boolean(sourcePlan.updateAvailable),
+    updateAvailable: Boolean(sourcePlan.updateAvailable || runtimePlan.runtimeUpdateAvailable),
+  };
   const activeRuns = classifyActiveRuns(state, input);
   const safetyPlan = applySafetyDecision(gitPlan, activeRuns);
   const restartAgentLabels = normalizeList(input.restartAgentLabels || input.agents, DEFAULT_RESTART_AGENT_LABELS);
@@ -447,6 +527,9 @@ async function sendSelfUpdateNotification(report, input = {}) {
 
 function selfUpdateSummary(report) {
   if (report.status === "updated") {
+    if (!report.sourceUpdateAvailable && report.runtimeUpdateAvailable) {
+      return `Published active runtime ${shortCommit(report.currentCommit)} from already-current ${report.branch}.`;
+    }
     return `Fast-forwarded ${report.branch} from ${shortCommit(report.previousCommit)} to ${shortCommit(report.currentCommit)} from ${report.remoteRef}.`;
   }
   if (report.status === "up_to_date") {
@@ -571,7 +654,9 @@ export async function runSelfUpdate(input = {}) {
       return blockedReport;
     }
 
-    await git(["merge", "--ff-only", finalPlan.remoteRef], { cwd: finalPlan.repoPath, timeout: input.mergeTimeoutMs || 300_000 });
+    if (finalPlan.sourceUpdateAvailable) {
+      await git(["merge", "--ff-only", finalPlan.remoteRef], { cwd: finalPlan.repoPath, timeout: input.mergeTimeoutMs || 300_000 });
+    }
     const currentCommit = await git(["rev-parse", `refs/heads/${finalPlan.branch}`], { cwd: finalPlan.repoPath });
     const updatedReport = {
       ...finalPlan,
@@ -580,12 +665,15 @@ export async function runSelfUpdate(input = {}) {
       updated: true,
       previousCommit: finalPlan.localCommit,
       currentCommit,
-      reason: `Fast-forwarded ${finalPlan.branch} to ${shortCommit(currentCommit)}.`,
+      reason: finalPlan.sourceUpdateAvailable
+        ? `Fast-forwarded ${finalPlan.branch} to ${shortCommit(currentCommit)}.`
+        : `Published the active runtime from already-current ${finalPlan.branch} at ${shortCommit(currentCommit)}.`,
     };
 
     if (input.deployRuntime !== false) {
       try {
-        updatedReport.runtimeDeployment = await deployRuntime({
+        const publishRuntime = input.deployRuntimeFn || deployRuntime;
+        updatedReport.runtimeDeployment = await publishRuntime({
           sourceRoot: finalPlan.repoPath,
           runtimeRoot: input.runtimeRoot || process.env.STUDIOOPS_RUNTIME_ROOT || process.env.MISSION_CONTROL_RUNTIME_ROOT,
         });
@@ -622,6 +710,12 @@ export function formatSelfUpdateReport(report) {
   }
   if (Number.isFinite(report.localAhead) || Number.isFinite(report.remoteAhead)) {
     lines.push(`Divergence: local ahead ${report.localAhead || 0}  remote ahead ${report.remoteAhead || 0}`);
+  }
+  if (report.runtimeChecked) {
+    lines.push(
+      `Runtime: ${shortCommit(report.runtimeCommit) || "unavailable"}  provenance ${report.runtimeProvenanceValid ? "valid" : "invalid"}`,
+    );
+    if (report.runtimeReason) lines.push(`Runtime state: ${report.runtimeReason}`);
   }
   if (report.previousCommit || report.currentCommit) {
     lines.push(`Updated: ${shortCommit(report.previousCommit)} -> ${shortCommit(report.currentCommit)}`);

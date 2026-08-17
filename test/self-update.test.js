@@ -70,6 +70,13 @@ async function createFixture() {
   return { root, remotePath, repoPath, writerPath };
 }
 
+function runtimeVerification(commit, valid = true) {
+  return {
+    runtime: { commit },
+    provenance: { valid },
+  };
+}
+
 test("clean self-update dry-run detects origin/main ahead and live run fast-forwards", async () => {
   const fixture = await createFixture();
   try {
@@ -111,6 +118,111 @@ test("clean self-update dry-run detects origin/main ahead and live run fast-forw
     assert.equal(await git(fixture.repoPath, ["rev-parse", "main"]), remote);
     assert.equal(applied.restartResults.length, DEFAULT_RESTART_AGENT_LABELS.length);
     assert.equal(applied.restartResults[0].status, "skipped");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("self-update publishes a stale runtime when source main already matches origin", async () => {
+  const fixture = await createFixture();
+  try {
+    const sourceCommit = await git(fixture.repoPath, ["rev-parse", "main"]);
+    const staleRuntimeCommit = "1".repeat(40);
+    const dryRun = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state: emptyState(),
+      runtimeVerification: runtimeVerification(staleRuntimeCommit),
+      dryRun: true,
+      record: false,
+      notify: false,
+    });
+
+    assert.equal(dryRun.status, "ready");
+    assert.equal(dryRun.sourceUpdateAvailable, false);
+    assert.equal(dryRun.runtimeUpdateAvailable, true);
+    assert.equal(dryRun.runtimeCommit, staleRuntimeCommit);
+    assert.match(dryRun.reason, /does not match local source/);
+
+    const deployments = [];
+    const applied = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state: emptyState(),
+      runtimeVerification: runtimeVerification(staleRuntimeCommit),
+      deployRuntimeFn: async (input) => {
+        deployments.push(input);
+        return { releasePath: `/runtime/releases/${sourceCommit}` };
+      },
+      restartAgents: false,
+      record: false,
+      notify: false,
+    });
+
+    assert.equal(applied.status, "updated");
+    assert.equal(applied.sourceUpdateAvailable, false);
+    assert.equal(applied.currentCommit, sourceCommit);
+    assert.equal(deployments.length, 1);
+    assert.equal(deployments[0].sourceRoot, fixture.repoPath);
+    assert.equal(await git(fixture.repoPath, ["rev-parse", "main"]), sourceCommit);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("self-update repairs invalid runtime provenance and no-ops for an aligned verified runtime", async () => {
+  const fixture = await createFixture();
+  try {
+    const sourceCommit = await git(fixture.repoPath, ["rev-parse", "main"]);
+    const invalid = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state: emptyState(),
+      runtimeVerification: runtimeVerification(sourceCommit, false),
+      dryRun: true,
+      record: false,
+      notify: false,
+    });
+    assert.equal(invalid.status, "ready");
+    assert.equal(invalid.runtimeUpdateAvailable, true);
+    assert.match(invalid.runtimeReason, /invalid provenance/);
+
+    const aligned = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state: emptyState(),
+      runtimeVerification: runtimeVerification(sourceCommit),
+      dryRun: true,
+      record: false,
+      notify: false,
+    });
+    assert.equal(aligned.status, "up_to_date");
+    assert.equal(aligned.sourceUpdateAvailable, false);
+    assert.equal(aligned.runtimeUpdateAvailable, false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("runtime-only repair remains blocked while a fresh builder is active", async () => {
+  const fixture = await createFixture();
+  try {
+    const report = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state: emptyState([{
+        id: "run_1",
+        taskId: "task_1",
+        group: "builder",
+        role: "builder",
+        status: "running",
+        startedAt: new Date().toISOString(),
+      }]),
+      runtimeVerification: runtimeVerification("2".repeat(40)),
+      dryRun: true,
+      record: false,
+      notify: false,
+    });
+
+    assert.equal(report.status, "blocked_active_runs");
+    assert.equal(report.sourceUpdateAvailable, false);
+    assert.equal(report.runtimeUpdateAvailable, true);
+    assert.equal(report.activeRunBlockers[0].id, "run_1");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

@@ -398,12 +398,16 @@ npm run self-update -- --plan
 npm run self-update
 ```
 
-The self-updater only fast-forwards the configured branch, `main` by default. It refuses to update when:
+The self-updater compares both the configured source branch (`main` by default) and the active immutable runtime provenance. It can therefore republish and restart a stale runtime even when the source checkout was already fast-forwarded by a person or another process. Source divergence and runtime drift are reported separately.
+
+It refuses to update or republish the runtime when:
 
 - the working tree has uncommitted or untracked files
 - local `main` cannot fast-forward to `origin/main`
 - the checkout is on another branch
 - builder or reviewer Codex runs are actively running
+
+An absent runtime, a runtime commit that differs from the verified source commit, or invalid runtime provenance is actionable drift. Runtime publication still uses the immutable release staging and atomic `current` symlink swap, so a repair does not execute files directly from the writable source checkout.
 
 Running builder/reviewer runs are ignored only when they are stale, such as a missing runner process when PID checks are enabled or a `startedAt` timestamp older than the configured stale-run window. After a successful update, the updater restarts these LaunchAgents:
 
