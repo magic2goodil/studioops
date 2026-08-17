@@ -6,7 +6,7 @@
     "config-store-policy": {
       "paths": ["src/config.js", "src/store.js", "test/config.test.js", "test/state-database.test.js"],
       "owner": "workflow-state",
-      "publicContracts": ["normalizeWorkspaceRetention", "eligibleRunWorkspaceSnapshotsInState", "claimRunWorkspaceCandidates", "finalizeRunWorkspaceCleanup", "releaseRunWorkspaceCleanup"],
+      "publicContracts": ["normalizeWorkspaceRetention", "eligibleRunWorkspaceSnapshots", "claimRunWorkspaceCandidates", "finalizeRunWorkspaceCleanup", "releaseRunWorkspaceCleanup"],
       "ownedData": ["run.workspaceCleanup", "meta.workspaceRetention"],
       "rollback": "disable defaults.runner.workspaceRetention; additive payload fields are ignored by older releases",
       "testLayers": ["unit", "contract", "persistence", "concurrency"]
