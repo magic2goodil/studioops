@@ -2434,7 +2434,7 @@ async function recordProjectResult(projectResult) {
         });
       }
     }
-  });
+  }, { operationName: "qa_integration.record_result" });
 }
 
 async function recordIneligibleProject(projectPlan) {

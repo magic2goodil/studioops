@@ -1048,7 +1048,7 @@ async function recordProjectResult(projectResult) {
         createdAt: now,
       });
     }
-  });
+  }, { operationName: "promotion.record_result" });
 }
 
 export async function runPromotion(input = {}) {

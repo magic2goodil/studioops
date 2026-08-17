@@ -648,7 +648,9 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
 }
 
 export async function claimRunWorkspaceCandidates(input = {}) {
-  return mutateState(async (state) => claimRunWorkspaceCandidatesInState(state, input));
+  return mutateState(async (state) => claimRunWorkspaceCandidatesInState(state, input), {
+    operationName: "workspace_cleanup.claim",
+  });
 }
 
 export function finalizeRunWorkspaceCleanupInState(state, runId, input = {}) {
@@ -665,7 +667,9 @@ export function finalizeRunWorkspaceCleanupInState(state, runId, input = {}) {
 }
 
 export async function finalizeRunWorkspaceCleanup(runId, input = {}) {
-  return mutateState(async (state) => finalizeRunWorkspaceCleanupInState(state, runId, input));
+  return mutateState(async (state) => finalizeRunWorkspaceCleanupInState(state, runId, input), {
+    operationName: "workspace_cleanup.finalize",
+  });
 }
 
 export function releaseRunWorkspaceCleanupInState(state, runId, input = {}) {
@@ -685,7 +689,9 @@ export function releaseRunWorkspaceCleanupInState(state, runId, input = {}) {
 }
 
 export async function releaseRunWorkspaceCleanup(runId, input = {}) {
-  return mutateState(async (state) => releaseRunWorkspaceCleanupInState(state, runId, input));
+  return mutateState(async (state) => releaseRunWorkspaceCleanupInState(state, runId, input), {
+    operationName: "workspace_cleanup.release",
+  });
 }
 
 export async function ensureDataFile() {
@@ -1478,7 +1484,7 @@ export async function addProject(input) {
       createdAt: now,
     });
     return project;
-  });
+  }, { operationName: "project.add" });
 }
 
 export async function updateProject(projectId, patch = {}) {
@@ -1562,7 +1568,7 @@ export async function updateProject(projectId, patch = {}) {
       createdAt: now,
     });
     return project;
-  });
+  }, { operationName: "project.update" });
 }
 
 export function adoptDefaultProjectStandardsInState(state, projectId, input = {}) {
@@ -1588,7 +1594,9 @@ export function adoptDefaultProjectStandardsInState(state, projectId, input = {}
 }
 
 export async function adoptDefaultProjectStandards(projectId, input = {}) {
-  return mutateState(async (state) => adoptDefaultProjectStandardsInState(state, projectId, input));
+  return mutateState(async (state) => adoptDefaultProjectStandardsInState(state, projectId, input), {
+    operationName: "project.adopt_standards",
+  });
 }
 
 function governedArchitectureParent(state, project, parentTaskId, architectureParentTaskId) {
@@ -1718,7 +1726,7 @@ export async function addTask(input) {
       createdAt: now,
     });
     return task;
-  });
+  }, { operationName: "task.add" });
 }
 
 function lifecycleInvalidationIds(state, task, decision) {
@@ -1904,7 +1912,9 @@ export async function transitionTask(command, input = {}) {
   const allowed = ["action", "taskId", "expectedStateVersion", "actorContext", "evidence"];
   const unknown = Object.keys(command).filter((key) => !allowed.includes(key));
   if (unknown.length) throw new Error(`Unknown lifecycle command fields: ${unknown.join(", ")}`);
-  return mutateState(async (state) => applyLifecycleTransitionInState(state, command, input));
+  return mutateState(async (state) => applyLifecycleTransitionInState(state, command, input), {
+    operationName: `task.transition.${command.action || "unknown"}`,
+  });
 }
 
 export async function repairLegacyTaskStatus(taskId, status, input = {}) {
@@ -1939,7 +1949,7 @@ export async function repairLegacyTaskStatus(taskId, status, input = {}) {
       createdAt: result.decision.occurredAt,
     });
     return result.task;
-  }, { repairTaskId: taskId });
+  }, { repairTaskId: taskId, operationName: "task.repair_legacy_status" });
 }
 
 export async function updateTask(taskId, patch) {
@@ -2221,7 +2231,7 @@ export async function updateTask(taskId, patch) {
       createdAt: task.updatedAt,
     });
     return task;
-  });
+  }, { operationName: "task.update" });
 }
 
 function missingArchitectureChildContractFields(child) {
@@ -2398,7 +2408,9 @@ export function completeArchitectureInState(state, taskId, input = {}) {
 }
 
 export async function completeArchitecture(taskId, input = {}) {
-  return mutateState(async (state) => completeArchitectureInState(state, taskId, input));
+  return mutateState(async (state) => completeArchitectureInState(state, taskId, input), {
+    operationName: "task.complete_architecture",
+  });
 }
 
 function qaDecisionSubject(candidate, input = {}) {
@@ -2595,7 +2607,7 @@ export async function recordQaDecision(taskId, input = {}) {
         repositoryVerifiedAt: verified.verification.verifiedAt,
       }),
     };
-  });
+  }, { operationName: "qa.record_task_decision" });
   if (!operation.ok) throw new Error(operation.error);
   return operation.result;
 }
@@ -2616,7 +2628,7 @@ export async function recordQaBundleDecision(bundleId, input = {}) {
         repositoryVerifiedAt: verified.verification.verifiedAt,
       }),
     };
-  });
+  }, { operationName: "qa.record_bundle_decision" });
   if (!operation.ok) throw new Error(operation.error);
   return operation.result;
 }
@@ -2644,7 +2656,7 @@ export async function addComment(taskId, body, author = "user") {
       createdAt: now,
     });
     return comment;
-  });
+  }, { operationName: "task.add_comment" });
 }
 
 export function recordReviewInState(state, taskId, input = {}) {
@@ -2744,7 +2756,7 @@ export function recordReviewInState(state, taskId, input = {}) {
 export async function recordReview(taskId, input = {}) {
   return mutateState(async (state) => {
     return recordReviewInState(state, taskId, input);
-  });
+  }, { operationName: "review.record" });
 }
 
 export async function automationTick(input = {}) {
@@ -2806,7 +2818,7 @@ export async function automationTick(input = {}) {
       createdAt: now,
     });
     return { actions };
-  });
+  }, { operationName: "automation.tick" });
 }
 
 const ACTIVE_DISK_INCIDENT_STATES = new Set(["reclaiming", "awaiting_health", "degraded"]);
@@ -2933,7 +2945,9 @@ export function openDiskPressureIncidentInState(state, input = {}) {
 }
 
 export async function openDiskPressureIncident(input = {}) {
-  return mutateState(async (state) => openDiskPressureIncidentInState(state, input));
+  return mutateState(async (state) => openDiskPressureIncidentInState(state, input), {
+    operationName: "disk_incident.open",
+  });
 }
 
 function requireDiskIncidentGeneration(state, input) {
@@ -2982,7 +2996,9 @@ export function updateDiskPressureIncidentInState(state, input = {}) {
 }
 
 export async function updateDiskPressureIncident(input = {}) {
-  return mutateState(async (state) => updateDiskPressureIncidentInState(state, input));
+  return mutateState(async (state) => updateDiskPressureIncidentInState(state, input), {
+    operationName: "disk_incident.update",
+  });
 }
 
 export function recoverDiskPressureIncidentInState(state, input = {}) {
@@ -3022,7 +3038,9 @@ export function recoverDiskPressureIncidentInState(state, input = {}) {
 }
 
 export async function recoverDiskPressureIncident(input = {}) {
-  return mutateState(async (state) => recoverDiskPressureIncidentInState(state, input));
+  return mutateState(async (state) => recoverDiskPressureIncidentInState(state, input), {
+    operationName: "disk_incident.recover",
+  });
 }
 
 function taskHasActiveRun(state, taskId) {
@@ -3198,7 +3216,9 @@ export function setOperatorPauseInState(state, input = {}) {
 }
 
 export async function setOperatorPause(input = {}) {
-  return mutateState(async (state) => setOperatorPauseInState(state, input));
+  return mutateState(async (state) => setOperatorPauseInState(state, input), {
+    operationName: "automation.pause",
+  });
 }
 
 export function resumeOperatorAutomationInState(state, input = {}) {
@@ -3223,7 +3243,9 @@ export function resumeOperatorAutomationInState(state, input = {}) {
 }
 
 export async function resumeOperatorAutomation(input = {}) {
-  return mutateState(async (state) => resumeOperatorAutomationInState(state, input));
+  return mutateState(async (state) => resumeOperatorAutomationInState(state, input), {
+    operationName: "automation.resume",
+  });
 }
 
 export function resetAutomationCircuitInState(state, input = {}) {
@@ -3321,7 +3343,9 @@ export async function resetAutomationCircuit(input = {}) {
   if (input.task && !input.expectedSnapshot && !String(input.expectedOpenedAt || "").trim()) {
     throw new Error("Task circuit reset requires --expected-opened-at or an expected snapshot.");
   }
-  return mutateState(async (state) => resetAutomationCircuitInState(state, input));
+  return mutateState(async (state) => resetAutomationCircuitInState(state, input), {
+    operationName: "automation.reset_circuit",
+  });
 }
 
 export async function updateRun(runId, patch = {}) {
@@ -3369,7 +3393,7 @@ export async function updateRun(runId, patch = {}) {
       createdAt: run.updatedAt,
     });
     return run;
-  });
+  }, { operationName: "run.update" });
 }
 
 export function findProject(state, keyOrId) {

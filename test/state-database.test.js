@@ -612,6 +612,105 @@ test("concurrent worker processes serialize updates without dropping comments", 
   }
 });
 
+test("slow mutation preparation does not hold the SQLite write lock", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-short-lock-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    const slowMutation = runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState(async (state) => {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        state.meta.slowMutationCompleted = true;
+      }, { operationName: "test.slow_prepare", idempotent: true });
+    `);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const startedAt = Date.now();
+    await runStoreScript(root, `
+      import { addComment } from ${JSON.stringify(storeModuleUrl)};
+      await addComment("task_1", "fast writer", "Contention test");
+    `);
+    const elapsedMs = Date.now() - startedAt;
+    await slowMutation;
+
+    assert.ok(elapsedMs < 600, `fast writer waited ${elapsedMs}ms behind mutation preparation`);
+    const state = readPersistedState(root);
+    assert.equal(state.meta.slowMutationCompleted, true);
+    assert.equal(state.comments.some((comment) => comment.body === "fast writer"), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("non-idempotent mutations fail closed instead of replaying after a version conflict", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-non-idempotent-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    const nonIdempotent = runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState(async (state) => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        state.meta.mustNotReplay = true;
+      }, { operationName: "test.non_idempotent", idempotent: false });
+    `);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await runStoreScript(root, `
+      import { addComment } from ${JSON.stringify(storeModuleUrl)};
+      await addComment("task_1", "wins conflict", "Contention test");
+    `);
+    await assert.rejects(nonIdempotent, /state changed during test\.non_idempotent/);
+
+    const state = readPersistedState(root);
+    assert.equal(state.meta.mustNotReplay, undefined);
+    assert.equal(state.comments.some((comment) => comment.body === "wins conflict"), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("database contention health is bounded and omits mutation payload data", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-contention-health-"));
+  try {
+    await writeLegacyState(root);
+    const { stdout } = await runStoreScript(root, `
+      import { addComment } from ${JSON.stringify(storeModuleUrl)};
+      import { databaseContentionHealth } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+      await addComment("task_1", "private comment body", "Health test");
+      process.stdout.write(JSON.stringify(await databaseContentionHealth()));
+    `);
+    const health = JSON.parse(stdout);
+    assert.equal(health.operationCount >= 1, true);
+    assert.equal(Array.isArray(health.recent), true);
+    assert.equal(JSON.stringify(health).includes("private comment body"), false);
+    assert.equal(health.recent.length <= 20, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("dispatcher runner watchdog notifier and QA writers preserve every concurrent update", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-worker-stress-"));
+  const workers = ["dispatcher", "runner", "watchdog", "notifier", "qa"];
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    await Promise.all(workers.flatMap((worker) => Array.from({ length: 4 }, (_, index) => runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState(async (state) => {
+        await new Promise((resolve) => setTimeout(resolve, ${5 + index * 3}));
+        state.meta.workerCounters = state.meta.workerCounters || {};
+        state.meta.workerCounters[${JSON.stringify(worker)}] = Number(state.meta.workerCounters[${JSON.stringify(worker)}] || 0) + 1;
+      }, { operationName: ${JSON.stringify(`${worker}.stress`)}, idempotent: true, maxBusyRetries: 8 });
+    `))));
+
+    const state = readPersistedState(root);
+    assert.deepEqual(state.meta.workerCounters, Object.fromEntries(workers.map((worker) => [worker, 4])));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("SQLite rejects mutation of a frozen candidate manifest and rolls back atomically", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-candidate-immutability-"));
   const sourceSha = "a".repeat(40);
