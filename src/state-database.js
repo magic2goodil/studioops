@@ -912,6 +912,13 @@ async function runStateIntegrityMigration(db) {
     }
     ensureLifecycleSchema(db);
     ensureCoordinationSchema(db);
+    if (process.env.STUDIOOPS_TEST_FAIL_COORDINATION_MIGRATION === "after_schema") {
+      if (!process.env.NODE_TEST_CONTEXT && !process.env.STUDIOOPS_TEST_ISOLATION) {
+        throw new Error("Coordination migration fault injection is restricted to isolated tests.");
+      }
+      assertIsolatedTestEnvironment();
+      throw new Error("Injected coordination migration failure after schema change.");
+    }
     const state = readStateFromOpenDatabase(db);
     const snapshot = mutationSnapshot(state);
     reconcileStateIntegrity(state);

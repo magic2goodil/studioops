@@ -12,14 +12,34 @@ import { digestOperationRequest } from "../src/coordination.js";
 const execFileAsync = promisify(execFile);
 const coordinationUrl = pathToFileURL(path.join(process.cwd(), "src/coordination.js")).href;
 
-async function run(root, source, clockMs = Date.parse("2026-08-17T00:00:00.000Z")) {
+async function run(root, source, clockMs = Date.parse("2026-08-17T00:00:00.000Z"), extraEnv = {}) {
   const env = await environmentForTestControlRoot(root);
   env.STUDIOOPS_COORDINATION_TEST_NOW_MS = String(clockMs);
+  Object.assign(env, extraEnv);
   return execFileAsync(process.execPath, ["--input-type=module", "-e", source], {
     cwd: root,
     env,
     timeout: 30_000,
   });
+}
+
+async function createV1CoordinationFixture(root) {
+  await run(root, `
+    import { ensureStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+    const db = await ensureStateDatabase();
+    db.exec("DROP INDEX IF EXISTS idx_coordination_leases_aggregate; DROP INDEX IF EXISTS idx_external_operations_aggregate");
+    db.exec("ALTER TABLE coordination_leases DROP COLUMN aggregate_type; ALTER TABLE coordination_leases DROP COLUMN aggregate_id");
+    db.exec("ALTER TABLE external_operations DROP COLUMN aggregate_type; ALTER TABLE external_operations DROP COLUMN aggregate_id");
+    const meta = JSON.parse(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get().payload);
+    meta.coordinationMigration.schemaVersion = 1;
+    db.prepare("UPDATE state_meta SET payload = ? WHERE singleton_id = 1").run(JSON.stringify(meta));
+    const task = { id: "task_aggregate", projectId: "project_test", title: "Coordination fixture", status: "in_progress", stateVersion: 7 };
+    db.prepare("INSERT INTO tasks(id, sequence, project_id, status, assigned_role, updated_at, state_version, payload) VALUES (?, 1, ?, ?, '', ?, ?, ?)")
+      .run(task.id, task.projectId, task.status, new Date().toISOString(), task.stateVersion, JSON.stringify(task));
+    db.prepare("INSERT INTO coordination_fence_counters(resource_key, last_fence, updated_at) VALUES ('provider:subject-1', 1, '2026-08-17T00:00:00.000Z')").run();
+    db.prepare("INSERT INTO coordination_leases(lease_id, resource_key, fence, owner_process_identity, expected_state_version, status, acquired_at, heartbeat_at, expires_at, terminal_at, detail_json) VALUES ('lease-v1', 'provider:subject-1', 1, 'worker:v1', 7, 'expired', '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:01.000Z', '2026-08-17T00:00:01.000Z', '{}')").run();
+    db.prepare("INSERT INTO external_operations(operation_key, operation_id, kind, request_digest, subject, expected_remote_state, lease_id, fence, owner_process_identity, expected_state_version, status, prepared_at, terminal_at, evidence_json) VALUES ('operation-v1', 'operation-id-v1', 'write', 'sha256:v1', 'subject-1', 'etag-1', 'lease-v1', 1, 'worker:v1', 7, 'quarantined', '2026-08-17T00:00:00.000Z', '2026-08-17T00:00:01.000Z', '{}')").run();
+  `);
 }
 
 function args(root) {
@@ -225,6 +245,98 @@ test("terminal completion rejects an operation after the authoritative aggregate
     `)).stdout.trim());
     assert.match(output.error, /state version changed from 7 to 8/i);
     assert.equal(output.row.status, "prepared");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a new fenced owner can atomically adopt and resolve an expired prepared intent", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-coordination-adoption-"));
+  try {
+    await seedAggregate(root);
+    const input = { ...args(root), leaseTtlMs: 1_000 };
+    const original = JSON.parse((await run(root, `
+      import { claimLease, prepareExternalOperation } from ${JSON.stringify(coordinationUrl)};
+      const base = ${JSON.stringify(input)};
+      const lease = (await claimLease(base)).lease;
+      const operation = await prepareExternalOperation({ ...base, ...lease, operationKey: "recoverable", kind: "write", requestDigest: "sha256:recoverable", subject: "subject-1", expectedRemoteState: "etag-1" });
+      console.log(JSON.stringify({ lease, operation }));
+    `)).stdout.trim());
+    const recovered = JSON.parse((await run(root, `
+      import { claimLease, prepareExternalOperation, completeExternalOperation } from ${JSON.stringify(coordinationUrl)};
+      const base = ${JSON.stringify({ ...input, ownerProcessIdentity: "worker:recovery" })};
+      const lease = (await claimLease(base)).lease;
+      const adopted = await prepareExternalOperation({ ...base, ...lease, operationKey: "recoverable", kind: "write", requestDigest: "sha256:recoverable", subject: "subject-1", expectedRemoteState: "etag-1" });
+      const completed = await completeExternalOperation({ ...base, ...lease, operationKey: "recoverable", requestDigest: "sha256:recoverable" });
+      console.log(JSON.stringify({ lease, adopted, completed }));
+    `, Date.parse("2026-08-17T00:00:01.001Z"))).stdout.trim());
+    assert.equal(recovered.lease.fence, original.lease.fence + 1);
+    assert.equal(recovered.adopted.leaseId, recovered.lease.leaseId);
+    assert.equal(recovered.completed.status, "succeeded");
+    const stale = JSON.parse((await run(root, `
+      import { completeExternalOperation } from ${JSON.stringify(coordinationUrl)};
+      let error = "";
+      try { await completeExternalOperation({ ...${JSON.stringify(input)}, ...${JSON.stringify(original.lease)}, operationKey: "recoverable", requestDigest: "sha256:recoverable" }); } catch (caught) { error = caught.message; }
+      console.log(JSON.stringify({ error }));
+    `, Date.parse("2026-08-17T00:00:01.002Z"))).stdout.trim());
+    assert.match(stale.error, /stale lease tuple/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("coordination schema upgrades v1 rows with a verified backup", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-coordination-v1-upgrade-"));
+  try {
+    await createV1CoordinationFixture(root);
+    const result = JSON.parse((await run(root, `
+      import { stat } from "node:fs/promises";
+      import { ensureStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+      const db = await ensureStateDatabase();
+      const meta = JSON.parse(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get().payload);
+      const columns = (table) => db.prepare(\`PRAGMA table_info(\${table})\`).all().map((column) => column.name);
+      const lease = db.prepare("SELECT lease_id, aggregate_type, aggregate_id FROM coordination_leases WHERE lease_id = 'lease-v1'").get();
+      const operation = db.prepare("SELECT operation_key, aggregate_type, aggregate_id FROM external_operations WHERE operation_key = 'operation-v1'").get();
+      const backup = await stat(meta.coordinationMigration.backupPath);
+      console.log(JSON.stringify({ version: meta.coordinationMigration.schemaVersion, verified: meta.coordinationMigration.backupVerified, backupBytes: backup.size, columns: { leases: columns("coordination_leases"), operations: columns("external_operations") }, lease, operation }));
+    `)).stdout.trim());
+    assert.equal(result.version, 2);
+    assert.equal(result.verified, true);
+    assert.ok(result.backupBytes > 0);
+    assert.ok(result.columns.leases.includes("aggregate_type") && result.columns.leases.includes("aggregate_id"));
+    assert.ok(result.columns.operations.includes("aggregate_type") && result.columns.operations.includes("aggregate_id"));
+    assert.deepEqual(result.lease, { lease_id: "lease-v1", aggregate_type: "", aggregate_id: "" });
+    assert.deepEqual(result.operation, { operation_key: "operation-v1", aggregate_type: "", aggregate_id: "" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("coordination migration rolls schema and metadata back after an injected failure", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-coordination-v1-rollback-"));
+  try {
+    await createV1CoordinationFixture(root);
+    await assert.rejects(
+      () => run(root, `
+        import { ensureStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+        await ensureStateDatabase();
+      `, Date.parse("2026-08-17T00:00:00.000Z"), { STUDIOOPS_TEST_FAIL_COORDINATION_MIGRATION: "after_schema" }),
+      /Injected coordination migration failure/,
+    );
+    const result = JSON.parse((await run(root, `
+      import { DatabaseSync } from "node:sqlite";
+      import path from "node:path";
+      import { missionControlDataDir } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/runtime-paths.js")).href)};
+      const db = new DatabaseSync(path.join(missionControlDataDir(), "mission-control.sqlite3"), { readOnly: true });
+      const meta = JSON.parse(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get().payload);
+      const columns = (table) => db.prepare(\`PRAGMA table_info(\${table})\`).all().map((column) => column.name);
+      console.log(JSON.stringify({ version: meta.coordinationMigration.schemaVersion, leases: columns("coordination_leases"), operations: columns("external_operations"), leaseCount: db.prepare("SELECT count(*) count FROM coordination_leases").get().count, operationCount: db.prepare("SELECT count(*) count FROM external_operations").get().count }));
+    `)).stdout.trim());
+    assert.equal(result.version, 1);
+    assert.equal(result.leases.includes("aggregate_type"), false);
+    assert.equal(result.operations.includes("aggregate_type"), false);
+    assert.equal(result.leaseCount, 1);
+    assert.equal(result.operationCount, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

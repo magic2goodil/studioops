@@ -229,6 +229,20 @@ function leaseForOperation(db, input, nowMs) {
   return row;
 }
 
+function operationAuthorityMatches(operation, lease) {
+  return operation.lease_id === lease.lease_id
+    && Number(operation.fence) === Number(lease.fence)
+    && operation.owner_process_identity === lease.owner_process_identity
+    && Number(operation.expected_state_version) === Number(lease.expected_state_version);
+}
+
+function assertOperationIntentMatches(existing, input) {
+  if (existing.kind !== input.kind || existing.subject !== input.subject
+    || existing.expected_remote_state !== input.expectedRemoteState) {
+    throw new Error("Operation key intent mismatch; refusing to adopt a different external operation.");
+  }
+}
+
 export async function prepareExternalOperation(input = {}) {
   const operationKey = text(input.operationKey, "operationKey");
   const kind = text(input.kind, "kind");
@@ -240,7 +254,29 @@ export async function prepareExternalOperation(input = {}) {
     const existing = db.prepare("SELECT * FROM external_operations WHERE operation_key = ?").get(operationKey);
     if (existing) {
       if (existing.request_digest !== requestDigest) throw new Error("Operation key payload mismatch; refusing to reuse the idempotency key.");
-      return rowToOperation(existing);
+      assertOperationIntentMatches(existing, { kind, subject, expectedRemoteState });
+      if (existing.status !== "prepared") return rowToOperation(existing);
+      const lease = leaseForOperation(db, input, nowMs);
+      assertAuthoritativeAggregateVersion(db, lease.aggregate_type, lease.aggregate_id, lease.expected_state_version);
+      if (operationAuthorityMatches(existing, lease)) return rowToOperation(existing);
+      const priorLease = db.prepare("SELECT * FROM coordination_leases WHERE lease_id = ?").get(existing.lease_id);
+      if (!priorLease || priorLease.resource_key !== lease.resource_key
+        || existing.aggregate_type !== lease.aggregate_type || existing.aggregate_id !== lease.aggregate_id) {
+        throw new Error("Prepared operation cannot be adopted across resource or aggregate boundaries.");
+      }
+      if (priorLease.status === "active" && priorLease.expires_at > iso(nowMs)) {
+        throw new Error("Prepared operation remains owned by an unexpired lease.");
+      }
+      const adopted = db.prepare(`UPDATE external_operations
+        SET lease_id = ?, fence = ?, owner_process_identity = ?, expected_state_version = ?
+        WHERE operation_key = ? AND status = 'prepared'
+          AND lease_id = ? AND fence = ? AND owner_process_identity = ? AND expected_state_version = ?`)
+        .run(
+          lease.lease_id, lease.fence, lease.owner_process_identity, lease.expected_state_version,
+          operationKey, existing.lease_id, existing.fence, existing.owner_process_identity, existing.expected_state_version,
+        );
+      if (adopted.changes !== 1) throw new Error("Prepared operation adoption compare-and-swap rejected.");
+      return rowToOperation(db.prepare("SELECT * FROM external_operations WHERE operation_key = ?").get(operationKey));
     }
     const lease = leaseForOperation(db, input, nowMs);
     assertAuthoritativeAggregateVersion(db, lease.aggregate_type, lease.aggregate_id, lease.expected_state_version);
