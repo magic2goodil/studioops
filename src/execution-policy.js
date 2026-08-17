@@ -27,6 +27,7 @@ export const DEFAULT_EXECUTION_POLICY = Object.freeze({
 });
 
 const COMPLEX_WORK_PATTERN = /\b(architecture|architectural|security|privacy|pii|consent|oauth|authentication|authorization|migration|schema|database|index|deployment|release|production|infrastructure|data loss)\b/i;
+const ROUTINE_CONFIG_PATTERN = /(^|\/)(?:\.editorconfig|\.prettier(?:rc|ignore)?|\.eslintignore|prettier\.config\.[^/]+|eslint\.config\.[^/]+|markdownlint(?:\.json|\.yaml|\.yml)?|\.markdownlint(?:\.json|\.yaml|\.yml)?)$/i;
 
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
@@ -65,6 +66,19 @@ function configuredTier(configured, name) {
   return tier && typeof tier === "object" ? tier : {};
 }
 
+function exactRoutineImpact(task = {}, complex = false) {
+  if (complex || task.impactEvidence?.unknown !== false) return false;
+  const files = Array.isArray(task.impactEvidence?.changedFiles)
+    ? task.impactEvidence.changedFiles.map((file) => String(file).replaceAll("\\", "/"))
+    : [];
+  if (!files.length) return false;
+  return files.every((file) => (
+    /(^|\/)(?:docs?\/|readme(?:\.[^/]*)?$|changelog(?:\.[^/]*)?$|contributing(?:\.[^/]*)?$|license(?:\.[^/]*)?$)/i.test(file)
+    || /\.mdx?$/i.test(file)
+    || ROUTINE_CONFIG_PATTERN.test(file)
+  ));
+}
+
 export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const configured = {
     ...DEFAULT_EXECUTION_POLICY,
@@ -75,6 +89,7 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const systemsArchitect = role.includes("architect");
   const lead = role.includes("lead");
   const complex = COMPLEX_WORK_PATTERN.test(taskText(task));
+  const proportionateReview = lead && exactRoutineImpact(task, complex);
   const mechanicalLabels = normalizedLabels(configured.mechanicalLabels);
   const escalationLabels = normalizedLabels(configured.escalationLabels);
   const taskLabels = normalizedLabels(task.labels);
@@ -90,7 +105,9 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
     : systemsArchitect
       ? routing.architectTier
       : lead
-        ? routing.leadTier
+        ? proportionateReview
+          ? routing.routineReviewTier || "balanced"
+          : routing.leadTier
         : complex
           ? routing.complexTier
           : mechanical
@@ -103,7 +120,7 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
       || (escalated ? configured.ultraReasoningEffort : "")
       || tierPolicy.reasoningEffort
       || (systemsArchitect ? configured.architectReasoningEffort : "")
-      || (lead ? configured.leadReasoningEffort : "")
+      || (lead && !proportionateReview ? configured.leadReasoningEffort : "")
       || (complex ? configured.complexReasoningEffort : "")
       || rolePolicy.reasoningEffort
       || configured.reasoningEffort,
@@ -146,8 +163,8 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
       ? "explicit_escalation"
       : systemsArchitect
         ? "systems_architect_role"
-        : lead
-          ? "lead_role"
+      : lead
+          ? proportionateReview ? "proportionate_exact_diff" : "lead_role"
           : complex
             ? "complex_task"
             : mechanical

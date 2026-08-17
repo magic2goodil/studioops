@@ -3428,7 +3428,7 @@ export function resetAutomationCircuitInState(state, input = {}) {
     addAutomationComment(
       state,
       task,
-      `Automation circuit reset after owner verification. New execution epoch ${task.automationAttemptEpoch}. Reason: ${target.automationCircuit.closeReason}`,
+      `${input.automatic ? "Automation circuit reset after fresh policy verification" : "Automation circuit reset after owner verification"}. New execution epoch ${task.automationAttemptEpoch}. Reason: ${target.automationCircuit.closeReason}`,
       now,
       target.automationCircuit.closedBy,
     );
@@ -4307,6 +4307,7 @@ Architecture mandate:
 - Design one authoritative pull-request validation path and one stable aggregate check. Ambiguous or shared impact must fail closed to full regression, and protected integration evidence must be reusable only at the exact immutable SHA.
 - Capture material decisions and rejected alternatives with concise reasons.
 - Break broad work into dependency-linked StudioOps child tasks. Each child must include the architectural constraints it consumes, observable acceptance criteria, validation commands/expectations, correct attachments, a narrow lane/work area, \`--parent ${task.id}\`, and \`--architecture-approved\`.
+- Declare a dependency only when the downstream implementation cannot be built or validated without the upstream contract or artifact. Do not use parent epics, review gates, release slices, or preferred ordering as hard dependencies; keep those as tracking or candidate-level gates so independent implementation can proceed in parallel.
 - Preserve a single coherent architecture across those child tasks. Builders must not independently reinvent infrastructure or data contracts.
 
 Required durable handoff:

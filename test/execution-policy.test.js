@@ -92,6 +92,52 @@ test("tiered routing keeps risky work on Sol while using Luna and Terra for rout
   assert.equal(risky.selectionReason, "complex_task");
 });
 
+test("exact routine documentation uses proportionate lead review while security documentation remains critical", () => {
+  const executionPolicy = {
+    modelTiers: {
+      balanced: { model: "gpt-5.6-terra", reasoningEffort: "high" },
+      critical: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+    },
+    tierRouting: {
+      defaultTier: "balanced",
+      leadTier: "critical",
+      complexTier: "critical",
+      routineReviewTier: "balanced",
+    },
+  };
+  const routine = resolveExecutionPolicy(
+    {
+      id: "task_docs",
+      title: "Clarify contributor wording",
+      impactEvidence: {
+        unknown: false,
+        changedFiles: ["docs/contributing.md", "README.md"],
+      },
+    },
+    { type: "start_review", role: "lead-reviewer" },
+    { executionPolicy },
+  );
+  const risky = resolveExecutionPolicy(
+    {
+      id: "task_security_docs",
+      title: "Document OAuth deployment security",
+      impactEvidence: {
+        unknown: false,
+        changedFiles: ["docs/oauth.md"],
+      },
+    },
+    { type: "start_review", role: "lead-reviewer" },
+    { executionPolicy },
+  );
+
+  assert.equal(routine.modelTier, "balanced");
+  assert.equal(routine.model, "gpt-5.6-terra");
+  assert.equal(routine.selectionReason, "proportionate_exact_diff");
+  assert.equal(risky.modelTier, "critical");
+  assert.equal(risky.model, "gpt-5.6-sol");
+  assert.equal(risky.selectionReason, "lead_role");
+});
+
 test("Spark requires an explicit mechanical label and never overrides risky work", () => {
   const executionPolicy = {
     modelTiers: {

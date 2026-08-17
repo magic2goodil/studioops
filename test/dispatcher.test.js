@@ -568,6 +568,151 @@ test("credit admission blocks a critical run once and opens an owner-visible cir
   const second = await dispatchSupervisorActions([action], options);
   assert.equal(second.runs.length, 0);
   assert.equal(second.skipped[0].reason, "task_status_changed:ready->blocked");
+  assert.deepEqual(second.recoveredCreditCircuitTaskIds, []);
+});
+
+test("fresh admissible telemetry automatically restores an unchanged credit-only circuit once", async () => {
+  const state = fixtureState();
+  state.tasks.push({
+    id: "task_credit_recovery",
+    projectId: "project_1",
+    title: "Harden OAuth authorization",
+    status: "ready",
+    priority: "critical",
+    acceptanceCriteria: ["Authorization remains tenant scoped."],
+  });
+  const action = {
+    id: "task_credit_recovery:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_credit_recovery",
+    taskTitle: "Harden OAuth authorization",
+    taskStatus: "ready",
+  };
+  const executionPolicy = {
+    modelTiers: {
+      critical: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+    },
+    tierRouting: { defaultTier: "critical", complexTier: "critical" },
+  };
+  const blockedPolicy = {
+    enabled: true,
+    tierBudgets: { critical: { estimatedCredits: 30, minRemainingPercent: 20 } },
+  };
+  await dispatchSupervisorActions([action], {
+    state,
+    executionPolicy,
+    creditPolicy: blockedPolicy,
+    creditSnapshot: {
+      status: "available",
+      source: "codex-app-server",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 7,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  });
+  assert.equal(state.tasks.at(-1).status, "blocked");
+
+  const recovered = await dispatchSupervisorActions([action], {
+    state,
+    executionPolicy,
+    creditPolicy: {
+      enabled: true,
+      tierBudgets: { critical: { estimatedCredits: 30, minRemainingPercent: 5 } },
+    },
+    creditSnapshot: {
+      status: "available",
+      source: "codex-app-server",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 7,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  });
+
+  assert.deepEqual(recovered.recoveredCreditCircuitTaskIds, ["task_credit_recovery"]);
+  assert.equal(recovered.runs.length, 1);
+  assert.equal(state.tasks.at(-1).automationCircuit.state, "closed");
+  assert.equal(state.tasks.at(-1).automationCircuit.closedBy, "StudioOps Budget Controller");
+  assert.equal(state.tasks.at(-1).automationCircuit.recoveryEvidence.remainingPercent, 7);
+  assert.ok(state.events.some((event) => event.type === "credit_admission_recovered"));
+
+  const duplicate = await dispatchSupervisorActions([action], {
+    state,
+    executionPolicy,
+    creditPolicy: {
+      enabled: true,
+      tierBudgets: { critical: { estimatedCredits: 30, minRemainingPercent: 5 } },
+    },
+    creditSnapshot: {
+      status: "available",
+      source: "codex-app-server",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 7,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  });
+  assert.equal(duplicate.runs.length, 0);
+  assert.deepEqual(duplicate.recoveredCreditCircuitTaskIds, []);
+});
+
+test("automatic credit recovery fails closed when candidate identity drifted", async () => {
+  const state = fixtureState();
+  const snapshot = {
+    status: "ready",
+    assignedAgentRole: "",
+    reviewCycle: 1,
+    reviewSubjectCycle: 1,
+    reviewSubjectSha: "a".repeat(40),
+    candidateIdentity: null,
+    branchName: "feature/original",
+  };
+  state.tasks.push({
+    id: "task_credit_drift",
+    projectId: "project_1",
+    title: "Review OAuth policy",
+    status: "blocked",
+    assignedAgentRole: "owner",
+    reviewCycle: 1,
+    reviewSubjectCycle: 1,
+    reviewSubjectSha: "b".repeat(40),
+    branchName: "feature/changed",
+    automationBlocker: {
+      type: "circuit",
+      modelTier: "critical",
+      resumeStatus: "ready",
+    },
+    automationCircuit: {
+      state: "open",
+      reasonCode: "credit_budget_insufficient",
+      openedAt: "2026-08-17T14:00:00.000Z",
+      snapshot,
+    },
+  });
+
+  const report = await dispatchSupervisorActions([], {
+    state,
+    creditPolicy: {
+      enabled: true,
+      tierBudgets: { critical: { estimatedCredits: 30, minRemainingPercent: 5 } },
+    },
+    creditSnapshot: {
+      status: "available",
+      source: "codex-app-server",
+      observedAt: new Date().toISOString(),
+      remainingPercent: 50,
+      reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  });
+
+  assert.deepEqual(report.recoveredCreditCircuitTaskIds, []);
+  assert.equal(state.tasks.at(-1).automationCircuit.state, "open");
 });
 
 test("credit admission allows an affordable ordinary run at its configured quality tier", async () => {
