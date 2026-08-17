@@ -248,25 +248,30 @@ function notificationFor(state, run) {
 
 export function notificationForBundle(bundle) {
   const taskSummary = (bundle.tasks || [])
-    .slice(0, 4)
-    .map((task) => `${task.id} ${task.title}`)
+    .slice(0, 3)
+    .map((task) => task.title)
     .join("; ");
-  const remainder = Math.max(0, (bundle.tasks || []).length - 4);
+  const remainder = Math.max(0, (bundle.tasks || []).length - 3);
   const releaseCandidate = bundle.status === "release_candidate_ready";
   return {
     title: releaseCandidate ? "StudioOps release candidate ready" : "StudioOps QA bundle ready",
-    subtitle: `${bundle.projectKey || bundle.projectId} · ${bundle.tasks?.length || 0} task(s)`,
-    body: `${taskSummary}${remainder ? `; and ${remainder} more` : ""}${releaseCandidate ? ` · ${bundle.promotionPrUrl || bundle.promotionBranch || "PR ready"}` : bundle.previewUrl ? ` · ${bundle.previewUrl}` : ""}`,
+    subtitle: `${bundle.projectName || bundle.projectKey || bundle.projectId} · ${bundle.tasks?.length || 0} change${bundle.tasks?.length === 1 ? "" : "s"}`,
+    body: `${releaseCandidate ? "Ready for release review" : "Ready to test locally"}: ${taskSummary || "validated product changes"}${remainder ? `; and ${remainder} more` : ""}${releaseCandidate ? ` · ${bundle.promotionPrUrl || bundle.promotionBranch || "Open StudioOps for the release PR"}` : bundle.previewUrl ? ` · ${bundle.previewUrl}` : " · Open StudioOps for the ordered QA checklist"}`,
   };
 }
 
 export function notificationForOwnerQaPacket(packet = {}) {
   const sha = String(packet.integration?.sha || "");
   const shortSha = sha ? sha.slice(0, 12) : "unknown";
+  const outcomes = (packet.tasks || [])
+    .slice(0, 2)
+    .map((task) => task.expectedOutcome || task.title)
+    .filter(Boolean)
+    .join("; ");
   return {
     title: "StudioOps QA candidate ready",
-    subtitle: `${packet.projectKey || packet.projectId || "Project"} · ${packet.tasks?.length || 0} task(s)`,
-    body: `A local QA candidate is ready. Approval applies only to tested SHA ${shortSha}. Open StudioOps for the checklist.`,
+    subtitle: `${packet.projectName || packet.projectKey || packet.projectId || "Project"} · ${packet.tasks?.length || 0} change${packet.tasks?.length === 1 ? "" : "s"}`,
+    body: `Ready to test: ${outcomes || "validated product changes"}. Approval applies only to tested SHA ${shortSha}. Open StudioOps for the ordered checklist.`,
   };
 }
 

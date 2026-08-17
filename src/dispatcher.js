@@ -9,7 +9,9 @@ import {
   generatePrompt,
   mutateState,
   readState,
+  resetAutomationCircuitInState,
   reviewStagesForTask,
+  taskAutomationCircuitIsCurrent,
   workflowSnapshotForTask,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
@@ -384,6 +386,60 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
     openedTaskIds.add(task.id);
   }
   return openedTaskIds;
+}
+
+export function recoverAffordableCreditCircuitsInState(state, options = {}, input = {}) {
+  const snapshot = options.creditSnapshot;
+  if (!options.creditPolicy?.enabled || snapshot?.status !== "available") return [];
+  const now = input.now || new Date().toISOString();
+  const recovered = [];
+
+  for (const task of state.tasks || []) {
+    const circuit = task.automationCircuit;
+    const blocker = task.automationBlocker;
+    if (
+      circuit?.state !== "open"
+      || circuit.reasonCode !== "credit_budget_insufficient"
+      || blocker?.type !== "circuit"
+      || !taskAutomationCircuitIsCurrent(task)
+    ) continue;
+
+    const admission = assessCreditAdmission(
+      snapshot,
+      { modelTier: blocker.modelTier },
+      options.creditPolicy,
+    );
+    if (!admission.allowed) continue;
+
+    resetAutomationCircuitInState(state, {
+      task: task.id,
+      expectedOpenedAt: circuit.openedAt,
+      reason: `Fresh credit telemetry admitted the unchanged ${admission.tier} workflow at ${admission.remainingPercent}% remaining quota.`,
+      author: "StudioOps Budget Controller",
+      automatic: true,
+      now,
+    });
+    task.automationCircuit.recoveryEvidence = {
+      snapshotStatus: admission.snapshotStatus,
+      snapshotSource: admission.snapshotSource,
+      snapshotObservedAt: admission.snapshotObservedAt,
+      tier: admission.tier,
+      remainingPercent: Number.isFinite(admission.remainingPercent)
+        ? admission.remainingPercent
+        : null,
+      decision: admission.code,
+    };
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "credit_admission_recovered",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title}: fresh credit telemetry restored ${task.status}; dispatch remains eligible for the next sweep.`,
+      createdAt: now,
+    });
+    recovered.push(task.id);
+  }
+  return recovered;
 }
 
 function resolveReviewTargetStage(stages, task, action) {
@@ -829,6 +885,9 @@ export async function dispatchSupervisorActions(actions, input = {}) {
 
     const now = new Date().toISOString();
     const options = { ...DEFAULTS, ...dispatchInput };
+    const recoveredCreditCircuitTaskIds = options.dryRun
+      ? []
+      : recoverAffordableCreditCircuitsInState(state, options, { now });
     const plan = planDispatches(state, actions, options);
     const runs = [];
 
@@ -840,6 +899,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         effectiveCapacity: plan.effectiveCapacity,
         selected: plan.selected,
         skipped: plan.skipped,
+        recoveredCreditCircuitTaskIds,
       };
     }
 
@@ -911,6 +971,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       effectiveCapacity: plan.effectiveCapacity,
       selected,
       skipped,
+      recoveredCreditCircuitTaskIds,
     };
   });
 }

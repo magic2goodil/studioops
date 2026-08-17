@@ -106,6 +106,7 @@ recorded on each run so the cost and quality decision remains auditable.
         "architectTier": "critical",
         "leadTier": "critical",
         "complexTier": "critical",
+        "routineReviewTier": "balanced",
         "escalationTier": "frontier"
       },
       "roles": {
@@ -127,6 +128,11 @@ recorded on each run so the cost and quality decision remains auditable.
 Tier names are stable policy concepts; model IDs and reasoning effort are
 replaceable local configuration. Architecture, lead, and complex work take
 precedence over cheaper routes.
+Lead review of an exact, classified documentation-only or routine formatting
+configuration diff uses the configurable `routineReviewTier` (balanced by
+default). Security, privacy, authentication, migration, deployment, release,
+production, infrastructure, and data-loss semantics remain critical regardless
+of file type.
 Complex work includes security, privacy, consent, authentication, database,
 migration, deployment, release, production, infrastructure, and data-loss
 terms. Spark is never selected implicitly: a low-risk builder task must carry
@@ -161,11 +167,11 @@ It does not store account identity or authentication tokens.
         },
         "balanced": {
           "estimatedCredits": 15,
-          "minRemainingPercent": 10
+          "minRemainingPercent": 5
         },
         "critical": {
           "estimatedCredits": 30,
-          "minRemainingPercent": 20
+          "minRemainingPercent": 5
         },
         "frontier": {
           "estimatedCredits": 40,
@@ -228,8 +234,11 @@ included quota, StudioOps uses remaining quota percentage instead.
 
 The controller never lowers a task below its quality-required tier. A failed
 critical or frontier admission opens one owner-visible task circuit before any
-model launch. Wait for a reset, add credits, or deliberately update the local
-budget, then use the circuit-reset command shown on the task. If the account
+model launch. A credit-only circuit is automatically closed when a later fresh
+snapshot admits the same required tier and the captured workflow and candidate
+identity are unchanged; the restored task becomes eligible on the following
+dispatcher sweep. Cost-budget circuits and any circuit whose identity drifted
+still require explicit operator review. If the account
 snapshot is unavailable or stale, the versioned
 `degradedTelemetryFallback.rules` contract is keyed only by stable execution
 risk tier. Frontier work fails closed by default. Ordinary critical work uses

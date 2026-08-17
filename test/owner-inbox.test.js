@@ -419,6 +419,8 @@ test("immutable ready QA bundles expose preview and task evidence as one decisio
   assert.equal(state.candidates[0].status, "frozen");
   assert.equal(inbox.count, 1);
   assert.equal(decision.kind, "qa_bundle");
+  assert.match(decision.title, /local QA ready/);
+  assert.match(decision.summary, /duration/i);
   assert.equal(decision.primaryAction.type, "preview");
   assert.equal(decision.tasks[0].id, "task_7");
   assert.equal(decision.tasks[0].taskUrl, "/tasks/task_7");
