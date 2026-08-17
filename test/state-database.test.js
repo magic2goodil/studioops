@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,13 @@ import { maintenanceWriteBlocker } from "../src/state-database.js";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
 import { readPersistedState } from "./state-database-helper.js";
+import {
+  claimRunWorkspaceCandidatesInState,
+  eligibleRunWorkspaceSnapshotsInState,
+  finalizeRunWorkspaceCleanupInState,
+  releaseRunWorkspaceCleanupInState,
+  workspacePathProtectionReason,
+} from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 const storeModuleUrl = pathToFileURL(path.join(process.cwd(), "src/store.js")).href;
@@ -53,6 +60,184 @@ function baseState() {
   };
 }
 
+test("workspace retention eligibility is age bounded, ordered, and protects active or unsafe paths", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [
+    { id: "run_old", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/old", workspaceStrategy: "worktree", workspacePath: `${root}/demo/run_old-feature-old`, completedAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z", workspaceBytes: 2 },
+    { id: "run_new", projectId: "project_1", projectKey: "demo", status: "completed", branchName: "feature/new", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_new-feature-new`, completedAt: "2026-08-15T00:00:00.000Z", updatedAt: "2026-08-15T00:00:00.000Z", workspaceBytes: 1 },
+    { id: "run_active", projectId: "project_1", projectKey: "demo", status: "running", branchName: "feature/active", workspaceStrategy: "worktree", workspacePath: `${root}/demo/run_active-feature-active`, updatedAt: "2026-08-01T00:00:00.000Z" },
+    { id: "run_artifact", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/artifact", workspaceStrategy: "clone", workspacePath: `${root}/demo/candidates/run_artifact-feature-artifact`, completedAt: "2026-08-01T00:00:00.000Z" },
+  ];
+  const candidates = eligibleRunWorkspaceSnapshotsInState(state, {
+    workspaceRoot: root,
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    policy: { retainForHours: { completed: 1, failed: 1, cancelled: 1 } },
+  });
+  assert.deepEqual(candidates.map((item) => item.runId), ["run_new", "run_old"]);
+  assert.equal(workspacePathProtectionReason(state.runs[3], { workspaceRoot: root, project: state.projects[0] }), "candidate_artifact_path");
+});
+
+test("workspace retention applies exact normal and pressure age boundaries", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [
+    { id: "run_boundary", projectId: "project_1", projectKey: "demo", status: "completed", branchName: "boundary", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_boundary-boundary`, completedAt: new Date(nowMs - 168 * 3_600_000).toISOString() },
+    { id: "run_too_young", projectId: "project_1", projectKey: "demo", status: "completed", branchName: "too-young", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_too_young-too-young`, completedAt: new Date(nowMs - 168 * 3_600_000 + 1).toISOString() },
+  ];
+  assert.deepEqual(eligibleRunWorkspaceSnapshotsInState(state, { workspaceRoot: root, nowMs }).map((item) => item.runId), ["run_boundary"]);
+
+  const pressureState = baseState();
+  pressureState.projects[0].repoPath = "/tmp/source/demo";
+  pressureState.runs = [
+    { id: "run_pressure_boundary", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "pressure-boundary", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_pressure_boundary-pressure-boundary`, completedAt: new Date(nowMs - 24 * 3_600_000).toISOString() },
+    { id: "run_pressure_young", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "pressure-young", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_pressure_young-pressure-young`, completedAt: new Date(nowMs - 24 * 3_600_000 + 1).toISOString() },
+  ];
+  assert.deepEqual(eligibleRunWorkspaceSnapshotsInState(pressureState, {
+    workspaceRoot: root,
+    nowMs,
+    pressure: true,
+    verifiedWorkspaceBytes: { run_pressure_boundary: 1, run_pressure_young: 1 },
+  }).map((item) => item.runId), ["run_pressure_boundary"]);
+});
+
+test("workspace retention protects roots, sources, unknown strategies, active references, and symlinked ancestors", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-retention-paths-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const project = { id: "project_1", key: "demo", repoPath: path.join(root, "demo", "run_source-source") };
+    const safeRun = { id: "run_safe", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "safe", workspaceStrategy: "clone", workspacePath: path.join(root, "demo", "run_safe-safe"), completedAt: "2026-08-01T00:00:00.000Z" };
+    assert.equal(workspacePathProtectionReason({ ...safeRun, workspacePath: root }, { workspaceRoot: root, project }), "outside_workspace_root");
+    assert.equal(workspacePathProtectionReason({ ...safeRun, workspacePath: path.join(root, "demo") }, { workspaceRoot: root, project }), "source_repository_path");
+    assert.equal(workspacePathProtectionReason({ ...safeRun, id: "run_source", branchName: "source", workspacePath: project.repoPath }, { workspaceRoot: root, project }), "source_repository_path");
+    assert.equal(workspacePathProtectionReason({ ...safeRun, workspaceStrategy: "source-checkout" }, { workspaceRoot: root, project }), "unexpected_workspace_strategy");
+
+    await mkdir(path.join(root, "outside"), { recursive: true });
+    await mkdir(path.join(root, "demo"), { recursive: true });
+    await symlink(path.join(root, "outside"), path.join(root, "demo", "linked"));
+    const linked = { ...safeRun, id: "linked", branchName: "workspace", workspacePath: path.join(root, "demo", "linked", "linked-workspace") };
+    assert.equal(workspacePathProtectionReason(linked, { workspaceRoot: root, project }), "symlinked_workspace_ancestor");
+
+    const state = baseState();
+    state.projects[0] = project;
+    state.runs = [
+      safeRun,
+      { ...safeRun, id: "run_active", status: "running", branchName: "active", workspacePath: "", executionRepoPath: safeRun.workspacePath },
+    ];
+    assert.deepEqual(eligibleRunWorkspaceSnapshotsInState(state, {
+      workspaceRoot: root,
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+      policy: { retainForHours: { failed: 1 } },
+    }), []);
+
+    await mkdir(safeRun.workspacePath, { recursive: true });
+    const activeAlias = path.join(root, "active-workspace-alias");
+    await symlink(safeRun.workspacePath, activeAlias);
+    state.runs = [
+      safeRun,
+      { ...safeRun, id: "run_active_alias", status: "running", branchName: "active-alias", workspacePath: "", executionRepoPath: activeAlias },
+    ];
+    assert.deepEqual(eligibleRunWorkspaceSnapshotsInState(state, {
+      workspaceRoot: root,
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+      policy: { retainForHours: { failed: 1 } },
+    }), []);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace cleanup leases are exclusive, expire for retry, and finalize idempotently", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [{ id: "run_lease", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/lease", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_lease-feature-lease`, completedAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z", workspaceBytes: 42 }];
+  const input = { workspaceRoot: root, nowMs: Date.parse("2026-08-17T00:00:00.000Z"), policy: { retainForHours: { failed: 1 } }, verifiedWorkspaceBytes: { run_lease: 42 }, leaseId: "lease_a" };
+  const first = claimRunWorkspaceCandidatesInState(state, input);
+  const second = claimRunWorkspaceCandidatesInState(state, { ...input, leaseId: "lease_b" });
+  assert.deepEqual(first.candidates.map((run) => run.id), ["run_lease"]);
+  assert.deepEqual(second.candidates, []);
+  const retry = claimRunWorkspaceCandidatesInState(state, { ...input, nowMs: input.nowMs + 900_001, leaseId: "lease_b" });
+  assert.deepEqual(retry.candidates.map((run) => run.id), ["run_lease"]);
+  assert.equal(finalizeRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_a", nowMs: input.nowMs + 900_002 }), null);
+  assert.equal(finalizeRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_b", nowMs: input.nowMs + 900_002, logicalBytes: 42, filesystemReclaimedBytes: 40, success: true }).state, "completed");
+  assert.equal(finalizeRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_b", nowMs: input.nowMs + 900_002 }).state, "completed");
+  assert.equal(releaseRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_b" }).state, "completed");
+});
+
+test("workspace cleanup refuses malformed persisted lease expiries", () => {
+  const state = baseState();
+  state.runs = [{
+    id: "run_malformed_lease",
+    status: "failed",
+    workspaceCleanup: { state: "claimed", leaseId: "lease_malformed", leaseExpiresAt: "not-a-timestamp" },
+  }];
+
+  assert.equal(finalizeRunWorkspaceCleanupInState(state, "run_malformed_lease", {
+    leaseId: "lease_malformed",
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+  }), null);
+  assert.equal(state.runs[0].workspaceCleanup.state, "claimed");
+});
+
+test("workspace capacity pressure uses only verified sizes and preserves failed cleanup evidence", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [
+    { id: "run_verified", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/verified", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_verified-feature-verified`, completedAt: "2026-08-15T00:00:00.000Z" },
+    { id: "run_unverified", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/unverified", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_unverified-feature-unverified`, completedAt: "2026-08-15T00:00:00.000Z", workspaceBytes: 999999 },
+  ];
+  const input = {
+    workspaceRoot: root,
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    policy: { retainForHours: { failed: 336 }, maxRetainedBytes: 10, pressureMinAgeHours: 24 },
+    verifiedWorkspaceBytes: { run_verified: 20 },
+  };
+  const candidates = eligibleRunWorkspaceSnapshotsInState(state, input);
+  assert.deepEqual(candidates.map((item) => item.runId), ["run_verified"]);
+  assert.equal(candidates[0].logicalBytes, 20);
+  const claim = claimRunWorkspaceCandidatesInState(state, { ...input, leaseId: "lease_failed" });
+  const released = releaseRunWorkspaceCleanupInState(state, "run_verified", {
+    leaseId: claim.leaseId,
+    now: "2026-08-17T00:01:00.000Z",
+    logicalBytes: 20,
+    filesystemReclaimedBytes: 18,
+    reason: "disk_pressure",
+    error: "line one\nline two\u0000 token=ghp_1234567890abcdef",
+  });
+  assert.equal(released.state, "released");
+  assert.equal(released.runId, "run_verified");
+  assert.equal(released.strategy, "clone");
+  assert.equal(released.logicalBytes, 20);
+  assert.equal(released.filesystemReclaimedBytes, 18);
+  assert.equal(released.reason, "disk_pressure");
+  assert.equal(released.error, "line one line two token=[REDACTED]");
+});
+
+test("completed cleanup evidence no longer contributes to retained-byte pressure", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [
+    { id: "run_cleaned", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "cleaned", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_cleaned-cleaned`, completedAt: "2026-08-01T00:00:00.000Z", workspaceCleanup: { state: "completed", logicalBytes: 20 } },
+    { id: "run_retained", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "retained", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_retained-retained`, completedAt: "2026-08-15T00:00:00.000Z" },
+  ];
+  const input = {
+    workspaceRoot: root,
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    policy: { retainForHours: { failed: 336 }, maxRetainedBytes: 25, pressureMinAgeHours: 24 },
+    verifiedWorkspaceBytes: { run_cleaned: 20, run_retained: 20 },
+  };
+  assert.deepEqual(eligibleRunWorkspaceSnapshotsInState(state, input), []);
+  const sweep = claimRunWorkspaceCandidatesInState(state, { ...input, leaseId: "lease_next" });
+  assert.deepEqual(sweep.candidates, []);
+  assert.equal(state.meta.workspaceRetention.verifiedRetainedBytes, 20);
+});
+
 async function writeLegacyState(root, state = baseState()) {
   const dataDir = path.join(root, "data");
   await mkdir(dataDir, { recursive: true });
@@ -67,6 +252,53 @@ async function runStoreScript(root, source) {
     timeout: 30_000,
   });
 }
+
+test("SQLite cleanup claims are exclusive across processes and terminal runs cannot reactivate", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-retention-concurrency-"));
+  const workspaceRoot = path.join(root, "run-workspaces");
+  try {
+    const state = baseState();
+    state.projects[0].repoPath = path.join(root, "source", "demo");
+    state.runs = [{
+      id: "run_terminal",
+      projectId: "project_1",
+      projectKey: "demo",
+      status: "failed",
+      branchName: "terminal",
+      workspaceStrategy: "clone",
+      workspacePath: path.join(workspaceRoot, "demo", "run_terminal-terminal"),
+      completedAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+    }];
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const claims = await Promise.all(["lease_a", "lease_b"].map((leaseId) => runStoreScript(root, `
+      import { claimRunWorkspaceCandidates } from ${JSON.stringify(storeModuleUrl)};
+      const claim = await claimRunWorkspaceCandidates({
+        workspaceRoot: ${JSON.stringify(workspaceRoot)},
+        nowMs: ${Date.parse("2026-08-17T00:00:00.000Z")},
+        policy: { retainForHours: { failed: 1 } },
+        verifiedWorkspaceBytes: { run_terminal: 1 },
+        leaseId: ${JSON.stringify(leaseId)}
+      });
+      console.log(JSON.stringify(claim.candidates.map((run) => run.id)));
+    `)));
+    assert.deepEqual(claims.map((result) => JSON.parse(result.stdout.trim())).sort((a, b) => a.length - b.length), [[], ["run_terminal"]]);
+    assert.equal(readPersistedState(root).runs[0].workspaceCleanup.state, "claimed");
+
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { updateRun } from ${JSON.stringify(storeModuleUrl)};
+        await updateRun("run_terminal", { status: "running" });
+      `),
+      /terminal run cannot transition back to active/,
+    );
+    assert.equal(readPersistedState(root).runs[0].status, "failed");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("SQLite migrates legacy state once and protects persisted PII at rest", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-migration-"));

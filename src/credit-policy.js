@@ -16,6 +16,11 @@ export const CREDIT_RISK_TIERS = Object.freeze([
   "frontier",
 ]);
 
+const CREDIT_SNAPSHOT_SOURCES = new Set(["codex-app-server", "studioops"]);
+const CREDIT_BUCKET_IDS = new Set(["codex"]);
+const FALLBACK_RULE_ID_PATTERN = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
+const MAX_FALLBACK_RULE_ID_LENGTH = 100;
+
 export const DEFAULT_DEGRADED_TELEMETRY_FALLBACK = Object.freeze({
   policyVersion: CREDIT_FALLBACK_POLICY_VERSION,
   explicitFailClosedLabels: ["credit-fail-closed"],
@@ -186,25 +191,24 @@ function resolveCodexBin(input = {}) {
   return DEFAULT_CODEX_BINS.find((candidate) => existsSync(candidate)) || "codex";
 }
 
-function boundedText(value, max = 500) {
-  const text = String(value || "").trim();
-  return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
+function normalizedFallbackRuleId(value) {
+  const ruleId = String(value ?? "").trim();
+  if (
+    !ruleId
+    || ruleId.length > MAX_FALLBACK_RULE_ID_LENGTH
+    || !FALLBACK_RULE_ID_PATTERN.test(ruleId)
+  ) return "";
+  return ruleId;
 }
 
-function sanitizedEvidenceText(value, max) {
-  const sanitized = String(value ?? "")
-    .trim()
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(
-      /\b(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,})\b/gi,
-      "[redacted-credential]",
-    )
-    .replace(
-      /\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi,
-      "$1=[redacted-credential]",
-    )
-    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]");
-  return boundedText(sanitized, max);
+function sanitizedSnapshotSource(value) {
+  const source = String(value ?? "").trim().toLowerCase();
+  return CREDIT_SNAPSHOT_SOURCES.has(source) ? source : "unclassified";
+}
+
+function sanitizedBucketId(value) {
+  const bucketId = String(value ?? "").trim().toLowerCase();
+  return CREDIT_BUCKET_IDS.has(bucketId) ? bucketId : "unclassified";
 }
 
 export function normalizeCreditSnapshot(result, input = {}) {
@@ -234,7 +238,7 @@ export function normalizeCreditSnapshot(result, input = {}) {
     status: "available",
     source: "codex-app-server",
     observedAt,
-    bucketId: sanitizedEvidenceText(bucket.limitId || "codex", 100),
+    bucketId: sanitizedBucketId(bucket.limitId || "codex"),
     usedPercent,
     remainingPercent: usedPercent === null ? null : Math.max(0, 100 - usedPercent),
     resetsAt: Math.max(
@@ -242,7 +246,7 @@ export function normalizeCreditSnapshot(result, input = {}) {
       ...windows.map((window) => Number(window.resetsAt || 0)).filter(Number.isFinite),
     ) || null,
     reached,
-    reachedType: sanitizedEvidenceText(bucket.rateLimitReachedType, 100),
+    reachedType: bucket.rateLimitReachedType ? "rate_limit_reached" : "",
     credits: {
       available: credits?.hasCredits === true,
       unlimited: credits?.unlimited === true,
@@ -262,7 +266,6 @@ export async function requestCodexCreditSnapshot(input = {}) {
     });
     const lines = readline.createInterface({ input: child.stdout });
     let settled = false;
-    let stderr = "";
 
     const finish = (snapshot) => {
       if (settled) return;
@@ -282,15 +285,13 @@ export async function requestCodexCreditSnapshot(input = {}) {
       });
     }, timeoutMs);
 
-    child.stderr.on("data", (chunk) => {
-      stderr = sanitizedEvidenceText(`${stderr}${chunk}`, 500);
-    });
-    child.on("error", (error) => {
+    child.stderr.resume();
+    child.on("error", () => {
       finish({
         status: "unknown",
         source: "codex-app-server",
         observedAt: new Date().toISOString(),
-        reason: `Codex account probe could not start: ${sanitizedEvidenceText(error.message, 500)}`,
+        reason: "Codex account probe could not start.",
       });
     });
     child.on("exit", (code) => {
@@ -299,7 +300,7 @@ export async function requestCodexCreditSnapshot(input = {}) {
           status: "unknown",
           source: "codex-app-server",
           observedAt: new Date().toISOString(),
-          reason: `Codex account probe exited before returning limits (${code ?? "unknown"}${stderr ? `: ${stderr}` : ""}).`,
+          reason: `Codex account probe exited before returning limits (${Number.isSafeInteger(code) ? code : "unknown"}).`,
         });
       }
     });
@@ -322,7 +323,7 @@ export async function requestCodexCreditSnapshot(input = {}) {
           status: "unknown",
           source: "codex-app-server",
           observedAt: new Date().toISOString(),
-          reason: `Codex account probe failed: ${sanitizedEvidenceText(message.error.message, 500)}`,
+          reason: "Codex account probe failed.",
         });
         return;
       }
@@ -389,6 +390,8 @@ function fallbackRuleAssessment(policy, tier, execution = {}) {
   const rule = configuredRule && typeof configuredRule === "object"
     ? cloneFallbackRule(configuredRule)
     : null;
+  const configuredRuleId = String(rule?.ruleId ?? "").trim();
+  const ruleId = normalizedFallbackRuleId(configuredRuleId);
   const limits = {
     maxConcurrentRuns: rule?.mode === "bounded" ? positiveSafeInteger(rule.maxConcurrentRuns) : null,
     maxAttempts: rule?.mode === "bounded" ? positiveSafeInteger(rule.maxAttempts) : null,
@@ -404,8 +407,10 @@ function fallbackRuleAssessment(policy, tier, execution = {}) {
     invalidReasonCode = "unclassified_credit_risk_tier";
   } else if (!rule) {
     invalidReasonCode = "missing_fallback_rule";
-  } else if (!rule.ruleId) {
+  } else if (!configuredRuleId) {
     invalidReasonCode = "missing_fallback_rule_id";
+  } else if (!ruleId) {
+    invalidReasonCode = "invalid_fallback_rule_id";
   } else if (!new Set(["bounded", "fail_closed"]).has(rule.mode)) {
     invalidReasonCode = "unsupported_fallback_rule_mode";
   } else if (
@@ -421,7 +426,7 @@ function fallbackRuleAssessment(policy, tier, execution = {}) {
   }
   return {
     policyVersion: Number.isFinite(policyVersion) ? policyVersion : null,
-    ruleId: rule?.ruleId || "",
+    ruleId,
     ruleMode: rule?.mode || "fail_closed",
     explicitFailClosedMatch,
     invalidReasonCode,
@@ -480,10 +485,10 @@ function sanitizedSnapshotEvidence(snapshot, policy, evaluation = {}) {
   return {
     evaluatedAt: new Date(evaluatedMs).toISOString(),
     snapshotStatus: status,
-    snapshotSource: sanitizedEvidenceText(snapshot?.source, 100),
+    snapshotSource: sanitizedSnapshotSource(snapshot?.source),
     snapshotObservedAt: observedAt,
     snapshotAgeMs,
-    snapshotReason: sanitizedEvidenceText(snapshot?.reason || defaultReason, 240),
+    snapshotReason: defaultReason,
   };
 }
 
@@ -528,7 +533,8 @@ function fallbackDecision(snapshotStatus, rule) {
 
 export function assessCreditAdmission(snapshot, execution = {}, input = {}, evaluation = {}) {
   const policy = mergedCreditPolicy(input);
-  const tier = String(execution.modelTier || "unclassified").trim() || "unclassified";
+  const requestedTier = String(execution.modelTier || "").trim().toLowerCase();
+  const tier = CREDIT_RISK_TIERS.includes(requestedTier) ? requestedTier : "unclassified";
   const fallbackRule = fallbackRuleAssessment(policy, tier, execution);
   const evaluationInput = Object.keys(evaluation || {}).length ? evaluation : {
     evaluatedAt: input.evaluatedAt,
@@ -544,6 +550,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
   };
   const estimatedCredits = Math.max(0, Number(budget.estimatedCredits || 0));
   const minRemainingPercent = Math.max(0, Number(budget.minRemainingPercent || 0));
+  const remainingPercent = finiteNumber(snapshot?.remainingPercent);
   const base = {
     enabled: Boolean(policy.enabled),
     tier,
@@ -588,7 +595,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       mode: "normal",
       reasonCode: "unlimited_credit_access",
       fallbackUsed: false,
-      remainingPercent: snapshot.remainingPercent,
+      remainingPercent,
     };
   }
   if (snapshot.reached) {
@@ -599,16 +606,13 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       mode: "normal",
       reasonCode: "rate_limit_reached",
       fallbackUsed: false,
-      remainingPercent: snapshot.remainingPercent,
-      reason: sanitizedEvidenceText(
-        snapshot.reachedType || "Codex reports that the active usage limit has been reached.",
-        240,
-      ),
+      remainingPercent,
+      reason: "Codex reports that the active usage limit has been reached.",
     };
   }
   if (
-    snapshot.remainingPercent !== null
-    && snapshot.remainingPercent < minRemainingPercent
+    remainingPercent !== null
+    && remainingPercent < minRemainingPercent
   ) {
     return {
       ...base,
@@ -617,7 +621,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       mode: "normal",
       reasonCode: "insufficient_quota_headroom",
       fallbackUsed: false,
-      remainingPercent: snapshot.remainingPercent,
+      remainingPercent,
       reason: `The ${tier} tier requires at least ${minRemainingPercent}% quota headroom.`,
     };
   }
@@ -632,7 +636,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       mode: "normal",
       reasonCode: "insufficient_credit_balance",
       fallbackUsed: false,
-      remainingPercent: snapshot.remainingPercent,
+      remainingPercent,
       requiredCredits,
       reason: `The configured estimate and reserve require ${requiredCredits} credits.`,
     };
@@ -645,7 +649,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     mode: "normal",
     reasonCode: balance === null ? "included_quota_available" : "credit_headroom_available",
     fallbackUsed: false,
-    remainingPercent: snapshot.remainingPercent,
+    remainingPercent,
     requiredCredits,
   };
 }

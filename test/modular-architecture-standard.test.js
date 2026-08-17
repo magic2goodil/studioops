@@ -285,3 +285,39 @@ test("the credit-admission ownership manifest is complete, acyclic, and fail clo
     );
   }
 });
+
+test("run workspace retention manifest is complete and acyclic", async () => {
+  const manifest = JSON.parse(await readFile("docs/architecture/run-workspace-retention.components.json", "utf8"));
+  assert.equal(manifest.workflowImpact, "full-regression");
+  const declaredDependencies = Object.entries(manifest.components).flatMap(([component, definition]) => (
+    (definition.dependsOn || []).map((dependency) => `${component} -> ${dependency}`)
+  ));
+  assert.deepEqual(declaredDependencies, [
+    "runner-filesystem-adapter -> config-store-policy",
+    "watchdog-recovery-coordinator -> config-store-policy",
+  ]);
+  assert.deepEqual(manifest.dependencyDirection, declaredDependencies);
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (component) => {
+    assert.ok(manifest.components[component], `unknown component dependency: ${component}`);
+    assert.equal(visiting.has(component), false, `dependency cycle at ${component}`);
+    if (visited.has(component)) return;
+    visiting.add(component);
+    for (const dependency of manifest.components[component].dependsOn || []) visit(dependency);
+    visiting.delete(component);
+    visited.add(component);
+  };
+  for (const component of Object.keys(manifest.components)) visit(component);
+  assert.equal(manifest.acyclic, true);
+  for (const required of [
+    "src/config.js",
+    "src/store.js",
+    "test/config.test.js",
+    "test/state-database.test.js",
+    "test/modular-architecture-standard.test.js",
+    "docs/architecture/run-workspace-retention.components.json",
+  ]) {
+    assert.ok(Object.values(manifest.components).some((component) => component.paths.includes(required)), required);
+  }
+});

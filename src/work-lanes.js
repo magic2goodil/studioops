@@ -64,6 +64,12 @@ function roleLane(role) {
   return "";
 }
 
+function actorIsReadOnly(actor = {}) {
+  const role = normalize(actor.role);
+  const actionType = normalize(actor.actionType || actor.type);
+  return actionType === "start-architecture" || role === "systems-architect";
+}
+
 export function inferTaskLane(task = {}, role = "") {
   const explicit = normalize(task.lane);
   if (explicit) return explicit;
@@ -115,6 +121,7 @@ export function conflictGroupForLane(lane) {
     case "design":
       return "frontend-surface";
     case "devops":
+      return "devops";
     case "project-wide":
       return "project-wide";
     case "owner":
@@ -125,22 +132,86 @@ export function conflictGroupForLane(lane) {
 }
 
 export function laneProfile(task = {}, actor = {}) {
+  if (actorIsReadOnly(actor)) {
+    return {
+      lane: "architecture-readonly",
+      conflictGroup: "read-only",
+      fileScope: [],
+      fileScopeExplicit: true,
+    };
+  }
   const role = actor.role || task.assignedAgentRole || "";
   const lane = normalize(actor.lane) || inferTaskLane(task, role);
-  const fileScope = Array.isArray(actor.fileScope) && actor.fileScope.length
+  const actorHasFileScope = Array.isArray(actor.fileScope) && actor.fileScope.length > 0;
+  const taskHasFileScope = Array.isArray(task.workAreas) && task.workAreas.length > 0;
+  const fileScope = actorHasFileScope
     ? actor.fileScope
     : fileScopeForLane(lane, task);
   return {
     lane,
     conflictGroup: conflictGroupForLane(lane),
     fileScope,
+    fileScopeExplicit: actor.fileScopeExplicit === true
+      || actor.scopeExplicit === true
+      || taskHasFileScope,
   };
+}
+
+function normalizeScopePattern(value) {
+  return String(value || "")
+    .trim()
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "")
+    .replace(/\/+/g, "/");
+}
+
+function literalPatternPrefix(value) {
+  const pattern = normalizeScopePattern(value);
+  const wildcardIndex = pattern.search(/[?*[\]{}]/);
+  return wildcardIndex === -1 ? pattern : pattern.slice(0, wildcardIndex);
+}
+
+function scopePatternIsAmbiguous(pattern) {
+  return pattern.startsWith("/")
+    || /^[a-z]:\//i.test(pattern)
+    || pattern.split("/").includes("..")
+    || pattern.includes("\0");
+}
+
+function scopePairMayOverlap(left, right) {
+  const leftPattern = normalizeScopePattern(left);
+  const rightPattern = normalizeScopePattern(right);
+  if (!leftPattern || !rightPattern) return true;
+  if (scopePatternIsAmbiguous(leftPattern) || scopePatternIsAmbiguous(rightPattern)) return true;
+  if (leftPattern === rightPattern) return true;
+
+  const leftHasWildcard = /[?*[\]{}]/.test(leftPattern);
+  const rightHasWildcard = /[?*[\]{}]/.test(rightPattern);
+  if (!leftHasWildcard && !rightHasWildcard) {
+    return leftPattern.startsWith(`${rightPattern}/`)
+      || rightPattern.startsWith(`${leftPattern}/`);
+  }
+
+  const leftPrefix = literalPatternPrefix(leftPattern);
+  const rightPrefix = literalPatternPrefix(rightPattern);
+  if (!leftPrefix || !rightPrefix) return true;
+  return leftPrefix.startsWith(rightPrefix) || rightPrefix.startsWith(leftPrefix);
+}
+
+export function fileScopesMayOverlap(leftScope, rightScope) {
+  if (!Array.isArray(leftScope) || !leftScope.length) return true;
+  if (!Array.isArray(rightScope) || !rightScope.length) return true;
+  return leftScope.some((left) => rightScope.some((right) => scopePairMayOverlap(left, right)));
 }
 
 export function laneProfilesConflict(left, right) {
   if (!left || !right) return false;
   if (left.projectId && right.projectId && left.projectId !== right.projectId) return false;
+  if (left.conflictGroup === "read-only" || right.conflictGroup === "read-only") return false;
   if (left.conflictGroup === "owner" || right.conflictGroup === "owner") return false;
   if (left.conflictGroup === "project-wide" || right.conflictGroup === "project-wide") return true;
-  return left.conflictGroup === right.conflictGroup;
+  const bothScopesExplicit = left.fileScopeExplicit === true && right.fileScopeExplicit === true;
+  if (left.conflictGroup === right.conflictGroup && !bothScopesExplicit) return true;
+  if (!bothScopesExplicit) return false;
+  return fileScopesMayOverlap(left.fileScope, right.fileScope);
 }

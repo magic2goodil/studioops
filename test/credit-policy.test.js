@@ -77,7 +77,7 @@ test("Codex rate-limit responses are reduced to a sanitized admission snapshot",
   assert.equal(JSON.stringify(snapshot).includes("email"), false);
 });
 
-test("normalized provider bucket diagnostics redact credential-shaped strings", () => {
+test("normalized provider bucket diagnostics use allowlisted identifiers", () => {
   const snapshot = normalizeCreditSnapshot({
     rateLimits: {
       limitId: "ghp_abcdefghijklmnopqrstuvwxyz123456",
@@ -85,8 +85,8 @@ test("normalized provider bucket diagnostics redact credential-shaped strings", 
     },
   }, { observedAt: "2026-08-16T12:00:00.000Z" });
 
-  assert.equal(snapshot.bucketId, "[redacted-credential]");
-  assert.equal(snapshot.reachedType, "[redacted-credential] for [redacted-email]");
+  assert.equal(snapshot.bucketId, "unclassified");
+  assert.equal(snapshot.reachedType, "rate_limit_reached");
 });
 
 test("legacy fail-closed tiers normalize while ordinary degraded work is bounded", () => {
@@ -297,18 +297,23 @@ test("snapshot classification and evidence are deterministic, distinct, and sani
   assert.equal(disabled.mode, "disabled");
   assert.equal(disabled.code, "disabled");
   assert.equal(stale.evaluatedAt, evaluation.evaluatedAt);
-  assert.equal(stale.snapshotReason, "token=[redacted-credential] for [redacted-email]");
+  assert.equal(stale.snapshotReason, "Credit snapshot is stale.");
   const evidence = JSON.stringify(stale);
   assert.doesNotMatch(evidence, /must-not-be-copied|private@example\.com|secret-token|raw-secret/);
 });
 
-test("provider-derived evidence redacts credential and identity shapes in degraded and normal decisions", () => {
+test("provider-derived evidence never copies free-form credentials or identity diagnostics", () => {
   const diagnostic = [
     "github ghp_abcdefghijklmnopqrstuvwxyz123456",
     "openai sk-proj-abcdefghijklmnopqrstuvwxyz123456",
     "bearer Bearer abcdefghijklmnopqrstuvwxyz",
     "api api-key=abcdefghijklmnopqrstuvwxyz123456",
     "identity operator@example.test",
+    `slack ${["xo", "xb-123456789012-abcdefghijklmnopqrstuv"].join("")}`,
+    "basic Basic dXNlcjpwYXNzd29yZA==",
+    "aws AKIAIOSFODNN7EXAMPLE",
+    "key -----BEGIN PRIVATE KEY-----",
+    "operator Jane Example",
   ].join("; ");
   const unknown = assessCreditAdmission(
     { status: "unknown", source: diagnostic, reason: diagnostic },
@@ -323,15 +328,49 @@ test("provider-derived evidence redacts credential and identity shapes in degrad
     evaluation,
   );
 
-  for (const evidence of [unknown.snapshotSource, unknown.snapshotReason, reached.reason]) {
-    assert.match(evidence, /\[redacted-credential\]/);
-    assert.doesNotMatch(
-      evidence,
-      /ghp_|sk-proj-|Bearer\s+abcdefghijkl|api-key=abcdefghijkl|operator@example\.test/i,
-    );
-  }
-  assert.match(unknown.snapshotReason, /\[redacted-email\]/);
-  assert.match(reached.reason, /\[redacted-email\]/);
+  assert.equal(unknown.snapshotSource, "unclassified");
+  assert.equal(unknown.snapshotReason, "Credit snapshot is unavailable.");
+  assert.equal(reached.reason, "Codex reports that the active usage limit has been reached.");
+  assert.doesNotMatch(JSON.stringify([unknown, reached]), /ghp_|sk-proj-|xoxb-|AKIA|PRIVATE KEY|Jane Example|dXNlcj/i);
+});
+
+test("risk tier, rule ID, and numeric evidence are bounded to safe DTO values", () => {
+  const maliciousTier = assessCreditAdmission(
+    availableSnapshot({ remainingPercent: "token=remaining-secret" }),
+    { modelTier: "token=secret-value" },
+    { enabled: true },
+    evaluation,
+  );
+  const maliciousRule = assessCreditAdmission(
+    { status: "unknown", source: "codex-app-server" },
+    { modelTier: "critical" },
+    {
+      enabled: true,
+      degradedTelemetryFallback: {
+        policyVersion: 1,
+        explicitFailClosedLabels: [],
+        rules: {
+          critical: {
+            ruleId: "token=super-secret-value",
+            mode: "bounded",
+            maxConcurrentRuns: 1,
+            maxAttempts: 1,
+            estimatedTokensPerRun: 1,
+            maxInFlightEstimatedTokens: 1,
+          },
+        },
+      },
+    },
+    evaluation,
+  );
+
+  assert.equal(maliciousTier.riskTier, "unclassified");
+  assert.equal(maliciousTier.tier, "unclassified");
+  assert.equal(maliciousTier.remainingPercent, null);
+  assert.equal(maliciousRule.ruleId, "");
+  assert.equal(maliciousRule.code, "invalid_fallback_rule_id");
+  assert.equal(maliciousRule.allowed, false);
+  assert.doesNotMatch(JSON.stringify([maliciousTier, maliciousRule]), /secret-value|remaining-secret/);
 });
 
 test("evaluation time is also accepted on the policy adapter input for compatibility", () => {
