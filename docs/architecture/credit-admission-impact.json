@@ -1,0 +1,144 @@
+{
+  "schemaVersion": 1,
+  "feature": "credit-admission",
+  "policyAuthority": "credit-admission-policy",
+  "publicContract": {
+    "module": "src/credit-policy.js",
+    "exports": [
+      "assessCreditAdmission",
+      "normalizeCreditPolicy",
+      "normalizeCreditSnapshot",
+      "getCodexCreditSnapshot",
+      "requestCodexCreditSnapshot"
+    ],
+    "policyVersion": 1,
+    "copiedFallbackPolicyAllowed": false,
+    "modelIdPolicyAllowed": false
+  },
+  "components": [
+    {
+      "id": "credit-admission-policy",
+      "classification": "policy",
+      "owner": "backend-credit-admission",
+      "paths": ["src/credit-policy.js"],
+      "ownsData": [],
+      "publicContracts": ["credit admission decision and sanitized evidence DTO"],
+      "allowedDependencies": ["node-runtime"],
+      "testLayers": {
+        "unit": ["test/credit-policy.test.js"],
+        "contract": ["test/dispatcher.test.js"],
+        "persistence": [],
+        "adapter": [],
+        "composition": ["npm run check"]
+      }
+    },
+    {
+      "id": "credit-admission-config-adapter",
+      "classification": "config-adapter",
+      "owner": "backend-configuration",
+      "paths": ["src/config.js", "src/mission-control-cli.js", "studioops.config.example.md"],
+      "ownsData": ["local trusted StudioOps configuration document"],
+      "publicContracts": ["canonicalCreditPolicyConfig", "normalizeCreditPolicyConfig", "normalizeConfig", "renderConfigMarkdown"],
+      "allowedDependencies": ["credit-admission-policy", "runtime-paths", "integration-policy"],
+      "testLayers": {
+        "unit": ["test/config.test.js"],
+        "contract": ["test/config.test.js"],
+        "persistence": [],
+        "adapter": ["test/config.test.js"],
+        "composition": ["npm run check"]
+      }
+    },
+    {
+      "id": "credit-admission-orchestration-state-consumers",
+      "classification": "orchestration-state-consumer",
+      "owner": "backend-automation",
+      "paths": ["src/dispatcher.js", "src/store.js"],
+      "ownsData": ["additive task, run, event, and comment JSON payload fields"],
+      "publicContracts": ["dispatcher admission consumption", "store public mutation contracts"],
+      "allowedDependencies": ["credit-admission-policy", "state-database"],
+      "testLayers": {
+        "unit": ["test/dispatcher.test.js"],
+        "contract": ["test/dispatcher.test.js"],
+        "persistence": ["test/state-database.test.js"],
+        "adapter": [],
+        "composition": ["npm run check"]
+      }
+    },
+    {
+      "id": "credit-admission-presentation-notification-adapters",
+      "classification": "presentation-notification-adapter",
+      "owner": "owner-experience",
+      "paths": ["src/owner-inbox.js", "src/notifier.js", "public/**"],
+      "ownsData": [],
+      "publicContracts": ["owner inbox read model", "local notification intent"],
+      "allowedDependencies": ["credit-admission-policy", "credit-admission-orchestration-state-consumers"],
+      "testLayers": {
+        "unit": ["test/owner-inbox.test.js", "test/notifier.test.js"],
+        "contract": ["test/owner-inbox-ui.test.js"],
+        "persistence": [],
+        "adapter": ["test/owner-inbox-ui.test.js", "test/notifier.test.js"],
+        "composition": ["npm run check"]
+      }
+    }
+  ],
+  "dependencyEdges": [
+    { "from": "credit-admission-config-adapter", "to": "credit-admission-policy" },
+    { "from": "credit-admission-orchestration-state-consumers", "to": "credit-admission-policy" },
+    { "from": "credit-admission-presentation-notification-adapters", "to": "credit-admission-policy" },
+    { "from": "credit-admission-presentation-notification-adapters", "to": "credit-admission-orchestration-state-consumers" }
+  ],
+  "prohibited": [
+    "dependency cycles",
+    "copied degraded-telemetry fallback policy outside src/credit-policy.js",
+    "model-name admission switches",
+    "raw provider payload, account identity, authentication token, or secret persistence",
+    "cross-component internal imports or raw state access"
+  ],
+  "impactClassifier": {
+    "input": "base/head diff plus this ownership and dependency manifest",
+    "pathRules": [
+      { "pattern": "src/credit-policy.js", "component": "credit-admission-policy", "selection": "full_regression" },
+      { "pattern": "src/config.js", "component": "credit-admission-config-adapter", "selection": "full_regression" },
+      { "pattern": "src/mission-control-cli.js", "component": "credit-admission-config-adapter", "selection": "full_regression" },
+      { "pattern": "studioops.config.example.md", "component": "credit-admission-config-adapter", "selection": "full_regression" },
+      { "pattern": "src/dispatcher.js", "component": "credit-admission-orchestration-state-consumers", "selection": "full_regression" },
+      { "pattern": "src/store.js", "component": "credit-admission-orchestration-state-consumers", "selection": "full_regression" },
+      { "pattern": "src/owner-inbox.js", "component": "credit-admission-presentation-notification-adapters", "selection": "full_regression" },
+      { "pattern": "src/notifier.js", "component": "credit-admission-presentation-notification-adapters", "selection": "full_regression" },
+      { "pattern": "public/**", "component": "credit-admission-presentation-notification-adapters", "selection": "full_regression" }
+    ],
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "fullRegressionTriggers": [
+      "shared public admission contract",
+      "multi-component change",
+      "persistence payload contract",
+      "ambiguous or unclassified path",
+      "ownership or dependency manifest change"
+    ],
+    "aggregateCommand": "npm run check",
+    "duplicateEquivalentWorkflowCount": 0
+  },
+  "compatibility": {
+    "legacyInputs": ["failClosedTiers", "tierBudgets"],
+    "window": "one release",
+    "sqliteJsonPayloadsRemainReadable": true,
+    "schemaOrIndexChange": false
+  },
+  "rollback": "Remove the additive degraded-telemetry configuration and evidence fields; preserve existing SQLite JSON payload readability.",
+  "exactShaEvidence": {
+    "required": true,
+    "bindings": [
+      "sourceSha",
+      "manifestSha256",
+      "selectedComponents",
+      "commands",
+      "outcomes",
+      "durations",
+      "retriesAndSkips",
+      "environmentContract",
+      "artifactDigests"
+    ]
+  }
+}

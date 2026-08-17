@@ -145,7 +145,6 @@ It does not store account identity or authentication tokens.
       "snapshotMaxAgeMs": 900000,
       "probeTimeoutMs": 20000,
       "reserveCredits": 5,
-      "failClosedTiers": ["critical", "frontier"],
       "tierBudgets": {
         "mechanical": {
           "estimatedCredits": 2,
@@ -167,13 +166,56 @@ It does not store account identity or authentication tokens.
           "estimatedCredits": 40,
           "minRemainingPercent": 35
         }
+      },
+      "degradedTelemetryFallback": {
+        "policyVersion": 1,
+        "explicitFailClosedLabels": ["credit-fail-closed"],
+        "rules": {
+          "mechanical": {
+            "ruleId": "mechanical-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 2,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 40000,
+            "maxInFlightEstimatedTokens": 80000
+          },
+          "economy": {
+            "ruleId": "economy-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 2,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 80000,
+            "maxInFlightEstimatedTokens": 160000
+          },
+          "balanced": {
+            "ruleId": "balanced-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 1,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 100000,
+            "maxInFlightEstimatedTokens": 100000
+          },
+          "critical": {
+            "ruleId": "critical-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 1,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 120000,
+            "maxInFlightEstimatedTokens": 120000
+          },
+          "frontier": {
+            "ruleId": "frontier-fail-closed-v1",
+            "mode": "fail_closed"
+          }
+        }
       }
     }
   }
 }
 ```
 
-The estimates are admission envelopes, not promises of exact spend. Actual
+The credit estimates and token reservations are admission envelopes, not
+promises of exact spend or provider-side token truncation. Actual
 credit use depends on model, context, cached input, output, reasoning, and
 tools. When Codex exposes a purchased-credit balance, StudioOps requires the
 tier estimate plus the configured reserve. When the account is operating on
@@ -183,8 +225,28 @@ The controller never lowers a task below its quality-required tier. A failed
 critical or frontier admission opens one owner-visible task circuit before any
 model launch. Wait for a reset, add credits, or deliberately update the local
 budget, then use the circuit-reset command shown on the task. If the account
-snapshot is unavailable or stale, configured `failClosedTiers` stop while
-lower tiers may continue.
+snapshot is unavailable or stale, the versioned
+`degradedTelemetryFallback.rules` contract is keyed only by stable execution
+risk tier. Frontier work fails closed by default. Ordinary critical work uses
+one concurrent run, one attempt, a 120,000 estimated-token reservation per
+run, and a 120,000 aggregate in-flight reservation. A match in
+`explicitFailClosedLabels` also fails closed regardless of tier. Missing,
+unclassified, malformed, zero, non-finite, or unsupported rules fail closed;
+the policy never switches on a model ID.
+
+For one compatibility release, existing `failClosedTiers` and `tierBudgets`
+configuration remains readable and is normalized into the version 1 contract.
+New configuration should use `degradedTelemetryFallback`; `tierBudgets`
+continues to carry the quota and purchased-credit estimates used when a fresh
+snapshot is available. Removing the additive fallback configuration and
+admission evidence fields rolls this slice back. Existing SQLite JSON payloads
+remain readable, and no schema or index change is required.
+
+Admission evaluation records only a sanitized, deterministic evidence DTO:
+evaluation time; policy version and rule ID; risk tier; explicit-label match;
+snapshot status, allowlisted source, observation time, age, and generic reason; decision
+code and mode; and all four bounded limits. Account identity, authentication
+tokens, raw provider payloads, and secrets are not part of this contract.
 
 Live dispatch gives a fail-closed critical or frontier run one bounded recovery
 only when its first sanitized snapshot is unknown. Before opening the SQLite

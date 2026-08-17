@@ -78,6 +78,62 @@ The app reads the first fenced `json studioops-config` block in this file.
         "lead-reviewer": { "reasoningEffort": "xhigh" }
       }
     },
+    "creditPolicy": {
+      "enabled": false,
+      "refreshIntervalMs": 300000,
+      "snapshotMaxAgeMs": 900000,
+      "probeTimeoutMs": 20000,
+      "reserveCredits": 5,
+      "tierBudgets": {
+        "mechanical": { "estimatedCredits": 2, "minRemainingPercent": 2 },
+        "economy": { "estimatedCredits": 8, "minRemainingPercent": 5 },
+        "balanced": { "estimatedCredits": 15, "minRemainingPercent": 10 },
+        "critical": { "estimatedCredits": 30, "minRemainingPercent": 20 },
+        "frontier": { "estimatedCredits": 40, "minRemainingPercent": 35 }
+      },
+      "degradedTelemetryFallback": {
+        "policyVersion": 1,
+        "explicitFailClosedLabels": ["credit-fail-closed"],
+        "rules": {
+          "mechanical": {
+            "ruleId": "mechanical-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 2,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 40000,
+            "maxInFlightEstimatedTokens": 80000
+          },
+          "economy": {
+            "ruleId": "economy-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 2,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 80000,
+            "maxInFlightEstimatedTokens": 160000
+          },
+          "balanced": {
+            "ruleId": "balanced-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 1,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 100000,
+            "maxInFlightEstimatedTokens": 100000
+          },
+          "critical": {
+            "ruleId": "critical-bounded-v1",
+            "mode": "bounded",
+            "maxConcurrentRuns": 1,
+            "maxAttempts": 1,
+            "estimatedTokensPerRun": 120000,
+            "maxInFlightEstimatedTokens": 120000
+          },
+          "frontier": {
+            "ruleId": "frontier-fail-closed-v1",
+            "mode": "fail_closed"
+          }
+        }
+      }
+    },
     "supervisor": {
       "intervalSeconds": 300,
       "baseUrl": "http://127.0.0.1:4317",
