@@ -36,9 +36,9 @@
       "id": "credit-admission-config-adapter",
       "classification": "config-adapter",
       "owner": "backend-configuration",
-      "paths": ["src/config.js"],
+      "paths": ["src/config.js", "src/mission-control-cli.js", "studioops.config.example.md"],
       "ownsData": ["local trusted StudioOps configuration document"],
-      "publicContracts": ["normalizeCreditPolicyConfig", "normalizeConfig", "renderConfigMarkdown"],
+      "publicContracts": ["canonicalCreditPolicyConfig", "normalizeCreditPolicyConfig", "normalizeConfig", "renderConfigMarkdown"],
       "allowedDependencies": ["credit-admission-policy", "runtime-paths", "integration-policy"],
       "testLayers": {
         "unit": ["test/config.test.js"],
@@ -99,6 +99,8 @@
     "pathRules": [
       { "pattern": "src/credit-policy.js", "component": "credit-admission-policy", "selection": "full_regression" },
       { "pattern": "src/config.js", "component": "credit-admission-config-adapter", "selection": "full_regression" },
+      { "pattern": "src/mission-control-cli.js", "component": "credit-admission-config-adapter", "selection": "full_regression" },
+      { "pattern": "studioops.config.example.md", "component": "credit-admission-config-adapter", "selection": "full_regression" },
       { "pattern": "src/dispatcher.js", "component": "credit-admission-orchestration-state-consumers", "selection": "full_regression" },
       { "pattern": "src/store.js", "component": "credit-admission-orchestration-state-consumers", "selection": "full_regression" },
       { "pattern": "src/owner-inbox.js", "component": "credit-admission-presentation-notification-adapters", "selection": "full_regression" },

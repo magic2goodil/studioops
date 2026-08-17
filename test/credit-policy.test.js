@@ -77,6 +77,18 @@ test("Codex rate-limit responses are reduced to a sanitized admission snapshot",
   assert.equal(JSON.stringify(snapshot).includes("email"), false);
 });
 
+test("normalized provider bucket diagnostics redact credential-shaped strings", () => {
+  const snapshot = normalizeCreditSnapshot({
+    rateLimits: {
+      limitId: "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      rateLimitReachedType: "sk-proj-abcdefghijklmnopqrstuvwxyz123456 for operator@example.test",
+    },
+  }, { observedAt: "2026-08-16T12:00:00.000Z" });
+
+  assert.equal(snapshot.bucketId, "[redacted-credential]");
+  assert.equal(snapshot.reachedType, "[redacted-credential] for [redacted-email]");
+});
+
 test("legacy fail-closed tiers normalize while ordinary degraded work is bounded", () => {
   const unknown = {
     status: "unknown",
@@ -285,9 +297,41 @@ test("snapshot classification and evidence are deterministic, distinct, and sani
   assert.equal(disabled.mode, "disabled");
   assert.equal(disabled.code, "disabled");
   assert.equal(stale.evaluatedAt, evaluation.evaluatedAt);
-  assert.equal(stale.snapshotReason, "token=[redacted] for [redacted-email]");
+  assert.equal(stale.snapshotReason, "token=[redacted-credential] for [redacted-email]");
   const evidence = JSON.stringify(stale);
   assert.doesNotMatch(evidence, /must-not-be-copied|private@example\.com|secret-token|raw-secret/);
+});
+
+test("provider-derived evidence redacts credential and identity shapes in degraded and normal decisions", () => {
+  const diagnostic = [
+    "github ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "openai sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+    "bearer Bearer abcdefghijklmnopqrstuvwxyz",
+    "api api-key=abcdefghijklmnopqrstuvwxyz123456",
+    "identity operator@example.test",
+  ].join("; ");
+  const unknown = assessCreditAdmission(
+    { status: "unknown", source: diagnostic, reason: diagnostic },
+    { modelTier: "economy" },
+    { enabled: true },
+    evaluation,
+  );
+  const reached = assessCreditAdmission(
+    availableSnapshot({ reached: true, reachedType: diagnostic }),
+    { modelTier: "economy" },
+    { enabled: true },
+    evaluation,
+  );
+
+  for (const evidence of [unknown.snapshotSource, unknown.snapshotReason, reached.reason]) {
+    assert.match(evidence, /\[redacted-credential\]/);
+    assert.doesNotMatch(
+      evidence,
+      /ghp_|sk-proj-|Bearer\s+abcdefghijkl|api-key=abcdefghijkl|operator@example\.test/i,
+    );
+  }
+  assert.match(unknown.snapshotReason, /\[redacted-email\]/);
+  assert.match(reached.reason, /\[redacted-email\]/);
 });
 
 test("evaluation time is also accepted on the policy adapter input for compatibility", () => {

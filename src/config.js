@@ -21,6 +21,11 @@ export function normalizeCreditPolicyConfig(value = {}) {
   return normalizeCreditPolicy(value);
 }
 
+export function canonicalCreditPolicyConfig(value = {}) {
+  const { failClosedTiers: _legacyFailClosedTiers, ...canonical } = normalizeCreditPolicyConfig(value);
+  return canonical;
+}
+
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -77,10 +82,10 @@ export function normalizeConfig(config = {}) {
   const hasDefaultCreditPolicy = hasOwnValue(defaults, "creditPolicy");
   const hasTopLevelCreditPolicy = hasOwnValue(config, "creditPolicy");
   const normalizedDefaultCreditPolicy = hasDefaultCreditPolicy
-    ? normalizeCreditPolicyConfig(defaults.creditPolicy)
+    ? canonicalCreditPolicyConfig(defaults.creditPolicy)
     : null;
   const normalizedTopLevelCreditPolicy = hasTopLevelCreditPolicy
-    ? normalizeCreditPolicyConfig({
+    ? canonicalCreditPolicyConfig({
         ...(defaults.creditPolicy || {}),
         ...(config.creditPolicy || {}),
       })

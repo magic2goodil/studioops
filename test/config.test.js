@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
+  canonicalCreditPolicyConfig,
   effectiveAutomationCapacity,
+  extractConfigJson,
   normalizeConfig,
   normalizeCreditPolicyConfig,
   projectFromConfig,
@@ -30,6 +33,7 @@ test("credit policy config emits the canonical versioned degraded-telemetry cont
   const policy = config.defaults.creditPolicy;
 
   assert.equal(policy.degradedTelemetryFallback.policyVersion, 1);
+  assert.equal(Object.hasOwn(policy, "failClosedTiers"), false);
   assert.equal(policy.degradedTelemetryFallback.rules.critical.mode, "fail_closed");
   assert.equal(
     policy.degradedTelemetryFallback.rules.critical.ruleId,
@@ -59,6 +63,19 @@ test("canonical critical fallback remains bounded and top-level overrides retain
   assert.equal(config.creditPolicy.reserveCredits, 9);
   assert.equal(config.creditPolicy.snapshotMaxAgeMs, 30_000);
   assert.equal(config.creditPolicy.degradedTelemetryFallback.rules.critical.maxAttempts, 1);
+});
+
+test("setup and tracked example configuration use canonical bounded critical defaults", async () => {
+  const canonical = canonicalCreditPolicyConfig();
+  const cliSource = await readFile("src/mission-control-cli.js", "utf8");
+  const example = extractConfigJson(await readFile("studioops.config.example.md", "utf8"));
+
+  assert.equal(Object.hasOwn(canonical, "failClosedTiers"), false);
+  assert.equal(canonical.degradedTelemetryFallback.rules.critical.mode, "bounded");
+  assert.equal(canonical.degradedTelemetryFallback.rules.frontier.mode, "fail_closed");
+  assert.deepEqual(example.defaults.creditPolicy, canonical);
+  assert.match(cliSource, /creditPolicy:\s*canonicalCreditPolicyConfig\(\)/);
+  assert.doesNotMatch(cliSource, /failClosedTiers:\s*\["critical",\s*"frontier"\]/);
 });
 
 test("canonical missing or malformed fallback rules are preserved for fail-closed evaluation", () => {

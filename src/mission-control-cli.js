@@ -31,6 +31,7 @@ import { formatPromotionReport, planPromotions, runPromotion } from "./promotion
 import { formatSelfUpdateReport, runSelfUpdate } from "./self-update.js";
 import { branchWebUrl, integrationBranchName } from "./integration-policy.js";
 import {
+  canonicalCreditPolicyConfig,
   effectiveAutomationCapacity,
   expandHome,
   INSTALLED_AUTOMATION_CAPACITY,
@@ -201,21 +202,7 @@ async function setup() {
           retryBackoffMs: 30000,
           staleRunMs: 7200000,
         },
-        creditPolicy: {
-          enabled: false,
-          refreshIntervalMs: 300000,
-          snapshotMaxAgeMs: 900000,
-          probeTimeoutMs: 20000,
-          reserveCredits: 5,
-          failClosedTiers: ["critical", "frontier"],
-          tierBudgets: {
-            mechanical: { estimatedCredits: 2, minRemainingPercent: 2 },
-            economy: { estimatedCredits: 8, minRemainingPercent: 5 },
-            balanced: { estimatedCredits: 15, minRemainingPercent: 10 },
-            critical: { estimatedCredits: 30, minRemainingPercent: 20 },
-            frontier: { estimatedCredits: 40, minRemainingPercent: 35 },
-          },
-        },
+        creditPolicy: canonicalCreditPolicyConfig(),
         supervisor: {
           intervalSeconds: 15,
           baseUrl: "http://127.0.0.1:4317",

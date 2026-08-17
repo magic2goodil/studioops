@@ -209,6 +209,8 @@ test("the credit-admission ownership manifest is complete, acyclic, and fail clo
   const expectedPaths = [
     "src/credit-policy.js",
     "src/config.js",
+    "src/mission-control-cli.js",
+    "studioops.config.example.md",
     "src/dispatcher.js",
     "src/store.js",
     "src/owner-inbox.js",
@@ -268,6 +270,7 @@ test("the credit-admission ownership manifest is complete, acyclic, and fail clo
   assert.doesNotMatch(policySource, /\bgpt-[\w.-]+|execution\.model\b/i);
   const adapterSources = await Promise.all([
     "src/config.js",
+    "src/mission-control-cli.js",
     "src/dispatcher.js",
     "src/store.js",
     "src/owner-inbox.js",

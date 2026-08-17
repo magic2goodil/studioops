@@ -192,11 +192,19 @@ function boundedText(value, max = 500) {
 }
 
 function sanitizedEvidenceText(value, max) {
-  return boundedText(value, max)
+  const sanitized = String(value ?? "")
+    .trim()
     .replace(/[\r\n\t]+/g, " ")
-    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
-    .replace(/\b(token|secret|password|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(
+      /\b(?:Bearer\s+[A-Za-z0-9._~+/=-]{8,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{16,})\b/gi,
+      "[redacted-credential]",
+    )
+    .replace(
+      /\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi,
+      "$1=[redacted-credential]",
+    )
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted-email]");
+  return boundedText(sanitized, max);
 }
 
 export function normalizeCreditSnapshot(result, input = {}) {
@@ -226,7 +234,7 @@ export function normalizeCreditSnapshot(result, input = {}) {
     status: "available",
     source: "codex-app-server",
     observedAt,
-    bucketId: String(bucket.limitId || "codex"),
+    bucketId: sanitizedEvidenceText(bucket.limitId || "codex", 100),
     usedPercent,
     remainingPercent: usedPercent === null ? null : Math.max(0, 100 - usedPercent),
     resetsAt: Math.max(
@@ -234,7 +242,7 @@ export function normalizeCreditSnapshot(result, input = {}) {
       ...windows.map((window) => Number(window.resetsAt || 0)).filter(Number.isFinite),
     ) || null,
     reached,
-    reachedType: String(bucket.rateLimitReachedType || ""),
+    reachedType: sanitizedEvidenceText(bucket.rateLimitReachedType, 100),
     credits: {
       available: credits?.hasCredits === true,
       unlimited: credits?.unlimited === true,
@@ -275,14 +283,14 @@ export async function requestCodexCreditSnapshot(input = {}) {
     }, timeoutMs);
 
     child.stderr.on("data", (chunk) => {
-      stderr = boundedText(`${stderr}${chunk}`, 500);
+      stderr = sanitizedEvidenceText(`${stderr}${chunk}`, 500);
     });
     child.on("error", (error) => {
       finish({
         status: "unknown",
         source: "codex-app-server",
         observedAt: new Date().toISOString(),
-        reason: `Codex account probe could not start: ${boundedText(error.message)}`,
+        reason: `Codex account probe could not start: ${sanitizedEvidenceText(error.message, 500)}`,
       });
     });
     child.on("exit", (code) => {
@@ -314,7 +322,7 @@ export async function requestCodexCreditSnapshot(input = {}) {
           status: "unknown",
           source: "codex-app-server",
           observedAt: new Date().toISOString(),
-          reason: `Codex account probe failed: ${boundedText(message.error.message)}`,
+          reason: `Codex account probe failed: ${sanitizedEvidenceText(message.error.message, 500)}`,
         });
         return;
       }
@@ -592,7 +600,10 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       reasonCode: "rate_limit_reached",
       fallbackUsed: false,
       remainingPercent: snapshot.remainingPercent,
-      reason: snapshot.reachedType || "Codex reports that the active usage limit has been reached.",
+      reason: sanitizedEvidenceText(
+        snapshot.reachedType || "Codex reports that the active usage limit has been reached.",
+        240,
+      ),
     };
   }
   if (
