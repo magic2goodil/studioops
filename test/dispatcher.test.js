@@ -799,6 +799,8 @@ test("unknown same-lane scope stays serialized and glob overlap is conservative"
   assert.equal(fileScopesMayOverlap(["src/a.js"], ["src/b.js"]), false);
   assert.equal(fileScopesMayOverlap(["packages/design"], ["packages/design/src/tokens.js"]), true);
   assert.equal(fileScopesMayOverlap(["**/*"], ["docs/readme.md"]), true);
+  assert.equal(fileScopesMayOverlap(["../outside/**"], ["src/safe.js"]), true);
+  assert.equal(fileScopesMayOverlap(["/tmp/outside/**"], ["src/safe.js"]), true);
 });
 
 test("read-only architecture runs do not block independent mutating work", () => {

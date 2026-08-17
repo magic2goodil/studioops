@@ -171,10 +171,18 @@ function literalPatternPrefix(value) {
   return wildcardIndex === -1 ? pattern : pattern.slice(0, wildcardIndex);
 }
 
+function scopePatternIsAmbiguous(pattern) {
+  return pattern.startsWith("/")
+    || /^[a-z]:\//i.test(pattern)
+    || pattern.split("/").includes("..")
+    || pattern.includes("\0");
+}
+
 function scopePairMayOverlap(left, right) {
   const leftPattern = normalizeScopePattern(left);
   const rightPattern = normalizeScopePattern(right);
   if (!leftPattern || !rightPattern) return true;
+  if (scopePatternIsAmbiguous(leftPattern) || scopePatternIsAmbiguous(rightPattern)) return true;
   if (leftPattern === rightPattern) return true;
 
   const leftHasWildcard = /[?*[\]{}]/.test(leftPattern);
