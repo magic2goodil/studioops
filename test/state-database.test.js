@@ -75,7 +75,7 @@ test("workspace retention eligibility is age bounded, ordered, and protects acti
     nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
     policy: { retainForHours: { completed: 1, failed: 1, cancelled: 1 } },
   });
-  assert.deepEqual(candidates.map((item) => item.runId), ["run_new", "run_old"]);
+  assert.deepEqual(candidates.map((item) => item.runId), ["run_old", "run_new"]);
   assert.equal(workspacePathProtectionReason(state.runs[3], { workspaceRoot: root, project: state.projects[0] }), "candidate_artifact_path");
 });
 
@@ -216,6 +216,34 @@ test("workspace capacity pressure uses only verified sizes and preserves failed 
   assert.equal(released.filesystemReclaimedBytes, 18);
   assert.equal(released.reason, "disk_pressure");
   assert.equal(released.error, "line one line two token=[REDACTED]");
+});
+
+test("pressure cleanup claims oldest terminal workspaces first with stable run-ID ties", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [
+    { id: "run_new_large", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "new-large", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_new_large-new-large`, completedAt: "2026-08-15T00:00:00.000Z" },
+    { id: "run_old_b", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "old-b", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_old_b-old-b`, completedAt: "2026-08-14T00:00:00.000Z" },
+    { id: "run_old_a", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "old-a", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_old_a-old-a`, completedAt: "2026-08-14T00:00:00.000Z" },
+  ];
+  const input = {
+    workspaceRoot: root,
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    pressure: true,
+    policy: { pressureMinAgeHours: 24, maxDeletesPerSweep: 2 },
+    verifiedWorkspaceBytes: { run_new_large: 10_000, run_old_b: 5, run_old_a: 10 },
+    leaseId: "oldest-first",
+  };
+
+  assert.deepEqual(
+    eligibleRunWorkspaceSnapshotsInState(state, input).map((item) => item.runId),
+    ["run_old_a", "run_old_b", "run_new_large"],
+  );
+  assert.deepEqual(
+    claimRunWorkspaceCandidatesInState(state, input).candidates.map((run) => run.id),
+    ["run_old_a", "run_old_b"],
+  );
 });
 
 test("completed cleanup evidence no longer contributes to retained-byte pressure", () => {
