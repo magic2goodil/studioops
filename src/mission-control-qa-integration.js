@@ -2,6 +2,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "./config.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
+import { resolveQaIntegrationOptions } from "./qa-integration-options.js";
 import { readState } from "./store.js";
 
 const DEFAULT_INTERVAL_SECONDS = 300;
@@ -31,35 +32,14 @@ function secondsFrom(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function qaIntegrationDefaults(config) {
-  return {
+async function optionsFrom(args) {
+  const config = await loadConfig();
+  const defaults = {
     ...(config?.defaults?.qaIntegration || {}),
     ...(config?.qaIntegration || {}),
   };
-}
-
-async function optionsFrom(args) {
-  const config = await loadConfig();
-  const defaults = qaIntegrationDefaults(config);
   return {
-    project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
-    task: args.task || args.tasks || args["task-id"],
-    partialTasks: args["partial-tasks"],
-    partialActorId: args["partial-actor-id"],
-    partialReasonCode: args["partial-reason-code"],
-    dryRun: Boolean(args.plan || args["dry-run"] || args.dryRun),
-    force: Boolean(args.force || args.reintegrate),
-    validationTimeoutMs: args["validation-timeout-ms"] || defaults.validationTimeoutMs,
-    qaWorkspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
-    githubAppAuth: args["no-github-app-auth"] ? false : (args["github-app-auth"] || defaults.githubAppAuth),
-    githubAppFallbackToLocalAuth: args["github-app-local-fallback"]
-      ? true
-      : args["no-github-app-local-fallback"]
-        ? false
-        : defaults.githubAppFallbackToLocalAuth,
-    githubAppCredentialsDir: args["github-apps-dir"] || defaults.githubAppCredentialsDir,
-    githubAppRole: args["github-app-role"] || defaults.githubAppRole,
-    githubAppDefaultRole: args["github-app-default-role"] || defaults.githubAppDefaultRole,
+    ...resolveQaIntegrationOptions(args, config),
     intervalSeconds: secondsFrom(
       args.interval || args["interval-seconds"] || defaults.intervalSeconds,
       DEFAULT_INTERVAL_SECONDS,
