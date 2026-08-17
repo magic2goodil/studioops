@@ -63,6 +63,12 @@ const ROLE_SETS = {
       name: "MC Promotion Worker",
       description: "Promotes owner-QA-passed work into protected target branches after validation.",
     },
+    {
+      key: "qa-integration-worker",
+      role: "qa-integration-worker",
+      name: "MC QA Integration Worker",
+      description: "Publishes immutable QA candidates and inspects protected-branch checks without merging them.",
+    },
   ],
 };
 
@@ -137,6 +143,7 @@ function appManifest(app, baseUrl) {
       issues: "write",
       metadata: "read",
       pull_requests: "write",
+      statuses: "read",
     },
     request_oauth_on_install: false,
     setup_on_update: false,
