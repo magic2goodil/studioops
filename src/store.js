@@ -37,6 +37,12 @@ import {
   readDatabaseStateReadOnly,
   writeDatabaseState,
 } from "./state-database.js";
+import {
+  createRemediationHandoff,
+  currentRemediationHandoff,
+  remediationPromptSection,
+  supersedeRemediationHandoff,
+} from "./remediation-handoff.js";
 
 const DATA_DIR = missionControlDataDir();
 const DATA_FILE = LEGACY_DATA_FILE;
@@ -2155,9 +2161,15 @@ export async function updateTask(taskId, patch) {
       if (!task.reviewSubjectCycle) {
         task.reviewSubjectCycle = Number(task.reviewCycle || 0);
       }
-      if (
-        !startedBuilderReviewCycle
-        && previousReviewSubjectSha
+      if (startedBuilderReviewCycle) {
+        supersedeRemediationHandoff(task, {
+          now: new Date().toISOString(),
+          replacementSubjectSha: subjectSha,
+          status: "submitted",
+          resolution: "Builder submitted a new candidate for the requested remediation.",
+        });
+      } else if (
+        previousReviewSubjectSha
         && previousReviewSubjectSha !== subjectSha
       ) {
         restartReviewsForSubjectChange(
@@ -2728,6 +2740,13 @@ export function recordReviewInState(state, taskId, input = {}) {
       createdAt: now,
     });
     if (outcome === "changes_requested") {
+      task.remediationHandoff = createRemediationHandoff(
+        task,
+        (state.reviews || [])
+          .filter((item) => item.taskId === task.id)
+          .filter((item) => reviewMatchesCurrentCandidate(task, item)),
+        now,
+      );
       const actions = routeChangesRequestedInState(state, task, project, stage, now, "StudioOps Automation", []);
       state.events.push({
         id: nextId(state.events, "event"),
@@ -3708,6 +3727,13 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
       currentReviewCycle(task),
     ) + 1;
   }
+  supersedeRemediationHandoff(task, {
+    now,
+    replacementSubjectSha: subjectSha,
+    resolution: options.candidateIdentityChanged
+      ? "Candidate identity changed after review."
+      : "Review subject SHA changed after remediation.",
+  });
   for (const candidate of state.candidates || []) {
     if (
       candidate.invalidation
@@ -4095,6 +4121,7 @@ export function taskWithProject(state, task) {
     comments: state.comments.filter((comment) => comment.taskId === task.id),
     runs: (state.runs || []).filter((run) => run.taskId === task.id),
     reviews: state.reviews.filter((review) => review.taskId === task.id),
+    currentRemediationHandoff: currentRemediationHandoff(task),
   };
 }
 
@@ -4239,6 +4266,7 @@ export function generatePrompt(state, taskId, role = "builder") {
     `- Trust lead approvals after review completion: ${reviewPolicy.trustLeadApprovals ? "yes, route to QA review instead of per-task owner review" : "no, route to owner review"}`,
     `- Lead-approved integration branch: ${reviewPolicy.integrationBranch || "(not configured)"}`,
   ].join("\n");
+  const remediationHandoff = remediationPromptSection(task);
 
   if (role === "systems-architect" || role === "architect") {
     return systemsArchitectPrompt(task, project, {
@@ -4341,6 +4369,9 @@ ${reviewPipeline}
 Review loop policy:
 ${reviewPolicyText}
 
+Current reviewer remediation handoff:
+${remediationHandoff}
+
 Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
@@ -4401,6 +4432,9 @@ ${safety}
 
 Review loop policy:
 ${reviewPolicyText}
+
+Current reviewer remediation handoff:
+${remediationHandoff}
 
 Task:
 ${task.title}

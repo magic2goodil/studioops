@@ -23,6 +23,7 @@ import { loadConfig } from "./config.js";
 import { buildOwnerInbox } from "./owner-inbox.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
 import { databaseContentionHealth } from "./state-database.js";
+import { currentRemediationHandoff } from "./remediation-handoff.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4317);
@@ -294,6 +295,27 @@ async function handleApi(req, res, url) {
       task: taskWithProject(state, task),
       prompts: Object.fromEntries(roles.map((role) => [role, generatePrompt(state, task.id, role)])),
     });
+    return;
+  }
+
+  const remediationMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/remediation-handoff$/);
+  if (remediationMatch && req.method === "GET") {
+    const state = await readState();
+    const task = state.tasks.find((item) => item.id === remediationMatch[1]);
+    const handoff = task ? currentRemediationHandoff(task) : null;
+    if (!task) {
+      sendJson(res, 404, { error: "Task not found." });
+      return;
+    }
+    if (
+      !handoff
+      || Number(url.searchParams.get("candidateCycle") || 0) !== Number(handoff.candidateCycle)
+      || String(url.searchParams.get("subjectSha") || "") !== String(handoff.subjectSha)
+    ) {
+      sendJson(res, 404, { error: "Current remediation handoff not found for that exact candidate." });
+      return;
+    }
+    sendJson(res, 200, { handoff });
     return;
   }
 

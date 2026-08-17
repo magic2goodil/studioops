@@ -296,6 +296,46 @@ function renderReviewPanel(task, project) {
   `;
 }
 
+function renderRemediationPanel(task) {
+  const handoff = task.currentRemediationHandoff;
+  const history = task.remediationHistory || [];
+  if (!handoff && !history.length) return "";
+  const findings = handoff?.findings || [];
+  return `
+    <section class="detail-section remediation-section" id="remediation-handoff">
+      <div class="section-heading">
+        <h3>Reviewer Remediation</h3>
+        <span>${escapeHtml(handoff?.status || history.at(-1)?.status || "resolved")}</span>
+      </div>
+      ${handoff ? `
+        <div class="remediation-meta">
+          <span>Candidate ${escapeHtml(handoff.candidateCycle)}</span>
+          <code title="Exact rejected subject SHA">${escapeHtml(handoff.subjectSha)}</code>
+          ${task.prUrl ? `<a href="${escapeHtml(task.prUrl)}" target="_blank" rel="noreferrer">Open PR</a>` : ""}
+          <a href="${escapeHtml(handoff.artifactRef)}">Open local artifact</a>
+        </div>
+        <ol class="remediation-findings">
+          ${findings.map((finding) => `
+            <li class="remediation-finding severity-${escapeHtml(finding.severity || "medium")}">
+              <div><strong>${escapeHtml(finding.severity || "medium")}</strong><span>${escapeHtml((finding.sources || []).map((source) => `${source.stageKey}/${source.role} (${source.reviewId})`).join(", "))}</span></div>
+              <p>${linkifyText(finding.body)}</p>
+            </li>
+          `).join("") || `<li class="muted-note">The reviewer did not provide detailed findings.</li>`}
+        </ol>
+        ${handoff.omittedFindingCount ? `<p class="muted-note">${escapeHtml(handoff.omittedFindingCount)} additional finding(s) are in the local artifact.</p>` : ""}
+      ` : `<p class="muted-note">No remediation handoff is active for the current candidate.</p>`}
+      ${history.length ? `
+        <details class="remediation-history">
+          <summary>Prior handoffs (${history.length})</summary>
+          <ul>
+            ${history.slice().reverse().map((item) => `<li><strong>${escapeHtml(item.status || "resolved")}</strong> · candidate ${escapeHtml(item.candidateCycle)} · <code>${escapeHtml(item.subjectSha)}</code>${item.resolution ? `<br>${escapeHtml(item.resolution)}` : ""}</li>`).join("")}
+          </ul>
+        </details>
+      ` : ""}
+    </section>
+  `;
+}
+
 function attachmentList(attachments) {
   if (!attachments?.length) return "";
   return `
@@ -1065,6 +1105,7 @@ async function renderDetail() {
       </div>
       ${!isFullPage ? `<a href="${escapeHtml(link)}">Open Full Page</a>` : ""}
     </div>
+    ${renderRemediationPanel(fullTask)}
     ${renderReviewPanel(fullTask, project)}
     <div class="detail-grid ${isFullPage ? "detail-grid-full" : ""}">
       <section class="detail-section">
