@@ -54,6 +54,39 @@ function childEnv(options = {}) {
   };
 }
 
+const PROJECT_COMMAND_CREDENTIAL_KEYS = new Set([
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GIT_ASKPASS",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_SSH_VARIANT",
+  "GIT_TERMINAL_PROMPT",
+  "SSH_ASKPASS",
+  "SSH_AUTH_SOCK",
+]);
+
+function projectCommandEnv(options = {}) {
+  const env = childEnv(options);
+  for (const key of Object.keys(env)) {
+    const upper = key.toUpperCase();
+    if (
+      PROJECT_COMMAND_CREDENTIAL_KEYS.has(upper)
+      || upper.startsWith("MISSION_CONTROL_GITHUB_")
+      || upper === "MISSION_CONTROL_GIT_USERNAME"
+      || upper.startsWith("STUDIOOPS_GITHUB_")
+      || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(upper)
+      || /^GH_(?:ENTERPRISE_)?TOKEN$/.test(upper)
+      || /^GITHUB_(?:APP|AUTH|INSTALLATION|PRIVATE_KEY|TOKEN)/.test(upper)
+    ) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
 function nextId(items, prefix) {
   const max = (items || [])
     .map((item) => String(item.id || ""))
@@ -443,7 +476,7 @@ async function runCommand(command, args, options = {}) {
   try {
     const result = await execFileAsync(command, args, {
       cwd: options.cwd,
-      env: childEnv(options),
+      env: options.projectCommand ? projectCommandEnv(options) : childEnv(options),
       timeout: Number(options.timeoutMs || COMMAND_TIMEOUT_MS),
       maxBuffer: 10 * 1024 * 1024,
     });
@@ -942,6 +975,7 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     const commandResult = await runCommand("sh", ["-lc", command], {
       cwd: preview.checkoutPath,
       env: options.env,
+      projectCommand: true,
       secrets: options.secrets,
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
       allowFailure: true,
@@ -1122,6 +1156,7 @@ async function runValidationCommands(repoPath, commands, options) {
     const result = await runCommand("sh", ["-lc", command], {
       cwd: repoPath,
       env: options.env,
+      projectCommand: true,
       secrets: options.secrets,
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
       allowFailure: true,
