@@ -185,7 +185,28 @@ export async function runWatchdog(input = {}) {
   await heartbeatWriter("watchdog", { status: "busy", lastSweepStartedAt: startedAt }, { ...input, disk: initial.data })
     .catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
   if (!initialPressure && !diskPressureIncidentIsActive(activeIncident)) {
-    const reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
+    let reconciliation;
+    try {
+      reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
+    } catch (error) {
+      if (!["STUDIOOPS_STATE_CONFLICT", "STUDIOOPS_MAINTENANCE"].includes(error?.code)) throw error;
+      reconciliation = {
+        actions: [],
+        deferred: true,
+        reason: error.code === "STUDIOOPS_MAINTENANCE" ? "maintenance_in_progress" : "concurrent_state_change",
+      };
+      if (error.code === "STUDIOOPS_MAINTENANCE") {
+        await heartbeatWriter("watchdog", {
+          status: "idle",
+          lastError: "",
+          lastSweepCompletedAt: new Date().toISOString(),
+          lastSuccessAt: new Date().toISOString(),
+        }, { ...input, disk: initial.data }).catch((heartbeatError) => (
+          console.error(`[watchdog] heartbeat failed: ${heartbeatError.message}`)
+        ));
+        return { generatedAt: new Date().toISOString(), disk: initial.data, disks: initial, reconciliation, actions: [] };
+      }
+    }
     const [state, heartbeats] = await Promise.all([stateReader(), (input.readWorkerHeartbeats || readWorkerHeartbeats)(input)]);
     const actions = planWatchdogActions(state, heartbeats, { ...input, disk: initial.data });
     const results = [];
