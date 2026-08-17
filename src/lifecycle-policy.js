@@ -186,6 +186,18 @@ function assertReviewGates(action, aggregate, evidence = {}, context = {}) {
   }
 }
 
+function assertCompletionEvidence(action, context = {}) {
+  if (action !== "finish_task") return;
+  const completion = context.completionEvidence;
+  if (!completion || completion.complete !== true) {
+    const missing = [
+      ...(completion?.missing || []),
+      ...(completion?.missingReviews || []),
+    ];
+    throw new Error(`Lifecycle action finish_task requires complete immutable evidence${missing.length ? `: ${missing.join(", ")}` : "."}`);
+  }
+}
+
 function assertBoundEvidence(action, ruleValue, aggregate, evidence = {}, context = {}) {
   const candidate = (context.candidates || []).find((item) => item.id === (evidence.candidateId || aggregate.candidateId));
   const candidateSource = candidate?.manifest?.sources?.find((source) => source.taskId === aggregate.id);
@@ -288,6 +300,7 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
   }
   assertBoundEvidence(action, ruleValue, aggregate, command.evidence || {}, context);
   assertReviewGates(action, aggregate, command.evidence || {}, context);
+  assertCompletionEvidence(action, context);
   const override = action === "owner_override" ? validateOwnerOverride(command.evidence) : null;
   const now = context.now || new Date(Number(context.nowMs ?? Date.now())).toISOString();
   const nextTask = {
@@ -320,6 +333,7 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
         subjectSha: String(command.evidence?.subjectSha || "").trim().toLowerCase(),
         candidateId: String(command.evidence?.candidateId || "").trim(),
         manifestDigest: String(command.evidence?.manifestDigest || "").trim(),
+        ...(action === "finish_task" ? { completionEvidence: context.completionEvidence } : {}),
       },
       invalidates: ruleValue.invalidates,
       override,

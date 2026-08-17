@@ -89,6 +89,108 @@ const VALID_DELIVERY_POLICY_PROFILES = new Set(["standard", "prototype-fast-lane
 const CAPABILITY_KEYS = ["backend", "frontend", "accessibility", "lead"];
 const ARCHITECTURE_TASK_PATTERN = /\b(app|application|platform|product|system|dashboard|portal|website|web app|mobile|native|mockup|redesign)\b/i;
 
+export const READINESS_FIELDS = Object.freeze([
+  "userStory", "expectedOutcome", "acceptanceCriteria", "affectedSurfaces",
+  "workAreas", "validationPlan", "riskClassification", "privacyNotes",
+  "securityNotes", "dependsOnTaskIds", "architectureDecision",
+]);
+
+function readinessValuePresent(field, value) {
+  if (field === "dependsOnTaskIds") return Array.isArray(value);
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return Boolean(String(value || "").trim());
+}
+
+export function evaluateTaskReadiness(task = {}, state = null) {
+  const missing = [];
+  const aliases = {
+    affectedSurfaces: task.affectedSurfaces || task.workAreas,
+    architectureDecision: task.architectureDecision || task.architectureSummary
+      || (task.architectureWaiver ? "waived" : "")
+      || (task.architectureStatus === "not_required" ? "not_required" : ""),
+  };
+  for (const field of READINESS_FIELDS) {
+    const value = aliases[field] ?? task[field];
+    if (!readinessValuePresent(field, value)) missing.push(field);
+  }
+  const dependencyErrors = state ? dependencyGraphErrors(state, task) : [];
+  return {
+    ready: missing.length === 0 && dependencyErrors.length === 0,
+    missing,
+    dependencyErrors,
+  };
+}
+
+export function dependencyGraphErrors(state = { tasks: [] }, task = {}) {
+  const errors = [];
+  const tasks = task.id
+    ? [...(state.tasks || []).filter((item) => item.id !== task.id), task]
+    : state.tasks || [];
+  const byId = new Map(tasks.map((item) => [item.id, item]));
+  const visiting = new Set();
+  const visited = new Set();
+  function visit(id, path = []) {
+    if (visiting.has(id)) {
+      errors.push(`Dependency cycle detected: ${[...path, id].join(" -> ")}`);
+      return;
+    }
+    if (visited.has(id)) return;
+    const current = byId.get(id);
+    if (!current) {
+      errors.push(`Unknown dependency task: ${id}`);
+      return;
+    }
+    visiting.add(id);
+    for (const dependencyId of current.dependsOnTaskIds || []) {
+      const dependency = byId.get(dependencyId);
+      if (dependency && current.projectId !== dependency.projectId) {
+        errors.push(`Cross-project dependency is not allowed: ${current.id} -> ${dependency.id}`);
+      }
+      visit(dependencyId, [...path, id]);
+    }
+    visiting.delete(id);
+    visited.add(id);
+  }
+  visit(task.id, []);
+  return [...new Set(errors)];
+}
+
+export function completionEvidenceForTask(state, task = {}) {
+  const reviews = (state.reviews || []).filter((review) => review.taskId === task.id && !review.invalidatedAt);
+  const currentReviews = reviews.filter((review) => reviewMatchesCurrentCandidate(task, review));
+  const requiredStages = state.projects
+    ? reviewStagesForTask(findProject(state, task.projectId) || {}, task).filter((stage) => stage.required !== false)
+    : [];
+  const missingReviews = requiredStages.filter((stage) => !currentReviews.some((review) => (
+    (review.stageKey === stage.key || review.status === stage.status) && ["approved", "skipped"].includes(review.outcome)
+  ))).map((stage) => stage.key || stage.status);
+  const project = (state.projects || []).find((item) => item.id === task.projectId) || {};
+  const subjectSha = String(task.reviewSubjectSha || task.candidateIdentity?.commitSha || "").trim();
+  const exactReceipt = (value) => {
+    if (!value || typeof value !== "object" || !subjectSha) return false;
+    const boundSha = String(value.subjectSha || value.sourceSha || value.commitSha || "").trim();
+    return boundSha === subjectSha && Boolean(String(value.id || value.url || value.recordedAt || "").trim());
+  };
+  const localWorkflow = projectUsesLocalWorkflow(project);
+  const requiresRelease = task.type === "release" || task.completionPolicy?.releaseRequired === true;
+  const requiresDeployment = task.type === "deployment" || task.area === "deployment" || task.completionPolicy?.deploymentRequired === true;
+  const merge = localWorkflow || exactReceipt(task.mergeEvidence);
+  const release = !requiresRelease || exactReceipt(task.releaseEvidence);
+  const deployment = !requiresDeployment || exactReceipt(task.deploymentEvidence);
+  const verification = exactReceipt(task.verificationEvidence);
+  return {
+    complete: missingReviews.length === 0 && merge && release && deployment && verification,
+    missingReviews,
+    missing: [
+      ...(merge ? [] : ["merge"]),
+      ...(release ? [] : ["release"]),
+      ...(deployment ? [] : ["deployment"]),
+      ...(verification ? [] : ["verification"]),
+    ],
+  };
+}
+
 export function projectUsesLocalWorkflow(project = {}) {
   return normalizeProjectWorkflowMode(project.workflowMode || "auto") === "local";
 }
@@ -1242,7 +1344,6 @@ function capabilityForReviewStage(stage = {}) {
 export function capabilityRoutingForTask(project = {}, task = {}) {
   const policy = normalizeDeliveryPolicy(project.deliveryPolicy);
   const evidence = normalizedImpactEvidence(task.impactEvidence || task);
-  if (policy.profile !== "prototype-fast-lane") return { policy, evidence, required: [...CAPABILITY_KEYS], skipped: [] };
   const required = new Set(["lead"]);
   if (evidence.backendRequired) required.add("backend");
   if (evidence.unknown || evidence.frontend) required.add("frontend");
@@ -1357,6 +1458,11 @@ export async function addProject(input) {
       localQaPreview: input.localQaPreview || input.qaIntegration?.localPreview || null,
       promotion: input.promotion || {},
       reviewPolicy,
+      wipPolicy: {
+        maxActiveTasks: Number(input.wipPolicy?.maxActiveTasks || input.maxActiveTasks || 0),
+        weights: input.wipPolicy?.weights || {},
+        agePromotionMs: Number(input.wipPolicy?.agePromotionMs || 24 * 60 * 60 * 1000),
+      },
       deliveryPolicy,
       trustLeadApprovals: reviewPolicy.trustLeadApprovals,
       integrationBranch: reviewPolicy.integrationBranch,
@@ -1437,6 +1543,12 @@ export async function updateProject(projectId, patch = {}) {
       });
       project.trustLeadApprovals = project.reviewPolicy.trustLeadApprovals;
       project.integrationBranch = project.reviewPolicy.integrationBranch;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "wipPolicy")) {
+      project.wipPolicy = {
+        ...(project.wipPolicy || {}),
+        ...(patch.wipPolicy || {}),
+      };
     }
     if (Object.prototype.hasOwnProperty.call(patch, "deliveryPolicy")) {
       project.deliveryPolicy = normalizeDeliveryPolicy(patch.deliveryPolicy);
@@ -1544,6 +1656,18 @@ export async function addTask(input) {
       dependsOnTaskIds,
       userStory: String(input.userStory || input.story || "").trim(),
       expectedOutcome: String(input.expectedOutcome || input.expected || "").trim(),
+      affectedSurfaces: normalizeList(input.affectedSurfaces || input.surfaces),
+      validationPlan: normalizeList(input.validationPlan || input.validation),
+      riskClassification: String(input.riskClassification || input.risk || "").trim(),
+      architectureDecision: String(input.architectureDecision || "").trim(),
+      architectureWaiver: input.architectureWaiver || "",
+      reasoningEffort: String(input.reasoningEffort || "").trim().toLowerCase(),
+      tokenBudget: Number(input.tokenBudget || 0),
+      costBudget: Number(input.costBudget || 0),
+      mergeEvidence: input.mergeEvidence || null,
+      releaseEvidence: input.releaseEvidence || null,
+      deploymentEvidence: input.deploymentEvidence || null,
+      verificationEvidence: input.verificationEvidence || null,
       attachments: normalizeAttachments(input.attachments || input.attachment),
       acceptanceCriteria: normalizeList(input.acceptanceCriteria),
       deliveryMode: normalizeDeliveryMode(input.deliveryMode),
@@ -1554,6 +1678,7 @@ export async function addTask(input) {
       architectureDecisionTaskIds: [],
       architectureCompletedAt: "",
       architectureCompletedBy: "",
+      readinessEnforced: true,
       privacyNotes: String(input.privacyNotes || "").trim(),
       securityNotes: String(input.securityNotes || "").trim(),
       branchName: String(input.branchName || "").trim(),
@@ -1561,6 +1686,9 @@ export async function addTask(input) {
       assignedAgentRole: String(input.assignedAgentRole || "").trim(),
       assignedThreadId: String(input.assignedThreadId || "").trim(),
       reviewerThreadId: String(input.reviewerThreadId || "").trim(),
+      reviewerThreadIds: input.reviewerThreadIds && typeof input.reviewerThreadIds === "object"
+        ? { ...input.reviewerThreadIds }
+        : {},
       reviewCycle: 0,
       reviewSubjectSha: "",
       reviewSubjectCycle: 0,
@@ -1574,6 +1702,12 @@ export async function addTask(input) {
       createdAt: now,
       updatedAt: now,
     };
+    if (["ready", "queued"].includes(task.status)) {
+      const readiness = evaluateTaskReadiness(task, state);
+      if (!readiness.ready) {
+        throw new Error(`Task is not ready for dispatch. Missing: ${readiness.missing.join(", ") || readiness.dependencyErrors.join("; ")}.`);
+      }
+    }
     state.tasks.push(task);
     state.events.push({
       id: nextId(state.events, "event"),
@@ -1675,11 +1809,15 @@ export function applyLifecycleTransitionInState(state, command, input = {}) {
   const task = findTask(state, command?.taskId);
   if (!task) throw new Error(`Unknown task: ${command?.taskId || "(missing)"}`);
   const project = findProject(state, task.projectId);
+  const completionEvidence = command.action === "finish_task"
+    ? completionEvidenceForTask(state, task)
+    : null;
   const result = evaluateLifecycleTransition(command, task, {
     runs: state.runs || [],
     candidates: state.candidates || [],
     reviews: state.reviews || [],
     reviewStages: project ? reviewStagesForTask(project, task) : [],
+    completionEvidence,
     allowCycleLimitLeadReview: Boolean(
       project
       && reviewPolicyForProject(project).leadOwnsFinalDecisionAtLimit
@@ -1738,6 +1876,13 @@ function applyStoreLifecycleTransition(state, task, targetStatus, input = {}) {
   if (targetStatus === task.status && input.force !== true) return null;
   const action = input.action || defaultLifecycleAction(task, targetStatus);
   const evidence = lifecycleEvidenceForTask(state, task, targetStatus, input.evidence);
+  if (action === "finish_task" || targetStatus === "done") {
+    const completion = completionEvidenceForTask(state, task);
+    if (!completion.complete && input.allowIncompleteDone !== true) {
+      throw new Error(`Task is not done from objective evidence. Missing: ${[...completion.missing, ...completion.missingReviews].join(", ")}.`);
+    }
+    evidence.completionEvidence = completion;
+  }
   if (action === "owner_override") {
     evidence.reasonCode = evidence.reasonCode || "local_adapter_transition";
     evidence.reason = evidence.reason || `The local compatibility adapter requested ${task.status} to ${targetStatus}.`;
@@ -1823,6 +1968,12 @@ export async function updateTask(taskId, patch) {
       }
       patch = { ...patch, status: normalizedStatus };
       requestedStatus = normalizedStatus;
+      if (["ready", "queued"].includes(normalizedStatus) && task.readinessEnforced === true) {
+        const readiness = evaluateTaskReadiness({ ...task, ...patch }, state);
+        if (!readiness.ready) {
+          throw new Error(`Task is not ready for dispatch. Missing: ${readiness.missing.join(", ") || readiness.dependencyErrors.join("; ")}.`);
+        }
+      }
     }
     const architectureCompletionFields = [
       "architectureStatus",
@@ -1851,6 +2002,18 @@ export async function updateTask(taskId, patch) {
       "parentTaskId",
       "userStory",
       "expectedOutcome",
+      "affectedSurfaces",
+      "validationPlan",
+      "riskClassification",
+      "architectureDecision",
+      "architectureWaiver",
+      "reasoningEffort",
+      "tokenBudget",
+      "costBudget",
+      "mergeEvidence",
+      "releaseEvidence",
+      "deploymentEvidence",
+      "verificationEvidence",
       "deliveryMode",
       "privacyNotes",
       "securityNotes",
@@ -1865,7 +2028,13 @@ export async function updateTask(taskId, patch) {
       if (Object.prototype.hasOwnProperty.call(patch, key)) {
         task[key] = key === "deliveryMode"
           ? normalizeDeliveryMode(patch[key])
-          : String(patch[key] || "").trim();
+          : ["tokenBudget", "costBudget"].includes(key)
+            ? Number(patch[key] || 0)
+            : ["affectedSurfaces", "validationPlan"].includes(key)
+              ? normalizeList(patch[key])
+              : ["mergeEvidence", "releaseEvidence", "deploymentEvidence", "verificationEvidence"].includes(key)
+                ? (patch[key] || null)
+                : String(patch[key] || "").trim();
       }
     }
     if (Object.prototype.hasOwnProperty.call(patch, "impactEvidence")) {
@@ -3226,7 +3395,19 @@ function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds
   }
   for (const dependencyId of dependsOnTaskIds || []) {
     if (dependencyId === taskId) throw new Error("A task cannot depend on itself.");
-    if (!findTask(state, dependencyId)) throw new Error(`Unknown dependency task: ${dependencyId}`);
+    const dependency = findTask(state, dependencyId);
+    if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
+    const task = taskId ? findTask(state, taskId) : null;
+    if (task && task.projectId !== dependency.projectId) {
+      throw new Error(`Cross-project dependency is not allowed: ${taskId} -> ${dependencyId}`);
+    }
+  }
+  if (taskId) {
+    const errors = dependencyGraphErrors(state, {
+      ...findTask(state, taskId),
+      dependsOnTaskIds,
+    });
+    if (errors.length) throw new Error(errors[0]);
   }
 }
 

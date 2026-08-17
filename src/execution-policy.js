@@ -6,6 +6,17 @@ export const DEFAULT_EXECUTION_POLICY = Object.freeze({
   architectReasoningEffort: "xhigh",
   leadReasoningEffort: "xhigh",
   complexReasoningEffort: "xhigh",
+  ultraReasoningEffort: "ultra",
+  tokenBudget: 120000,
+  costBudget: 0,
+  roleTokenBudgets: {
+    builder: 120000,
+    "backend-reviewer": 100000,
+    "frontend-reviewer": 100000,
+    "accessibility-reviewer": 90000,
+    "lead-reviewer": 140000,
+    "systems-architect": 180000,
+  },
   mechanicalLabels: ["spark-ok"],
   escalationLabels: ["ultra-review"],
   modelTiers: {},
@@ -20,6 +31,11 @@ const COMPLEX_WORK_PATTERN = /\b(architecture|architectural|security|privacy|pii
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function nonNegativeNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function normalizedEffort(value, fallback) {
@@ -82,7 +98,10 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
             : rolePolicy.tier || routing.defaultTier;
   const tierPolicy = configuredTier(configured, selectedTier);
   const reasoningEffort = normalizedEffort(
-    tierPolicy.reasoningEffort
+    task.reasoningEffort
+      || task.reasoningBudget?.reasoningEffort
+      || (escalated ? configured.ultraReasoningEffort : "")
+      || tierPolicy.reasoningEffort
       || (systemsArchitect ? configured.architectReasoningEffort : "")
       || (lead ? configured.leadReasoningEffort : "")
       || (complex ? configured.complexReasoningEffort : "")
@@ -93,7 +112,9 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
 
   return {
     model: String(
-      tierPolicy.model
+      task.model
+        || task.reasoningBudget?.model
+        || tierPolicy.model
         || (systemsArchitect ? DEFAULT_EXECUTION_POLICY.model : "")
         || rolePolicy.model
         || configured.model
@@ -101,6 +122,23 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
     ).trim(),
     modelTier: String(selectedTier || "").trim(),
     reasoningEffort,
+    tokenBudget: positiveInteger(
+      task.tokenBudget
+        || task.reasoningBudget?.tokenBudget
+        || tierPolicy.tokenBudget
+        || rolePolicy.tokenBudget
+        || configured.roleTokenBudgets?.[role]
+        || configured.tokenBudget,
+      DEFAULT_EXECUTION_POLICY.tokenBudget,
+    ),
+    costBudget: nonNegativeNumber(
+      task.costBudget
+        ?? task.reasoningBudget?.costBudget
+        ?? tierPolicy.costBudget
+        ?? rolePolicy.costBudget
+        ?? configured.costBudget,
+      DEFAULT_EXECUTION_POLICY.costBudget,
+    ),
     maxAttempts: positiveInteger(rolePolicy.maxAttempts || configured.maxAttempts, DEFAULT_EXECUTION_POLICY.maxAttempts),
     retryBackoffMs: positiveInteger(rolePolicy.retryBackoffMs || configured.retryBackoffMs, DEFAULT_EXECUTION_POLICY.retryBackoffMs),
     staleRunMs: positiveInteger(rolePolicy.staleRunMs || configured.staleRunMs, DEFAULT_EXECUTION_POLICY.staleRunMs),
@@ -117,6 +155,17 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
               : rolePolicy.tier || rolePolicy.model
                 ? "role_policy"
                 : "default_role",
+  };
+}
+
+export function reasoningBudgetForTask(task = {}, action = {}, input = {}) {
+  const policy = resolveExecutionPolicy(task, action, input);
+  return {
+    model: policy.model,
+    modelTier: policy.modelTier,
+    reasoningEffort: policy.reasoningEffort,
+    tokenBudget: policy.tokenBudget,
+    costBudget: policy.costBudget,
   };
 }
 

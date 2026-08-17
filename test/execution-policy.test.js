@@ -144,6 +144,33 @@ test("Spark requires an explicit mechanical label and never overrides risky work
   assert.equal(escalated.selectionReason, "explicit_escalation");
 });
 
+test("Ultra escalation overrides ordinary tier effort while explicit task budgets remain authoritative", () => {
+  const executionPolicy = {
+    ultraReasoningEffort: "ultra",
+    escalationLabels: ["ultra-review"],
+    modelTiers: {
+      frontier: { model: "gpt-5.6-sol", reasoningEffort: "high", tokenBudget: 180000 },
+    },
+    tierRouting: { defaultTier: "frontier", escalationTier: "frontier" },
+  };
+  const escalated = resolveExecutionPolicy(
+    { id: "task_ultra", title: "Review trust boundary", labels: ["ultra-review"] },
+    { type: "start_review", role: "lead-reviewer" },
+    { executionPolicy },
+  );
+  assert.equal(escalated.reasoningEffort, "ultra");
+  assert.equal(escalated.tokenBudget, 180000);
+
+  const overridden = resolveExecutionPolicy(
+    { id: "task_override", title: "Bounded review", labels: ["ultra-review"], reasoningEffort: "xhigh", tokenBudget: 42000, costBudget: 7 },
+    { type: "start_review", role: "lead-reviewer" },
+    { executionPolicy },
+  );
+  assert.equal(overridden.reasoningEffort, "xhigh");
+  assert.equal(overridden.tokenBudget, 42000);
+  assert.equal(overridden.costBudget, 7);
+});
+
 test("execution attempts are scoped to workflow cycle, action, and role", () => {
   assert.equal(
     executionAttemptKey(
