@@ -152,6 +152,62 @@ test("a valid transition is pure and increments the aggregate version exactly on
   });
 });
 
+test("an owner can reject user review and bind one corrected builder candidate", () => {
+  const originalSha = "a".repeat(40);
+  const correctedSha = "b".repeat(40);
+  const state = {
+    projects: [{ id: "project_1" }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Owner-reviewed candidate",
+      status: "user_review",
+      stateVersion: 7,
+      assignedAgentRole: "owner",
+      reviewCycle: 2,
+      reviewSubjectCycle: 2,
+      reviewSubjectSha: originalSha,
+    }],
+    runs: [],
+    reviews: [{
+      id: "review_1",
+      taskId: "task_1",
+      stageKey: "lead",
+      outcome: "approved",
+      candidateCycle: 2,
+      subjectSha: originalSha,
+    }],
+    candidates: [],
+    qaBundles: [],
+    events: [],
+  };
+
+  const rejected = applyLifecycleTransitionInState(state, {
+    action: "request_changes",
+    taskId: "task_1",
+    expectedStateVersion: 7,
+    actorContext: { actorId: "local-owner", actorType: "owner", role: "owner", trusted: true },
+    evidence: { targetStatus: "needs_changes", candidateCycle: 2, subjectSha: originalSha },
+  }, { nowMs: NOW });
+
+  assert.equal(rejected.task.status, "needs_changes");
+  assert.equal(rejected.task.stateVersion, 8);
+  assert.equal(Boolean(state.reviews[0].invalidatedAt), true);
+
+  const resubmitted = applyLifecycleTransitionInState(state, {
+    action: "record_builder_handoff",
+    taskId: "task_1",
+    expectedStateVersion: 8,
+    actorContext: { actorId: "workflow-engine", actorType: "system", role: "workflow-engine", trusted: true },
+    evidence: { targetStatus: "builder_review", candidateCycle: 3, subjectSha: correctedSha },
+  }, { nowMs: NOW });
+
+  assert.equal(resubmitted.task.status, "builder_review");
+  assert.equal(resubmitted.task.reviewCycle, 3);
+  assert.equal(resubmitted.task.reviewSubjectCycle, 3);
+  assert.equal(resubmitted.task.reviewSubjectSha, correctedSha);
+});
+
 test("stale, untrusted, unassigned, wrong-role, wrong-run, expired-lease, wrong-cycle, wrong-SHA, and prohibited edges fail closed", () => {
   const cases = [
     ["stale", ({ command }) => { command.expectedStateVersion = 2; }, /Stale lifecycle command/],
