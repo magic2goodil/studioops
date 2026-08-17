@@ -819,3 +819,96 @@ test("SQLite archives excess machine QA history without compacting human comment
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("SQLite bounds repetitive automation tick history without removing product events", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-automation-tick-compaction-"));
+  try {
+    const state = baseState();
+    state.events = Array.from({ length: 250 }, (_, index) => ({
+      id: `event_tick_${index + 1}`,
+      type: "automation_tick",
+      projectId: "",
+      taskId: "",
+      message: "Automation tick completed with 0 action(s).",
+      createdAt: new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
+    }));
+    state.events.splice(25, 0, {
+      id: "event_task_created",
+      type: "task_created",
+      projectId: "project_1",
+      taskId: "task_1",
+      message: "Persist me created",
+      createdAt: "2026-07-01T00:25:30.000Z",
+    });
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.events.filter((item) => item.type === "automation_tick").length, 200);
+    assert.equal(persisted.events.some((item) => item.id === "event_task_created"), true);
+    assert.equal(persisted.meta.operationalArchive.activeAutomationTickEvents, 200);
+
+    const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
+    try {
+      assert.equal(db.prepare(
+        "SELECT count(*) count FROM operational_archive WHERE entity_type = 'events'",
+      ).get().count, 50);
+    } finally {
+      db.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite bounds live event projections and noisy machine comments while preserving human evidence", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operational-projection-compaction-"));
+  try {
+    const state = baseState();
+    state.events = Array.from({ length: 5_025 }, (_, index) => ({
+      id: `event_dispatch_${index + 1}`,
+      type: "dispatch_created",
+      projectId: "project_1",
+      taskId: "task_1",
+      message: `Dispatch ${index + 1}`,
+      createdAt: new Date(Date.UTC(2026, 6, 1, 0, 0, index)).toISOString(),
+    }));
+    state.comments = Array.from({ length: 25 }, (_, index) => ({
+      id: `comment_runner_${index + 1}`,
+      taskId: "task_1",
+      author: "StudioOps Runner",
+      body: `Run update ${index + 1}`,
+      createdAt: new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
+    }));
+    state.comments.splice(5, 0, {
+      id: "comment_owner",
+      taskId: "task_1",
+      author: "Project Owner",
+      body: "Preserve this human decision.",
+      createdAt: "2026-07-01T00:05:30.000Z",
+    });
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.events.length, 5_000);
+    assert.equal(persisted.comments.filter((item) => item.author === "StudioOps Runner").length, 10);
+    assert.equal(persisted.comments.some((item) => item.id === "comment_owner"), true);
+    assert.equal(persisted.meta.operationalArchive.activeEvents, 5_000);
+    assert.equal(persisted.meta.operationalArchive.activeMachineCommentsPerTaskAuthor, 10);
+
+    const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
+    try {
+      assert.equal(db.prepare(
+        "SELECT count(*) count FROM operational_archive WHERE entity_type = 'events'",
+      ).get().count, 25);
+      assert.equal(db.prepare(
+        "SELECT count(*) count FROM operational_archive WHERE entity_type = 'comments'",
+      ).get().count, 15);
+    } finally {
+      db.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

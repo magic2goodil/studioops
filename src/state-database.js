@@ -17,7 +17,15 @@ const STATE_INTEGRITY_VERSION = 4;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
+const ACTIVE_AUTOMATION_TICK_EVENTS = 200;
+const ACTIVE_MACHINE_COMMENTS_PER_TASK_AUTHOR = 10;
+const ACTIVE_EVENTS = 5_000;
 const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
+const NOISY_MACHINE_COMMENT_AUTHORS = new Set([
+  "StudioOps Automation",
+  "StudioOps Dispatcher",
+  "StudioOps Runner",
+]);
 const VALID_TASK_STATUSES = new Set([
   "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
   "ready", "queued", "in_progress", "blocked", "builder_review", "backend_review",
@@ -171,6 +179,15 @@ function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
 export function compactOperationalHistory(state, input = {}) {
   const commentLimit = Math.max(1, Number(input.commentLimit || ACTIVE_QA_COMMENTS_PER_TASK));
   const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
+  const automationTickEventLimit = Math.max(
+    1,
+    Number(input.automationTickEventLimit || ACTIVE_AUTOMATION_TICK_EVENTS),
+  );
+  const machineCommentLimit = Math.max(
+    1,
+    Number(input.machineCommentLimit || ACTIVE_MACHINE_COMMENTS_PER_TASK_AUTHOR),
+  );
+  const activeEventLimit = Math.max(1, Number(input.activeEventLimit || ACTIVE_EVENTS));
   const staleReviewRunLimit = Math.max(
     1,
     Number(input.staleReviewRunLimit || ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH),
@@ -191,11 +208,29 @@ export function compactOperationalHistory(state, input = {}) {
     (comment) => comment.taskId || "unassigned",
     commentLimit,
   );
-  const events = archiveOldestBeyondLimit(
+  const machineComments = archiveOldestBeyondLimit(
+    comments.active,
+    (comment) => NOISY_MACHINE_COMMENT_AUTHORS.has(comment.author),
+    (comment) => `${comment.taskId || "unassigned"}:${comment.author}`,
+    machineCommentLimit,
+  );
+  const automationTickEvents = archiveOldestBeyondLimit(
     Array.isArray(state.events) ? state.events : [],
+    (event) => event.type === "automation_tick",
+    () => "automation_tick",
+    automationTickEventLimit,
+  );
+  const qaEvents = archiveOldestBeyondLimit(
+    automationTickEvents.active,
     (event) => /^qa_(?:integration|bundle)_/.test(event.type || ""),
     (event) => event.taskId || `${event.projectId || "unassigned"}:${event.type || "qa"}`,
     eventLimit,
+  );
+  const events = archiveOldestBeyondLimit(
+    qaEvents.active,
+    () => true,
+    () => "events",
+    activeEventLimit,
   );
   const runs = archiveOldestBeyondLimit(
     Array.isArray(state.runs) ? state.runs : [],
@@ -210,10 +245,14 @@ export function compactOperationalHistory(state, input = {}) {
     (run) => run.dispatchKey || `${run.taskId || "unassigned"}:${run.role || "reviewer"}`,
     staleReviewRunLimit,
   );
-  state.comments = comments.active;
+  state.comments = machineComments.active;
   state.events = events.active;
   state.runs = runs.active;
-  return { comments: comments.archived, events: events.archived, runs: runs.archived };
+  return {
+    comments: [...comments.archived, ...machineComments.archived],
+    events: [...automationTickEvents.archived, ...qaEvents.archived, ...events.archived],
+    runs: runs.archived,
+  };
 }
 
 function archivePayload(entityType, item) {
@@ -264,6 +303,9 @@ function recordOperationalArchiveMetadata(state, archived, now, backupPath = "")
     runs: Number(previous.runs || 0) + (archived.runs || []).length,
     activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
     activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
+    activeAutomationTickEvents: ACTIVE_AUTOMATION_TICK_EVENTS,
+    activeMachineCommentsPerTaskAuthor: ACTIVE_MACHINE_COMMENTS_PER_TASK_AUTHOR,
+    activeEvents: ACTIVE_EVENTS,
     activeStaleReviewRunsPerDispatch: ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH,
   };
 }
