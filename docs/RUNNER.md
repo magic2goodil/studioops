@@ -58,6 +58,19 @@ Each workflow action gets two worker-launch attempts by default with a 30-second
 
 Before claiming work, the runner checks the data volume used for SQLite state and run output. The default safety floor is 5 GiB or 2% free, whichever is stricter. Existing builders are not killed by this check; new claims pause until capacity is restored, and the watchdog records the reason instead of entering a restart loop.
 
+Before that claim gate, the runner performs the configured terminal-workspace
+retention sweep when its interval is due, and immediately when either the data
+or workspace volume is below its threshold. Retention eligibility, pressure
+age, retained-byte accounting, the 25-item bound, and cleanup leases are owned
+by the store contract; the runner only measures and removes filesystem
+artifacts. Evidence includes both volume reports before and after cleanup,
+whether they share a volume, selected/skipped reasons, logical bytes, the
+actual available-byte delta, failures, and any remaining shortfall. Worktree
+removal is serialized with the source repository Git lock and uses local
+`git worktree remove --force`/`prune`; clone and local-clone workspaces use
+guarded recursive removal. Path and symlink checks are repeated immediately
+before each destructive operation.
+
 ## Run Continuously
 
 ```bash
@@ -178,6 +191,16 @@ Runner logs are written to:
 data/run-outputs/<run_id>.log
 data/run-outputs/<run_id>.last-message.md
 ```
+
+Before claiming work, the runner performs a bounded retention sweep when the
+configured interval is due or either the state database volume or workspace
+volume is below its byte or percentage safety threshold. Cleanup reports keep
+the configured thresholds, byte and percentage-point shortfalls, logical and
+filesystem recovery evidence, and bounded exclusion reason counts. Under disk
+pressure, safe old terminal workspaces are measured before the store issues a
+size-verified deletion lease. Source repositories, active workspaces, candidate
+artifacts, unknown workspace layouts, and paths outside the configured local
+workspace root remain protected.
 
 List runs:
 

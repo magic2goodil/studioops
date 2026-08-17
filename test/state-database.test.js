@@ -104,6 +104,54 @@ test("workspace retention applies exact normal and pressure age boundaries", () 
   }).map((item) => item.runId), ["run_pressure_boundary"]);
 });
 
+test("pressure discovery measures safe old workspaces before the verified deletion claim", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [{
+    id: "run_unmeasured",
+    projectId: "project_1",
+    projectKey: "demo",
+    status: "failed",
+    branchName: "unmeasured",
+    workspaceStrategy: "clone",
+    workspacePath: `${root}/demo/run_unmeasured-unmeasured`,
+    completedAt: new Date(nowMs - 48 * 3_600_000).toISOString(),
+  }];
+  const policy = { retainForHours: { failed: 336 }, pressureMinAgeHours: 24 };
+
+  const discovery = eligibleRunWorkspaceSnapshotsInState(state, {
+    workspaceRoot: root,
+    nowMs,
+    pressure: true,
+    policy,
+    includeUnverifiedPressureCandidates: true,
+  });
+  assert.deepEqual(discovery.map((item) => item.runId), ["run_unmeasured"]);
+  assert.equal(discovery[0].discoveryOnly, true);
+
+  const unverifiedClaim = claimRunWorkspaceCandidatesInState(state, {
+    workspaceRoot: root,
+    nowMs,
+    pressure: true,
+    policy,
+    leaseId: "unverified",
+  });
+  assert.deepEqual(unverifiedClaim.candidates, []);
+  assert.equal(unverifiedClaim.selectionReport.excludedByReason.unverified_workspace_size, 1);
+
+  const verifiedClaim = claimRunWorkspaceCandidatesInState(state, {
+    workspaceRoot: root,
+    nowMs,
+    pressure: true,
+    policy,
+    verifiedWorkspaceBytes: { run_unmeasured: 42 },
+    leaseId: "verified",
+  });
+  assert.deepEqual(verifiedClaim.candidates.map((run) => run.id), ["run_unmeasured"]);
+});
+
 test("workspace retention protects roots, sources, unknown strategies, active references, and symlinked ancestors", async () => {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-retention-paths-"));
   const root = await realpath(temporaryRoot);

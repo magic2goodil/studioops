@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -19,9 +19,11 @@ import {
   prepareRunWorkspace,
   resolveProjectWorkflowMode,
   runGitHubRemoteRecoveryProbes,
+  runWorkspaceCleanup,
   runQueuedRuns,
 } from "../src/runner.js";
 import { materializeLocalCandidate } from "../src/workspace.js";
+import { eligibleRunWorkspaceSnapshotsInState } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1212,4 +1214,286 @@ test("legacy queued security work is upgraded to the current xhigh execution pol
   assert.equal(run.model, "gpt-5.6-sol");
   assert.equal(run.modelReasoningEffort, "xhigh");
   assert.equal(run.modelSelectionReason, "complex_task");
+});
+
+function cleanupDiskReader(reports) {
+  let index = 0;
+  return async ({ path: target }) => ({
+    path: target,
+    availableBytes: reports[Math.min(index, reports.length - 1)].availableBytes,
+    totalBytes: 1_000_000,
+    availablePercent: reports[Math.min(index++, reports.length - 1)].availablePercent,
+    minAvailableBytes: 1,
+    minAvailablePercent: 1,
+    pressure: reports[Math.min(index - 1, reports.length - 1)].pressure,
+  });
+}
+
+test("runner cleanup removes worktree, clone, and local-clone fixtures without touching the source", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-runner-cleanup-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const sourceRepo = await createRepository(root, { name: "source" });
+    const workspaceRoot = path.join(root, "workspaces");
+    const projectRoot = path.join(workspaceRoot, "demo");
+    const worktreePath = path.join(projectRoot, "run_worktree-cleanup-worktree");
+    const clonePath = path.join(projectRoot, "run_clone-clone");
+    const localClonePath = path.join(projectRoot, "run_local-local-clone");
+    await mkdir(clonePath, { recursive: true });
+    await mkdir(localClonePath, { recursive: true });
+    await writeFile(path.join(clonePath, "payload"), "clone\n");
+    await writeFile(path.join(localClonePath, "payload"), "local\n");
+    await git(sourceRepo, ["worktree", "add", "-b", "cleanup-worktree", worktreePath, "main"]);
+    const state = {
+      meta: {},
+      projects: [{ id: "project_1", key: "demo", repoPath: sourceRepo }],
+      runs: [
+        { id: "run_worktree", projectId: "project_1", projectKey: "demo", status: "failed", completedAt: "2026-08-01T00:00:00.000Z", branchName: "cleanup-worktree", workspaceStrategy: "worktree", workspacePath: worktreePath },
+        { id: "run_clone", projectId: "project_1", projectKey: "demo", status: "failed", completedAt: "2026-08-01T00:00:00.000Z", branchName: "clone", workspaceStrategy: "clone", workspacePath: clonePath },
+        { id: "run_local", projectId: "project_1", projectKey: "demo", status: "failed", completedAt: "2026-08-01T00:00:00.000Z", branchName: "local-clone", workspaceStrategy: "local-clone", workspacePath: localClonePath },
+      ],
+    };
+    assert.equal(eligibleRunWorkspaceSnapshotsInState(state, {
+      workspaceRoot,
+      policy: { retainForHours: { failed: 1 } },
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    }).length, 3);
+    const report = await runWorkspaceCleanup({
+      state,
+      workspaceRoot,
+      dataPath: path.join(root, "data"),
+      workspaceRetention: { retainForHours: { failed: 1 } },
+      eligibleRunWorkspaceSnapshots: async (input) => eligibleRunWorkspaceSnapshotsInState(state, input),
+      readDiskAvailability: cleanupDiskReader([
+        { availableBytes: 100_000, availablePercent: 10, pressure: false },
+      ]),
+      git: async (args, options) => {
+        if (args[0] === "worktree" && args[1] === "remove") {
+          await rm(args.at(-1), { recursive: true, force: true });
+          return { stdout: "", stderr: "" };
+        }
+        return execFileAsync("git", args, options);
+      },
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    });
+    assert.equal(report.selectedCount, 3, JSON.stringify(report));
+    assert.equal(report.failures.length, 0);
+    for (const target of [worktreePath, clonePath, localClonePath]) {
+      await assert.rejects(() => lstat(target), { code: "ENOENT" });
+    }
+    assert.equal(await git(sourceRepo, ["rev-parse", "--is-inside-work-tree"]), "true");
+    assert.equal((await git(sourceRepo, ["worktree", "list", "--porcelain"])).split("worktree ").length - 1, 1);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("runner cleanup preserves unsafe, unrecorded, candidate, and symlinked workspaces", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-runner-safety-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const sourceRepo = await createRepository(root, { name: "source" });
+    const workspaceRoot = path.join(root, "workspaces");
+    const safePath = path.join(workspaceRoot, "demo", "run_safe-safe");
+    const siblingPath = path.join(workspaceRoot, "demo", "unrecorded");
+    const candidatePath = path.join(workspaceRoot, "candidates", "artifact");
+    const outsidePath = path.join(root, "outside");
+    const linkedPath = path.join(workspaceRoot, "demo", "run_linked-linked");
+    await mkdir(safePath, { recursive: true });
+    await mkdir(siblingPath, { recursive: true });
+    await mkdir(candidatePath, { recursive: true });
+    await mkdir(outsidePath, { recursive: true });
+    await writeFile(path.join(outsidePath, "keep"), "keep\n");
+    await symlink(outsidePath, linkedPath);
+    const state = {
+      meta: {},
+      projects: [{ id: "project_1", key: "demo", repoPath: sourceRepo }],
+      runs: [
+        { id: "run_safe", projectId: "project_1", projectKey: "demo", status: "failed", completedAt: "2026-08-01T00:00:00.000Z", branchName: "safe", workspaceStrategy: "clone", workspacePath: safePath },
+        { id: "run_linked", projectId: "project_1", projectKey: "demo", status: "failed", completedAt: "2026-08-01T00:00:00.000Z", branchName: "linked", workspaceStrategy: "clone", workspacePath: linkedPath },
+      ],
+    };
+    const report = await runWorkspaceCleanup({
+      state,
+      workspaceRoot,
+      dataPath: path.join(root, "data"),
+      workspaceRetention: { retainForHours: { failed: 1 } },
+      eligibleRunWorkspaceSnapshots: async (input) => eligibleRunWorkspaceSnapshotsInState(state, input),
+      readDiskAvailability: cleanupDiskReader([{ availableBytes: 100_000, availablePercent: 10, pressure: false }]),
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    });
+    assert.equal(report.selectedCount, 1, JSON.stringify(report));
+    await assert.rejects(() => lstat(safePath), { code: "ENOENT" });
+    await lstat(siblingPath);
+    await lstat(candidatePath);
+    await lstat(linkedPath);
+    await lstat(path.join(outsidePath, "keep"));
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("runner cleanup fails closed on a post-claim symlink swap, releases the lease, and is idempotent for missing targets", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-runner-race-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const workspaceRoot = path.join(root, "workspaces");
+    const target = path.join(workspaceRoot, "demo", "run_race-race");
+    const outside = path.join(root, "outside");
+    await mkdir(target, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(path.join(outside, "keep"), "keep\n");
+    const run = { id: "run_race", projectId: "project_1", projectKey: "demo", status: "failed", completedAt: "2026-08-01T00:00:00.000Z", branchName: "race", workspaceStrategy: "clone", workspacePath: target };
+    const state = { meta: {}, projects: [{ id: "project_1", key: "demo", repoPath: path.join(root, "source") }], runs: [run] };
+    let released = null;
+    const report = await runWorkspaceCleanup({
+      state,
+      workspaceRoot,
+      dataPath: path.join(root, "data"),
+      workspaceRetention: { retainForHours: { failed: 1 } },
+      readDiskAvailability: cleanupDiskReader([{ availableBytes: 100_000, availablePercent: 10, pressure: false }]),
+      eligibleRunWorkspaceSnapshots: async () => [{ runId: run.id, workspacePath: target }],
+      claimRunWorkspaceCandidates: async () => {
+        await rm(target, { recursive: true, force: true });
+        await symlink(outside, target);
+        return { leaseId: "lease_race", candidates: [{ ...run, workspaceCleanup: { state: "claimed", leaseId: "lease_race" } }] };
+      },
+      releaseRunWorkspaceCleanup: async (runId, input) => {
+        released = { runId, ...input };
+        return { state: "released" };
+      },
+    });
+    assert.equal(report.selectedCount, 0);
+    assert.equal(report.failures.length, 1);
+    assert.equal(released.runId, run.id);
+    assert.match(released.error, /symlink/);
+    await lstat(path.join(outside, "keep"));
+    await lstat(target);
+
+    const missingRun = { ...run, id: "run_missing", workspacePath: path.join(workspaceRoot, "demo", "run_missing-missing") };
+    const missing = await runWorkspaceCleanup({
+      state,
+      workspaceRoot,
+      dataPath: path.join(root, "data"),
+      workspaceRetention: { retainForHours: { failed: 1 } },
+      readDiskAvailability: cleanupDiskReader([{ availableBytes: 100_000, availablePercent: 10, pressure: false }]),
+      eligibleRunWorkspaceSnapshots: async () => [{ runId: missingRun.id, workspacePath: missingRun.workspacePath }],
+      claimRunWorkspaceCandidates: async () => ({ leaseId: "lease_missing", candidates: [missingRun] }),
+      finalizeRunWorkspaceCleanup: async () => ({ state: "completed" }),
+    });
+    assert.equal(missing.selectedCount, 1);
+    assert.equal(missing.logicalDeletedBytes, 0);
+    assert.equal(missing.failures.length, 0);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("runner cleanup reports percent pressure, thresholds, and bounded policy exclusions", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-runner-pressure-report-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const workspaceRoot = path.join(root, "workspaces");
+    const dataPath = path.join(root, "data");
+    const oldPath = path.join(workspaceRoot, "demo", "run_old-old");
+    await mkdir(oldPath, { recursive: true });
+    await writeFile(path.join(oldPath, "payload"), "measured before cleanup\n");
+    const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+    const state = {
+      meta: {},
+      projects: [{ id: "project_1", key: "demo", repoPath: path.join(root, "source") }],
+      runs: [
+        { id: "run_old", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "old", workspaceStrategy: "clone", workspacePath: oldPath, completedAt: new Date(nowMs - 48 * 3_600_000).toISOString() },
+        { id: "run_young", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "young", workspaceStrategy: "clone", workspacePath: path.join(workspaceRoot, "demo", "run_young-young"), completedAt: new Date(nowMs - 1 * 3_600_000).toISOString() },
+        { id: "run_active", projectId: "project_1", projectKey: "demo", status: "running", branchName: "active", workspaceStrategy: "clone", workspacePath: path.join(workspaceRoot, "demo", "run_active-active"), updatedAt: new Date(nowMs - 48 * 3_600_000).toISOString() },
+        { id: "run_artifact", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "artifact", workspaceStrategy: "clone", workspacePath: path.join(workspaceRoot, "candidates", "run_artifact-artifact"), completedAt: new Date(nowMs - 48 * 3_600_000).toISOString() },
+      ],
+    };
+    const percentPressure = async ({ path: target }) => ({
+      path: target,
+      availableBytes: 900_000,
+      totalBytes: 1_000_000,
+      availablePercent: 1,
+      minAvailableBytes: 100,
+      minAvailablePercent: 5,
+      pressure: true,
+    });
+
+    const report = await runWorkspaceCleanup({
+      state,
+      workspaceRoot,
+      dataPath,
+      sameVolume: true,
+      workspaceRetention: {
+        retainForHours: { failed: 336 },
+        pressureMinAgeHours: 24,
+      },
+      readDiskAvailability: percentPressure,
+      nowMs,
+    });
+
+    assert.equal(report.selectedCount, 1, JSON.stringify(report));
+    assert.equal(report.remainingShortfall.pressure, true);
+    assert.equal(report.remainingShortfall.bytes, 0);
+    assert.equal(report.remainingShortfall.percentPoints, 4);
+    assert.equal(report.policy.thresholds.data.minAvailablePercent, 5);
+    assert.equal(report.selection.selectedCount, 1);
+    assert.equal(report.selection.excludedByReason.minimum_age_not_reached, 1);
+    assert.equal(report.selection.excludedByReason.nonterminal_run, 1);
+    assert.equal(report.selection.excludedByReason.protected_candidate_artifact_path, 1);
+    assert.equal(report.skippedCount, 3);
+    await assert.rejects(() => lstat(oldPath), { code: "ENOENT" });
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("runner claims after recoverable pressure cleanup but pauses for persistent pressure or disk recovery", async () => {
+  const state = { meta: {}, projects: [], runs: [] };
+  const resolvedReports = [
+    { availableBytes: 1, availablePercent: 0.1, pressure: true },
+    { availableBytes: 1, availablePercent: 0.1, pressure: true },
+    { availableBytes: 100, availablePercent: 10, pressure: false },
+    { availableBytes: 100, availablePercent: 10, pressure: false },
+  ];
+  let claims = 0;
+  const resolved = await runQueuedRuns({
+    state,
+    workspaceRoot: "/tmp/workspaces",
+    dataPath: "/tmp/data",
+    workspaceRetention: { enabled: true },
+    readDiskAvailability: cleanupDiskReader(resolvedReports),
+    reconcileStaleRuns: async () => [],
+    claimRuns: async () => { claims += 1; return []; },
+    runGitHubRemoteRecoveryProbes: async () => [],
+  });
+  assert.equal(resolved.paused, undefined);
+  assert.equal(claims, 1);
+
+  const persistent = await runQueuedRuns({
+    state,
+    workspaceRoot: "/tmp/workspaces",
+    dataPath: "/tmp/data",
+    workspaceRetention: { enabled: true },
+    disk: { availableBytes: 1, availablePercent: 0.1, minAvailableBytes: 100, minAvailablePercent: 2, pressure: true },
+    reconcileStaleRuns: async () => [],
+    claimRuns: async () => { throw new Error("claim must not run"); },
+    runGitHubRemoteRecoveryProbes: async () => [],
+  });
+  assert.equal(persistent.paused, true);
+  assert.equal(persistent.pauseReason, "disk_space_below_safety_threshold");
+
+  const recoveryState = { ...state, meta: { diskRecovery: { state: "awaiting_watchdog_health" }, operatorPause: { active: true } } };
+  const recovery = await runQueuedRuns({
+    state: recoveryState,
+    workspaceRoot: "/tmp/workspaces",
+    dataPath: "/tmp/data",
+    workspaceRetention: { enabled: true },
+    disk: { availableBytes: 100, availablePercent: 10, minAvailableBytes: 1, minAvailablePercent: 1, pressure: false },
+    reconcileStaleRuns: async () => [],
+    claimRuns: async () => { throw new Error("claim must not run"); },
+    runGitHubRemoteRecoveryProbes: async () => [],
+  });
+  assert.equal(recovery.pauseReason, "disk_recovery_awaiting_watchdog_health");
+  assert.equal(recoveryState.meta.operatorPause.active, true);
 });

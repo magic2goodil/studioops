@@ -315,34 +315,72 @@ function verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferen
   }, 0);
 }
 
-export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
+function incrementRetentionReason(report, reason) {
+  report.excludedByReason[reason] = (report.excludedByReason[reason] || 0) + 1;
+}
+
+function retentionSelectionInState(state, input = {}) {
   const policy = normalizeWorkspaceRetention(input.policy || {});
-  if (!policy.enabled) return [];
+  const report = {
+    consideredCount: (state.runs || []).length,
+    eligibleCount: 0,
+    selectedCount: 0,
+    excludedCount: 0,
+    excludedByReason: {},
+  };
+  if (!policy.enabled) {
+    report.excludedCount = report.consideredCount;
+    if (report.excludedCount) report.excludedByReason.policy_disabled = report.excludedCount;
+    return { candidates: [], report };
+  }
   const nowMs = Number(input.nowMs ?? Date.now());
   const pressure = input.pressure === true;
   const root = String(input.workspaceRoot || "");
   const activeReferences = activeRunWorkspaceReferences(state);
-  if (activeReferences.ambiguous) return [];
+  if (activeReferences.ambiguous) {
+    report.excludedCount = report.consideredCount;
+    if (report.excludedCount) report.excludedByReason.active_reference_ambiguous = report.excludedCount;
+    return { candidates: [], report };
+  }
   const sourceRepoPaths = (state.projects || []).map((project) => project.repoPath).filter(Boolean);
   const verifiedRetainedBytes = verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferences);
   const capacityPressure = verifiedRetainedBytes > policy.maxRetainedBytes;
   const candidates = [];
   for (const run of state.runs || []) {
-    if (!WORKSPACE_TERMINAL_STATUSES.has(run.status)) continue;
-    if (run.workspaceCleanup?.state === "completed") continue;
+    let exclusion = "";
+    if (!WORKSPACE_TERMINAL_STATUSES.has(run.status)) exclusion = "nonterminal_run";
+    else if (run.workspaceCleanup?.state === "completed") exclusion = "cleanup_completed";
     const completedMs = Date.parse(run.completedAt || run.updatedAt || "");
-    if (!Number.isFinite(completedMs)) continue;
-    const ageHours = (nowMs - completedMs) / 3_600_000;
+    if (!exclusion && !Number.isFinite(completedMs)) exclusion = "missing_terminal_timestamp";
     const project = (state.projects || []).find((item) => item.id === run.projectId || item.key === run.projectKey);
-    const protection = workspacePathProtectionReason(run, { workspaceRoot: root, project, sourceRepoPaths });
-    if (protection) continue;
-    if (activeReferenceProtectsPath(activeReferences, run.workspacePath)) continue;
+    const protection = exclusion ? "" : workspacePathProtectionReason(run, { workspaceRoot: root, project, sourceRepoPaths });
+    if (!exclusion && protection) exclusion = `protected_${protection}`;
+    if (!exclusion && activeReferenceProtectsPath(activeReferences, run.workspacePath)) {
+      exclusion = "active_workspace_reference";
+    }
+    if (exclusion) {
+      incrementRetentionReason(report, exclusion);
+      continue;
+    }
+    const ageHours = (nowMs - completedMs) / 3_600_000;
     const verifiedBytes = verifiedWorkspaceBytes(run, input);
     const retentionEligible = ageHours >= policy.retainForHours[run.status];
+    const pressureAgeEligible = ageHours >= policy.pressureMinAgeHours;
     const pressureEligible = verifiedBytes !== null
       && (pressure || capacityPressure)
-      && ageHours >= policy.pressureMinAgeHours;
-    if (!retentionEligible && !pressureEligible) continue;
+      && pressureAgeEligible;
+    const pressureDiscoveryEligible = input.includeUnverifiedPressureCandidates === true
+      && pressure
+      && pressureAgeEligible;
+    if (!retentionEligible && !pressureEligible && !pressureDiscoveryEligible) {
+      incrementRetentionReason(
+        report,
+        (pressure || capacityPressure) && pressureAgeEligible && verifiedBytes === null
+          ? "unverified_workspace_size"
+          : "minimum_age_not_reached",
+      );
+      continue;
+    }
     candidates.push({
       runId: run.id,
       projectId: run.projectId || "",
@@ -355,15 +393,24 @@ export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
       verified: verifiedBytes !== null,
       retentionEligible,
       pressureEligible,
+      discoveryOnly: !retentionEligible && !pressureEligible,
       eligibilityReason: retentionEligible
         ? "status_retention"
         : pressure ? "disk_pressure" : "capacity_pressure",
     });
   }
-  return candidates.sort((a, b) => (
+  candidates.sort((a, b) => (
     a.completedAt.localeCompare(b.completedAt)
     || a.runId.localeCompare(b.runId)
   ));
+  report.eligibleCount = candidates.length;
+  report.excludedCount = report.consideredCount - report.eligibleCount;
+  return { candidates, report, verifiedRetainedBytes, capacityPressure };
+}
+
+export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
+  const selection = retentionSelectionInState(state, input);
+  return input.withSelectionReport === true ? selection : selection.candidates;
 }
 
 export async function eligibleRunWorkspaceSnapshots(input = {}) {
@@ -376,27 +423,37 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
   const policy = normalizeWorkspaceRetention(input.policy || {});
   const requestedLeaseId = String(input.leaseId || "").trim();
   const leaseId = requestedLeaseId || randomUUID();
-  if (!policy.enabled) return { leaseId, expiresAt: "", candidates: [] };
+  if (!policy.enabled) {
+    const selection = retentionSelectionInState(state, input);
+    return { leaseId, expiresAt: "", candidates: [], selectionReport: selection.report };
+  }
   const expiresAt = new Date(nowMs + policy.cleanupLeaseSeconds * 1000).toISOString();
-  const snapshots = eligibleRunWorkspaceSnapshotsInState(state, input);
+  const selection = retentionSelectionInState(state, input);
+  const snapshots = selection.candidates;
   const root = String(input.workspaceRoot || "");
   const activeReferences = activeRunWorkspaceReferences(state);
-  const verifiedRetainedBytes = verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferences);
-  const capacityPressure = verifiedRetainedBytes > policy.maxRetainedBytes;
+  const verifiedRetainedBytes = selection.verifiedRetainedBytes
+    ?? verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferences);
+  const capacityPressure = selection.capacityPressure ?? verifiedRetainedBytes > policy.maxRetainedBytes;
   const maximumClaims = Math.min(
     policy.maxDeletesPerSweep,
     Number.isSafeInteger(Number(input.limit)) && Number(input.limit) > 0
       ? Number(input.limit)
       : policy.maxDeletesPerSweep,
   );
-  const available = snapshots
-    .filter((item) => {
-      const run = (state.runs || []).find((candidate) => candidate.id === item.runId);
-      const expiry = Date.parse(run?.workspaceCleanup?.leaseExpiresAt || "");
-      return item.verified
-        && (run?.workspaceCleanup?.state !== "claimed" || !Number.isFinite(expiry) || expiry <= nowMs);
-    })
-    .slice(0, maximumClaims);
+  const available = [];
+  const claimExclusions = {};
+  const excludeClaim = (reason) => {
+    claimExclusions[reason] = (claimExclusions[reason] || 0) + 1;
+  };
+  for (const item of snapshots) {
+    const run = (state.runs || []).find((candidate) => candidate.id === item.runId);
+    const expiry = Date.parse(run?.workspaceCleanup?.leaseExpiresAt || "");
+    if (!item.verified) excludeClaim("unverified_workspace_size");
+    else if (run?.workspaceCleanup?.state === "claimed" && Number.isFinite(expiry) && expiry > nowMs) {
+      excludeClaim("active_cleanup_lease");
+    } else available.push(item);
+  }
   let selected;
   if (input.pressure === true || !capacityPressure) {
     selected = available;
@@ -416,7 +473,19 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
     }
   }
   const candidates = [];
-  for (const snapshot of selected.slice(0, maximumClaims)) {
+  const selectedWithinLimit = selected.slice(0, maximumClaims);
+  if (selected.length > selectedWithinLimit.length) {
+    claimExclusions.sweep_limit = selected.length - selectedWithinLimit.length;
+  }
+  if (capacityPressure && input.pressure !== true) {
+    const selectedIds = new Set(selected.map((item) => item.runId));
+    for (const item of available) {
+      if (!selectedIds.has(item.runId) && item.pressureEligible && !item.retentionEligible) {
+        excludeClaim("capacity_target_satisfied");
+      }
+    }
+  }
+  for (const snapshot of selectedWithinLimit) {
     const run = (state.runs || []).find((item) => item.id === snapshot.runId);
     if (!run) continue;
     run.workspaceCleanup = { state: "claimed", leaseId, claimedAt: now, leaseExpiresAt: expiresAt };
@@ -435,7 +504,14 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
     verifiedRetainedBytes,
     maxRetainedBytes: policy.maxRetainedBytes,
   };
-  return { leaseId, expiresAt, candidates };
+  const selectionReport = {
+    ...selection.report,
+    selectedCount: candidates.length,
+    excludedCount: selection.report.excludedCount
+      + Object.values(claimExclusions).reduce((total, count) => total + count, 0),
+    excludedByReason: { ...selection.report.excludedByReason, ...claimExclusions },
+  };
+  return { leaseId, expiresAt, candidates, selectionReport };
 }
 
 export async function claimRunWorkspaceCandidates(input = {}) {
