@@ -788,6 +788,46 @@ test("promotion reconciliation records an exact merged candidate once", async ()
   }
 });
 
+test("promotion reconciliation preserves a deployed task while backfilling exact merge evidence once", async () => {
+  const fixture = await reconciliationFixture("MERGED");
+  try {
+    const state = JSON.parse(await readFile(path.join(fixture.root, "data", "mission-control.json"), "utf8"));
+    state.tasks[0].status = "deployed";
+    state.tasks[0].deploymentEvidence = {
+      id: `deployment:${fixture.candidate.id}:task_1`,
+      candidateId: fixture.candidate.id,
+      subjectSha: fixture.sourceSha,
+      recordedAt: "2026-07-25T13:05:00.000Z",
+    };
+    await writeState(fixture.root, state);
+    const script = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        env: { PATH: ${JSON.stringify(`${fixture.fakeBin}:/usr/local/bin:/usr/bin:/bin`)} }
+      });
+      console.log(JSON.stringify(report));
+    `;
+
+    const first = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root });
+    const report = JSON.parse(first.stdout.trim());
+    let persisted = readPersistedState(fixture.root);
+    assert.equal(report.projects[0].status, "merged");
+    assert.equal(persisted.tasks[0].status, "deployed");
+    assert.equal(persisted.tasks[0].mergeEvidence.candidateId, fixture.candidate.id);
+    assert.equal(persisted.tasks[0].mergeEvidence.subjectSha, fixture.sourceSha);
+    assert.equal(persisted.tasks[0].mergeEvidence.mergeCommit, fixture.mergeCommit);
+    assert.equal(persisted.candidates[0].status, "merged");
+
+    const second = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root });
+    assert.equal(JSON.parse(second.stdout.trim()).projects.length, 0);
+    persisted = readPersistedState(fixture.root);
+    assert.equal(persisted.events.filter((event) => event.type === "release_candidate_merged").length, 1);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("promotion reconciliation closes a superseded candidate when a trusted merged candidate contains it", async () => {
   const fixture = await reconciliationFixture("CLOSED");
   try {
