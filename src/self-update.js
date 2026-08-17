@@ -157,7 +157,7 @@ export function classifyActiveRuns(state, input = {}) {
 
 async function mutateSelfUpdateState(input, mutator) {
   if (input.state) return mutator(input.state);
-  return mutateState(mutator);
+  return mutateState(mutator, { operationName: "self_update.lease" });
 }
 
 async function acquireSelfUpdateLease(plan, input = {}) {
@@ -606,7 +606,7 @@ async function recordSelfUpdateResult(report, input = {}) {
     }
 
     return { status: "recorded", eventId: event.id, commentId: comment?.id || "" };
-  });
+  }, { operationName: "self_update.record_result" });
 }
 
 export async function runSelfUpdate(input = {}) {

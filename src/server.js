@@ -22,6 +22,7 @@ import {
 import { loadConfig } from "./config.js";
 import { buildOwnerInbox } from "./owner-inbox.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
+import { databaseContentionHealth } from "./state-database.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4317);
@@ -152,6 +153,7 @@ async function handleApi(req, res, url) {
       status: "ok",
       storage: state.meta?.storageBackend || "unknown",
       updatedAt: state.meta?.updatedAt || "",
+      databaseContention: await databaseContentionHealth(),
     });
     return;
   }

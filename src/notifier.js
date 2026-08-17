@@ -420,7 +420,7 @@ export async function markNotificationAttempt(itemId, statusPatch, notificationT
       createdAt: now,
     });
     return run;
-  });
+  }, { operationName: "notification.record_attempt" });
 }
 
 export async function sendPendingNotifications(input = {}) {

@@ -905,7 +905,7 @@ async function persistRunWorkspace(run, workspace) {
     liveRun.workspacePath = workspace.workspacePath;
     liveRun.workspaceStrategy = workspace.strategy;
     liveRun.updatedAt = new Date().toISOString();
-  });
+  }, { operationName: "runner.persist_workspace" });
 }
 
 async function createWorktreeWorkspace(run, workspacePath, branch, startRef, log, gitEnv) {
@@ -1449,7 +1449,7 @@ async function recordUnsafeBranchReuse(run, reason) {
       message: `${run.id} blocked stale branch reuse`,
       createdAt: now,
     });
-  });
+  }, { operationName: "runner.block_branch_reuse" });
 }
 
 function nonRetryableWorkspaceFailureReason(notes) {
@@ -1494,7 +1494,7 @@ async function pauseTaskForAutomationConfig(run, reason, notes) {
       message: `${run.id} paused after non-retryable workspace preparation failure: ${reason}`,
       createdAt: now,
     });
-  });
+  }, { operationName: "runner.block_configuration" });
 }
 
 async function blockQueuedRunForPreflight(state, run, failure, now) {
@@ -1895,7 +1895,7 @@ export async function reconcileStaleRuns(input = {}) {
       recovered.push({ runId: run.id, taskId: run.taskId, reason, blocked: disposition.blocked });
     }
     return recovered;
-  });
+  }, { operationName: "runner.reconcile_stale" });
 }
 
 async function persistRunThread(run, threadId) {
@@ -1928,7 +1928,7 @@ async function persistRunThread(run, threadId) {
       message: `${run.id} linked to Codex thread ${threadId}`,
       createdAt: now,
     });
-  });
+  }, { operationName: "runner.persist_thread" });
 }
 
 export function sdkThreadOptions(run, input = {}) {

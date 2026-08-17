@@ -21,6 +21,11 @@ const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
 const ACTIVE_STALE_REVIEW_RUNS_PER_DISPATCH = 3;
+const SQLITE_BUSY_TIMEOUT_MS = 250;
+const DEFAULT_MUTATION_RETRIES = 4;
+const MAX_MUTATION_RETRIES = 8;
+const CONTENTION_EVENT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const MAX_CONTENTION_EVENTS = 1_000;
 const VALID_TASK_STATUSES = new Set([
   "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
   "ready", "queued", "in_progress", "blocked", "builder_review", "backend_review",
@@ -47,7 +52,7 @@ function openDatabase() {
   if (database) return database;
   assertIsolatedTestEnvironment();
   database = new DatabaseSync(DATABASE_FILE);
-  database.exec("PRAGMA busy_timeout = 10000");
+  database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
   // Two fresh worker processes can open the same database before either has
   // finished switching the journal mode. Retry only this initialization pragma;
   // all later writes retain SQLite's normal busy-timeout/error behavior.
@@ -158,6 +163,14 @@ function openDatabase() {
       payload TEXT NOT NULL,
       PRIMARY KEY(entity_type, entity_id)
     );
+    CREATE TABLE IF NOT EXISTS database_contention_events (
+      id TEXT PRIMARY KEY,
+      operation_name TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      wait_ms INTEGER NOT NULL DEFAULT 0,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
     CREATE INDEX IF NOT EXISTS idx_comments_task_created ON comments(task_id, created_at);
@@ -170,8 +183,79 @@ function openDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_manifest_digest ON candidates(manifest_digest);
     CREATE INDEX IF NOT EXISTS idx_notification_outbox_status ON notification_outbox(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_database_contention_created ON database_contention_events(created_at);
   `);
   return database;
+}
+
+function isSqliteBusy(error) {
+  const text = `${error?.code || ""} ${error?.message || ""}`;
+  return /SQLITE_BUSY|database is locked|database table is locked/i.test(text);
+}
+
+function boundedOperationName(value) {
+  const normalized = String(value || "state_mutation")
+    .replace(/[^a-zA-Z0-9_.:-]/g, "_")
+    .slice(0, 120);
+  return normalized || "state_mutation";
+}
+
+function mutationRetryPolicy(options = {}) {
+  const idempotent = options.idempotent === true;
+  const requested = Number(options.maxBusyRetries ?? DEFAULT_MUTATION_RETRIES);
+  return {
+    idempotent,
+    maxRetries: idempotent
+      ? Math.min(MAX_MUTATION_RETRIES, Math.max(0, Number.isFinite(requested) ? Math.floor(requested) : DEFAULT_MUTATION_RETRIES))
+      : 0,
+  };
+}
+
+function retryDelayMs(attempt) {
+  const exponential = Math.min(400, 20 * (2 ** Math.max(0, attempt - 1)));
+  return exponential + Math.floor(Math.random() * 31);
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function recordContentionEvent(db, input = {}) {
+  const createdAt = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO database_contention_events(id, operation_name, outcome, wait_ms, retry_count, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    randomUUID(),
+    boundedOperationName(input.operationName),
+    String(input.outcome || "committed").slice(0, 40),
+    Math.max(0, Math.round(Number(input.waitMs) || 0)),
+    Math.max(0, Math.floor(Number(input.retryCount) || 0)),
+    createdAt,
+  );
+  const retentionCutoff = new Date(Date.now() - CONTENTION_EVENT_RETENTION_MS).toISOString();
+  db.prepare("DELETE FROM database_contention_events WHERE created_at < ?").run(retentionCutoff);
+  db.prepare(`
+    DELETE FROM database_contention_events
+    WHERE id IN (
+      SELECT id FROM database_contention_events
+      ORDER BY created_at DESC, id DESC
+      LIMIT -1 OFFSET ?
+    )
+  `).run(MAX_CONTENTION_EVENTS);
+}
+
+function readStateSnapshot(db) {
+  db.exec("BEGIN");
+  try {
+    const state = readStateFromOpenDatabase(db);
+    const version = Number(db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0);
+    db.exec("COMMIT");
+    return { state, version };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function ensureCoordinationSchema(db) {
@@ -1121,31 +1205,110 @@ export async function writeDatabaseState(state) {
 
 export async function mutateDatabaseState(mutator, options = {}) {
   const db = await ensureStateDatabase();
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const state = readStateFromOpenDatabase(db);
+  const operationName = boundedOperationName(options.operationName);
+  const retryPolicy = mutationRetryPolicy(options);
+  const startedAt = Date.now();
+  let retryCount = 0;
+
+  while (true) {
+    const { state, version: expectedVersion } = readStateSnapshot(db);
     assertMaintenanceWriteAllowed(state);
     const snapshot = mutationSnapshot(state);
     reconcileStateIntegrity(state);
+
+    // Mutators run before the write transaction. They must only transform the
+    // supplied snapshot or perform retry-safe reads; external writes belong in
+    // the fenced operation-intent workflow.
     const result = await mutator(state);
     reconcileStateIntegrity(state);
     state.meta = state.meta || {};
     const archived = compactOperationalHistory(state);
-    if (archivedItemCount(archived)) {
-      const now = new Date().toISOString();
-      archiveOperationalHistory(db, archived, now);
-      recordOperationalArchiveMetadata(state, archived, now);
-    }
-    state.meta.updatedAt = new Date().toISOString();
+    const now = new Date().toISOString();
+    if (archivedItemCount(archived)) recordOperationalArchiveMetadata(state, archived, now);
+    state.meta.updatedAt = now;
     state.meta.storageBackend = "sqlite";
-    writeMutationToOpenDatabase(db, state, snapshot, options);
-    db.exec("COMMIT");
-    await secureStoragePaths();
-    return result;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
+
+    let transactionStarted = false;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      const currentVersion = Number(
+        db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
+      );
+      if (currentVersion !== expectedVersion) {
+        const conflict = new Error(
+          `StudioOps state changed during ${operationName}; expected version ${expectedVersion}, observed ${currentVersion}.`,
+        );
+        conflict.code = "STUDIOOPS_STATE_CONFLICT";
+        throw conflict;
+      }
+      const currentMeta = parsePayload(
+        db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload,
+        {},
+      );
+      assertMaintenanceWriteAllowed({ meta: currentMeta });
+      if (archivedItemCount(archived)) archiveOperationalHistory(db, archived, now);
+      writeMutationToOpenDatabase(db, state, snapshot, options);
+      recordContentionEvent(db, {
+        operationName,
+        outcome: "committed",
+        waitMs: Date.now() - startedAt,
+        retryCount,
+      });
+      db.exec("COMMIT");
+      transactionStarted = false;
+      await secureStoragePaths();
+      return result;
+    } catch (error) {
+      if (transactionStarted) db.exec("ROLLBACK");
+      const retryableConflict = error.code === "STUDIOOPS_STATE_CONFLICT" || isSqliteBusy(error);
+      if (!retryableConflict || !retryPolicy.idempotent || retryCount >= retryPolicy.maxRetries) {
+        error.operationName = operationName;
+        error.retryCount = retryCount;
+        throw error;
+      }
+      retryCount += 1;
+      await sleep(retryDelayMs(retryCount));
+    }
   }
+}
+
+export async function databaseContentionHealth(input = {}) {
+  const db = await ensureStateDatabase();
+  const windowMinutes = Math.min(1_440, Math.max(1, Number(input.windowMinutes) || 15));
+  const cutoff = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+  const aggregate = db.prepare(`
+    SELECT
+      count(*) AS operation_count,
+      coalesce(sum(retry_count), 0) AS retry_count,
+      coalesce(max(wait_ms), 0) AS max_wait_ms,
+      coalesce(round(avg(wait_ms)), 0) AS average_wait_ms,
+      max(created_at) AS last_operation_at
+    FROM database_contention_events
+    WHERE created_at >= ?
+  `).get(cutoff);
+  const recent = db.prepare(`
+    SELECT operation_name, outcome, wait_ms, retry_count, created_at
+    FROM database_contention_events
+    WHERE created_at >= ? AND (retry_count > 0 OR wait_ms >= ?)
+    ORDER BY created_at DESC
+    LIMIT 20
+  `).all(cutoff, SQLITE_BUSY_TIMEOUT_MS);
+  return {
+    windowMinutes,
+    operationCount: Number(aggregate.operation_count || 0),
+    retryCount: Number(aggregate.retry_count || 0),
+    maxWaitMs: Number(aggregate.max_wait_ms || 0),
+    averageWaitMs: Number(aggregate.average_wait_ms || 0),
+    lastOperationAt: aggregate.last_operation_at || "",
+    recent: recent.map((event) => ({
+      operation: event.operation_name,
+      outcome: event.outcome,
+      waitMs: Number(event.wait_ms || 0),
+      retries: Number(event.retry_count || 0),
+      createdAt: event.created_at,
+    })),
+  };
 }
 
 export async function backupStateDatabase(destination = "") {
