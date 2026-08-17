@@ -16,7 +16,7 @@ const TABLE_NAME = { qaBundles: "qa_bundles" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "qaBundles", "candidates"]);
 const STATE_INTEGRITY_VERSION = 5;
 const LIFECYCLE_SCHEMA_VERSION = 1;
-export const COORDINATION_SCHEMA_VERSION = 1;
+export const COORDINATION_SCHEMA_VERSION = 2;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
@@ -174,6 +174,8 @@ function ensureCoordinationSchema(db) {
     CREATE TABLE IF NOT EXISTS coordination_leases (
       lease_id TEXT PRIMARY KEY,
       resource_key TEXT NOT NULL,
+      aggregate_type TEXT NOT NULL,
+      aggregate_id TEXT NOT NULL,
       fence INTEGER NOT NULL CHECK (fence > 0),
       owner_process_identity TEXT NOT NULL,
       expected_state_version INTEGER NOT NULL CHECK (expected_state_version > 0),
@@ -196,6 +198,8 @@ function ensureCoordinationSchema(db) {
       kind TEXT NOT NULL,
       request_digest TEXT NOT NULL,
       subject TEXT NOT NULL,
+      aggregate_type TEXT NOT NULL,
+      aggregate_id TEXT NOT NULL,
       expected_remote_state TEXT NOT NULL,
       lease_id TEXT NOT NULL,
       fence INTEGER NOT NULL CHECK (fence > 0),
@@ -213,14 +217,36 @@ function ensureCoordinationSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_external_operations_lease
       ON external_operations(lease_id, fence, expected_state_version);
   `);
+  const leaseColumns = new Set(db.prepare("PRAGMA table_info(coordination_leases)").all().map((column) => column.name));
+  if (!leaseColumns.has("aggregate_type")) db.exec("ALTER TABLE coordination_leases ADD COLUMN aggregate_type TEXT NOT NULL DEFAULT ''");
+  if (!leaseColumns.has("aggregate_id")) db.exec("ALTER TABLE coordination_leases ADD COLUMN aggregate_id TEXT NOT NULL DEFAULT ''");
+  const operationColumns = new Set(db.prepare("PRAGMA table_info(external_operations)").all().map((column) => column.name));
+  if (!operationColumns.has("aggregate_type")) db.exec("ALTER TABLE external_operations ADD COLUMN aggregate_type TEXT NOT NULL DEFAULT ''");
+  if (!operationColumns.has("aggregate_id")) db.exec("ALTER TABLE external_operations ADD COLUMN aggregate_id TEXT NOT NULL DEFAULT ''");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_coordination_leases_aggregate
+      ON coordination_leases(aggregate_type, aggregate_id, expected_state_version);
+    CREATE INDEX IF NOT EXISTS idx_external_operations_aggregate
+      ON external_operations(aggregate_type, aggregate_id, expected_state_version, status);
+  `);
 }
 
 function coordinationSchemaIsCurrent(db, meta = {}) {
   const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+  const leaseColumns = tables.has("coordination_leases")
+    ? new Set(db.prepare("PRAGMA table_info(coordination_leases)").all().map((column) => column.name))
+    : new Set();
+  const operationColumns = tables.has("external_operations")
+    ? new Set(db.prepare("PRAGMA table_info(external_operations)").all().map((column) => column.name))
+    : new Set();
   return Number(meta.coordinationMigration?.schemaVersion || 0) >= COORDINATION_SCHEMA_VERSION
     && tables.has("coordination_fence_counters")
     && tables.has("coordination_leases")
-    && tables.has("external_operations");
+    && tables.has("external_operations")
+    && leaseColumns.has("aggregate_type")
+    && leaseColumns.has("aggregate_id")
+    && operationColumns.has("aggregate_type")
+    && operationColumns.has("aggregate_id");
 }
 
 function ensureLifecycleSchema(db) {

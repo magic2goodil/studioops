@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
+import { assertIsolatedTestEnvironment } from "./runtime-paths.js";
 import { ensureStateDatabase } from "./state-database.js";
 
 const MAX_TEXT = 512;
@@ -29,16 +30,44 @@ function positiveVersion(value) {
   return version;
 }
 
-function nowValue(value) {
-  const number = Number(value ?? Date.now());
-  if (!Number.isFinite(number)) throw new Error("nowMs must be finite.");
-  return number;
+function coordinatorNow() {
+  const testValue = process.env.STUDIOOPS_COORDINATION_TEST_NOW_MS;
+  if (testValue !== undefined) {
+    if (!process.env.NODE_TEST_CONTEXT && !process.env.STUDIOOPS_TEST_ISOLATION) {
+      throw new Error("The coordination test clock is permitted only in a verified isolated test process.");
+    }
+    assertIsolatedTestEnvironment();
+    const number = Number(testValue);
+    if (!Number.isFinite(number)) throw new Error("The coordination test clock must be finite.");
+    return number;
+  }
+  return Date.now();
 }
 
 function iso(ms) { return new Date(ms).toISOString(); }
 
 function ownerIdentity(value) {
   return text(value || `pid:${process.pid}@${os.hostname()}`, "ownerProcessIdentity", { max: 160 });
+}
+
+function aggregateIdentity(input) {
+  const aggregateType = text(input.aggregateType, "aggregateType", { max: 80 });
+  if (aggregateType !== "task") throw new Error(`Unsupported coordination aggregate type: ${aggregateType}.`);
+  return { aggregateType, aggregateId: text(input.aggregateId, "aggregateId", { max: 160 }) };
+}
+
+function authoritativeAggregateVersion(db, aggregateType, aggregateId) {
+  if (aggregateType !== "task") throw new Error(`Unsupported coordination aggregate type: ${aggregateType}.`);
+  const row = db.prepare("SELECT state_version FROM tasks WHERE id = ?").get(aggregateId);
+  if (!row) throw new Error(`Coordination aggregate ${aggregateType}:${aggregateId} does not exist.`);
+  return Number(row.state_version);
+}
+
+function assertAuthoritativeAggregateVersion(db, aggregateType, aggregateId, expectedStateVersion) {
+  const current = authoritativeAggregateVersion(db, aggregateType, aggregateId);
+  if (current !== Number(expectedStateVersion)) {
+    throw new Error(`Coordination aggregate state version changed from ${expectedStateVersion} to ${current}.`);
+  }
 }
 
 function boundedTtl(value) {
@@ -69,6 +98,8 @@ function rowToLease(row) {
   return {
     leaseId: row.lease_id,
     resourceKey: row.resource_key,
+    aggregateType: row.aggregate_type,
+    aggregateId: row.aggregate_id,
     fence: Number(row.fence),
     ownerProcessIdentity: row.owner_process_identity,
     expectedStateVersion: Number(row.expected_state_version),
@@ -88,6 +119,8 @@ function rowToOperation(row) {
     kind: row.kind,
     requestDigest: row.request_digest,
     subject: row.subject,
+    aggregateType: row.aggregate_type,
+    aggregateId: row.aggregate_id,
     expectedRemoteState: row.expected_remote_state,
     leaseId: row.lease_id,
     fence: Number(row.fence),
@@ -132,11 +165,13 @@ function currentLease(db, input, nowMs, activeOnly = true) {
 
 export async function claimResourceLease(input = {}) {
   const resourceKey = text(input.resourceKey, "resourceKey");
+  const { aggregateType, aggregateId } = aggregateIdentity(input);
   const owner = ownerIdentity(input.ownerProcessIdentity);
   const expectedStateVersion = positiveVersion(input.expectedStateVersion);
-  const nowMs = nowValue(input.nowMs);
+  const nowMs = coordinatorNow();
   const ttl = boundedTtl(input.leaseTtlMs);
   return transaction((db) => {
+    assertAuthoritativeAggregateVersion(db, aggregateType, aggregateId, expectedStateVersion);
     const existing = db.prepare("SELECT * FROM coordination_leases WHERE resource_key = ? AND status = 'active'").get(resourceKey);
     if (existing && existing.expires_at > iso(nowMs)) {
       return { acquired: false, lease: rowToLease(existing) };
@@ -153,16 +188,16 @@ export async function claimResourceLease(input = {}) {
     const expiresAt = iso(nowMs + ttl);
     db.prepare(`
       INSERT INTO coordination_leases(
-        lease_id, resource_key, fence, owner_process_identity, expected_state_version, status,
+        lease_id, resource_key, aggregate_type, aggregate_id, fence, owner_process_identity, expected_state_version, status,
         acquired_at, heartbeat_at, expires_at, detail_json
-      ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, '{}')
-    `).run(leaseId, resourceKey, fence, owner, expectedStateVersion, acquiredAt, acquiredAt, expiresAt);
-    return { acquired: true, lease: { leaseId, resourceKey, fence, ownerProcessIdentity: owner, expectedStateVersion, status: "active", acquiredAt, heartbeatAt: acquiredAt, expiresAt, terminalAt: "" } };
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, '{}')
+    `).run(leaseId, resourceKey, aggregateType, aggregateId, fence, owner, expectedStateVersion, acquiredAt, acquiredAt, expiresAt);
+    return { acquired: true, lease: { leaseId, resourceKey, aggregateType, aggregateId, fence, ownerProcessIdentity: owner, expectedStateVersion, status: "active", acquiredAt, heartbeatAt: acquiredAt, expiresAt, terminalAt: "" } };
   });
 }
 
 export async function renewResourceLease(input = {}) {
-  const nowMs = nowValue(input.nowMs);
+  const nowMs = coordinatorNow();
   const expiresAt = iso(nowMs + boundedTtl(input.leaseTtlMs));
   return transaction((db) => {
     const predicate = leasePredicate(input);
@@ -175,7 +210,7 @@ export async function renewResourceLease(input = {}) {
 }
 
 async function endLease(input, status) {
-  const nowMs = nowValue(input.nowMs);
+  const nowMs = coordinatorNow();
   return transaction((db) => {
     const predicate = leasePredicate(input);
     const result = db.prepare(`UPDATE coordination_leases SET status = ?, terminal_at = ?
@@ -200,7 +235,7 @@ export async function prepareExternalOperation(input = {}) {
   const requestDigest = text(input.requestDigest, "requestDigest", { max: 160 });
   const subject = text(input.subject, "subject");
   const expectedRemoteState = text(input.expectedRemoteState, "expectedRemoteState", { max: 1_024 });
-  const nowMs = nowValue(input.nowMs);
+  const nowMs = coordinatorNow();
   return transaction((db) => {
     const existing = db.prepare("SELECT * FROM external_operations WHERE operation_key = ?").get(operationKey);
     if (existing) {
@@ -208,12 +243,13 @@ export async function prepareExternalOperation(input = {}) {
       return rowToOperation(existing);
     }
     const lease = leaseForOperation(db, input, nowMs);
+    assertAuthoritativeAggregateVersion(db, lease.aggregate_type, lease.aggregate_id, lease.expected_state_version);
     const operationId = randomUUID();
     db.prepare(`INSERT INTO external_operations(
-      operation_key, operation_id, kind, request_digest, subject, expected_remote_state,
+      operation_key, operation_id, kind, request_digest, subject, aggregate_type, aggregate_id, expected_remote_state,
       lease_id, fence, owner_process_identity, expected_state_version, status, prepared_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?)`)
-      .run(operationKey, operationId, kind, requestDigest, subject, expectedRemoteState, lease.lease_id, lease.fence, lease.owner_process_identity, lease.expected_state_version, iso(nowMs));
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?)`)
+      .run(operationKey, operationId, kind, requestDigest, subject, lease.aggregate_type, lease.aggregate_id, expectedRemoteState, lease.lease_id, lease.fence, lease.owner_process_identity, lease.expected_state_version, iso(nowMs));
     return rowToOperation(db.prepare("SELECT * FROM external_operations WHERE operation_key = ?").get(operationKey));
   });
 }
@@ -225,7 +261,7 @@ export async function terminalExternalOperation(input = {}) {
   if (input.evidence && typeof input.evidence === "object") assertSafeEvidence(input.evidence);
   const evidence = input.evidence && typeof input.evidence === "object" ? JSON.stringify(input.evidence) : "{}";
   if (evidence.length > 2_048 || SECRET_PATTERN.test(evidence)) throw new Error("Operation evidence must be bounded and secret-free.");
-  const nowMs = nowValue(input.nowMs);
+  const nowMs = coordinatorNow();
   return transaction((db) => {
     const existing = db.prepare("SELECT * FROM external_operations WHERE operation_key = ?").get(operationKey);
     if (!existing) throw new Error("External operation is not prepared.");
@@ -241,6 +277,10 @@ export async function terminalExternalOperation(input = {}) {
       return rowToOperation(existing);
     }
     const lease = leaseForOperation(db, input, nowMs);
+    if (lease.aggregate_type !== existing.aggregate_type || lease.aggregate_id !== existing.aggregate_id) {
+      throw new Error("External operation aggregate binding does not match the current lease.");
+    }
+    assertAuthoritativeAggregateVersion(db, existing.aggregate_type, existing.aggregate_id, existing.expected_state_version);
     const predicate = leasePredicate(input);
     const result = db.prepare(`UPDATE external_operations SET status = ?, terminal_at = ?, evidence_json = ?
       WHERE operation_key = ? AND request_digest = ? AND status = 'prepared' AND lease_id = ? AND fence = ?
@@ -260,7 +300,7 @@ export const abandonLease = abandonResourceLease;
 export const releaseLease = releaseResourceLease;
 
 export async function compactCoordinationHistory(input = {}) {
-  const nowMs = nowValue(input.nowMs);
+  const nowMs = coordinatorNow();
   const leaseCutoff = iso(nowMs - Number(input.leaseDetailRetentionMs ?? 30 * 24 * 60 * 60 * 1_000));
   const operationCutoff = iso(nowMs - Number(input.operationEvidenceRetentionMs ?? 90 * 24 * 60 * 60 * 1_000));
   return transaction((db) => {
@@ -279,5 +319,5 @@ export async function listDueExternalOperations(input = {}) {
 export async function listExpiringLeases(input = {}) {
   const db = await ensureStateDatabase();
   const limit = Math.min(100, Math.max(1, Number(input.limit || 50)));
-  return db.prepare("SELECT * FROM coordination_leases WHERE status = 'active' AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?").all(iso(nowValue(input.nowMs)), limit).map(rowToLease);
+  return db.prepare("SELECT * FROM coordination_leases WHERE status = 'active' AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?").all(iso(coordinatorNow()), limit).map(rowToLease);
 }

@@ -6,9 +6,9 @@
     "fenced-coordination": {
       "paths": ["src/coordination.js", "src/state-database.js", "test/coordination.test.js", "test/state-database.test.js"],
       "owner": "backend-fenced-coordination",
-      "publicContracts": ["claimResourceLease", "renewResourceLease", "abandonResourceLease", "releaseResourceLease", "prepareExternalOperation", "terminalExternalOperation"],
+      "publicContracts": ["aggregate-bound claimResourceLease", "renewResourceLease", "abandonResourceLease", "releaseResourceLease", "aggregate-bound prepareExternalOperation", "authoritative-version terminalExternalOperation"],
       "ownedData": ["coordination_fence_counters", "coordination_leases", "external_operations"],
-      "ownedMigrations": ["coordination schema v1 in src/state-database.js; verified pre-migration backup"],
+      "ownedMigrations": ["coordination schema v2 in src/state-database.js; verified pre-migration backup; v1 aggregate binding columns added without destructive rewrite"],
       "ownedEvents": [],
       "dependsOn": ["workflow-state"],
       "allowedDependencyDirection": ["runner -> fenced-coordination", "provider-adapters -> fenced-coordination"],
