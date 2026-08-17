@@ -622,6 +622,48 @@ test("credit admission allows an affordable ordinary run at its configured quali
   assert.equal(report.runs[0].creditAdmission.remainingPercent, 80);
 });
 
+test("fresh credit telemetry recovers a matching credit circuit exactly once", async () => {
+  const state = fixtureState();
+  state.tasks.push({
+    id: "task_recovered_credit",
+    projectId: "project_1",
+    title: "Deploy the production database migration",
+    status: "ready",
+    priority: "critical",
+  });
+  const action = {
+    id: "task_recovered_credit:start_builder",
+    type: "start_builder",
+    role: "builder",
+    taskId: "task_recovered_credit",
+    taskStatus: "ready",
+  };
+  const options = {
+    state,
+    executionPolicy: {
+      modelTiers: { economy: { model: "gpt-5.6-luna" }, critical: { model: "gpt-5.6-sol" } },
+      tierRouting: { defaultTier: "economy", complexTier: "critical" },
+    },
+    creditPolicy: {
+      enabled: true,
+      tierBudgets: { critical: { estimatedCredits: 30, minRemainingPercent: 20 } },
+    },
+    creditSnapshot: {
+      status: "available", observedAt: new Date().toISOString(), remainingPercent: 10, reached: false,
+      credits: { available: false, unlimited: false, balance: null },
+    },
+  };
+  await dispatchSupervisorActions([action], options);
+  assert.equal(state.tasks.at(-1).automationCircuit.state, "open");
+  const recovered = await dispatchSupervisorActions([action], {
+    ...options,
+    creditSnapshot: { ...options.creditSnapshot, remainingPercent: 50, observedAt: new Date().toISOString() },
+  });
+  assert.deepEqual(recovered.recoveredCreditCircuits.map((item) => item.taskId), ["task_recovered_credit"]);
+  assert.equal(recovered.runs.length, 1);
+  assert.equal(state.tasks.at(-1).automationCircuit.state, "closed");
+});
+
 test("one sweep exposes and uses three compatible builder and reviewer slots by default", () => {
   const state = fixtureState();
   state.projects = [];

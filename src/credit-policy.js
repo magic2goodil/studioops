@@ -77,7 +77,7 @@ export const DEFAULT_CREDIT_POLICY = Object.freeze({
     mechanical: { estimatedCredits: 2, minRemainingPercent: 2 },
     economy: { estimatedCredits: 8, minRemainingPercent: 5 },
     balanced: { estimatedCredits: 15, minRemainingPercent: 10 },
-    critical: { estimatedCredits: 30, minRemainingPercent: 20 },
+    critical: { estimatedCredits: 30, minRemainingPercent: 5 },
     frontier: { estimatedCredits: 40, minRemainingPercent: 35 },
   },
   degradedTelemetryFallback: DEFAULT_DEGRADED_TELEMETRY_FALLBACK,

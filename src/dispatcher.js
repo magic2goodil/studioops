@@ -10,6 +10,8 @@ import {
   mutateState,
   readState,
   reviewStagesForTask,
+  resetAutomationCircuitInState,
+  taskAutomationCircuitIsCurrent,
   workflowSnapshotForTask,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
@@ -305,6 +307,59 @@ function dispatchSafetyReason(state, task, action, options) {
   return "";
 }
 
+/**
+ * Close only credit-admission circuits whose captured workflow and candidate
+ * identity are still current and whose new, sanitized telemetry is fresh.
+ * Budget circuits and all other operational blockers remain owner-gated.
+ */
+export function recoverCreditAdmissionCircuitsInState(state, input = {}) {
+  if (input.dryRun || !input.creditPolicy?.enabled) return [];
+  const recovered = [];
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  for (const task of state.tasks || []) {
+    const circuit = task.automationCircuit;
+    const blocker = task.automationBlocker;
+    if (
+      circuit?.state !== "open"
+      || circuit.reasonCode !== "credit_budget_insufficient"
+      || blocker?.type !== "circuit"
+      || !taskAutomationCircuitIsCurrent(task)
+    ) continue;
+    const action = { type: blocker.actionType || "start_builder", role: blocker.role || "builder" };
+    const resolvedExecutionPolicy = resolveExecutionPolicy(task, action, input);
+    const executionPolicy = {
+      ...resolvedExecutionPolicy,
+      modelTier: blocker.modelTier || resolvedExecutionPolicy.modelTier,
+    };
+    const admission = assessCreditAdmission(input.creditSnapshot, executionPolicy, input.creditPolicy, { nowMs });
+    if (!admission.allowed || !["available", "recovered"].includes(admission.snapshotStatus)) continue;
+    const snapshotAge = Number(admission.snapshotAgeMs);
+    if (!Number.isFinite(snapshotAge) || snapshotAge > Number(input.creditPolicy.snapshotMaxAgeMs)) continue;
+    resetAutomationCircuitInState(state, {
+      task: task.id,
+      expectedOpenedAt: circuit.openedAt,
+      expectedSnapshot: circuit.snapshot,
+      now,
+      author: "StudioOps Credit Controller",
+      reason: `Fresh ${admission.snapshotStatus} telemetry restored ${admission.tier} admission at ${admission.remainingPercent ?? "unknown"}% headroom.`,
+    });
+    task.automationCircuit.recoveryEvidence = {
+      snapshotStatus: admission.snapshotStatus,
+      snapshotSource: admission.snapshotSource,
+      snapshotObservedAt: admission.snapshotObservedAt,
+      snapshotAgeMs: admission.snapshotAgeMs,
+      tier: admission.tier,
+      code: admission.code,
+      remainingPercent: Number.isFinite(admission.remainingPercent) ? admission.remainingPercent : null,
+      ruleId: admission.ruleId,
+      policyVersion: admission.policyVersion,
+    };
+    recovered.push({ taskId: task.id, actionType: action.type, tier: admission.tier, code: admission.code });
+  }
+  return recovered;
+}
+
 function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
   const openedTaskIds = new Set();
   for (const item of skipped || []) {
@@ -331,6 +386,7 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
       type: "circuit",
       reason: blockerCode,
       actionType: action.type,
+      role: action.role || "builder",
       modelTier: admission.tier,
       estimatedCredits: admission.estimatedCredits,
       minRemainingPercent: admission.minRemainingPercent,
@@ -829,6 +885,11 @@ export async function dispatchSupervisorActions(actions, input = {}) {
 
     const now = new Date().toISOString();
     const options = { ...DEFAULTS, ...dispatchInput };
+    const recoveredCreditCircuits = recoverCreditAdmissionCircuitsInState(state, {
+      ...options,
+      now,
+      nowMs: Date.parse(now),
+    });
     const plan = planDispatches(state, actions, options);
     const runs = [];
 
@@ -837,6 +898,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         generatedAt: now,
         dryRun: true,
         runs,
+        recoveredCreditCircuits,
         effectiveCapacity: plan.effectiveCapacity,
         selected: plan.selected,
         skipped: plan.skipped,
@@ -908,6 +970,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       generatedAt: now,
       dryRun: false,
       runs,
+      recoveredCreditCircuits,
       effectiveCapacity: plan.effectiveCapacity,
       selected,
       skipped,
