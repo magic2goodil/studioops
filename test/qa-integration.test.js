@@ -767,7 +767,7 @@ test("validation commands use the QA integration PATH override", async () => {
   }
 });
 
-test("QA integration redacts GitHub token values from validation output before storing it", async () => {
+test("QA integration removes repository credentials from validation environments", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-redaction-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
@@ -791,7 +791,7 @@ test("QA integration redacts GitHub token values from validation output before s
     await git(repoPath, ["push", "origin", "feature/task"]);
     await git(repoPath, ["checkout", "main"]);
 
-    const validationCommand = `${JSON.stringify(process.execPath)} -e "console.log(process.env.GH_TOKEN); console.error(process.env.MISSION_CONTROL_GITHUB_TOKEN)"`;
+    const validationCommand = `${JSON.stringify(process.execPath)} -e "console.log(JSON.stringify({ gh: process.env.GH_TOKEN, github: process.env.GITHUB_TOKEN, mission: process.env.MISSION_CONTROL_GITHUB_TOKEN, askpass: process.env.GIT_ASKPASS, ssh: process.env.SSH_AUTH_SOCK, marker: process.env.SAFE_VALIDATION_MARKER }))"`;
 
     await mkdir(path.join(root, "data"), { recursive: true });
     await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
@@ -835,7 +835,10 @@ test("QA integration redacts GitHub token values from validation output before s
         env: {
           GH_TOKEN: ${JSON.stringify(fakeToken)},
           GITHUB_TOKEN: ${JSON.stringify(fakeToken)},
-          MISSION_CONTROL_GITHUB_TOKEN: ${JSON.stringify(fakeToken)}
+          MISSION_CONTROL_GITHUB_TOKEN: ${JSON.stringify(fakeToken)},
+          GIT_ASKPASS: "/tmp/credential-helper",
+          SSH_AUTH_SOCK: "/tmp/agent.sock",
+          SAFE_VALIDATION_MARKER: "safe-value"
         },
         secrets: [${JSON.stringify(fakeToken)}],
       });
@@ -844,14 +847,19 @@ test("QA integration redacts GitHub token values from validation output before s
     const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
     const report = JSON.parse(runResult.stdout.trim());
     const reportText = JSON.stringify(report);
-    const stateText = JSON.stringify(readPersistedState(root));
+    const persistedState = readPersistedState(root);
+    const stateText = JSON.stringify(persistedState);
+    const validationOutput = report.projects[0].validation[0].output;
+    const persistedValidationOutput = persistedState.tasks[0].integrationValidation.commands[0].output;
 
     assert.equal(report.projects[0].status, "preview_missing");
     assert.equal(report.projects[0].tasks[0].status, "preview_missing");
     assert.equal(reportText.includes(fakeToken), false);
-    assert.match(reportText, /\[REDACTED_GITHUB_APP_TOKEN\]/);
+    assert.equal(validationOutput, '{"marker":"safe-value"}');
+    assert.doesNotMatch(reportText, /credential-helper|agent\.sock/);
     assert.equal(stateText.includes(fakeToken), false);
-    assert.match(stateText, /\[REDACTED_GITHUB_APP_TOKEN\]/);
+    assert.equal(persistedValidationOutput, '{"marker":"safe-value"}');
+    assert.doesNotMatch(stateText, /credential-helper|agent\.sock/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
