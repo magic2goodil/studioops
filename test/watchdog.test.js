@@ -179,6 +179,58 @@ function disk(pathname, pressure) {
   };
 }
 
+test("watchdog defers a concurrent automation mutation while preserving worker health checks", async () => {
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const state = { meta: {}, projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [] };
+  const conflict = Object.assign(new Error("expected test conflict"), { code: "STUDIOOPS_STATE_CONFLICT" });
+  const report = await runWatchdog({
+    state,
+    nowMs,
+    diskPair: { data: disk("/tmp/studioops-data", false), workspace: disk("/tmp/studioops-workspaces", false) },
+    automationTick: async () => { throw conflict; },
+    readWorkerHeartbeats: async () => healthyHeartbeats(nowMs),
+    writeWorkerHeartbeat: async () => ({}),
+  });
+  assert.deepEqual(report.reconciliation, {
+    actions: [], deferred: true, reason: "concurrent_state_change",
+  });
+  assert.deepEqual(report.actions, []);
+});
+
+test("watchdog defers all restart activity during a verified maintenance lease", async () => {
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const state = { meta: {}, projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [] };
+  const maintenance = Object.assign(new Error("expected maintenance"), { code: "STUDIOOPS_MAINTENANCE" });
+  let heartbeatReads = 0;
+  const report = await runWatchdog({
+    state,
+    nowMs,
+    diskPair: { data: disk("/tmp/studioops-data", false), workspace: disk("/tmp/studioops-workspaces", false) },
+    automationTick: async () => { throw maintenance; },
+    readWorkerHeartbeats: async () => { heartbeatReads += 1; return []; },
+    writeWorkerHeartbeat: async () => ({}),
+    restartWorker: async () => { throw new Error("restart must not run during maintenance"); },
+  });
+  assert.deepEqual(report.reconciliation, {
+    actions: [], deferred: true, reason: "maintenance_in_progress",
+  });
+  assert.deepEqual(report.actions, []);
+  assert.equal(heartbeatReads, 0);
+});
+
+test("watchdog still fails loudly for unknown automation errors", async () => {
+  const state = { meta: {}, projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [] };
+  await assert.rejects(
+    runWatchdog({
+      state,
+      diskPair: { data: disk("/tmp/studioops-data", false), workspace: disk("/tmp/studioops-workspaces", false) },
+      automationTick: async () => { throw new Error("unexpected corruption"); },
+      writeWorkerHeartbeat: async () => ({}),
+    }),
+    /unexpected corruption/,
+  );
+});
+
 test("durable disk incidents use compare-and-set generations and bounded observations", async () => {
   const state = { meta: {}, events: [], projects: [], tasks: [], runs: [] };
   const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
