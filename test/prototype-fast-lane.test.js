@@ -59,7 +59,7 @@ test("stale or conflicting impact evidence fails closed to every specialist lane
 test("an unclassified changed path fails closed even when the diff is nonempty", () => {
   const routing = capabilityRoutingForTask(
     { deliveryPolicy: { profile: "prototype-fast-lane" } },
-    { impactEvidence: { changedFiles: ["scripts/opaque-release-surface.mjs"] } },
+    { impactEvidence: { changedFiles: ["vendor/opaque-surface.bin"] } },
   );
   assert.equal(routing.evidence.unknown, true);
   assert.deepEqual(routing.required, ["backend", "frontend", "accessibility", "lead"]);

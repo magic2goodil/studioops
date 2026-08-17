@@ -1089,7 +1089,9 @@ test("recovery probes do not delay ordinary claimed worker launch", async () => 
     },
   });
 
-  await new Promise((resolve) => setImmediate(resolve));
+  for (let attempt = 0; attempt < 100 && order.length < 2; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
   assert.deepEqual(order, ["run:run_ready", "probe"]);
   finishProbe([{ taskId: "task_blocked", status: "waiting", code: "unavailable" }]);
   const report = await reportPromise;
