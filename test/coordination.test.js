@@ -76,6 +76,23 @@ test("two processes get one exclusive claim and takeover gets a higher fence", a
   }
 });
 
+test("expired lease release and abandon calls are stale no-ops", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-coordination-expiry-"));
+  try {
+    const input = { ...args(root), leaseTtlMs: 1_000 };
+    const output = JSON.parse((await run(root, `
+      import { claimLease, releaseLease, abandonLease } from ${JSON.stringify(coordinationUrl)};
+      const base = ${JSON.stringify(input)};
+      const lease = (await claimLease(base)).lease;
+      const staleInput = { ...base, ...lease, nowMs: base.nowMs + 1_001 };
+      console.log(JSON.stringify({ release: await releaseLease(staleInput), abandon: await abandonLease(staleInput) }));
+    `)).stdout.trim());
+    assert.deepEqual(output, { release: null, abandon: null });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("heartbeat and terminal operation CAS reject stale owners; replay and mismatch are safe", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-coordination-cas-"));
   try {
@@ -88,14 +105,17 @@ test("heartbeat and terminal operation CAS reject stale owners; replay and misma
       const stale = await renewLease({ ...base, ...lease, ownerProcessIdentity: "worker:stale" });
       const done = await completeExternalOperation({ ...base, ...lease, operationKey: operation.operationKey, requestDigest: operation.requestDigest, evidence: { remoteState: "etag-2" } });
       const replay = await completeExternalOperation({ ...base, ...lease, operationKey: operation.operationKey, requestDigest: operation.requestDigest });
+      let staleReplay = "";
+      try { await completeExternalOperation({ ...base, ...lease, ownerProcessIdentity: "worker:stale", operationKey: operation.operationKey, requestDigest: operation.requestDigest }); } catch (error) { staleReplay = error.message; }
       let mismatch = "";
       try { await prepareExternalOperation({ ...base, ...lease, operationKey: "op:1", kind: "write", requestDigest: "sha256:wrong", subject: "subject-1", expectedRemoteState: "etag-1" }); } catch (error) { mismatch = error.message; }
-      console.log(JSON.stringify({ stale, done, replay, mismatch }));
+      console.log(JSON.stringify({ stale, done, replay, staleReplay, mismatch }));
     `;
     const output = JSON.parse((await run(root, source)).stdout.trim());
     assert.equal(output.stale, null);
     assert.equal(output.done.status, "succeeded");
     assert.equal(output.replay.status, "succeeded");
+    assert.match(output.staleReplay, /stale lease tuple/i);
     assert.match(output.mismatch, /mismatch/i);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -106,11 +126,20 @@ test("operation request digest is deterministic and storage rejects credential-s
   assert.equal(digestOperationRequest({ b: 2, a: 1 }), digestOperationRequest({ b: 2, a: 1 }));
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-coordination-secret-"));
   try {
-    await assert.rejects(() => run(root, `
-      import { claimLease, prepareExternalOperation } from ${JSON.stringify(coordinationUrl)};
-      const lease = (await claimLease(${JSON.stringify(args(root))})).lease;
-      await prepareExternalOperation({ ...lease, ...${JSON.stringify(args(root))}, operationKey: "secret", kind: "write", requestDigest: "token=not-persisted", subject: "x", expectedRemoteState: "y" });
-    `), /secret|credential|requestDigest/i);
+    const output = JSON.parse((await run(root, `
+      import { claimLease, prepareExternalOperation, completeExternalOperation } from ${JSON.stringify(coordinationUrl)};
+      import { ensureStateDatabase } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href)};
+      const base = ${JSON.stringify(args(root))};
+      const lease = (await claimLease(base)).lease;
+      const operation = await prepareExternalOperation({ ...lease, ...base, operationKey: "secret", kind: "write", requestDigest: "sha256:safe", subject: "x", expectedRemoteState: "y" });
+      let error = "";
+      try { await completeExternalOperation({ ...base, ...lease, operationKey: operation.operationKey, requestDigest: operation.requestDigest, evidence: { token: "credential-value" } }); } catch (caught) { error = caught.message; }
+      const db = await ensureStateDatabase();
+      const row = db.prepare("SELECT evidence_json, status FROM external_operations WHERE operation_key = 'secret'").get();
+      console.log(JSON.stringify({ error, row }));
+    `)).stdout.trim());
+    assert.match(output.error, /sensitive|secret/i);
+    assert.deepEqual(output.row, { evidence_json: "{}", status: "prepared" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

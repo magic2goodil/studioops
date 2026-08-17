@@ -48,7 +48,20 @@ function openDatabase() {
   assertIsolatedTestEnvironment();
   database = new DatabaseSync(DATABASE_FILE);
   database.exec("PRAGMA busy_timeout = 10000");
-  database.exec("PRAGMA journal_mode = WAL");
+  // Two fresh worker processes can open the same database before either has
+  // finished switching the journal mode. Retry only this initialization pragma;
+  // all later writes retain SQLite's normal busy-timeout/error behavior.
+  const retryUntil = Date.now() + 10_000;
+  while (true) {
+    try {
+      database.exec("PRAGMA journal_mode = WAL");
+      break;
+    } catch (error) {
+      if (!/locked/i.test(error.message || "") || Date.now() >= retryUntil) throw error;
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(wait, 0, 0, 25);
+    }
+  }
   database.exec("PRAGMA synchronous = FULL");
   database.exec("PRAGMA foreign_keys = ON");
   database.exec(`

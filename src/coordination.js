@@ -7,6 +7,7 @@ const DEFAULT_LEASE_TTL_MS = 30_000;
 const MIN_LEASE_TTL_MS = 1_000;
 const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1_000;
 const SECRET_PATTERN = /\b(?:authorization|bearer|password|passwd|secret|token|api[_-]?key|private[-_ ]?key)\s*[:=]/i;
+const SENSITIVE_KEY_PATTERN = /(?:authorization|bearer|password|passwd|secret|token|api[_-]?key|private[-_ ]?key)/i;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -46,6 +47,21 @@ function boundedTtl(value) {
     throw new Error(`leaseTtlMs must be between ${MIN_LEASE_TTL_MS} and ${MAX_LEASE_TTL_MS}.`);
   }
   return ttl;
+}
+
+function assertSafeEvidence(value, path = "evidence") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertSafeEvidence(item, `${path}[${index}]`));
+    return;
+  }
+  if (!value || typeof value !== "object") {
+    if (typeof value === "string" && SECRET_PATTERN.test(value)) throw new Error("Operation evidence must be secret-free.");
+    return;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (SENSITIVE_KEY_PATTERN.test(key)) throw new Error(`Operation evidence field ${path}.${key} is sensitive.`);
+    assertSafeEvidence(item, `${path}.${key}`);
+  }
 }
 
 function rowToLease(row) {
@@ -163,7 +179,8 @@ async function endLease(input, status) {
   return transaction((db) => {
     const predicate = leasePredicate(input);
     const result = db.prepare(`UPDATE coordination_leases SET status = ?, terminal_at = ?
-      WHERE lease_id = ? AND fence = ? AND owner_process_identity = ? AND expected_state_version = ? AND status = 'active'`).run(status, iso(nowMs), ...predicate);
+      WHERE lease_id = ? AND fence = ? AND owner_process_identity = ? AND expected_state_version = ?
+        AND status = 'active' AND expires_at > ?`).run(status, iso(nowMs), ...predicate, iso(nowMs));
     return result.changes === 1 ? rowToLease(db.prepare("SELECT * FROM coordination_leases WHERE lease_id = ?").get(predicate[0])) : null;
   });
 }
@@ -205,6 +222,7 @@ export async function terminalExternalOperation(input = {}) {
   const operationKey = text(input.operationKey, "operationKey");
   const requestDigest = text(input.requestDigest, "requestDigest", { max: 160 });
   const status = input.status === "quarantined" ? "quarantined" : "succeeded";
+  if (input.evidence && typeof input.evidence === "object") assertSafeEvidence(input.evidence);
   const evidence = input.evidence && typeof input.evidence === "object" ? JSON.stringify(input.evidence) : "{}";
   if (evidence.length > 2_048 || SECRET_PATTERN.test(evidence)) throw new Error("Operation evidence must be bounded and secret-free.");
   const nowMs = nowValue(input.nowMs);
@@ -213,6 +231,12 @@ export async function terminalExternalOperation(input = {}) {
     if (!existing) throw new Error("External operation is not prepared.");
     if (existing.request_digest !== requestDigest) throw new Error("Operation key payload mismatch; refusing terminal replay.");
     if (existing.status !== "prepared") {
+      // A terminal replay is read-only, but it still needs the original authority tuple.
+      const [, fence, owner, version] = leasePredicate(input);
+      if (existing.lease_id !== input.leaseId || Number(existing.fence) !== fence
+        || existing.owner_process_identity !== owner || Number(existing.expected_state_version) !== version) {
+        throw new Error("External operation terminal replay rejected for a stale lease tuple.");
+      }
       if (existing.status !== status) throw new Error("External operation terminal result is immutable.");
       return rowToOperation(existing);
     }
