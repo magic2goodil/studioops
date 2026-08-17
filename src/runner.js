@@ -1537,6 +1537,7 @@ export async function claimRuns(input = {}) {
     const available = Math.max(0, limit - activeCount);
     if (available <= 0) return [];
     if (activeSelfUpdateLease(state, input)) return [];
+    if (diskPressureIncidentIsActive(state.meta?.diskPressureIncident) && !input.ignoreDiskPressureIncident) return [];
 
     const claimed = [];
     const plannedRuns = [];
