@@ -1,6 +1,7 @@
 import {
   architectureIsCompleteInState,
   capabilityRoutingForTask,
+  evaluateTaskReadiness,
   candidateIdentityForTask,
   candidateIdentityIsComplete,
   cycleLimitLeadReviewApplies,
@@ -167,6 +168,9 @@ function actionBase(state, task, type, role, reason, options = {}) {
     taskTitle: task.title,
     taskStatus: task.status,
     priority: task.priority || "medium",
+    createdAt: task.createdAt || "",
+    agePromotion: Number.isFinite(Date.parse(task.createdAt || ""))
+      && Date.now() - Date.parse(task.createdAt) >= 24 * 60 * 60 * 1000,
     reason,
     taskUrl: taskUrl(options.baseUrl, task),
     branchName: task.branchName || "",
@@ -183,6 +187,9 @@ function actionBase(state, task, type, role, reason, options = {}) {
     candidateCycle: currentReviewCandidateCycle(task),
     candidateIdentity: task.candidateIdentity || null,
     skippedReviewLanes: capabilityRoutingForTask(project || {}, task).skipped,
+    reviewerIdentity: role && role.includes("review")
+      ? `${role}:${task.id}:candidate-${currentReviewCandidateCycle(task) || 0}`
+      : "",
     promptCommand: role && role !== "owner" && !String(role).includes("integration-worker") ? promptCommand(task, role) : "",
     reviewCommand: options.stage ? reviewCommand(task, options.stage) : "",
     integrationCommand: options.integrationCommand || "",
@@ -192,6 +199,7 @@ function actionBase(state, task, type, role, reason, options = {}) {
       status: dependency.status,
       title: dependency.title,
     })),
+    readiness: task.readinessEnforced === true ? evaluateTaskReadiness(task, state) : null,
   };
 }
 
@@ -568,6 +576,13 @@ function taskActions(state, task, options = {}) {
 
 function sortActions(actions) {
   return actions.sort((a, b) => {
+    const ageWeight = (action) => {
+      const ageMs = Math.max(0, Date.now() - Date.parse(action.createdAt || action.updatedAt || ""));
+      const promotion = ageMs >= 24 * 60 * 60 * 1000 ? 1 : 0;
+      return promotion;
+    };
+    const promoted = ageWeight(b) - ageWeight(a);
+    if (promoted !== 0) return promoted;
     const priority = (PRIORITY_WEIGHT[a.priority] ?? 2) - (PRIORITY_WEIGHT[b.priority] ?? 2);
     if (priority !== 0) return priority;
     return `${a.projectKey}:${a.taskId}:${a.type}`.localeCompare(`${b.projectKey}:${b.taskId}:${b.type}`);

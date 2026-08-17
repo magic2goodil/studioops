@@ -164,6 +164,18 @@ function activeCounts(state) {
   }, {});
 }
 
+function projectWipLimit(project) {
+  const configured = Number(project?.wipPolicy?.maxActiveTasks || project?.maxActiveTasks || 0);
+  return Number.isInteger(configured) && configured > 0 ? configured : 0;
+}
+
+function activeProjectTaskCount(state, projectId) {
+  return new Set((state.tasks || [])
+    .filter((task) => task.projectId === projectId)
+    .filter((task) => ["queued", "in_progress", "builder_review", "backend_review", "frontend_review", "accessibility_review", "regression_review", "lead_review", "needs_changes"].includes(task.status))
+    .map((task) => task.id)).size;
+}
+
 function effectiveGroupCapacity(options, initialCounts, finalCounts) {
   return Object.fromEntries(["architect", "builder", "reviewer", "owner"].map((group) => {
     const limit = concurrencyLimitFor(group, options);
@@ -624,6 +636,16 @@ function makeRun(state, task, action, options, now) {
     modelTier: executionPolicy.modelTier,
     modelReasoningEffort: executionPolicy.reasoningEffort,
     modelSelectionReason: executionPolicy.selectionReason,
+    tokenBudget: executionPolicy.tokenBudget,
+    costBudget: executionPolicy.costBudget,
+    costTelemetry: {
+      estimatedCredits: creditAdmission.estimatedCredits,
+      tokenBudget: executionPolicy.tokenBudget,
+      actualCredits: null,
+      actualTokens: null,
+      recordedAt: now,
+    },
+    reviewerIdentity: action.reviewerIdentity || "",
     creditAdmission: {
       code: creditAdmission.code,
       tier: creditAdmission.tier,
@@ -691,6 +713,16 @@ export function planDispatches(state, actions, input = {}) {
     if (action.taskStatus && task.status !== action.taskStatus) {
       skipped.push({ action, reason: `task_status_changed:${action.taskStatus}->${task.status}` });
       continue;
+    }
+    const project = state.projects?.find((item) => item.id === task.projectId);
+    const wipLimit = projectWipLimit(project);
+    if (wipLimit && ["builder", "architect"].includes(runGroupFor(action))) {
+      const active = activeProjectTaskCount(state, task.projectId);
+      const alreadyActive = ["queued", "in_progress", "builder_review", "backend_review", "frontend_review", "accessibility_review", "regression_review", "lead_review", "needs_changes"].includes(task.status);
+      if (active >= wipLimit && !alreadyActive) {
+        skipped.push({ action, reason: "project_wip_limit", projectId: task.projectId, wipLimit, active });
+        continue;
+      }
     }
     const reviewSafetyReason = reviewDispatchSafetyReason(state, task, action);
     if (reviewSafetyReason) {
