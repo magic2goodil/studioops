@@ -1,5 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import {
   assertCandidateEnvelope,
@@ -15,7 +16,11 @@ import {
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
 import { missionControlDataDir } from "./runtime-paths.js";
-import { normalizeProjectWorkflowMode, withDefaultProjectStandards } from "./config.js";
+import {
+  normalizeProjectWorkflowMode,
+  normalizeWorkspaceRetention,
+  withDefaultProjectStandards,
+} from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   DATABASE_FILE,
@@ -86,6 +91,7 @@ const DEPENDENCY_COMPLETE_STATUSES = new Set([
 ]);
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
+const WORKSPACE_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const DEFAULT_ORPHANED_TASK_GRACE_MS = 15 * 60 * 1000;
 const DEFAULT_TRANSIENT_RECOVERY_MS = 2 * 60 * 1000;
 const MAX_TRANSIENT_RECOVERY_MS = 15 * 60 * 1000;
@@ -170,6 +176,184 @@ export {
   DEFAULT_REVIEW_POLICY,
   VALID_DELIVERY_POLICY_PROFILES,
 };
+
+export const WORKSPACE_RETENTION_STATUSES = Object.freeze([...WORKSPACE_TERMINAL_STATUSES]);
+
+function workspaceSegment(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "")
+    .slice(0, 72);
+}
+
+export function expectedRunWorkspacePath(workspaceRoot, projectKey, runId, branchName) {
+  const root = path.resolve(String(workspaceRoot || ""));
+  const project = workspaceSegment(projectKey);
+  const run = workspaceSegment(runId);
+  const branch = workspaceSegment(branchName);
+  if (!root || !project || !run || !branch) return "";
+  return path.join(root, project, `${run}-${branch}`);
+}
+
+export function workspacePathProtectionReason(run = {}, input = {}) {
+  const workspaceRoot = String(input.workspaceRoot || "").trim();
+  const candidate = String(run.workspacePath || "").trim();
+  if (!workspaceRoot || !candidate) return "missing_workspace_path";
+  const root = path.resolve(workspaceRoot);
+  const resolved = path.resolve(candidate);
+  const relative = path.relative(root, resolved);
+  if (!relative || relative.startsWith("..")) return "outside_workspace_root";
+  for (let current = resolved; current !== root && current.startsWith(`${root}${path.sep}`); current = path.dirname(current)) {
+    try {
+      if (lstatSync(current).isSymbolicLink()) return "symlinked_workspace_ancestor";
+    } catch {
+      // A not-yet-created path is verified by the filesystem adapter at deletion time.
+    }
+  }
+  try {
+    if (realpathSync(root) !== root) return "symlinked_workspace_root";
+  } catch {
+    // The adapter will fail closed if the root cannot be resolved.
+  }
+  if (relative.split(path.sep).includes("candidates")) return "candidate_artifact_path";
+  if (run.workspaceStrategy !== "worktree" && run.workspaceStrategy !== "clone" && run.workspaceStrategy !== "local-clone") {
+    return "unexpected_workspace_strategy";
+  }
+  const project = input.project || {};
+  if (project.repoPath && path.resolve(project.repoPath) === resolved) return "source_repository_path";
+  const expected = expectedRunWorkspacePath(root, project.key || run.projectKey, run.id, run.branchName || run.branch);
+  if (!expected || expected !== resolved) return "workspace_identity_mismatch";
+  return "";
+}
+
+function cleanupEvidence(run, input, result) {
+  const safeError = String(result.error || "").replace(/[\r\n\t]+/g, " ").trim().slice(0, 500);
+  return {
+    runId: run.id,
+    strategy: run.workspaceStrategy || "",
+    logicalBytes: Number.isFinite(Number(input.logicalBytes)) && Number(input.logicalBytes) >= 0 ? Number(input.logicalBytes) : 0,
+    filesystemReclaimedBytes: Number.isFinite(Number(input.filesystemReclaimedBytes)) && Number(input.filesystemReclaimedBytes) >= 0
+      ? Number(input.filesystemReclaimedBytes)
+      : null,
+    reason: String(input.reason || "retention_sweep").trim().slice(0, 120),
+    leaseId: String(input.leaseId || "").trim().slice(0, 160),
+    claimedAt: String(input.claimedAt || run.workspaceCleanup?.claimedAt || "").trim(),
+    finalizedAt: String(input.now || new Date().toISOString()).trim(),
+    error: safeError,
+  };
+}
+
+export function eligibleRunWorkspaceSnapshotsInState(state, input = {}) {
+  const policy = normalizeWorkspaceRetention(input.policy || {});
+  if (!policy.enabled) return [];
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const pressure = input.pressure === true;
+  const root = String(input.workspaceRoot || "");
+  const activePaths = new Set((state.runs || [])
+    .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
+    .map((run) => path.resolve(String(run.workspacePath || ""))));
+  const candidates = [];
+  for (const run of state.runs || []) {
+    if (!WORKSPACE_TERMINAL_STATUSES.has(run.status)) continue;
+    if (run.workspaceCleanup?.state === "completed") continue;
+    const completedMs = Date.parse(run.completedAt || run.updatedAt || "");
+    if (!Number.isFinite(completedMs)) continue;
+    const ageHours = (nowMs - completedMs) / 3_600_000;
+    const requiredAge = Math.max(policy.retainForHours[run.status], pressure ? policy.pressureMinAgeHours : 0);
+    if (ageHours < requiredAge) continue;
+    const project = (state.projects || []).find((item) => item.id === run.projectId || item.key === run.projectKey);
+    const protection = workspacePathProtectionReason(run, { workspaceRoot: root, project });
+    if (protection) continue;
+    const resolved = path.resolve(run.workspacePath);
+    if (activePaths.has(resolved)) continue;
+    candidates.push({
+      runId: run.id,
+      projectId: run.projectId || "",
+      workspacePath: run.workspacePath,
+      workspaceStrategy: run.workspaceStrategy,
+      status: run.status,
+      completedAt: run.completedAt || run.updatedAt,
+      ageHours,
+      logicalBytes: Number(run.workspaceBytes || run.logicalBytes || 0) || 0,
+      verified: true,
+    });
+  }
+  return candidates.sort((a, b) => a.logicalBytes - b.logicalBytes || a.completedAt.localeCompare(b.completedAt) || a.runId.localeCompare(b.runId));
+}
+
+export function claimRunWorkspaceCandidatesInState(state, input = {}) {
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const policy = normalizeWorkspaceRetention(input.policy || {});
+  const leaseId = String(input.leaseId || randomUUID()).trim();
+  if (!policy.enabled) return { leaseId, expiresAt: "", candidates: [] };
+  const expiresAt = new Date(nowMs + policy.cleanupLeaseSeconds * 1000).toISOString();
+  const ids = new Set(eligibleRunWorkspaceSnapshotsInState(state, input)
+    .filter((item) => {
+      const run = (state.runs || []).find((candidate) => candidate.id === item.runId);
+      const expiry = Date.parse(run?.workspaceCleanup?.leaseExpiresAt || "");
+      return run?.workspaceCleanup?.state !== "claimed" || !Number.isFinite(expiry) || expiry <= nowMs;
+    })
+    .slice(0, Math.min(policy.maxDeletesPerSweep, Number(input.limit) || policy.maxDeletesPerSweep))
+    .map((item) => item.runId));
+  const candidates = [];
+  for (const run of state.runs || []) {
+    if (!ids.has(run.id)) continue;
+    run.workspaceCleanup = { state: "claimed", leaseId, claimedAt: now, leaseExpiresAt: expiresAt };
+    candidates.push(structuredClone(run));
+  }
+  state.meta = state.meta || {};
+  state.meta.workspaceRetention = {
+    ...(state.meta.workspaceRetention || {}),
+    lastSweepAt: now,
+    lastSweepLeaseId: leaseId,
+    pressure: input.pressure === true,
+    pressureIncident: input.pressure === true
+      ? { at: now, reason: String(input.pressureReason || "disk_pressure").slice(0, 120) }
+      : state.meta.workspaceRetention?.pressureIncident || null,
+    candidateCount: candidates.length,
+    verifiedRetainedBytes: candidates.reduce((total, run) => total + (run.workspaceBytes || run.logicalBytes || 0), 0),
+    maxRetainedBytes: policy.maxRetainedBytes,
+  };
+  return { leaseId, expiresAt, candidates };
+}
+
+export async function claimRunWorkspaceCandidates(input = {}) {
+  return mutateState(async (state) => claimRunWorkspaceCandidatesInState(state, input));
+}
+
+export function finalizeRunWorkspaceCleanupInState(state, runId, input = {}) {
+  const run = (state.runs || []).find((item) => item.id === runId);
+  if (!run) throw new Error(`Unknown run: ${runId}`);
+  const cleanup = run.workspaceCleanup || {};
+  if (cleanup.state === "completed") return structuredClone(cleanup);
+  if (cleanup.leaseId !== String(input.leaseId || "").trim()) return null;
+  if (Date.parse(cleanup.leaseExpiresAt || "") <= Number(input.nowMs ?? Date.now())) return null;
+  const evidence = cleanupEvidence(run, input, input.success === false ? { error: input.error } : {});
+  run.workspaceCleanup = { ...evidence, state: input.success === false ? "released" : "completed" };
+  return structuredClone(run.workspaceCleanup);
+}
+
+export async function finalizeRunWorkspaceCleanup(runId, input = {}) {
+  return mutateState(async (state) => finalizeRunWorkspaceCleanupInState(state, runId, input));
+}
+
+export function releaseRunWorkspaceCleanupInState(state, runId, input = {}) {
+  const run = (state.runs || []).find((item) => item.id === runId);
+  if (!run) throw new Error(`Unknown run: ${runId}`);
+  const cleanup = run.workspaceCleanup || {};
+  if (cleanup.state === "released") return structuredClone(cleanup);
+  if (cleanup.state === "completed") return structuredClone(cleanup);
+  if (cleanup.leaseId !== String(input.leaseId || "").trim()) return null;
+  run.workspaceCleanup = { ...cleanup, state: "released", releasedAt: String(input.now || new Date().toISOString()), error: String(input.error || "").slice(0, 500) };
+  return structuredClone(run.workspaceCleanup);
+}
+
+export async function releaseRunWorkspaceCleanup(runId, input = {}) {
+  return mutateState(async (state) => releaseRunWorkspaceCleanupInState(state, runId, input));
+}
 
 export async function ensureDataFile() {
   await ensureStateDatabase();
@@ -2271,6 +2455,9 @@ export async function updateRun(runId, patch = {}) {
     if (!run) throw new Error(`Unknown run: ${runId}`);
     if (patch.status && !VALID_RUN_STATUSES.has(patch.status)) {
       throw new Error(`Invalid run status: ${patch.status}`);
+    }
+    if (patch.status && ACTIVE_RUN_STATUSES.has(patch.status) && run.workspaceCleanup?.state === "claimed") {
+      throw new Error("A run with a workspace cleanup lease cannot transition back to active.");
     }
     const allowed = [
       "status",

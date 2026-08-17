@@ -194,3 +194,16 @@ test("the shared contract is deterministic and treats unclassified changes as fu
   assert.match(contract, /multi-component, ambiguous, or unclassified changes/i);
   assert.match(contract, /A selected failure or cancellation fails it/i);
 });
+
+test("run workspace retention manifest is complete and acyclic", async () => {
+  const manifest = JSON.parse(await readFile("docs/architecture/run-workspace-retention.components.json", "utf8"));
+  assert.equal(manifest.workflowImpact, "full-regression");
+  assert.equal(manifest.acyclic, true);
+  assert.deepEqual(manifest.dependencyDirection, [
+    "runner-filesystem-adapter -> config-store-policy",
+    "watchdog-recovery-coordinator -> config-store-policy",
+  ]);
+  for (const required of ["src/config.js", "src/store.js", "test/config.test.js", "test/state-database.test.js"]) {
+    assert.ok(Object.values(manifest.components).some((component) => component.paths.includes(required)), required);
+  }
+});

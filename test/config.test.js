@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import {
   effectiveAutomationCapacity,
   normalizeConfig,
+  normalizeWorkspaceRetention,
   projectFromConfig,
   writeConfig,
 } from "../src/config.js";
@@ -113,4 +114,35 @@ test("project-level prototype fast lane policy survives config import", () => {
   });
 
   assert.deepEqual(project.deliveryPolicy, { profile: "prototype-fast-lane" });
+});
+
+test("workspace retention defaults and invalid values fail safe deterministically", () => {
+  assert.deepEqual(normalizeConfig({ defaults: {} }).defaults.runner.workspaceRetention, {
+    enabled: true,
+    retainForHours: { completed: 168, failed: 336, cancelled: 168 },
+    pressureMinAgeHours: 24,
+    maxRetainedBytes: 53687091200,
+    maxDeletesPerSweep: 25,
+    sweepIntervalSeconds: 600,
+    cleanupLeaseSeconds: 900,
+  });
+  assert.deepEqual(normalizeWorkspaceRetention({
+    enabled: true,
+    retainForHours: { completed: 1, failed: 2, cancelled: 3 },
+    pressureMinAgeHours: 4,
+    maxRetainedBytes: 5,
+    maxDeletesPerSweep: 6,
+    sweepIntervalSeconds: 7,
+    cleanupLeaseSeconds: 8,
+  }), {
+    enabled: true,
+    retainForHours: { completed: 1, failed: 2, cancelled: 3 },
+    pressureMinAgeHours: 4,
+    maxRetainedBytes: 5,
+    maxDeletesPerSweep: 6,
+    sweepIntervalSeconds: 7,
+    cleanupLeaseSeconds: 8,
+  });
+  assert.equal(normalizeWorkspaceRetention({ terminalStatuses: ["running"] }).enabled, false);
+  assert.equal(normalizeWorkspaceRetention({ maxRetainedBytes: -1, cleanupLeaseSeconds: Infinity }).maxRetainedBytes, 53687091200);
 });

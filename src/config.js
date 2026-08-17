@@ -16,6 +16,51 @@ export const INSTALLED_AUTOMATION_CAPACITY = Object.freeze({
   runnerLimit: 3,
 });
 
+export const DEFAULT_WORKSPACE_RETENTION = Object.freeze({
+  enabled: true,
+  retainForHours: Object.freeze({ completed: 168, failed: 336, cancelled: 168 }),
+  pressureMinAgeHours: 24,
+  maxRetainedBytes: 53_687_091_200,
+  maxDeletesPerSweep: 25,
+  sweepIntervalSeconds: 600,
+  cleanupLeaseSeconds: 900,
+});
+
+const WORKSPACE_RETENTION_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+function finiteNonNegative(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function positiveFinite(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function normalizeWorkspaceRetention(value = {}) {
+  const raw = value && typeof value === "object" ? value : {};
+  const rawRetainForHours = raw.retainForHours && typeof raw.retainForHours === "object"
+    ? raw.retainForHours
+    : {};
+  const invalidStatusConfiguration = raw.terminalStatuses !== undefined
+    && (!Array.isArray(raw.terminalStatuses)
+      || raw.terminalStatuses.some((status) => !WORKSPACE_RETENTION_STATUSES.has(String(status).trim().toLowerCase())));
+  return {
+    enabled: invalidStatusConfiguration ? false : raw.enabled !== false,
+    retainForHours: {
+      completed: finiteNonNegative(rawRetainForHours.completed, DEFAULT_WORKSPACE_RETENTION.retainForHours.completed),
+      failed: finiteNonNegative(rawRetainForHours.failed, DEFAULT_WORKSPACE_RETENTION.retainForHours.failed),
+      cancelled: finiteNonNegative(rawRetainForHours.cancelled, DEFAULT_WORKSPACE_RETENTION.retainForHours.cancelled),
+    },
+    pressureMinAgeHours: finiteNonNegative(raw.pressureMinAgeHours, DEFAULT_WORKSPACE_RETENTION.pressureMinAgeHours),
+    maxRetainedBytes: finiteNonNegative(raw.maxRetainedBytes, DEFAULT_WORKSPACE_RETENTION.maxRetainedBytes),
+    maxDeletesPerSweep: positiveFinite(raw.maxDeletesPerSweep, DEFAULT_WORKSPACE_RETENTION.maxDeletesPerSweep),
+    sweepIntervalSeconds: positiveFinite(raw.sweepIntervalSeconds, DEFAULT_WORKSPACE_RETENTION.sweepIntervalSeconds),
+    cleanupLeaseSeconds: positiveFinite(raw.cleanupLeaseSeconds, DEFAULT_WORKSPACE_RETENTION.cleanupLeaseSeconds),
+  };
+}
+
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -95,6 +140,7 @@ export function normalizeConfig(config = {}) {
           runner.limit ?? runner.maxRuns,
           INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
         ),
+        workspaceRetention: normalizeWorkspaceRetention(runner.workspaceRetention),
       },
     },
   };

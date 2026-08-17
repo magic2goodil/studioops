@@ -11,6 +11,13 @@ import { maintenanceWriteBlocker } from "../src/state-database.js";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
 import { readPersistedState } from "./state-database-helper.js";
+import {
+  claimRunWorkspaceCandidatesInState,
+  eligibleRunWorkspaceSnapshotsInState,
+  finalizeRunWorkspaceCleanupInState,
+  releaseRunWorkspaceCleanupInState,
+  workspacePathProtectionReason,
+} from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 const storeModuleUrl = pathToFileURL(path.join(process.cwd(), "src/store.js")).href;
@@ -52,6 +59,40 @@ function baseState() {
     qaBundles: [],
   };
 }
+
+test("workspace retention eligibility is age bounded, ordered, and protects active or unsafe paths", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [
+    { id: "run_old", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/old", workspaceStrategy: "worktree", workspacePath: `${root}/demo/run_old-feature-old`, completedAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z", workspaceBytes: 2 },
+    { id: "run_new", projectId: "project_1", projectKey: "demo", status: "completed", branchName: "feature/new", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_new-feature-new`, completedAt: "2026-08-15T00:00:00.000Z", updatedAt: "2026-08-15T00:00:00.000Z", workspaceBytes: 1 },
+    { id: "run_active", projectId: "project_1", projectKey: "demo", status: "running", branchName: "feature/active", workspaceStrategy: "worktree", workspacePath: `${root}/demo/run_active-feature-active`, updatedAt: "2026-08-01T00:00:00.000Z" },
+    { id: "run_artifact", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/artifact", workspaceStrategy: "clone", workspacePath: `${root}/demo/candidates/run_artifact-feature-artifact`, completedAt: "2026-08-01T00:00:00.000Z" },
+  ];
+  const candidates = eligibleRunWorkspaceSnapshotsInState(state, {
+    workspaceRoot: root,
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    policy: { retainForHours: { completed: 1, failed: 1, cancelled: 1 } },
+  });
+  assert.deepEqual(candidates.map((item) => item.runId), ["run_new", "run_old"]);
+  assert.equal(workspacePathProtectionReason(state.runs[3], { workspaceRoot: root, project: state.projects[0] }), "candidate_artifact_path");
+});
+
+test("workspace cleanup leases are exclusive, expire for retry, and finalize idempotently", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [{ id: "run_lease", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/lease", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_lease-feature-lease`, completedAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z", workspaceBytes: 42 }];
+  const input = { workspaceRoot: root, nowMs: Date.parse("2026-08-17T00:00:00.000Z"), policy: { retainForHours: { failed: 1 } }, leaseId: "lease_a" };
+  const first = claimRunWorkspaceCandidatesInState(state, input);
+  const second = claimRunWorkspaceCandidatesInState(state, { ...input, leaseId: "lease_b" });
+  assert.deepEqual(first.candidates.map((run) => run.id), ["run_lease"]);
+  assert.deepEqual(second.candidates, []);
+  assert.equal(finalizeRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_a", nowMs: input.nowMs + 1, logicalBytes: 42, filesystemReclaimedBytes: 40, success: true }).state, "completed");
+  assert.equal(finalizeRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_a", nowMs: input.nowMs + 1 }).state, "completed");
+  assert.equal(releaseRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_a" }).state, "completed");
+});
 
 async function writeLegacyState(root, state = baseState()) {
   const dataDir = path.join(root, "data");

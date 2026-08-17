@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "workflowImpact": "full-regression",
+  "reason": "multi-component public workflow and persistence contract",
+  "components": {
+    "config-store-policy": {
+      "paths": ["src/config.js", "src/store.js", "test/config.test.js", "test/state-database.test.js"],
+      "owner": "workflow-state",
+      "publicContracts": ["normalizeWorkspaceRetention", "eligibleRunWorkspaceSnapshotsInState", "claimRunWorkspaceCandidates", "finalizeRunWorkspaceCleanup", "releaseRunWorkspaceCleanup"],
+      "ownedData": ["run.workspaceCleanup", "meta.workspaceRetention"],
+      "rollback": "disable defaults.runner.workspaceRetention; additive payload fields are ignored by older releases",
+      "testLayers": ["unit", "contract", "persistence", "concurrency"]
+    },
+    "runner-filesystem-adapter": {
+      "paths": ["src/runner.js"],
+      "owner": "runner",
+      "publicContracts": ["filesystem deletion adapter"],
+      "ownedData": [],
+      "dependsOn": ["config-store-policy"],
+      "rollback": "stop cleanup adapter; retain workspaces"
+    },
+    "watchdog-recovery-coordinator": {
+      "paths": ["src/watchdog.js"],
+      "owner": "watchdog",
+      "publicContracts": ["lease recovery coordinator"],
+      "ownedData": [],
+      "dependsOn": ["config-store-policy"],
+      "rollback": "stop recovery coordinator; leases expire safely"
+    },
+    "architecture-validation": {
+      "paths": ["test/modular-architecture-standard.test.js", "docs/architecture/run-workspace-retention.components.json"],
+      "owner": "shared-validation",
+      "publicContracts": ["deterministic ownership and dependency manifest"],
+      "ownedData": [],
+      "testLayers": ["composition"]
+    }
+  },
+  "dependencyDirection": ["runner-filesystem-adapter -> config-store-policy", "watchdog-recovery-coordinator -> config-store-policy"],
+  "acyclic": true,
+  "unclassifiedChangesFailClosed": true
+}
