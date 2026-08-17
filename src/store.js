@@ -315,8 +315,13 @@ function verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferen
   }, 0);
 }
 
-function incrementRetentionReason(report, reason) {
+function incrementRetentionReason(report, reason, bytes = null) {
   report.excludedByReason[reason] = (report.excludedByReason[reason] || 0) + 1;
+  if (bytes === null) {
+    report.excludedUnknownSizeCountByReason[reason] = (report.excludedUnknownSizeCountByReason[reason] || 0) + 1;
+  } else {
+    report.excludedVerifiedBytesByReason[reason] = (report.excludedVerifiedBytesByReason[reason] || 0) + bytes;
+  }
 }
 
 function retentionSelectionInState(state, input = {}) {
@@ -327,10 +332,15 @@ function retentionSelectionInState(state, input = {}) {
     selectedCount: 0,
     excludedCount: 0,
     excludedByReason: {},
+    excludedVerifiedBytesByReason: {},
+    excludedUnknownSizeCountByReason: {},
   };
   if (!policy.enabled) {
     report.excludedCount = report.consideredCount;
-    if (report.excludedCount) report.excludedByReason.policy_disabled = report.excludedCount;
+    if (report.excludedCount) {
+      report.excludedByReason.policy_disabled = report.excludedCount;
+      report.excludedUnknownSizeCountByReason.policy_disabled = report.excludedCount;
+    }
     return { candidates: [], report };
   }
   const nowMs = Number(input.nowMs ?? Date.now());
@@ -339,7 +349,10 @@ function retentionSelectionInState(state, input = {}) {
   const activeReferences = activeRunWorkspaceReferences(state);
   if (activeReferences.ambiguous) {
     report.excludedCount = report.consideredCount;
-    if (report.excludedCount) report.excludedByReason.active_reference_ambiguous = report.excludedCount;
+    if (report.excludedCount) {
+      report.excludedByReason.active_reference_ambiguous = report.excludedCount;
+      report.excludedUnknownSizeCountByReason.active_reference_ambiguous = report.excludedCount;
+    }
     return { candidates: [], report };
   }
   const sourceRepoPaths = (state.projects || []).map((project) => project.repoPath).filter(Boolean);
@@ -359,7 +372,7 @@ function retentionSelectionInState(state, input = {}) {
       exclusion = "active_workspace_reference";
     }
     if (exclusion) {
-      incrementRetentionReason(report, exclusion);
+      incrementRetentionReason(report, exclusion, verifiedWorkspaceBytes(run, input));
       continue;
     }
     const ageHours = (nowMs - completedMs) / 3_600_000;
@@ -378,6 +391,7 @@ function retentionSelectionInState(state, input = {}) {
         (pressure || capacityPressure) && pressureAgeEligible && verifiedBytes === null
           ? "unverified_workspace_size"
           : "minimum_age_not_reached",
+        verifiedBytes,
       );
       continue;
     }
@@ -443,15 +457,22 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
   );
   const available = [];
   const claimExclusions = {};
-  const excludeClaim = (reason) => {
+  const claimExcludedVerifiedBytes = {};
+  const claimExcludedUnknownSizes = {};
+  const excludeClaim = (reason, item = null) => {
     claimExclusions[reason] = (claimExclusions[reason] || 0) + 1;
+    if (item?.verified) {
+      claimExcludedVerifiedBytes[reason] = (claimExcludedVerifiedBytes[reason] || 0) + item.logicalBytes;
+    } else {
+      claimExcludedUnknownSizes[reason] = (claimExcludedUnknownSizes[reason] || 0) + 1;
+    }
   };
   for (const item of snapshots) {
     const run = (state.runs || []).find((candidate) => candidate.id === item.runId);
     const expiry = Date.parse(run?.workspaceCleanup?.leaseExpiresAt || "");
-    if (!item.verified) excludeClaim("unverified_workspace_size");
+    if (!item.verified) excludeClaim("unverified_workspace_size", item);
     else if (run?.workspaceCleanup?.state === "claimed" && Number.isFinite(expiry) && expiry > nowMs) {
-      excludeClaim("active_cleanup_lease");
+      excludeClaim("active_cleanup_lease", item);
     } else available.push(item);
   }
   let selected;
@@ -476,12 +497,14 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
   const selectedWithinLimit = selected.slice(0, maximumClaims);
   if (selected.length > selectedWithinLimit.length) {
     claimExclusions.sweep_limit = selected.length - selectedWithinLimit.length;
+    claimExcludedVerifiedBytes.sweep_limit = selected.slice(selectedWithinLimit.length)
+      .reduce((total, item) => total + item.logicalBytes, 0);
   }
   if (capacityPressure && input.pressure !== true) {
     const selectedIds = new Set(selected.map((item) => item.runId));
     for (const item of available) {
       if (!selectedIds.has(item.runId) && item.pressureEligible && !item.retentionEligible) {
-        excludeClaim("capacity_target_satisfied");
+        excludeClaim("capacity_target_satisfied", item);
       }
     }
   }
@@ -510,6 +533,14 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
     excludedCount: selection.report.excludedCount
       + Object.values(claimExclusions).reduce((total, count) => total + count, 0),
     excludedByReason: { ...selection.report.excludedByReason, ...claimExclusions },
+    excludedVerifiedBytesByReason: {
+      ...selection.report.excludedVerifiedBytesByReason,
+      ...claimExcludedVerifiedBytes,
+    },
+    excludedUnknownSizeCountByReason: {
+      ...selection.report.excludedUnknownSizeCountByReason,
+      ...claimExcludedUnknownSizes,
+    },
   };
   return { leaseId, expiresAt, candidates, selectionReport };
 }
@@ -2554,6 +2585,14 @@ export async function automationTick(input = {}) {
   return mutate(async (state) => {
     const nowMs = Number(input.nowMs || Date.now());
     const now = new Date(nowMs).toISOString();
+    if (diskPressureIncidentIsActive(state.meta?.diskPressureIncident) && !input.ignoreDiskPressureIncident) {
+      return {
+        actions: [],
+        paused: true,
+        pauseReason: "disk_recovery_in_progress",
+        incidentId: state.meta.diskPressureIncident.id,
+      };
+    }
     if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
       return {
         actions: [],
@@ -2599,6 +2638,222 @@ export async function automationTick(input = {}) {
     });
     return { actions };
   });
+}
+
+const ACTIVE_DISK_INCIDENT_STATES = new Set(["reclaiming", "awaiting_health", "degraded"]);
+
+export function diskPressureIncidentIsActive(incident) {
+  return Boolean(incident && ACTIVE_DISK_INCIDENT_STATES.has(incident.state));
+}
+
+function boundedDiskEvidence(value = {}) {
+  const boundedNumber = (input) => Number.isFinite(Number(input)) ? Math.max(0, Number(input)) : 0;
+  return {
+    path: String(value.path || "").slice(0, 1024),
+    availableBytes: boundedNumber(value.availableBytes),
+    availablePercent: boundedNumber(value.availablePercent),
+    minAvailableBytes: boundedNumber(value.minAvailableBytes),
+    minAvailablePercent: boundedNumber(value.minAvailablePercent),
+    pressure: value.pressure === true,
+  };
+}
+
+function boundedCleanupEvidence(value = {}) {
+  const reasonCounts = Object.fromEntries(Object.entries(value.selection?.excludedByReason || {})
+    .slice(0, 32)
+    .map(([reason, count]) => [String(reason).slice(0, 120), Math.max(0, Number(count) || 0)]));
+  const reasonBytes = Object.fromEntries(Object.entries(value.selection?.excludedVerifiedBytesByReason || {})
+    .slice(0, 32)
+    .map(([reason, bytes]) => [String(reason).slice(0, 120), Math.max(0, Number(bytes) || 0)]));
+  const unknownSizes = Object.fromEntries(Object.entries(value.selection?.excludedUnknownSizeCountByReason || {})
+    .slice(0, 32)
+    .map(([reason, count]) => [String(reason).slice(0, 120), Math.max(0, Number(count) || 0)]));
+  return {
+    attempted: value.attempted === true,
+    selectedCount: Math.max(0, Number(value.selectedCount) || 0),
+    skippedCount: Math.max(0, Number(value.skippedCount) || 0),
+    failureCount: Math.max(0, Number(value.failureCount) || 0),
+    logicalDeletedBytes: Math.max(0, Number(value.logicalDeletedBytes) || 0),
+    actualAvailableByteDelta: Math.max(0, Number(value.actualAvailableByteDelta) || 0),
+    excludedByReason: reasonCounts,
+    excludedVerifiedBytesByReason: reasonBytes,
+    excludedUnknownSizeCountByReason: unknownSizes,
+    remainingShortfall: {
+      pressure: value.remainingShortfall?.pressure === true,
+      bytes: Math.max(0, Number(value.remainingShortfall?.bytes) || 0),
+      percentPoints: Math.max(0, Number(value.remainingShortfall?.percentPoints) || 0),
+    },
+  };
+}
+
+function boundedRecoveryHealth(value = {}) {
+  return {
+    disksHealthy: value.disksHealthy === true,
+    database: {
+      ok: value.database?.ok === true,
+      checkedAt: String(value.database?.checkedAt || "").slice(0, 64),
+      reason: String(value.database?.reason || "").slice(0, 120),
+      projectCount: Math.max(0, Number(value.database?.projectCount) || 0),
+      taskCount: Math.max(0, Number(value.database?.taskCount) || 0),
+      runCount: Math.max(0, Number(value.database?.runCount) || 0),
+    },
+    workers: {
+      ok: value.workers?.ok === true,
+      checkedAt: String(value.workers?.checkedAt || "").slice(0, 64),
+      workers: (value.workers?.workers || []).slice(0, 32).map((worker) => ({
+        worker: String(worker.worker || "").slice(0, 80),
+        ok: worker.ok === true,
+        reason: String(worker.reason || "").slice(0, 120),
+        status: String(worker.status || "").slice(0, 40),
+        updatedAt: String(worker.updatedAt || "").slice(0, 64),
+      })),
+    },
+    diskRecovery: {
+      recoveredWithoutCleanup: value.diskRecovery?.recoveredWithoutCleanup === true,
+      sameVolume: value.diskRecovery?.sameVolume !== false,
+    },
+  };
+}
+
+export function openDiskPressureIncidentInState(state, input = {}) {
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  state.meta = state.meta || {};
+  state.events = state.events || [];
+  const current = state.meta.diskPressureIncident;
+  const observations = Math.min(1_000_000, Math.max(0, Number(current?.observationCount) || 0) + 1);
+  const evidence = {
+    data: boundedDiskEvidence(input.data),
+    workspace: boundedDiskEvidence(input.workspace),
+  };
+  if (diskPressureIncidentIsActive(current)) {
+    state.meta.diskPressureIncident = {
+      ...current,
+      state: "reclaiming",
+      generation: Math.max(1, Number(current.generation) || 1) + 1,
+      observationCount: observations,
+      lastObservedAt: now,
+      lastObservation: evidence,
+    };
+    return structuredClone(state.meta.diskPressureIncident);
+  }
+  const incident = {
+    id: `disk_incident_${randomUUID()}`,
+    state: "reclaiming",
+    generation: 1,
+    openedAt: now,
+    lastObservedAt: now,
+    observationCount: 1,
+    affectedVolumes: evidence,
+    lastObservation: evidence,
+    cleanupTotals: {
+      logicalDeletedBytes: 0,
+      actualAvailableByteDelta: 0,
+      selectedCount: 0,
+      failureCount: 0,
+    },
+    restartedWorkers: [],
+  };
+  state.meta.diskPressureIncident = incident;
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "disk_pressure_incident_opened",
+    message: "StudioOps opened a durable disk-pressure recovery incident and blocked new automation claims.",
+    createdAt: now,
+  });
+  return structuredClone(incident);
+}
+
+export async function openDiskPressureIncident(input = {}) {
+  return mutateState(async (state) => openDiskPressureIncidentInState(state, input));
+}
+
+function requireDiskIncidentGeneration(state, input) {
+  const incident = state.meta?.diskPressureIncident;
+  if (!diskPressureIncidentIsActive(incident)) throw new Error("No active disk-pressure incident exists.");
+  if (String(input.incidentId || "") !== incident.id) throw new Error("Disk incident compare-and-set ID mismatch.");
+  if (Number(input.expectedGeneration) !== Number(incident.generation)) {
+    throw new Error("Disk incident compare-and-set generation mismatch.");
+  }
+  return incident;
+}
+
+export function updateDiskPressureIncidentInState(state, input = {}) {
+  const incident = requireDiskIncidentGeneration(state, input);
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  const cleanup = boundedCleanupEvidence(input.cleanup);
+  const restartedWorkers = [...new Set([
+    ...(incident.restartedWorkers || []),
+    ...(input.restartedWorkers || []).map((worker) => String(worker).slice(0, 80)),
+  ])].slice(0, 32);
+  state.meta.diskPressureIncident = {
+    ...incident,
+    state: ["reclaiming", "awaiting_health", "degraded"].includes(input.state)
+      ? input.state
+      : "awaiting_health",
+    generation: Number(incident.generation) + 1,
+    lastObservedAt: now,
+    lastObservation: {
+      data: boundedDiskEvidence(input.data),
+      workspace: boundedDiskEvidence(input.workspace),
+    },
+    cleanup,
+    cleanupTotals: {
+      logicalDeletedBytes: Math.max(0, Number(incident.cleanupTotals?.logicalDeletedBytes) || 0)
+        + cleanup.logicalDeletedBytes,
+      actualAvailableByteDelta: Math.max(0, Number(incident.cleanupTotals?.actualAvailableByteDelta) || 0)
+        + cleanup.actualAvailableByteDelta,
+      selectedCount: Math.max(0, Number(incident.cleanupTotals?.selectedCount) || 0) + cleanup.selectedCount,
+      failureCount: Math.max(0, Number(incident.cleanupTotals?.failureCount) || 0) + cleanup.failureCount,
+    },
+    health: boundedRecoveryHealth(input.health),
+    restartedWorkers,
+    remediation: String(input.remediation || "").slice(0, 1000),
+  };
+  return structuredClone(state.meta.diskPressureIncident);
+}
+
+export async function updateDiskPressureIncident(input = {}) {
+  return mutateState(async (state) => updateDiskPressureIncidentInState(state, input));
+}
+
+export function recoverDiskPressureIncidentInState(state, input = {}) {
+  const incident = requireDiskIncidentGeneration(state, input);
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  state.events = state.events || [];
+  const cleanup = boundedCleanupEvidence(input.cleanup);
+  state.meta.diskPressureIncident = {
+    ...incident,
+    state: "recovered",
+    generation: Number(incident.generation) + 1,
+    recoveredAt: now,
+    durationMs: Math.max(0, nowMs - Date.parse(incident.openedAt || now)),
+    finalObservation: {
+      data: boundedDiskEvidence(input.data),
+      workspace: boundedDiskEvidence(input.workspace),
+    },
+    cleanup,
+    cleanupTotals: {
+      logicalDeletedBytes: Math.max(0, Number(incident.cleanupTotals?.logicalDeletedBytes) || 0)
+        + cleanup.logicalDeletedBytes,
+      actualAvailableByteDelta: Math.max(0, Number(incident.cleanupTotals?.actualAvailableByteDelta) || 0)
+        + cleanup.actualAvailableByteDelta,
+      selectedCount: Math.max(0, Number(incident.cleanupTotals?.selectedCount) || 0) + cleanup.selectedCount,
+      failureCount: Math.max(0, Number(incident.cleanupTotals?.failureCount) || 0) + cleanup.failureCount,
+    },
+    health: boundedRecoveryHealth(input.health),
+  };
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "disk_pressure_incident_recovered",
+    message: "StudioOps verified disk, database, and managed-worker health and closed the recovery incident.",
+    createdAt: now,
+  });
+  return structuredClone(state.meta.diskPressureIncident);
+}
+
+export async function recoverDiskPressureIncident(input = {}) {
+  return mutateState(async (state) => recoverDiskPressureIncidentInState(state, input));
 }
 
 function taskHasActiveRun(state, taskId) {

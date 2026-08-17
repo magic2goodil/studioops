@@ -3,7 +3,18 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { planWatchdogActions, restartWorker } from "../src/watchdog.js";
+import {
+  managedWorkerHealth,
+  planWatchdogActions,
+  restartWorker,
+  runWatchdog,
+} from "../src/watchdog.js";
+import {
+  automationTick,
+  openDiskPressureIncidentInState,
+  recoverDiskPressureIncidentInState,
+  updateDiskPressureIncidentInState,
+} from "../src/store.js";
 import {
   createOverlappingSweepStarter,
   readWorkerHeartbeats,
@@ -144,4 +155,230 @@ test("watchdog refuses to restart a LaunchAgent owned by another runtime root", 
     /does not match current root/,
   );
   assert.equal(restarted, false);
+});
+
+function healthyHeartbeats(nowMs, dataDir = "/tmp/studioops-data") {
+  return ["dispatcher", "runner", "supervisor", "notifier"].map((worker) => ({
+    worker,
+    status: "idle",
+    dataDir,
+    updatedAt: new Date(nowMs).toISOString(),
+    lastSweepStartedAt: new Date(nowMs - 1_000).toISOString(),
+  }));
+}
+
+function disk(pathname, pressure) {
+  return {
+    path: pathname,
+    availableBytes: pressure ? 1 : 1_000_000,
+    totalBytes: 2_000_000,
+    availablePercent: pressure ? 0.1 : 50,
+    minAvailableBytes: 100,
+    minAvailablePercent: 2,
+    pressure,
+  };
+}
+
+test("durable disk incidents use compare-and-set generations and bounded observations", async () => {
+  const state = { meta: {}, events: [], projects: [], tasks: [], runs: [] };
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const first = openDiskPressureIncidentInState(state, {
+    nowMs,
+    data: disk("/tmp/data", true),
+    workspace: disk("/tmp/workspaces", true),
+  });
+  const second = openDiskPressureIncidentInState(state, {
+    nowMs: nowMs + 1,
+    data: disk("/tmp/data", true),
+    workspace: disk("/tmp/workspaces", false),
+  });
+  assert.equal(first.id, second.id);
+  assert.equal(second.generation, 2);
+  assert.equal(second.observationCount, 2);
+  assert.equal(state.events.filter((event) => event.type === "disk_pressure_incident_opened").length, 1);
+  assert.throws(() => updateDiskPressureIncidentInState(state, {
+    incidentId: second.id,
+    expectedGeneration: 1,
+  }), /generation mismatch/);
+  const awaiting = updateDiskPressureIncidentInState(state, {
+    incidentId: second.id,
+    expectedGeneration: 2,
+    state: "awaiting_health",
+    cleanup: { selectedCount: 1, logicalDeletedBytes: 10 },
+    health: { database: { ok: true } },
+  });
+  assert.equal(awaiting.generation, 3);
+  const recovered = recoverDiskPressureIncidentInState(state, {
+    incidentId: awaiting.id,
+    expectedGeneration: 3,
+    nowMs: nowMs + 10,
+    data: disk("/tmp/data", false),
+    workspace: disk("/tmp/workspaces", false),
+    health: { database: { ok: true }, workers: { ok: true } },
+  });
+  assert.equal(recovered.state, "recovered");
+  assert.equal(state.events.filter((event) => event.type === "disk_pressure_incident_recovered").length, 1);
+});
+
+test("automation remains blocked by an active disk incident without clearing operator controls", async () => {
+  const state = {
+    meta: {
+      diskPressureIncident: { id: "disk_incident_1", state: "awaiting_health", generation: 2 },
+      operatorPause: { active: true, reason: "Owner pause" },
+    },
+    projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [],
+  };
+  const result = await automationTick({ state });
+  assert.equal(result.paused, true);
+  assert.equal(result.pauseReason, "disk_recovery_in_progress");
+  assert.equal(state.meta.operatorPause.active, true);
+});
+
+test("managed worker health rejects stale, error, and wrong-root heartbeats", () => {
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const heartbeats = healthyHeartbeats(nowMs);
+  heartbeats[0].dataDir = "/tmp/wrong";
+  heartbeats[1].status = "error";
+  heartbeats[2].updatedAt = new Date(nowMs - 600_000).toISOString();
+  const health = managedWorkerHealth(heartbeats, { nowMs, dataDir: "/tmp/studioops-data" });
+  assert.equal(health.ok, false);
+  assert.deepEqual(health.workers.map((worker) => worker.reason), [
+    "worker_data_root_mismatch",
+    "worker_status_unhealthy",
+    "heartbeat_stale",
+    "",
+  ]);
+});
+
+test("watchdog recovers once after cleanup, database, and worker checks while preserving owner pause", async () => {
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const dataDir = "/tmp/studioops-data";
+  const workspaceRoot = "/tmp/studioops-workspaces";
+  const state = {
+    meta: { operatorPause: { active: true, reason: "Controlled cutover" } },
+    projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [],
+  };
+  let diskRead = 0;
+  const pairs = [
+    { data: disk(dataDir, true), workspace: disk(workspaceRoot, true) },
+    { data: disk(dataDir, false), workspace: disk(workspaceRoot, false) },
+  ];
+  const report = await runWatchdog({
+    state,
+    nowMs,
+    dataDir,
+    workspaceRoot,
+    readDiskPair: async () => pairs[Math.min(diskRead++, pairs.length - 1)],
+    runWorkspaceCleanup: async () => ({
+      attempted: true,
+      after: { data: disk(dataDir, false), workspace: disk(workspaceRoot, false) },
+      selection: { excludedByReason: {} },
+      selectedCount: 1,
+      skippedCount: 0,
+      failureCount: 0,
+      logicalDeletedBytes: 100,
+      actualAvailableByteDelta: 100,
+      remainingShortfall: { pressure: false, bytes: 0, percentPoints: 0 },
+    }),
+    readWorkerHeartbeats: async () => healthyHeartbeats(nowMs, dataDir),
+    writeWorkerHeartbeat: async () => ({}),
+  });
+  assert.equal(report.incident.state, "recovered");
+  assert.equal(report.reconciliation.paused, true);
+  assert.equal(report.reconciliation.pauseReason, "Controlled cutover");
+  assert.equal(state.meta.operatorPause.active, true);
+  assert.equal(state.events.filter((event) => event.type === "disk_pressure_incident_recovered").length, 1);
+});
+
+test("watchdog keeps a flapping or database-degraded incident active", async () => {
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const dataDir = "/tmp/studioops-data";
+  const workspaceRoot = "/tmp/studioops-workspaces";
+  const state = { meta: {}, projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [] };
+  let stateReads = 0;
+  let diskReads = 0;
+  const report = await runWatchdog({
+    state,
+    nowMs,
+    dataDir,
+    workspaceRoot,
+    readState: async () => {
+      stateReads += 1;
+      if (stateReads > 1) throw new Error("simulated database read failure");
+      return state;
+    },
+    readDiskPair: async () => {
+      diskReads += 1;
+      return diskReads === 1
+        ? { data: disk(dataDir, true), workspace: disk(workspaceRoot, true) }
+        : { data: disk(dataDir, true), workspace: disk(workspaceRoot, false) };
+    },
+    runWorkspaceCleanup: async () => ({
+      attempted: true,
+      after: { data: disk(dataDir, false), workspace: disk(workspaceRoot, false) },
+      selection: { excludedByReason: { protected_source_repository_path: 1 } },
+      selectedCount: 0,
+      skippedCount: 1,
+      failureCount: 0,
+      logicalDeletedBytes: 0,
+      actualAvailableByteDelta: 0,
+      remainingShortfall: { pressure: true, bytes: 0, percentPoints: 1.9 },
+    }),
+    readWorkerHeartbeats: async () => healthyHeartbeats(nowMs, dataDir),
+    writeWorkerHeartbeat: async () => ({}),
+  });
+  assert.equal(report.incident.state, "degraded");
+  assert.equal(report.incident.health.database.ok, false);
+  assert.match(report.incident.remediation, /Disk remains below threshold/);
+  assert.equal(report.reconciliation.pauseReason, "disk_recovery_in_progress");
+});
+
+test("watchdog attempts one root-verified worker restart per incident before later recovery", async () => {
+  const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
+  const dataDir = "/tmp/studioops-data";
+  const workspaceRoot = "/tmp/studioops-workspaces";
+  const state = { meta: {}, projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [] };
+  const pairs = { data: disk(dataDir, false), workspace: disk(workspaceRoot, false) };
+  const unhealthy = healthyHeartbeats(nowMs, dataDir);
+  unhealthy[1].dataDir = "/tmp/wrong-root";
+  const restarts = [];
+  const options = {
+    state,
+    nowMs,
+    dataDir,
+    workspaceRoot,
+    rootDir: "/tmp/studioops-root",
+    diskPair: { data: disk(dataDir, true), workspace: disk(workspaceRoot, true) },
+    readDiskPair: async () => pairs,
+    runWorkspaceCleanup: async () => ({
+      attempted: true,
+      after: pairs,
+      selection: { excludedByReason: {} },
+      selectedCount: 1,
+      skippedCount: 0,
+      failureCount: 0,
+      logicalDeletedBytes: 100,
+      actualAvailableByteDelta: 100,
+      remainingShortfall: { pressure: false, bytes: 0, percentPoints: 0 },
+    }),
+    readWorkerHeartbeats: async () => unhealthy,
+    writeWorkerHeartbeat: async () => ({}),
+    resolveWorkerRoot: async () => "/tmp/studioops-root",
+    restartWorker: async (worker) => { restarts.push(worker); },
+  };
+  const first = await runWatchdog(options);
+  assert.equal(first.incident.state, "awaiting_health");
+  assert.deepEqual(restarts, ["runner"]);
+  assert.deepEqual(first.incident.restartedWorkers, ["runner"]);
+
+  const second = await runWatchdog({ ...options, diskPair: pairs });
+  assert.equal(second.incident.state, "awaiting_health");
+  assert.deepEqual(restarts, ["runner"]);
+
+  const recovered = await runWatchdog({
+    ...options,
+    diskPair: pairs,
+    readWorkerHeartbeats: async () => healthyHeartbeats(nowMs, dataDir),
+  });
+  assert.equal(recovered.incident.state, "recovered");
 });

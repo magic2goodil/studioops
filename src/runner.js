@@ -23,6 +23,7 @@ import {
   architectureIsCompleteInState,
   claimDueGitHubRemoteRecoveryProbes,
   currentReviewCandidateCycle,
+  diskPressureIncidentIsActive,
   claimRunWorkspaceCandidates,
   claimRunWorkspaceCandidatesInState,
   eligibleRunWorkspaceSnapshots,
@@ -226,6 +227,8 @@ export async function runWorkspaceCleanup(input = {}) {
       selectedCount: 0,
       excludedCount: 0,
       excludedByReason: {},
+      excludedVerifiedBytesByReason: {},
+      excludedUnknownSizeCountByReason: {},
     },
     selected: [],
     skipped: [],
@@ -2401,16 +2404,19 @@ export async function runQueuedRuns(input = {}) {
     state.meta?.diskRecovery?.awaitingWatchdogHealth
       || state.meta?.diskRecovery?.state === "awaiting_watchdog_health",
   );
+  const durableDiskIncident = diskPressureIncidentIsActive(state.meta?.diskPressureIncident);
   const postCleanupPressure = Boolean(
     cleanup.after?.data?.pressure || cleanup.after?.workspace?.pressure || disk.pressure,
   );
-  if (postCleanupPressure || diskRecoveryAwaitingHealth) {
+  if (postCleanupPressure || diskRecoveryAwaitingHealth || durableDiskIncident) {
     return {
       generatedAt: new Date().toISOString(),
       disk,
       cleanup,
       paused: true,
-      pauseReason: diskRecoveryAwaitingHealth
+      pauseReason: durableDiskIncident
+        ? "disk_recovery_in_progress"
+        : diskRecoveryAwaitingHealth
         ? "disk_recovery_awaiting_watchdog_health"
         : "disk_space_below_safety_threshold",
       recovered: [],

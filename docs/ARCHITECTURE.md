@@ -48,6 +48,8 @@ Postgres is a future backend option when StudioOps needs multiple machines or re
 
 LaunchAgents execute an immutable release under `~/.codex/studioops/runtime/releases/`, with `current` swapped atomically. Their working directory defaults to `~/.codex/studioops/control-plane` so the local config, database, and logs remain outside cloud-synchronized development folders. A separate clean `~/.codex/studioops/source` checkout stays on `main` for self-updates, independent of any developer feature branch. This avoids partial reads from synchronized folders and ensures a restart actually runs the newly installed worker version.
 
+Disk-pressure recovery is a persisted compare-and-set state machine in the SQLite control plane. The runner and automation steward refuse new claims while an incident is `reclaiming`, `awaiting_health`, or `degraded`. The watchdog orchestrates the public retention adapter, disk observations, complete-state read, managed-worker heartbeat verification, and a single atomic recovery transition; it does not own workspace selection or deletion policy. Operator pauses, circuits, review evidence, and release gates remain separate authoritative controls.
+
 The UI and CLI can run anywhere Node.js is supported. The included always-on service installer, local notification channel, heartbeat scheduling, and worker restart implementation currently target macOS LaunchAgents.
 
 ## Safety Gates
