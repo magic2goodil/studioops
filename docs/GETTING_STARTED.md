@@ -75,15 +75,43 @@ node src/mission-control-cli.js add-project \
 
 Use an absolute local repository path. Add the project's actual validation commands and safety rules before enabling unattended builders.
 
-## 4. Run The Local UI
+## 4. Run And Enroll The Local Control Plane
 
 ```bash
 npm run dev
 ```
 
-Open [http://127.0.0.1:4317](http://127.0.0.1:4317). Keep the default localhost bind while learning the system.
+Keep the default `127.0.0.1` bind while learning the system. On first start,
+StudioOps creates `~/.codex/studioops/control-plane/control-plane-auth` with mode
+`0700`, writes only a hash of the owner password there, and prints the path of
+the `0600` operator log. The log contains a high-entropy bootstrap secret for
+one enrollment. The secret expires after 30 minutes and is invalid after use.
 
-The current UI is not an internet-facing authenticated service. Never forward this port to the public internet. Local-network access is available for trusted networks and is documented in [LOCAL_AUTOMATION.md](LOCAL_AUTOMATION.md).
+Submit `POST /api/auth/enroll` from the same origin with JSON containing
+`bootstrapSecret`, a password of at least 12 characters, and an optional
+`displayName`. Preserve the returned recovery codes in an appropriate local
+password manager; StudioOps stores only their digests. Enrollment returns an
+opaque `HttpOnly`, `SameSite=Strict` session cookie and a CSRF token. Browser
+clients must keep the CSRF token in JavaScript memory and send it as
+`X-StudioOps-CSRF-Token` on every authenticated mutation.
+
+Open [http://127.0.0.1:4317](http://127.0.0.1:4317) after enrollment. A process
+restart intentionally discards sessions. Use `POST /api/auth/login` with the
+owner password to obtain a new cookie and CSRF token; the password hash survives
+restart. `POST /api/auth/logout` revokes one session, `POST /api/auth/rotate`
+changes the password and recovery codes, and `POST /api/auth/recover` consumes
+one recovery code and revokes all sessions.
+
+High-risk decisions require a second step. Send the owner password plus the
+exact action, aggregate ID, current aggregate version, and candidate identity to
+`POST /api/auth/reauth`. Supply the returned value as
+`X-StudioOps-Reauth-Grant` on the decision request. A grant expires after two
+minutes, is usable once, and cannot be replayed for another action, version, or
+candidate.
+
+This is single-owner local authentication, not an internet-facing identity
+service. Never forward the port to the public internet. The separately secured
+LAN mode is documented in [LOCAL_AUTOMATION.md](LOCAL_AUTOMATION.md#control-plane-network-modes).
 
 ## 5. Create A First Task
 

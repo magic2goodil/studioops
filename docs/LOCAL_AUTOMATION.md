@@ -273,19 +273,63 @@ and never downgrades quality. Plan mode performs no recovery probe. Credit logs
 and test fixtures contain only sanitized limit fields, never tokens, account
 identity, raw account payloads, or secrets.
 
+## Control-Plane Network Modes
+
+### Default loopback mode
+
 By default, the web UI is only available on the local machine:
 
 ```text
 http://127.0.0.1:4317
 ```
 
-For phone or local-network testing:
+Loopback mode accepts only loopback `Host` values for the configured port. It
+does not honor a non-loopback bind, even if `STUDIOOPS_HOST` or the legacy
+`MISSION_CONTROL_HOST` requests one. First-run enrollment, login, session/CSRF
+handling, recovery, and reauthentication are described in
+[Getting Started](GETTING_STARTED.md#4-run-and-enroll-the-local-control-plane).
+
+### Secured LAN mode
+
+LAN access is a separate fail-closed mode. Enroll the owner in loopback mode
+first. Then supply all of these values when starting the web process:
 
 ```bash
-MISSION_CONTROL_HOST=0.0.0.0 MISSION_CONTROL_PORT=4317 npm run install-agents
+STUDIOOPS_CONTROL_PLANE_MODE=lan \
+STUDIOOPS_HOST=0.0.0.0 \
+STUDIOOPS_PORT=4317 \
+STUDIOOPS_TLS_KEY=/absolute/private/path/studioops-key.pem \
+STUDIOOPS_TLS_CERT=/absolute/private/path/studioops-cert.pem \
+STUDIOOPS_ALLOWED_HOSTS=studioops.home.arpa:4317 \
+STUDIOOPS_ALLOWED_ORIGINS=https://studioops.home.arpa:4317 \
+npm run dev
 ```
 
-Only use `0.0.0.0` on a trusted local network.
+TLS key and certificate files must remain outside the repository. Hosts are
+exact HTTP `Host` authorities; origins are exact HTTPS origins. Missing TLS,
+hosts, origins, or owner enrollment prevents startup. Host and Origin checks do
+not replace a trusted LAN, host firewall, or least-privilege service
+capabilities. Public internet exposure remains unsupported.
+
+The LaunchAgent installer defaults to loopback. Do not use the former
+`MISSION_CONTROL_HOST=0.0.0.0 npm run install-agents` shortcut: the installed
+web process will now refuse that incomplete configuration. An always-on LAN
+deployment must place the complete secured-LAN environment in the web
+LaunchAgent and keep its TLS files owner-readable; reinstalling may replace
+manual LaunchAgent changes, so verify the installed plist and startup logs after
+every reinstall.
+
+Service automation that calls HTTP uses an owner-only
+`control-plane-auth/service-capabilities.json` file. Each entry contains a
+high-entropy bearer `token`, an explicit `capabilities` list, and a bound `actor`
+identity/role (plus run and lease IDs when the lifecycle contract requires
+them). Keep the file mode `0600`. Service capabilities do not receive owner-only
+QA, credential, reauthentication, automation-resume, or circuit-reset access.
+
+Local attachment previews are confined to
+`data/local-attachments`. Register additional owner-controlled roots with the
+platform path-list variable `STUDIOOPS_ATTACHMENT_ROOTS`; files outside those
+roots are rejected even for authenticated callers.
 
 Run maintenance commands from the same working root used during `npm run install-agents`. A watchdog started from another checkout will report the root mismatch and leave the installed workers untouched. `STUDIOOPS_WORKING_ROOT`, `STUDIOOPS_DATA_DIR`, and the legacy `MISSION_CONTROL_*` aliases can select the intended persistent instance explicitly.
 
