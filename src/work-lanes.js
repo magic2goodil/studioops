@@ -64,6 +64,12 @@ function roleLane(role) {
   return "";
 }
 
+function actorIsReadOnly(actor = {}) {
+  const role = normalize(actor.role);
+  const actionType = normalize(actor.actionType || actor.type);
+  return actionType === "start-architecture" || role === "systems-architect";
+}
+
 export function inferTaskLane(task = {}, role = "") {
   const explicit = normalize(task.lane);
   if (explicit) return explicit;
@@ -125,6 +131,13 @@ export function conflictGroupForLane(lane) {
 }
 
 export function laneProfile(task = {}, actor = {}) {
+  if (actorIsReadOnly(actor)) {
+    return {
+      lane: "architecture-readonly",
+      conflictGroup: "read-only",
+      fileScope: [],
+    };
+  }
   const role = actor.role || task.assignedAgentRole || "";
   const lane = normalize(actor.lane) || inferTaskLane(task, role);
   const fileScope = Array.isArray(actor.fileScope) && actor.fileScope.length
@@ -140,6 +153,7 @@ export function laneProfile(task = {}, actor = {}) {
 export function laneProfilesConflict(left, right) {
   if (!left || !right) return false;
   if (left.projectId && right.projectId && left.projectId !== right.projectId) return false;
+  if (left.conflictGroup === "read-only" || right.conflictGroup === "read-only") return false;
   if (left.conflictGroup === "owner" || right.conflictGroup === "owner") return false;
   if (left.conflictGroup === "project-wide" || right.conflictGroup === "project-wide") return true;
   return left.conflictGroup === right.conflictGroup;

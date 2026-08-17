@@ -725,6 +725,96 @@ test("reports make an explicit lower concurrency limit distinct from lane confli
   assert.match(text, /concurrency limits 0; lane\/file-scope conflicts 1/);
 });
 
+test("read-only architecture runs do not block independent mutating work", () => {
+  const state = fixtureState();
+  state.tasks = [
+    {
+      id: "task_architecture",
+      projectId: "project_1",
+      title: "Plan lifecycle controls",
+      status: "architecture_in_progress",
+      lane: "backend",
+      workAreas: ["src/store.js", "src/server.js"],
+    },
+    {
+      id: "task_builder",
+      projectId: "project_1",
+      title: "Implement workspace cleanup adapter",
+      status: "ready",
+      lane: "devops",
+      workAreas: ["src/runner.js"],
+    },
+  ];
+  state.runs = [{
+    id: "run_architecture",
+    taskId: "task_architecture",
+    projectId: "project_1",
+    status: "running",
+    group: "architect",
+    role: "systems-architect",
+    actionType: "start_architecture",
+  }];
+  const action = {
+    id: "task_builder:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_builder",
+    taskTitle: "Implement workspace cleanup adapter",
+    taskStatus: "ready",
+  };
+
+  const report = planDispatches(state, [action]);
+
+  assert.equal(report.selected.length, 1);
+  assert.equal(report.selected[0].taskId, "task_builder");
+  assert.equal(report.effectiveCapacity.groups.architect.active, 1);
+  assert.equal(report.effectiveCapacity.groups.builder.selected, 1);
+});
+
+test("read-only architecture runs remain architect-concurrency limited", () => {
+  const state = fixtureState();
+  state.tasks = [
+    {
+      id: "task_architecture_a",
+      projectId: "project_1",
+      title: "Plan lifecycle controls",
+      status: "architecture_in_progress",
+    },
+    {
+      id: "task_architecture_b",
+      projectId: "project_1",
+      title: "Plan lease controls",
+      status: "architecture_pending",
+    },
+  ];
+  state.runs = [{
+    id: "run_architecture_a",
+    taskId: "task_architecture_a",
+    projectId: "project_1",
+    status: "running",
+    group: "architect",
+    role: "systems-architect",
+    actionType: "start_architecture",
+  }];
+  const action = {
+    id: "task_architecture_b:start_architecture",
+    type: "start_architecture",
+    role: "systems-architect",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_architecture_b",
+    taskTitle: "Plan lease controls",
+    taskStatus: "architecture_pending",
+  };
+
+  const report = planDispatches(state, [action]);
+
+  assert.equal(report.selected.length, 0);
+  assert.equal(report.skipped[0].reason, "architect_concurrency_limit");
+});
+
 function criticalCreditFixture() {
   const state = fixtureState();
   state.tasks.push({
