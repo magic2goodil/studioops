@@ -761,8 +761,10 @@ export function buildOwnerInbox(state, input = {}) {
 
   for (const task of state.tasks || []) {
     const project = findProject(state, task.projectId);
-    const blocked = taskAutomationCircuitIsCurrent(task)
-      || (task.status === "blocked" && Boolean(task.automationBlocker));
+    const circuitBlocker = task.automationBlocker?.type === "circuit";
+    const blocked = circuitBlocker
+      ? taskAutomationCircuitIsCurrent(task)
+      : task.status === "blocked" && Boolean(task.automationBlocker);
     if (blocked) {
       groupedItems.operations.push(operationTaskItem(state, task, input));
       continue;

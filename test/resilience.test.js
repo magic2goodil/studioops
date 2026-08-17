@@ -11,6 +11,7 @@ import {
   resumeOperatorAutomationInState,
   scheduleGitHubRemoteRecoveryProbeInState,
   setOperatorPauseInState,
+  taskAutomationCircuitIsCurrent,
   workflowSnapshotForTask,
 } from "../src/store.js";
 import { createSupervisorReport } from "../src/supervisor.js";
@@ -329,6 +330,62 @@ test("automation reconciliation preserves a matching blocked circuit", () => {
   assert.equal(state.tasks[0].automationCircuit.state, "open");
   assert.equal(state.tasks[0].automationBlocker.type, "circuit");
   assert.equal(result.some((action) => /superseded stale/.test(action)), false);
+});
+
+test("blocked circuit comparison detects immutable candidate drift", () => {
+  const snapshot = workflowSnapshotForTask({
+    status: "backend_review",
+    assignedAgentRole: "backend-reviewer",
+    reviewCycle: 1,
+    reviewSubjectCycle: 1,
+    reviewSubjectSha: "a".repeat(40),
+    candidateIdentity: {
+      commitSha: "a".repeat(40),
+      treeSha: "b".repeat(40),
+      baseSha: "c".repeat(40),
+      branch: "codex/demo-task",
+      candidateCycle: 1,
+    },
+    branchName: "codex/demo-task",
+  });
+  const state = stateWith({
+    ...snapshot,
+    status: "blocked",
+    assignedAgentRole: "owner",
+    automationBlocker: { type: "circuit", resumeStatus: "backend_review" },
+    automationCircuit: { state: "open", snapshot },
+  });
+
+  assert.equal(taskAutomationCircuitIsCurrent(state.tasks[0]), true);
+
+  state.tasks[0].reviewSubjectSha = "d".repeat(40);
+  state.tasks[0].candidateIdentity = {
+    ...state.tasks[0].candidateIdentity,
+    commitSha: "d".repeat(40),
+  };
+  assert.equal(taskAutomationCircuitIsCurrent(state.tasks[0]), false);
+
+  const result = reconcileAutomationStateInState(state, { now: "2026-07-21T12:00:00.000Z" });
+  assert.equal(state.tasks[0].automationCircuit.state, "superseded");
+  assert.equal(state.tasks[0].automationBlocker, undefined);
+  assert.ok(result.some((action) => /superseded stale automation circuit/.test(action)));
+});
+
+test("blocked circuit comparison detects branch drift", () => {
+  const snapshot = workflowSnapshotForTask({
+    status: "queued",
+    assignedAgentRole: "builder",
+    branchName: "codex/demo-task-old",
+  });
+  const state = stateWith({
+    status: "blocked",
+    assignedAgentRole: "owner",
+    branchName: "codex/demo-task-new",
+    automationBlocker: { type: "circuit", resumeStatus: "queued" },
+    automationCircuit: { state: "open", snapshot },
+  });
+
+  assert.equal(taskAutomationCircuitIsCurrent(state.tasks[0]), false);
 });
 
 test("task circuit reset compare-and-set rejects live drift without overwriting candidate state", () => {
