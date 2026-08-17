@@ -94,6 +94,43 @@ test("workspace cleanup leases are exclusive, expire for retry, and finalize ide
   assert.equal(releaseRunWorkspaceCleanupInState(state, "run_lease", { leaseId: "lease_a" }).state, "completed");
 });
 
+test("workspace capacity pressure uses only verified sizes and preserves failed cleanup evidence", () => {
+  const root = "/tmp/studioops-run-workspaces";
+  const state = baseState();
+  state.projects[0].repoPath = "/tmp/source/demo";
+  state.runs = [
+    { id: "run_verified", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/verified", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_verified-feature-verified`, completedAt: "2026-08-15T00:00:00.000Z" },
+    { id: "run_unverified", projectId: "project_1", projectKey: "demo", status: "failed", branchName: "feature/unverified", workspaceStrategy: "clone", workspacePath: `${root}/demo/run_unverified-feature-unverified`, completedAt: "2026-08-15T00:00:00.000Z", workspaceBytes: 999999 },
+  ];
+  const input = {
+    workspaceRoot: root,
+    nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    policy: { retainForHours: { failed: 1 }, maxRetainedBytes: 10, pressureMinAgeHours: 24 },
+    verifiedWorkspaceBytes: { run_verified: 20 },
+    pressure: true,
+  };
+  const candidates = eligibleRunWorkspaceSnapshotsInState(state, input);
+  assert.deepEqual(candidates.map((item) => item.runId), ["run_verified", "run_unverified"]);
+  assert.equal(candidates[0].logicalBytes, 20);
+  assert.equal(candidates[1].verified, false);
+  const claim = claimRunWorkspaceCandidatesInState(state, { ...input, leaseId: "lease_failed" });
+  const released = releaseRunWorkspaceCleanupInState(state, "run_verified", {
+    leaseId: claim.leaseId,
+    now: "2026-08-17T00:01:00.000Z",
+    logicalBytes: 20,
+    filesystemReclaimedBytes: 18,
+    reason: "disk_pressure",
+    error: "line one\nline two\u0000secret",
+  });
+  assert.equal(released.state, "released");
+  assert.equal(released.runId, "run_verified");
+  assert.equal(released.strategy, "clone");
+  assert.equal(released.logicalBytes, 20);
+  assert.equal(released.filesystemReclaimedBytes, 18);
+  assert.equal(released.reason, "disk_pressure");
+  assert.equal(released.error, "line one line two secret");
+});
+
 async function writeLegacyState(root, state = baseState()) {
   const dataDir = path.join(root, "data");
   await mkdir(dataDir, { recursive: true });
