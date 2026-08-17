@@ -11,6 +11,29 @@ const OWNER_NOTIFICATION_ACTIONS = new Set([
 ]);
 const MAX_NOTIFICATION_ATTEMPTS = 3;
 const NOTIFICATION_RETRY_MS = 5 * 60 * 1000;
+const DEFAULT_STUDIOOPS_BASE_URL = "http://127.0.0.1:4317";
+
+export function studioOpsBaseUrl(env = process.env) {
+  return String(
+    env.STUDIOOPS_BASE_URL
+      || env.MISSION_CONTROL_BASE_URL
+      || DEFAULT_STUDIOOPS_BASE_URL,
+  ).replace(/\/$/, "");
+}
+
+function taskActionUrl(taskId) {
+  return taskId ? `${studioOpsBaseUrl()}/tasks/${encodeURIComponent(taskId)}` : `${studioOpsBaseUrl()}/`;
+}
+
+function notificationEnvelope({ title, subtitle, body, taskId = "" }) {
+  return {
+    subject: title,
+    title,
+    subtitle,
+    body,
+    actionUrl: taskActionUrl(taskId),
+  };
+}
 
 function nextId(items, prefix) {
   const max = (items || [])
@@ -59,30 +82,33 @@ export function notificationRetryReady(item) {
   return !Number.isFinite(retryAt) || retryAt <= Date.now();
 }
 
-function notificationFor(state, run) {
+export function notificationFor(state, run) {
   const project = findProject(state, run.projectId);
   const task = findTask(state, run.taskId);
   if (run.status === "failed") {
     const failureNote = String(run.notes || run.exitCode || "").trim();
     const logHint = run.outputPath ? ` Log: ${run.outputPath}` : "";
-    return {
+    return notificationEnvelope({
       title: "StudioOps run failed",
       subtitle: `${project?.key || run.projectId} · ${run.id}`,
       body: `${task?.title || run.taskId}.${failureNote ? ` ${failureNote}` : ""}${logHint}`,
-    };
+      taskId: run.taskId,
+    });
   }
   if (run.actionType === "notify_qa_review" || run.actionType === "qa_bundle_ready") {
-    return {
+    return notificationEnvelope({
       title: "StudioOps QA review ready",
       subtitle: `${project?.key || run.projectId} · ${run.taskId}`,
       body: `${task?.title || "Task ready for local QA"}${run.integrationBranch ? ` · ${run.integrationBranch}` : ""}${run.prUrl ? ` · ${run.prUrl}` : ""}`,
-    };
+      taskId: run.taskId,
+    });
   }
-  return {
+  return notificationEnvelope({
     title: "StudioOps needs your review",
     subtitle: `${project?.key || run.projectId} · ${run.taskId}`,
     body: `${task?.title || "Task ready for owner review"}${run.prUrl ? ` · ${run.prUrl}` : ""}`,
-  };
+    taskId: run.taskId,
+  });
 }
 
 export function notificationForBundle(bundle) {
@@ -92,10 +118,21 @@ export function notificationForBundle(bundle) {
     .join("; ");
   const remainder = Math.max(0, (bundle.tasks || []).length - 4);
   const releaseCandidate = bundle.status === "release_candidate_ready";
-  return {
+  return notificationEnvelope({
     title: releaseCandidate ? "StudioOps release candidate ready" : "StudioOps QA bundle ready",
     subtitle: `${bundle.projectKey || bundle.projectId} · ${bundle.tasks?.length || 0} task(s)`,
     body: `${taskSummary}${remainder ? `; and ${remainder} more` : ""}${releaseCandidate ? ` · ${bundle.promotionPrUrl || bundle.promotionBranch || "PR ready"}` : bundle.previewUrl ? ` · ${bundle.previewUrl}` : ""}`,
+    taskId: bundle.tasks?.[0]?.id || "",
+  });
+}
+
+export function renderEmailNotification(notification) {
+  const envelope = notification || {};
+  return {
+    subject: String(envelope.subject || envelope.title || "StudioOps notification"),
+    body: [envelope.title || envelope.subject, envelope.subtitle, envelope.body, `Action: ${envelope.actionUrl || taskActionUrl("")}`]
+      .filter(Boolean)
+      .join("\n"),
   };
 }
 
@@ -224,12 +261,13 @@ export async function markNotificationAttempt(itemId, statusPatch, notificationT
 }
 
 export async function sendPendingNotifications(input = {}) {
-  const plan = await planNotifications(input);
+  const plan = input.plan || await planNotifications(input);
+  const sendNotification = input.sendNotification || sendMacNotification;
   const sent = [];
   for (const item of plan.pending) {
     if (input.dryRun) continue;
     try {
-      await sendMacNotification(item.notification);
+      await sendNotification(item.notification);
       sent.push(await markNotificationAttempt(item.id, {
         notificationStatus: "sent",
         notificationChannel: "macos",

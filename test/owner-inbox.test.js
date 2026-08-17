@@ -201,6 +201,10 @@ test("current owner exceptions remain decision-counted after desktop notificatio
   assert.equal(inbox.items[0].prUrl, "https://github.com/example/dollos/pull/36");
   assert.equal(inbox.items[0].checklist[0].taskId, "task_7");
   assert.match(inbox.items[0].checklist[0].text, /ritual duration/);
+  const responseBody = JSON.stringify(inbox);
+  assert.doesNotMatch(responseBody, /Mission Control/);
+  assert.match(responseBody, /Fix ritual duration/);
+  assert.match(responseBody, /https:\/\/github\.com\/example\/dollos\/pull\/36/);
 });
 
 test("standalone owner decisions require every current exact-SHA review", () => {

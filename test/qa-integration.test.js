@@ -15,6 +15,7 @@ import {
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
 import {
+  fetchQaTaskSource,
   planQaIntegrations,
   projectPlanHasWork,
   qaResultFingerprint,
@@ -370,6 +371,61 @@ test("review policy Trust Leads settings override stale top-level mirrors", () =
   );
   assert.equal(imported.reviewPolicy.trustLeadApprovals, true);
   assert.equal(imported.reviewPolicy.integrationBranch, "qa/imported");
+});
+
+test("QA scratch refs prefer current evidence and use legacy refs only as read-only fallback", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-refs-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  try {
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await git(repoPath, ["config", "user.email", "studioops-test@example.com"]);
+    await git(repoPath, ["config", "user.name", "StudioOps Test"]);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "main"]);
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "app.txt"), "current\n", "utf8");
+    await git(repoPath, ["commit", "-am", "current"]);
+    const currentSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "feature/task"]);
+    await git(repoPath, ["checkout", "main"]);
+
+    await git(repoPath, ["update-ref", "refs/mission-control/tasks/task_1", baseSha]);
+    await git(repoPath, ["update-ref", "refs/reviewer/unrelated", baseSha]);
+
+    const current = await fetchQaTaskSource(repoPath, {
+      id: "task_1",
+      branchName: "feature/task",
+    });
+    assert.equal(current.ok, true);
+    assert.equal(current.ref, "refs/studioops/tasks/task_1");
+    assert.equal(current.sourceRef, "refs/heads/feature/task");
+    assert.equal(current.headSha, currentSha);
+    assert.equal(
+      await git(repoPath, ["rev-parse", "refs/mission-control/tasks/task_1"]),
+      baseSha,
+    );
+    assert.equal(await git(repoPath, ["rev-parse", "refs/reviewer/unrelated"]), baseSha);
+
+    const legacyFallback = await fetchQaTaskSource(repoPath, { id: "task_1" });
+    assert.equal(legacyFallback.ok, true);
+    assert.equal(legacyFallback.ref, "refs/mission-control/tasks/task_1");
+    assert.equal(legacyFallback.sourceRef, "");
+    assert.equal(legacyFallback.headSha, baseSha);
+    assert.deepEqual(
+      (await git(repoPath, ["for-each-ref", "--format=%(refname)", "refs/mission-control"]))
+        .split("\n")
+        .filter(Boolean),
+      ["refs/mission-control/tasks/task_1"],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("QA integration skips already-ready tasks unless forced", () => {
@@ -1679,6 +1735,9 @@ test("protected QA branches use one idempotent integration PR and advance only a
     assert.equal(persisted.tasks[0].integrationPrUrl, pendingProject.integrationPr.url);
     assert.equal(persisted.tasks[0].integrationCheckState.state, "pending");
     assert.match(persisted.tasks[0].integrationBlocker, /required human review/);
+    assert.equal(persisted.comments.length, 1);
+    assert.equal(persisted.comments[0].author, "StudioOps QA Integration");
+    assert.match(persisted.comments[0].body, /^StudioOps /);
     assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
 
     const failed = await runQaIntegrationFixture(root, {
@@ -1694,6 +1753,15 @@ test("protected QA branches use one idempotent integration PR and advance only a
     assert.equal(failed.projects[0].integrationCandidateBranch, pendingProject.integrationCandidateBranch);
     assert.equal(failed.projects[0].integrationCheckState.failed, 1);
     assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+    persisted = readPersistedState(root);
+    assert.equal(
+      persisted.comments.filter((comment) => comment.author === "Mission Control QA Integration").length,
+      0,
+    );
+    assert.equal(
+      persisted.comments.filter((comment) => comment.author === "StudioOps QA Integration").length,
+      2,
+    );
 
     const checksPassed = await runQaIntegrationFixture(root, {
       input: { force: true },
