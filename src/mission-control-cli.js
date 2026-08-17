@@ -484,6 +484,7 @@ Automation:
   studioops automation-pause --reason "Incident investigation"
   studioops automation-resume --reason "Database and workers verified"
   studioops circuit-reset --task task_101 --expected-opened-at 2026-01-01T00:00:00.000Z --reason "Credentials verified"
+  studioops status task_1 --status builder_review --subject-sha SHA --tree-sha TREE --base-sha BASE --branch feature/x --impact-files src/x.js
   studioops supervisor --json
   studioops dispatcher --plan
   studioops runner --plan
@@ -859,6 +860,23 @@ Automation:
         throw new Error("Usage: status TASK_ID --status builder_review --subject-sha FULL_SHA (the exact full head SHA is required for reviewer intake)");
       }
       patch.subjectSha = subjectSha;
+      if (Object.prototype.hasOwnProperty.call(args, "branch")) patch.branchName = args.branch;
+      if (Object.prototype.hasOwnProperty.call(args, "branch-name")) patch.branchName = args["branch-name"];
+      if (Object.prototype.hasOwnProperty.call(args, "pr")) patch.prUrl = args.pr;
+      if (Object.prototype.hasOwnProperty.call(args, "pr-url")) patch.prUrl = args["pr-url"];
+      const candidateIdentity = {};
+      if (Object.prototype.hasOwnProperty.call(args, "tree-sha")) candidateIdentity.treeSha = args["tree-sha"];
+      if (Object.prototype.hasOwnProperty.call(args, "base-sha")) candidateIdentity.baseSha = args["base-sha"];
+      if (Object.keys(candidateIdentity).length) patch.candidateIdentity = candidateIdentity;
+      if (
+        Object.prototype.hasOwnProperty.call(args, "impact-files")
+        || Object.prototype.hasOwnProperty.call(args, "impact")
+      ) {
+        patch.impactEvidence = {
+          changedFiles: normalizeList(args["impact-files"]),
+          impact: normalizeList(args.impact),
+        };
+      }
     }
     const task = await updateTask(taskId, patch);
     console.log(`${task.id} -> ${task.status}`);
