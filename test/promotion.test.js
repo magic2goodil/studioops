@@ -138,6 +138,85 @@ function releaseCandidateFixture({ baseSha, sourceSha, integrationSha, prUrl }) 
   return candidate;
 }
 
+function mergedCandidateFixture({ baseSha, sourceSha, integrationSha, mergeCommit, prUrl }) {
+  const candidate = createCandidateEnvelope({
+    qaBundleId: "qa_bundle_2",
+    manifest: {
+      candidateId: "candidate_2",
+      projectId: "project_1",
+      base: { branch: "main", sha: baseSha },
+      sources: [{
+        taskId: "task_2",
+        sourceRef: "refs/heads/feature/replacement",
+        headSha: sourceSha,
+        candidateCycle: 1,
+        reviews: [{
+          id: "review_2",
+          stageKey: "lead",
+          role: "lead-reviewer",
+          outcome: "approved",
+          subjectSha: sourceSha,
+          candidateCycle: 1,
+          reviewedAt: "2026-07-25T13:05:00.000Z",
+        }],
+      }],
+      integration: { branch: "qa/candidate-replacement", sha: integrationSha },
+      checks: [{
+        id: "check_2",
+        kind: "local-validation",
+        name: "test -f replacement.txt",
+        outcome: "passed",
+        subjectSha: integrationSha,
+        evidenceDigest: `sha256:${"b".repeat(64)}`,
+      }],
+      preview: {
+        url: "http://127.0.0.1:4174/",
+        status: "healthy",
+        commitSha: integrationSha,
+        verifiedAt: "2026-07-25T13:10:00.000Z",
+        attestation: {
+          kind: "header",
+          key: "x-studioops-commit",
+          observedSha: integrationSha,
+        },
+      },
+      assembly: {
+        mode: "atomic",
+        requestedTaskIds: ["task_2"],
+        includedTaskIds: ["task_2"],
+        excludedTaskIds: [],
+      },
+    },
+    createdAt: "2026-07-25T13:10:00.000Z",
+  });
+  candidate.status = "merged";
+  candidate.qaDecision = {
+    outcome: "passed",
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationSha,
+    taskIds: ["task_2"],
+    author: "Owner QA",
+    notes: "",
+    repositoryVerifiedAt: "2026-07-25T13:11:00.000Z",
+    decidedAt: "2026-07-25T13:12:00.000Z",
+  };
+  candidate.promotion = {
+    branch: "qa/promotion-replacement",
+    prUrl,
+    commitSha: integrationSha,
+    manifestDigest: candidate.manifestDigest,
+    readyAt: "2026-07-25T13:13:00.000Z",
+  };
+  candidate.promotionMerge = {
+    mergeCommit,
+    mergedAt: "2026-07-25T13:14:00.000Z",
+    reconciledAt: "2026-07-25T13:15:00.000Z",
+  };
+  candidate.updatedAt = "2026-07-25T13:15:00.000Z";
+  return candidate;
+}
+
 test("promotion planning requires a complete candidate-level QA pass, not a status label", () => {
   const fixture = {
     baseSha: "a".repeat(40),
@@ -704,6 +783,68 @@ test("promotion reconciliation records an exact merged candidate once", async ()
     const second = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root });
     assert.equal(JSON.parse(second.stdout.trim()).projects.length, 0);
     assert.equal(readPersistedState(fixture.root).comments.length, state.comments.length);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("promotion reconciliation closes a superseded candidate when a trusted merged candidate contains it", async () => {
+  const fixture = await reconciliationFixture("CLOSED");
+  try {
+    await git(fixture.repoPath, ["checkout", "-b", "feature/replacement", fixture.sourceSha]);
+    await writeFile(path.join(fixture.repoPath, "replacement.txt"), "replacement\n", "utf8");
+    await git(fixture.repoPath, ["add", "replacement.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "replacement candidate"]);
+    const replacementSha = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "feature/replacement"]);
+    await git(fixture.repoPath, ["push", "origin", "HEAD:qa/candidate-replacement"]);
+    await git(fixture.repoPath, ["checkout", "main"]);
+    await git(fixture.repoPath, ["merge", "--no-ff", replacementSha, "-m", "merge replacement candidate"]);
+    const replacementMerge = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "main"]);
+
+    const state = JSON.parse(await readFile(path.join(fixture.root, "data", "mission-control.json"), "utf8"));
+    const replacement = mergedCandidateFixture({
+      baseSha: fixture.candidate.manifest.base.sha,
+      sourceSha: replacementSha,
+      integrationSha: replacementSha,
+      mergeCommit: replacementMerge,
+      prUrl: "https://github.com/example/demo/pull/43",
+    });
+    state.tasks.push({
+      id: "task_2",
+      projectId: "project_1",
+      title: "Replacement task",
+      status: "merged",
+      stateVersion: 2,
+      reviewCycle: 1,
+      reviewSubjectCycle: 1,
+      reviewSubjectSha: replacementSha,
+    });
+    state.candidates.push(replacement);
+    await writeState(fixture.root, state);
+
+    const script = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        env: { PATH: ${JSON.stringify(`${fixture.fakeBin}:/usr/local/bin:/usr/bin:/bin`)} }
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const first = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    const persisted = readPersistedState(fixture.root);
+
+    assert.equal(first.projects[0].status, "merged");
+    assert.equal(first.projects[0].reconciledByCandidateId, replacement.id);
+    assert.equal(persisted.tasks[0].status, "merged");
+    assert.equal(persisted.tasks[0].mergeEvidence.subjectSha, fixture.sourceSha);
+    assert.equal(persisted.tasks[0].mergeEvidence.reconciledByCandidateId, replacement.id);
+    assert.equal(persisted.tasks[0].mergeEvidence.mergeCommit, replacementMerge);
+    assert.equal(persisted.candidates[0].promotionMerge.reconciledByCandidateId, replacement.id);
+
+    const second = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    assert.equal(second.projects.length, 0);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
