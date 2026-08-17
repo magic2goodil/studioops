@@ -188,6 +188,51 @@ for (const [workflowMode, prUrl] of [
   });
 }
 
+test("builder-review status atomically persists complete immutable candidate evidence", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-builder-review-candidate-"));
+  try {
+    await writeLegacyState(root, builderReviewStatusState("github", "https://github.com/example/demo/pull/1"));
+    const env = await environmentForTestControlRoot(root);
+    const subjectSha = "d".repeat(40);
+    const treeSha = "e".repeat(40);
+    const baseSha = "f".repeat(40);
+    await execFileAsync(process.execPath, [
+      cliPath,
+      "status",
+      "task_1",
+      "--status",
+      "builder_review",
+      "--subject-sha",
+      subjectSha,
+      "--tree-sha",
+      treeSha,
+      "--base-sha",
+      baseSha,
+      "--branch",
+      "codex/demo-corrected",
+      "--pr-url",
+      "https://github.com/example/demo/pull/2",
+      "--impact-files",
+      "src/store.js,test/store.test.js",
+      "--impact",
+      "backend",
+    ], { cwd: root, env });
+
+    const task = (await readPersistedState(root, env)).tasks[0];
+    assert.equal(task.status, "builder_review");
+    assert.equal(task.reviewSubjectSha, subjectSha);
+    assert.equal(task.branchName, "codex/demo-corrected");
+    assert.equal(task.prUrl, "https://github.com/example/demo/pull/2");
+    assert.equal(task.candidateIdentity.commitSha, subjectSha);
+    assert.equal(task.candidateIdentity.treeSha, treeSha);
+    assert.equal(task.candidateIdentity.baseSha, baseSha);
+    assert.equal(task.candidateIdentity.branch, "codex/demo-corrected");
+    assert.deepEqual(task.candidateIdentity.impactEvidence.changedFiles, ["src/store.js", "test/store.test.js"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("builder-review status fails closed for missing or non-full subject SHA", async () => {
   for (const subjectSha of [null, "not-a-sha", "c".repeat(12)]) {
     const root = await mkdtemp(path.join(os.tmpdir(), "studioops-builder-review-invalid-"));

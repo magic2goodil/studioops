@@ -205,6 +205,63 @@ test("current impact evidence refreshes identity and unchanged-tree metadata rep
   assert.deepEqual(current.candidateIdentity.impactEvidence.changedFiles, ["src/App.jsx"]);
 });
 
+test("an atomic builder handoff replaces stale candidate coordinates without an intermediate review restart", async () => {
+  const originalSha = "6".repeat(40);
+  const correctedSha = "7".repeat(40);
+  const project = await addProject({
+    key: "atomic-candidate-handoff",
+    name: "Atomic candidate handoff",
+    workflowMode: "github",
+    deliveryPolicy: { profile: "prototype-fast-lane" },
+  });
+  const task = await addTask({
+    project: project.id,
+    title: "Reviewer correction",
+    status: "in_progress",
+    branchName: "feature/atomic-handoff",
+  });
+  const identity = {
+    commitSha: originalSha,
+    treeSha: "8".repeat(40),
+    baseSha: "9".repeat(40),
+    branch: "feature/atomic-handoff",
+    candidateCycle: 1,
+    impactEvidence: { changedFiles: ["src/store.js"] },
+  };
+
+  await updateTask(task.id, {
+    status: "builder_review",
+    subjectSha: originalSha,
+    impactEvidence: identity.impactEvidence,
+    candidateIdentity: identity,
+  });
+  await updateTask(task.id, { status: "in_progress" });
+  await updateTask(task.id, {
+    status: "builder_review",
+    subjectSha: correctedSha,
+    impactEvidence: identity.impactEvidence,
+    candidateIdentity: {
+      ...identity,
+      commitSha: correctedSha,
+      treeSha: "a".repeat(40),
+      candidateCycle: 2,
+    },
+  });
+
+  const state = await readState();
+  const current = state.tasks.find((item) => item.id === task.id);
+  assert.equal(current.status, "builder_review");
+  assert.equal(current.reviewCycle, 2);
+  assert.equal(current.reviewSubjectCycle, 2);
+  assert.equal(current.reviewSubjectSha, correctedSha);
+  assert.equal(current.candidateIdentity.commitSha, correctedSha);
+  assert.equal(current.candidateIdentity.treeSha, "a".repeat(40));
+  assert.equal(
+    state.events.some((event) => event.taskId === task.id && event.type === "review_subject_changed"),
+    false,
+  );
+});
+
 test("material impact changes invalidate same-SHA capability skips and start a new candidate cycle", async () => {
   const sha = "2".repeat(40);
   const project = await addProject({
