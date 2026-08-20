@@ -77,6 +77,82 @@ test("terminal run retention preserves configured attempt-budget evidence", () =
   assert.equal(state.runs.every((run) => run.maxAttempts === 5), true);
 });
 
+test("credit admission pause and recovery evidence round-trip through additive SQLite payloads", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-credit-pause-"));
+  try {
+    await writeLegacyState(root, baseState());
+    await runStoreScript(root, `
+      import {
+        mutateState,
+        persistCreditAdmissionPauseInState,
+      } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        persistCreditAdmissionPauseInState(state, state.tasks[0], {
+          actionType: "start_builder",
+          now: "2026-08-20T12:00:00.000Z",
+          creditAdmission: {
+            fallbackUsed: true,
+            allowed: false,
+            code: "fallback_concurrency_exhausted",
+            reasonCode: "fallback_concurrency_exhausted",
+            reason: "The bounded fallback concurrency limit is exhausted.",
+            snapshotStatus: "unknown",
+            snapshotSource: "studioops",
+            snapshotObservedAt: "2026-08-20T11:59:59.000Z",
+            snapshotAgeMs: 1000,
+            policyVersion: 1,
+            ruleId: "critical-bounded-v1",
+            tier: "critical",
+            explicitFailClosedMatch: false,
+            estimatedCredits: 30,
+            estimatedTokensPerRun: 120000,
+            maxConcurrentRuns: 1,
+            maxAttempts: 1,
+            maxInFlightEstimatedTokens: 120000,
+            retryEvidence: { attempted: true, attemptCount: 1, initialSnapshotStatus: "unknown", resultSnapshotStatus: "unknown" },
+            observedCounters: { activeRuns: 1, selectedRuns: 0, reservedRuns: 1, attemptsConsumed: 0, activeEstimatedTokens: 120000, selectedEstimatedTokens: 0, reservedEstimatedTokens: 120000 },
+          },
+        });
+      });
+    `);
+    let persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].status, "ready");
+    assert.equal(persisted.tasks[0].creditAdmissionPause.active, true);
+    assert.equal(persisted.tasks[0].creditAdmissionPause.creditAdmission.retryEvidence.attemptCount, 1);
+    assert.deepEqual(
+      persisted.comments[0].creditAdmission,
+      persisted.events.find((event) => event.type === "credit_admission_paused").creditAdmission,
+    );
+
+    await runStoreScript(root, `
+      import {
+        mutateState,
+        recoverCreditAdmissionPauseInState,
+      } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        recoverCreditAdmissionPauseInState(state, state.tasks[0], {
+          now: "2026-08-20T12:01:00.000Z",
+          creditAdmission: {
+            fallbackUsed: false,
+            allowed: true,
+            code: "included_quota_available",
+            reasonCode: "included_quota_available",
+            snapshotStatus: "available",
+            snapshotSource: "studioops",
+            tier: "critical",
+          },
+        });
+      });
+    `);
+    persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].creditAdmissionPause.active, false);
+    assert.equal(persisted.tasks[0].creditAdmissionPause.recoveryEvidence.snapshotStatus, "available");
+    assert.equal(persisted.events.filter((event) => event.type === "credit_admission_recovered").length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("workspace retention eligibility is age bounded, ordered, and protects active or unsafe paths", () => {
   const root = "/tmp/studioops-run-workspaces";
   const state = baseState();

@@ -8,7 +8,9 @@ import {
   findTask,
   generatePrompt,
   mutateState,
+  persistCreditAdmissionPauseInState,
   readState,
+  recoverCreditAdmissionPauseInState,
   resetAutomationCircuitInState,
   reviewStagesForTask,
   taskAutomationCircuitIsCurrent,
@@ -149,6 +151,123 @@ function executionAttemptCount(state, attemptKey) {
   )).length;
 }
 
+function creditExecution(task, action, options) {
+  return {
+    ...resolveExecutionPolicy(task, action, options),
+    labels: normalizeList(task.labels),
+  };
+}
+
+function fallbackReservationKey(admission = {}) {
+  return [admission.policyVersion ?? "unversioned", admission.ruleId || "unclassified", admission.tier || "unclassified"].join(":");
+}
+
+function createFallbackPlanningState(state) {
+  const attemptsByKey = new Map();
+  const reservationsByRule = new Map();
+  for (const run of state.runs || []) {
+    if (run.attemptKey && executionAttemptWasConsumed(run)) {
+      attemptsByKey.set(run.attemptKey, Number(attemptsByKey.get(run.attemptKey) || 0) + 1);
+    }
+    const evidence = run.creditAdmission;
+    if (!ACTIVE_RUN_STATUSES.has(run.status) || evidence?.fallbackUsed !== true) continue;
+    const key = fallbackReservationKey(evidence);
+    const reservation = reservationsByRule.get(key) || {
+      activeRuns: 0,
+      selectedRuns: 0,
+      activeEstimatedTokens: 0,
+      selectedEstimatedTokens: 0,
+    };
+    reservation.activeRuns += 1;
+    reservation.activeEstimatedTokens += Math.max(0, Number(evidence.estimatedTokensPerRun || 0));
+    reservationsByRule.set(key, reservation);
+  }
+  return { attemptsByKey, reservationsByRule };
+}
+
+function fallbackObservedCounters(planning, admission, attemptCount) {
+  const reservation = planning.reservationsByRule.get(fallbackReservationKey(admission)) || {
+    activeRuns: 0,
+    selectedRuns: 0,
+    activeEstimatedTokens: 0,
+    selectedEstimatedTokens: 0,
+  };
+  return {
+    activeRuns: reservation.activeRuns,
+    selectedRuns: reservation.selectedRuns,
+    reservedRuns: reservation.activeRuns + reservation.selectedRuns,
+    attemptsConsumed: attemptCount,
+    activeEstimatedTokens: reservation.activeEstimatedTokens,
+    selectedEstimatedTokens: reservation.selectedEstimatedTokens,
+    reservedEstimatedTokens: reservation.activeEstimatedTokens + reservation.selectedEstimatedTokens,
+  };
+}
+
+function sanitizedRetryEvidence(value, admission) {
+  const evidence = value && typeof value === "object" ? value : {};
+  const snapshotStatuses = new Set(["unknown", "stale", "available", "recovered", "disabled"]);
+  const snapshotSources = new Set(["codex-app-server", "studioops", "unclassified"]);
+  const normalizedStatus = (candidate, fallback) => {
+    const status = String(candidate || "").trim().toLowerCase();
+    return snapshotStatuses.has(status) ? status : fallback;
+  };
+  const normalizedSource = (candidate, fallback = "unclassified") => {
+    const source = String(candidate || "").trim().toLowerCase();
+    return snapshotSources.has(source) ? source : fallback;
+  };
+  const normalizedTimestamp = (candidate) => {
+    const parsed = Date.parse(String(candidate || ""));
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : "";
+  };
+  const normalizedAge = (candidate) => {
+    const parsed = Number(candidate);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  };
+  return {
+    attempted: evidence.attempted === true,
+    attemptCount: evidence.attempted === true ? 1 : 0,
+    initialSnapshotStatus: normalizedStatus(evidence.initialSnapshotStatus, admission.snapshotStatus),
+    initialSnapshotSource: normalizedSource(evidence.initialSnapshotSource, admission.snapshotSource),
+    initialSnapshotObservedAt: normalizedTimestamp(evidence.initialSnapshotObservedAt),
+    initialSnapshotAgeMs: normalizedAge(evidence.initialSnapshotAgeMs),
+    resultSnapshotStatus: normalizedStatus(evidence.resultSnapshotStatus, admission.snapshotStatus),
+    resultSnapshotSource: normalizedSource(evidence.resultSnapshotSource, admission.snapshotSource),
+    resultSnapshotObservedAt: normalizedTimestamp(evidence.resultSnapshotObservedAt),
+    resultSnapshotAgeMs: normalizedAge(evidence.resultSnapshotAgeMs),
+  };
+}
+
+function fallbackEvidence(admission, options, observedCounters, override = {}) {
+  const decision = override.allowed ?? admission.allowed;
+  return {
+    ...admission,
+    ...override,
+    decision: decision ? "allowed" : "blocked",
+    snapshotClass: admission.snapshotStatus,
+    retryEvidence: sanitizedRetryEvidence(options.creditSnapshotRetryEvidence || {
+      attempted: false,
+      attemptCount: 0,
+      initialSnapshotStatus: admission.snapshotStatus,
+      resultSnapshotStatus: admission.snapshotStatus,
+    }, admission),
+    observedCounters: structuredClone(observedCounters),
+  };
+}
+
+function reserveFallbackSelection(planning, admission) {
+  if (admission?.fallbackUsed !== true || admission.allowed !== true) return;
+  const key = fallbackReservationKey(admission);
+  const reservation = planning.reservationsByRule.get(key) || {
+    activeRuns: 0,
+    selectedRuns: 0,
+    activeEstimatedTokens: 0,
+    selectedEstimatedTokens: 0,
+  };
+  reservation.selectedRuns += 1;
+  reservation.selectedEstimatedTokens += Math.max(0, Number(admission.estimatedTokensPerRun || 0));
+  planning.reservationsByRule.set(key, reservation);
+}
+
 function hasExistingDispatch(state, action, task) {
   const key = dispatchKeyFor(task, action);
   return (state.runs || []).some((run) => (
@@ -245,25 +364,34 @@ function findLaneConflict(state, selected, action, task) {
   return conflict ? { conflict, profile } : { conflict: null, profile };
 }
 
-function needsUnknownCreditSnapshotRetry(state, actions, options) {
-  if (options.dryRun) return false;
-  return (actions || []).some((action) => {
-    if (!DISPATCHABLE_ACTIONS.has(action.type) || runGroupFor(action) === "owner") return false;
-    if (!projectAllowed(action, options)) return false;
+function degradedCreditSnapshotRetry(state, actions, options) {
+  if (options.dryRun) return null;
+  for (const action of actions || []) {
+    if (!DISPATCHABLE_ACTIONS.has(action.type) || runGroupFor(action) === "owner") continue;
+    if (!projectAllowed(action, options)) continue;
     const task = findTask(state, action.taskId);
-    if (!task || task.automationCircuit?.state === "open") return false;
-    if (hasExistingDispatch(state, action, task)) return false;
-    if (action.taskStatus && task.status !== action.taskStatus) return false;
-    if (reviewDispatchSafetyReason(state, task, action)) return false;
-    if (preCreditDispatchSafetyReason(state, task, action, options)) return false;
-    const executionPolicy = resolveExecutionPolicy(task, action, options);
+    if (!task || task.automationCircuit?.state === "open") continue;
+    if (hasExistingDispatch(state, action, task)) continue;
+    if (action.taskStatus && task.status !== action.taskStatus) continue;
+    if (reviewDispatchSafetyReason(state, task, action)) continue;
+    if (preCreditDispatchSafetyReason(state, task, action, options)) continue;
+    const executionPolicy = creditExecution(task, action, options);
     const admission = assessCreditAdmission(
       options.creditSnapshot,
       executionPolicy,
       options.creditPolicy,
     );
-    return admission.code === "credit_snapshot_unknown";
-  });
+    if (!["unknown", "stale"].includes(admission.snapshotStatus)) continue;
+    return {
+      attempted: true,
+      attemptCount: 1,
+      initialSnapshotStatus: admission.snapshotStatus,
+      initialSnapshotSource: admission.snapshotSource,
+      initialSnapshotObservedAt: admission.snapshotObservedAt,
+      initialSnapshotAgeMs: admission.snapshotAgeMs,
+    };
+  }
+  return null;
 }
 
 function preCreditDispatchSafetyReason(state, task, action, options) {
@@ -286,12 +414,12 @@ function preCreditDispatchSafetyReason(state, task, action, options) {
   return "";
 }
 
-function dispatchSafetyReason(state, task, action, options) {
+function dispatchSafetyAssessment(state, task, action, options, planning) {
   const preCreditReason = preCreditDispatchSafetyReason(state, task, action, options);
-  if (preCreditReason) return preCreditReason;
-  if (runGroupFor(action) === "owner") return "";
-  const executionPolicy = resolveExecutionPolicy(task, action, options);
-  const creditAdmission = assessCreditAdmission(
+  if (preCreditReason) return { reason: preCreditReason };
+  if (runGroupFor(action) === "owner") return { reason: "" };
+  const executionPolicy = creditExecution(task, action, options);
+  let creditAdmission = assessCreditAdmission(
     options.creditSnapshot,
     executionPolicy,
     options.creditPolicy,
@@ -299,12 +427,54 @@ function dispatchSafetyReason(state, task, action, options) {
   if (
     executionPolicy.costBudget > 0
     && Number(creditAdmission.estimatedCredits || 0) > executionPolicy.costBudget
-  ) return "task_budget:estimated_cost_exceeds_budget";
-  if (!creditAdmission.allowed) return `credit_gate:${creditAdmission.code}`;
+  ) return { reason: "task_budget:estimated_cost_exceeds_budget", creditAdmission, executionPolicy };
   const attemptKey = executionAttemptKey(task, action);
-  const attemptCount = executionAttemptCount(state, attemptKey);
-  if (attemptCount >= executionPolicy.maxAttempts) return "attempt_budget_exhausted";
-  return "";
+  const attemptCount = Number(planning.attemptsByKey.get(attemptKey) || 0);
+  if (creditAdmission.fallbackUsed) {
+    const observedCounters = fallbackObservedCounters(planning, creditAdmission, attemptCount);
+    creditAdmission = fallbackEvidence(creditAdmission, options, observedCounters);
+    if (!creditAdmission.allowed) {
+      return { reason: `credit_gate:${creditAdmission.code}`, creditAdmission, executionPolicy, attemptKey, attemptCount };
+    }
+    const effectiveMaxAttempts = Math.min(executionPolicy.maxAttempts, creditAdmission.maxAttempts);
+    if (attemptCount >= effectiveMaxAttempts) {
+      creditAdmission = fallbackEvidence(creditAdmission, options, observedCounters, {
+        allowed: false,
+        code: "fallback_attempt_budget_exhausted",
+        reasonCode: "fallback_attempt_budget_exhausted",
+        reason: `The bounded fallback attempt limit is exhausted (${attemptCount}/${effectiveMaxAttempts}).`,
+      });
+      return { reason: `credit_gate:${creditAdmission.code}`, creditAdmission, executionPolicy, attemptKey, attemptCount };
+    }
+    if (observedCounters.reservedRuns >= creditAdmission.maxConcurrentRuns) {
+      creditAdmission = fallbackEvidence(creditAdmission, options, observedCounters, {
+        allowed: false,
+        code: "fallback_concurrency_exhausted",
+        reasonCode: "fallback_concurrency_exhausted",
+        reason: `The bounded fallback concurrency limit is exhausted (${observedCounters.reservedRuns}/${creditAdmission.maxConcurrentRuns}).`,
+      });
+      return { reason: `credit_gate:${creditAdmission.code}`, creditAdmission, executionPolicy, attemptKey, attemptCount };
+    }
+    if (
+      observedCounters.reservedEstimatedTokens + creditAdmission.estimatedTokensPerRun
+      > creditAdmission.maxInFlightEstimatedTokens
+    ) {
+      creditAdmission = fallbackEvidence(creditAdmission, options, observedCounters, {
+        allowed: false,
+        code: "fallback_token_reservation_exhausted",
+        reasonCode: "fallback_token_reservation_exhausted",
+        reason: "The bounded fallback aggregate estimated-token reservation is exhausted.",
+      });
+      return { reason: `credit_gate:${creditAdmission.code}`, creditAdmission, executionPolicy, attemptKey, attemptCount };
+    }
+  }
+  if (!creditAdmission.allowed) {
+    return { reason: `credit_gate:${creditAdmission.code}`, creditAdmission, executionPolicy, attemptKey, attemptCount };
+  }
+  if (attemptCount >= executionPolicy.maxAttempts) {
+    return { reason: "attempt_budget_exhausted", creditAdmission, executionPolicy, attemptKey, attemptCount };
+  }
+  return { reason: "", creditAdmission, executionPolicy, attemptKey, attemptCount };
 }
 
 function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
@@ -316,12 +486,13 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
     const task = findTask(state, item.taskId);
     const action = skippedAction(actions, item);
     if (!task || !action || task.automationCircuit?.state === "open") continue;
-    const executionPolicy = resolveExecutionPolicy(task, action, options);
-    const admission = assessCreditAdmission(
+    const executionPolicy = creditExecution(task, action, options);
+    const admission = item.creditAdmission || assessCreditAdmission(
       options.creditSnapshot,
       executionPolicy,
       options.creditPolicy,
     );
+    if (creditGate && admission.fallbackUsed) continue;
     const resumeStatus = task.status;
     const snapshot = workflowSnapshotForTask(task);
     task.status = "blocked";
@@ -388,6 +559,45 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
   return openedTaskIds;
 }
 
+function persistCreditAdmissionPauses(state, actions, skipped, now) {
+  const pausedTaskIds = new Set();
+  for (const item of skipped || []) {
+    if (!String(item.reason || "").startsWith("credit_gate:")) continue;
+    if (item.creditAdmission?.fallbackUsed !== true) continue;
+    const task = findTask(state, item.taskId);
+    const action = skippedAction(actions, item);
+    if (!task || !action) continue;
+    const result = persistCreditAdmissionPauseInState(state, task, {
+      actionType: action.type,
+      creditAdmission: item.creditAdmission,
+      now,
+    });
+    if (result.created) pausedTaskIds.add(task.id);
+  }
+  return pausedTaskIds;
+}
+
+function recoverCreditAdmissionPausesInState(state, options, now) {
+  if (!options.creditPolicy?.enabled) return [];
+  const recovered = [];
+  for (const task of state.tasks || []) {
+    const pause = task.creditAdmissionPause;
+    if (pause?.active !== true) continue;
+    const admission = assessCreditAdmission(
+      options.creditSnapshot,
+      { modelTier: pause.creditAdmission?.tier || "", labels: normalizeList(task.labels) },
+      options.creditPolicy,
+    );
+    if (!["available", "recovered"].includes(admission.snapshotStatus)) continue;
+    const result = recoverCreditAdmissionPauseInState(state, task, {
+      creditAdmission: admission,
+      now,
+    });
+    if (result.recovered) recovered.push(task.id);
+  }
+  return recovered;
+}
+
 export function recoverAffordableCreditCircuitsInState(state, options = {}, input = {}) {
   const snapshot = options.creditSnapshot;
   if (!options.creditPolicy?.enabled || snapshot?.status !== "available") return [];
@@ -409,7 +619,11 @@ export function recoverAffordableCreditCircuitsInState(state, options = {}, inpu
       { modelTier: blocker.modelTier },
       options.creditPolicy,
     );
-    if (!admission.allowed) continue;
+    if (
+      !admission.allowed
+      || admission.fallbackUsed
+      || !["available", "recovered"].includes(admission.snapshotStatus)
+    ) continue;
 
     resetAutomationCircuitInState(state, {
       task: task.id,
@@ -666,7 +880,10 @@ function dispatchComment(run, action) {
   if (action.type === "notify_owner") {
     return `Owner review notification queued as dispatch ${run.id}. Task is ready for final human review. StudioOps did not merge or deploy it; production requires a separate explicit human release decision bound to the immutable candidate packet.${action.prUrl ? `\n\nPR: ${action.prUrl}` : ""}`;
   }
-  return `Dispatched ${action.role || "worker"} work as ${run.id} using provider ${run.provider}. The prompt snapshot is stored on the run record.${action.promptCommand ? `\n\nPrompt command: \`${action.promptCommand}\`` : ""}`;
+  const creditEvidence = run.creditAdmission?.fallbackUsed
+    ? ` Bounded fallback evidence: ${run.creditAdmission.code}; tier/rule ${run.creditAdmission.tier}/${run.creditAdmission.ruleId}; ${run.creditAdmission.estimatedTokensPerRun} estimated tokens reserved for admission only.`
+    : "";
+  return `Dispatched ${action.role || "worker"} work as ${run.id} using provider ${run.provider}. The prompt snapshot is stored on the run record.${creditEvidence}${action.promptCommand ? `\n\nPrompt command: \`${action.promptCommand}\`` : ""}`;
 }
 
 function projectAllowed(action, options) {
@@ -675,7 +892,7 @@ function projectAllowed(action, options) {
   return onlyProjects.includes(action.projectKey) || onlyProjects.includes(action.projectId);
 }
 
-function makeRun(state, task, action, options, now) {
+function makeRun(state, task, action, options, now, assessment = {}) {
   const group = runGroupFor(action);
   const role = action.role || (group === "owner" ? "owner" : "builder");
   const prompt = action.type === "qa_integration_blocked"
@@ -692,14 +909,19 @@ function makeRun(state, task, action, options, now) {
     ? ""
     : requestedThreadId;
   const profile = laneProfile(task, action);
-  const executionPolicy = resolveExecutionPolicy(task, action, options);
-  const creditAdmission = assessCreditAdmission(
+  const executionPolicy = assessment.executionPolicy || creditExecution(task, action, options);
+  const creditAdmission = assessment.creditAdmission || assessCreditAdmission(
     options.creditSnapshot,
     executionPolicy,
     options.creditPolicy,
   );
-  const attemptKey = executionAttemptKey(task, action);
-  const attempt = executionAttemptCount(state, attemptKey) + 1;
+  const attemptKey = assessment.attemptKey || executionAttemptKey(task, action);
+  const attempt = Number.isFinite(assessment.attemptCount)
+    ? assessment.attemptCount + 1
+    : executionAttemptCount(state, attemptKey) + 1;
+  const maxAttempts = creditAdmission.fallbackUsed
+    ? Math.min(executionPolicy.maxAttempts, creditAdmission.maxAttempts)
+    : executionPolicy.maxAttempts;
   return {
     id: nextId(state.runs, "run"),
     taskId: task.id,
@@ -728,19 +950,10 @@ function makeRun(state, task, action, options, now) {
       recordedAt: now,
     },
     reviewerIdentity: action.reviewerIdentity || "",
-    creditAdmission: {
-      code: creditAdmission.code,
-      tier: creditAdmission.tier,
-      estimatedCredits: creditAdmission.estimatedCredits,
-      minRemainingPercent: creditAdmission.minRemainingPercent,
-      remainingPercent: Number.isFinite(creditAdmission.remainingPercent)
-        ? creditAdmission.remainingPercent
-        : null,
-      snapshotStatus: creditAdmission.snapshotStatus,
-    },
+    creditAdmission: structuredClone(creditAdmission),
     attemptKey,
     attempt,
-    maxAttempts: executionPolicy.maxAttempts,
+    maxAttempts,
     retryBackoffMs: executionPolicy.retryBackoffMs,
     staleRunMs: executionPolicy.staleRunMs,
     status: dispatchStatusFor(action),
@@ -769,6 +982,7 @@ export function planDispatches(state, actions, input = {}) {
   const maxDispatches = Math.max(1, Number(options.maxDispatchesPerSweep || DEFAULTS.maxDispatchesPerSweep));
   const selected = [];
   const skipped = [];
+  const creditPlanning = createFallbackPlanningState(state);
 
   for (const action of actions || []) {
     if (selected.length >= maxDispatches) {
@@ -811,9 +1025,9 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: reviewSafetyReason });
       continue;
     }
-    const safetyReason = dispatchSafetyReason(state, task, action, options);
-    if (safetyReason) {
-      skipped.push({ action, reason: safetyReason });
+    const safety = dispatchSafetyAssessment(state, task, action, options, creditPlanning);
+    if (safety.reason) {
+      skipped.push({ action, reason: safety.reason, creditAdmission: safety.creditAdmission });
       continue;
     }
     const group = runGroupFor(action);
@@ -834,8 +1048,9 @@ export function planDispatches(state, actions, input = {}) {
       });
       continue;
     }
-    selected.push({ action, task, group, profile });
+    selected.push({ action, task, group, profile, creditAssessment: safety });
     counts[group] = (counts[group] || 0) + 1;
+    reserveFallbackSelection(creditPlanning, safety.creditAdmission);
   }
 
   return {
@@ -843,7 +1058,7 @@ export function planDispatches(state, actions, input = {}) {
       maxDispatchesPerSweep: maxDispatches,
       groups: effectiveGroupCapacity(options, initialCounts, counts),
     },
-    selected: selected.map(({ action, task, group, profile }) => ({
+    selected: selected.map(({ action, task, group, profile, creditAssessment }) => ({
       action,
       taskId: task.id,
       taskTitle: task.title,
@@ -852,6 +1067,8 @@ export function planDispatches(state, actions, input = {}) {
       conflictGroup: profile.conflictGroup,
       fileScope: profile.fileScope,
       fileScopeExplicit: profile.fileScopeExplicit,
+      creditAdmission: creditAssessment.creditAdmission,
+      creditAssessment,
     })),
     skipped: skipped.map(({ action, reason, ...details }) => ({
       actionId: action?.id || "",
@@ -870,9 +1087,31 @@ export async function dispatchSupervisorActions(actions, input = {}) {
   const preflightOptions = { ...DEFAULTS, ...dispatchInput };
   if (!preflightOptions.dryRun && preflightOptions.creditPolicy?.enabled) {
     const preflightState = inputState || await readState();
-    if (needsUnknownCreditSnapshotRetry(preflightState, actions, preflightOptions)) {
+    const retryEvidence = degradedCreditSnapshotRetry(preflightState, actions, preflightOptions);
+    if (retryEvidence) {
       const probe = input.creditSnapshotProbe || requestCodexCreditSnapshot;
-      dispatchInput.creditSnapshot = await probe(preflightOptions.creditPolicy);
+      try {
+        dispatchInput.creditSnapshot = await probe(preflightOptions.creditPolicy);
+      } catch {
+        dispatchInput.creditSnapshot = {
+          status: "unknown",
+          source: "studioops",
+          observedAt: new Date().toISOString(),
+          reason: "Credit telemetry probe failed.",
+        };
+      }
+      const postProbeAdmission = assessCreditAdmission(
+        dispatchInput.creditSnapshot,
+        { modelTier: "mechanical" },
+        preflightOptions.creditPolicy,
+      );
+      dispatchInput.creditSnapshotRetryEvidence = {
+        ...retryEvidence,
+        resultSnapshotStatus: postProbeAdmission.snapshotStatus,
+        resultSnapshotSource: postProbeAdmission.snapshotSource,
+        resultSnapshotObservedAt: postProbeAdmission.snapshotObservedAt,
+        resultSnapshotAgeMs: postProbeAdmission.snapshotAgeMs,
+      };
     }
   }
   const mutate = input.state
@@ -885,6 +1124,9 @@ export async function dispatchSupervisorActions(actions, input = {}) {
 
     const now = new Date().toISOString();
     const options = { ...DEFAULTS, ...dispatchInput };
+    const recoveredCreditPauseTaskIds = options.dryRun
+      ? []
+      : recoverCreditAdmissionPausesInState(state, options, now);
     const recoveredCreditCircuitTaskIds = options.dryRun
       ? []
       : recoverAffordableCreditCircuitsInState(state, options, { now });
@@ -899,6 +1141,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         effectiveCapacity: plan.effectiveCapacity,
         selected: plan.selected,
         skipped: plan.skipped,
+        recoveredCreditPauseTaskIds,
         recoveredCreditCircuitTaskIds,
       };
     }
@@ -918,6 +1161,12 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       now,
     );
     for (const taskId of creditBlockedTaskIds) openedTaskIds.add(taskId);
+    const pausedCreditAdmissionTaskIds = persistCreditAdmissionPauses(
+      state,
+      actions,
+      plan.skipped,
+      now,
+    );
     const selected = plan.selected.filter((item) => (
       !openedTaskIds.has(item.taskId) || item.group === "owner"
     ));
@@ -936,7 +1185,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
     for (const item of selected) {
       const task = findTask(state, item.taskId);
       if (!task) continue;
-      const run = makeRun(state, task, item.action, options, now);
+      const run = makeRun(state, task, item.action, options, now, item.creditAssessment);
       state.runs.push(run);
       runs.push(run);
 
@@ -951,6 +1200,9 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         taskId: task.id,
         author: "StudioOps Dispatcher",
         body: dispatchComment(run, item.action),
+        ...(run.creditAdmission?.fallbackUsed
+          ? { creditAdmission: structuredClone(run.creditAdmission) }
+          : {}),
         createdAt: now,
       });
 
@@ -960,8 +1212,22 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         projectId: task.projectId,
         taskId: task.id,
         message: `${task.title} dispatched to ${run.role} as ${run.id} (${run.model}, ${run.modelReasoningEffort})`,
+        ...(run.creditAdmission?.fallbackUsed
+          ? { creditAdmission: structuredClone(run.creditAdmission) }
+          : {}),
         createdAt: now,
       });
+      if (run.creditAdmission?.fallbackUsed) {
+        state.events.push({
+          id: nextId(state.events, "event"),
+          type: "credit_fallback_dispatched",
+          projectId: task.projectId,
+          taskId: task.id,
+          message: `${task.title}: bounded fallback admitted ${run.id} under ${run.creditAdmission.ruleId}`,
+          creditAdmission: structuredClone(run.creditAdmission),
+          createdAt: now,
+        });
+      }
     }
 
     return {
@@ -971,6 +1237,8 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       effectiveCapacity: plan.effectiveCapacity,
       selected,
       skipped,
+      pausedCreditAdmissionTaskIds: [...pausedCreditAdmissionTaskIds],
+      recoveredCreditPauseTaskIds,
       recoveredCreditCircuitTaskIds,
     };
   });
