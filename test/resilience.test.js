@@ -6,6 +6,7 @@ import {
   applyGitHubRemoteRecoveryProbeResultInState,
   automationTick,
   claimDueGitHubRemoteRecoveryProbesInState,
+  persistCreditAdmissionPauseInState,
   reconcileAutomationStateInState,
   resetAutomationCircuitInState,
   resumeOperatorAutomationInState,
@@ -206,6 +207,35 @@ test("transient recovery opens a circuit instead of looping after the recovery b
   assert.equal(state.tasks[0].automationCircuit.state, "open");
   assert.equal(state.tasks[0].automationCircuit.snapshot.status, "queued");
   assert.equal(state.tasks[0].automationBlocker.type, "circuit");
+});
+
+test("credit admission pauses remain supervisor-eligible and never become failure circuits", () => {
+  const state = stateWith({ status: "ready", assignedAgentRole: "" });
+  persistCreditAdmissionPauseInState(state, state.tasks[0], {
+    actionType: "start_builder",
+    now: "2026-07-21T11:00:00.000Z",
+    creditAdmission: {
+      fallbackUsed: true,
+      allowed: false,
+      code: "credit_snapshot_unknown",
+      reasonCode: "configured_fail_closed_rule",
+      snapshotStatus: "unknown",
+      policyVersion: 1,
+      ruleId: "frontier-fail-closed-v1",
+      tier: "frontier",
+      retryEvidence: { attempted: true, attemptCount: 1 },
+      observedCounters: { reservedRuns: 0, reservedEstimatedTokens: 0 },
+    },
+  });
+
+  const actions = reconcileAutomationStateInState(state, { nowMs: NOW });
+
+  assert.equal(state.tasks[0].status, "ready");
+  assert.equal(state.tasks[0].assignedAgentRole, "");
+  assert.equal(state.tasks[0].automationCircuit, undefined);
+  assert.equal(state.tasks[0].automationBlocker, undefined);
+  assert.equal(state.tasks[0].creditAdmissionPause.active, true);
+  assert.equal(actions.some((action) => action.includes("circuit")), false);
 });
 
 test("operator pause prevents automation state advancement", async () => {

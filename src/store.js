@@ -3139,6 +3139,113 @@ export function workflowSnapshotForTask(task, overrides = {}) {
   };
 }
 
+function creditAdmissionPauseFingerprint(task, input = {}) {
+  const evidence = input.creditAdmission || {};
+  return [
+    task.id,
+    String(input.actionType || "unknown_action"),
+    String(evidence.ruleId || "unclassified_rule"),
+    String(evidence.snapshotStatus || "unknown"),
+  ].join(":");
+}
+
+function creditAdmissionAuditBody(prefix, evidence = {}) {
+  const observed = evidence.observedCounters || {};
+  return `${prefix} Decision: ${evidence.code || "unknown"} (${evidence.reasonCode || "unclassified"}). `
+    + `Tier/rule: ${evidence.tier || "unclassified"}/${evidence.ruleId || "unclassified"}. `
+    + `Snapshot: ${evidence.snapshotStatus || "unknown"}; probe attempts: ${Number(evidence.retryEvidence?.attemptCount || 0)}. `
+    + `Fallback reservations at admission: ${Number(observed.reservedRuns || 0)} runs, `
+    + `${Number(observed.reservedEstimatedTokens || 0)} estimated tokens. `
+    + "Estimated tokens are admission reservations, not provider output limits.";
+}
+
+export function persistCreditAdmissionPauseInState(state, task, input = {}) {
+  const now = input.now || new Date().toISOString();
+  const creditAdmission = structuredClone(input.creditAdmission || {});
+  const fingerprint = creditAdmissionPauseFingerprint(task, {
+    actionType: input.actionType,
+    creditAdmission,
+  });
+  const current = task.creditAdmissionPause;
+  if (current?.active === true && current.fingerprint === fingerprint) {
+    return { created: false, pause: current };
+  }
+
+  const pause = {
+    active: true,
+    fingerprint,
+    actionType: String(input.actionType || ""),
+    policyVersion: creditAdmission.policyVersion ?? null,
+    ruleId: creditAdmission.ruleId || "",
+    snapshotStatus: creditAdmission.snapshotStatus || "unknown",
+    reasonCode: creditAdmission.reasonCode || creditAdmission.code || "credit_admission_paused",
+    creditAdmission,
+    pausedAt: now,
+  };
+  task.creditAdmissionPause = pause;
+  task.updatedAt = now;
+  state.comments = state.comments || [];
+  state.events = state.events || [];
+  const body = creditAdmissionAuditBody(
+    `Credit admission paused ${pause.actionType || "automation"} without changing workflow state or consuming an attempt.`,
+    creditAdmission,
+  );
+  state.comments.push({
+    id: nextId(state.comments, "comment"),
+    taskId: task.id,
+    author: "StudioOps Budget Controller",
+    body,
+    creditAdmission: structuredClone(creditAdmission),
+    createdAt: now,
+  });
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "credit_admission_paused",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title}: ${pause.actionType || "automation"} paused by ${pause.reasonCode}`,
+    creditAdmission: structuredClone(creditAdmission),
+    createdAt: now,
+  });
+  return { created: true, pause };
+}
+
+export function recoverCreditAdmissionPauseInState(state, task, input = {}) {
+  const current = task.creditAdmissionPause;
+  if (current?.active !== true) return { recovered: false, pause: current || null };
+  const now = input.now || new Date().toISOString();
+  const creditAdmission = structuredClone(input.creditAdmission || {});
+  task.creditAdmissionPause = {
+    ...current,
+    active: false,
+    recoveredAt: now,
+    recoveryEvidence: creditAdmission,
+  };
+  task.updatedAt = now;
+  state.comments = state.comments || [];
+  state.events = state.events || [];
+  const body = `Credit admission recovered after fresh telemetry (${creditAdmission.code || "available"}). `
+    + `${current.actionType || "Automation"} remains eligible for normal admission in this sweep.`;
+  state.comments.push({
+    id: nextId(state.comments, "comment"),
+    taskId: task.id,
+    author: "StudioOps Budget Controller",
+    body,
+    creditAdmission: structuredClone(creditAdmission),
+    createdAt: now,
+  });
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "credit_admission_recovered",
+    projectId: task.projectId,
+    taskId: task.id,
+    message: `${task.title}: fresh credit telemetry cleared the transient admission pause`,
+    creditAdmission: structuredClone(creditAdmission),
+    createdAt: now,
+  });
+  return { recovered: true, pause: task.creditAdmissionPause };
+}
+
 export function taskAutomationCircuitIsCurrent(task = {}) {
   const circuit = task.automationCircuit;
   if (circuit?.state !== "open") return false;

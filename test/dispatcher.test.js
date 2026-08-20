@@ -1106,7 +1106,7 @@ test("live dispatch retries one transient unknown snapshot outside admission and
   assert.equal(state.tasks.at(-1).automationCircuit, undefined);
 });
 
-test("live dispatch probes an unknown snapshot exactly once and opens one circuit if still unknown", async () => {
+test("live dispatch probes an unknown snapshot exactly once and persists one transient pause if still unknown", async () => {
   const { state, action, options } = criticalCreditFixture();
   let probes = 0;
   options.creditSnapshotProbe = async () => {
@@ -1119,8 +1119,16 @@ test("live dispatch probes an unknown snapshot exactly once and opens one circui
   assert.equal(probes, 1);
   assert.equal(report.runs.length, 0);
   assert.equal(report.skipped[0].reason, "credit_gate:credit_snapshot_unknown");
-  assert.equal(state.tasks.at(-1).automationCircuit.state, "open");
-  assert.equal(state.events.filter((event) => event.type === "credit_admission_blocked").length, 1);
+  assert.equal(state.tasks.at(-1).status, "ready");
+  assert.equal(state.tasks.at(-1).assignedAgentRole, undefined);
+  assert.equal(state.tasks.at(-1).automationCircuit, undefined);
+  assert.equal(state.tasks.at(-1).creditAdmissionPause.active, true);
+  assert.equal(state.events.filter((event) => event.type === "credit_admission_paused").length, 1);
+
+  await dispatchSupervisorActions([action], options);
+  assert.equal(probes, 2);
+  assert.equal(state.events.filter((event) => event.type === "credit_admission_paused").length, 1);
+  assert.equal(state.comments.filter((comment) => comment.author === "StudioOps Budget Controller").length, 1);
 });
 
 test("plan mode never performs the unknown credit recovery probe", async () => {
@@ -1137,6 +1145,260 @@ test("plan mode never performs the unknown credit recovery probe", async () => {
   assert.equal(probes, 0);
   assert.equal(report.dryRun, true);
   assert.equal(report.skipped[0].reason, "credit_gate:credit_snapshot_unknown");
+  assert.equal(options.state.tasks.at(-1).creditAdmissionPause, undefined);
+  assert.equal(options.state.comments.length, 0);
+});
+
+test("degraded snapshot classes and fail-closed selectors pause without consuming workflow state", async () => {
+  const cases = [
+    { name: "unknown", snapshot: { status: "unknown", observedAt: new Date().toISOString() } },
+    { name: "stale", snapshot: { status: "available", observedAt: "2026-01-01T00:00:00.000Z" }, snapshotMaxAgeMs: 1 },
+    { name: "frontier", snapshot: { status: "unknown", observedAt: new Date().toISOString() }, frontier: true },
+    { name: "explicit", snapshot: { status: "unknown", observedAt: new Date().toISOString() }, label: "credit-fail-closed" },
+  ];
+  for (const item of cases) {
+    const { state, action, options } = criticalCreditFixture();
+    if (!item.frontier && !item.label) delete options.creditPolicy.failClosedTiers;
+    if (item.frontier) options.executionPolicy.tierRouting.complexTier = "frontier";
+    if (item.label) {
+      delete options.creditPolicy.failClosedTiers;
+      state.tasks.at(-1).labels = [item.label];
+    }
+    options.creditPolicy.snapshotMaxAgeMs = item.snapshotMaxAgeMs || 60_000;
+    options.creditSnapshot = item.snapshot;
+    let probes = 0;
+    options.creditSnapshotProbe = async () => {
+      probes += 1;
+      return item.snapshot.status === "available"
+        ? { ...item.snapshot, status: "stale" }
+        : { ...item.snapshot, observedAt: new Date().toISOString() };
+    };
+
+    const report = await dispatchSupervisorActions([action], options);
+
+    assert.equal(probes, 1, item.name);
+    assert.equal(report.runs.length, item.name === "unknown" || item.name === "stale" ? 1 : 0, item.name);
+    if (report.runs.length) {
+      assert.equal(report.runs[0].creditAdmission.fallbackUsed, true, item.name);
+      assert.equal(report.runs[0].creditAdmission.snapshotStatus, item.name, item.name);
+    } else {
+      assert.equal(state.tasks.at(-1).status, "ready", item.name);
+      assert.equal(state.tasks.at(-1).creditAdmissionPause.active, true, item.name);
+      assert.equal(state.tasks.at(-1).creditAdmissionPause.creditAdmission.explicitFailClosedMatch, Boolean(item.label), item.name);
+    }
+  }
+});
+
+function boundedFallbackOptions(state, overrides = {}) {
+  return {
+    state,
+    builderConcurrency: 100,
+    maxDispatchesPerSweep: 100,
+    executionPolicy: {
+      modelTiers: { critical: { model: "gpt-5.6-sol", reasoningEffort: "high" } },
+      tierRouting: { defaultTier: "critical", complexTier: "critical" },
+      maxAttempts: 3,
+    },
+    creditPolicy: {
+      enabled: true,
+      snapshotMaxAgeMs: 60_000,
+      degradedTelemetryFallback: {
+        policyVersion: 1,
+        explicitFailClosedLabels: ["credit-fail-closed"],
+        rules: {
+          critical: {
+            ruleId: "test-critical-bounded-v1",
+            mode: "bounded",
+            maxConcurrentRuns: 2,
+            maxAttempts: 1,
+            estimatedTokensPerRun: 80_000,
+            maxInFlightEstimatedTokens: 160_000,
+            ...overrides,
+          },
+        },
+      },
+    },
+    creditSnapshot: { status: "unknown", source: "studioops", observedAt: new Date().toISOString() },
+    creditSnapshotProbe: async () => ({ status: "unknown", source: "studioops", observedAt: new Date().toISOString() }),
+  };
+}
+
+function compatibleCriticalActions(count) {
+  const state = fixtureState();
+  state.tasks = [];
+  state.projects = [];
+  const actions = [];
+  for (let index = 0; index < count; index += 1) {
+    const taskId = `task_fallback_${index}`;
+    const projectId = `project_fallback_${index}`;
+    state.projects.push({ id: projectId, key: `fallback-${index}`, name: `Fallback ${index}` });
+    state.tasks.push({
+      id: taskId,
+      projectId,
+      title: `Secure database migration ${index}`,
+      status: "ready",
+      lane: "backend",
+      workAreas: [`src/fallback-${index}/**`],
+    });
+    actions.push({
+      id: `${taskId}:start_builder`,
+      type: "start_builder",
+      role: "builder",
+      projectId,
+      projectKey: `fallback-${index}`,
+      taskId,
+      taskTitle: state.tasks.at(-1).title,
+      taskStatus: "ready",
+    });
+  }
+  return { state, actions };
+}
+
+test("same-sweep fallback reservations enforce concurrency and persist complete matching evidence", async () => {
+  const { state, actions } = compatibleCriticalActions(3);
+  const options = boundedFallbackOptions(state);
+  let probes = 0;
+  options.creditSnapshotProbe = async () => {
+    probes += 1;
+    return { status: "unknown", source: "studioops", observedAt: new Date().toISOString() };
+  };
+
+  const report = await dispatchSupervisorActions(actions, options);
+
+  assert.equal(probes, 1);
+  assert.equal(report.runs.length, 2);
+  assert.equal(report.skipped[0].reason, "credit_gate:fallback_concurrency_exhausted");
+  assert.equal(report.runs[0].maxAttempts, 1);
+  assert.deepEqual(report.runs.map((run) => run.creditAdmission.observedCounters.selectedRuns), [0, 1]);
+  const evidence = report.runs[0].creditAdmission;
+  for (const field of [
+    "fallbackUsed", "decision", "code", "reasonCode", "reason", "snapshotClass", "snapshotStatus", "snapshotSource",
+    "snapshotObservedAt", "snapshotAgeMs", "policyVersion", "ruleId", "tier",
+    "explicitFailClosedMatch", "estimatedCredits", "estimatedTokensPerRun",
+    "maxConcurrentRuns", "maxAttempts", "maxInFlightEstimatedTokens", "retryEvidence",
+    "observedCounters",
+  ]) assert.ok(Object.hasOwn(evidence, field), field);
+  const comment = state.comments.find((item) => item.author === "StudioOps Dispatcher" && item.creditAdmission?.ruleId === evidence.ruleId);
+  const event = state.events.find((item) => item.type === "credit_fallback_dispatched" && item.creditAdmission?.ruleId === evidence.ruleId);
+  assert.deepEqual(comment.creditAdmission, evidence);
+  assert.deepEqual(event.creditAdmission, evidence);
+  assert.equal(JSON.stringify(evidence).includes("provider output"), false);
+  assert.equal(state.tasks[2].creditAdmissionPause.reasonCode, "fallback_concurrency_exhausted");
+  assert.ok(Buffer.byteLength(JSON.stringify(state.tasks[2].creditAdmissionPause)) <= 2_000);
+});
+
+test("active token reservations and consumed fallback attempts independently exhaust bounded capacity", async () => {
+  const cases = [
+    {
+      name: "tokens",
+      rule: { maxConcurrentRuns: 3, maxInFlightEstimatedTokens: 100_000 },
+      expected: "credit_gate:fallback_token_reservation_exhausted",
+      active: true,
+    },
+    {
+      name: "attempts",
+      rule: { maxConcurrentRuns: 3, maxInFlightEstimatedTokens: 240_000 },
+      expected: "credit_gate:fallback_attempt_budget_exhausted",
+      failed: true,
+    },
+  ];
+  for (const item of cases) {
+    const { state, actions } = compatibleCriticalActions(1);
+    const options = boundedFallbackOptions(state, item.rule);
+    const attemptKey = "task_fallback_0:0:start_builder:builder";
+    state.runs.push({
+      id: `run_${item.name}`,
+      taskId: item.active ? "different_task" : "task_fallback_0",
+      projectId: "different_project",
+      attemptKey: item.active ? "different_task:0:start_builder:builder" : attemptKey,
+      actionType: "start_builder",
+      group: "builder",
+      role: "builder",
+      status: item.failed ? "failed" : "running",
+      startedAt: new Date().toISOString(),
+      creditAdmission: {
+        fallbackUsed: true,
+        policyVersion: 1,
+        ruleId: "test-critical-bounded-v1",
+        tier: "critical",
+        estimatedTokensPerRun: 80_000,
+      },
+    });
+
+    const report = await dispatchSupervisorActions(actions, options);
+
+    assert.equal(report.runs.length, 0, item.name);
+    assert.equal(report.skipped[0].reason, item.expected, item.name);
+    assert.equal(state.tasks[0].status, "ready", item.name);
+    assert.equal(state.tasks[0].automationCircuit, undefined, item.name);
+    assert.equal(state.tasks[0].creditAdmissionPause.active, true, item.name);
+  }
+});
+
+test("fresh telemetry clears one transient pause and dispatches through normal admission in the same sweep", async () => {
+  const { state, action, options } = criticalCreditFixture();
+  options.creditSnapshotProbe = async () => ({ ...options.creditSnapshot, observedAt: new Date().toISOString() });
+  await dispatchSupervisorActions([action], options);
+  assert.equal(state.tasks.at(-1).creditAdmissionPause.active, true);
+
+  options.creditSnapshot = {
+    status: "available",
+    source: "studioops",
+    observedAt: new Date().toISOString(),
+    remainingPercent: 80,
+    reached: false,
+    credits: { available: false, unlimited: false, balance: null },
+  };
+  let probes = 0;
+  options.creditSnapshotProbe = async () => {
+    probes += 1;
+    throw new Error("fresh telemetry must not be probed");
+  };
+  const recovered = await dispatchSupervisorActions([action], options);
+  const duplicate = await dispatchSupervisorActions([action], options);
+
+  assert.equal(probes, 0);
+  assert.deepEqual(recovered.recoveredCreditPauseTaskIds, ["task_credit"]);
+  assert.equal(recovered.runs.length, 1);
+  assert.equal(recovered.runs[0].creditAdmission.fallbackUsed, false);
+  assert.equal(state.tasks.at(-1).creditAdmissionPause.active, false);
+  assert.equal(state.events.filter((event) => event.type === "credit_admission_recovered").length, 1);
+  assert.equal(state.comments.filter((comment) => comment.body.startsWith("Credit admission recovered")).length, 1);
+  assert.deepEqual(duplicate.recoveredCreditPauseTaskIds, []);
+});
+
+test("fallback planning remains below 50ms for 50 actions and 50 active reservations", () => {
+  const { state, actions } = compatibleCriticalActions(50);
+  const options = boundedFallbackOptions(state, {
+    maxConcurrentRuns: 100,
+    estimatedTokensPerRun: 1_000,
+    maxInFlightEstimatedTokens: 100_000,
+  });
+  state.runs = Array.from({ length: 50 }, (_, index) => ({
+    id: `run_active_fallback_${index}`,
+    taskId: `active_task_${index}`,
+    projectId: `active_project_${index}`,
+    actionType: "start_builder",
+    group: "builder",
+    role: "builder",
+    lane: "backend",
+    fileScope: [`src/active-${index}/**`],
+    fileScopeExplicit: true,
+    status: "running",
+    creditAdmission: {
+      fallbackUsed: true,
+      policyVersion: 1,
+      ruleId: "test-critical-bounded-v1",
+      tier: "critical",
+      estimatedTokensPerRun: 1_000,
+    },
+  }));
+  const startedAt = performance.now();
+  const report = planDispatches(state, actions, options);
+  const durationMs = performance.now() - startedAt;
+
+  assert.equal(report.selected.length, 50);
+  assert.ok(durationMs < 50, `fallback planning took ${durationMs.toFixed(2)}ms`);
 });
 
 test("a retry that reports a real limit opens one circuit without another probe or model run", async () => {
