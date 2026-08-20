@@ -23,6 +23,11 @@ function rule(from, to, options = {}) {
   const actors = options.actors || (actorTypes.length === roles.length
     ? actorTypes.map((actorType, index) => [actorType, roles[index]])
     : actorTypes.flatMap((actorType) => roles.map((role) => [actorType, role])));
+  const edgeActors = (options.edgeActors || []).map(([source, target, allowedActors]) => Object.freeze([
+    source,
+    target,
+    Object.freeze(allowedActors.map((actor) => Object.freeze([...actor]))),
+  ]));
   return Object.freeze({
     from: Object.freeze([...from]),
     to: Object.freeze([...to]),
@@ -30,6 +35,7 @@ function rule(from, to, options = {}) {
     actorTypes: Object.freeze([...actorTypes]),
     roles: Object.freeze([...roles]),
     actors: Object.freeze(actors.map((actor) => Object.freeze([...actor]))),
+    edgeActors: Object.freeze(edgeActors),
     assignment: options.assignment || "none",
     activeRun: options.activeRun === true,
     workflowLease: options.workflowLease === true,
@@ -58,7 +64,7 @@ export const LIFECYCLE_ACTION_MATRIX = Object.freeze({
   restart_review: rule([...REVIEW_STATUSES, "needs_changes"], REVIEW_STATUSES, { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   record_review_approval: rule(REVIEW_STATUSES, REVIEW_STATUSES, { actorTypes: ["worker"], roles: ["assigned-reviewer"], assignment: "required", activeRun: true, workflowLease: true, candidateCycle: true, subjectBinding: "sha", edges: REVIEW_STATUSES.map((status) => [status, status]) }),
   record_review_evidence: rule(REVIEW_STATUSES, REVIEW_STATUSES, { actorTypes: ["system"], roles: ["review-recorder"], candidateCycle: true, subjectBinding: "sha", edges: REVIEW_STATUSES.map((status) => [status, status]) }),
-  request_changes: rule([...reviewRoutingSources, "qa_review", "promotion_blocked", "user_review"], ["needs_changes"], { actorTypes: ["worker", "owner", "system"], roles: ["assigned-reviewer", "owner", "workflow-engine"], candidateCycle: true, subjectBinding: "candidate_or_sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
+  request_changes: rule([...reviewRoutingSources, "qa_review", "promotion_blocked", "user_review"], ["needs_changes"], { actorTypes: ["worker", "owner", "system"], roles: ["assigned-reviewer", "owner", "workflow-engine"], edgeActors: [["user_review", "needs_changes", [["owner", "owner"], ["system", "workflow-engine"]]]], candidateCycle: true, subjectBinding: "candidate_or_sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   reject_builder_intake: rule(["builder_review"], ["needs_changes"], { actorTypes: ["system"], roles: ["workflow-engine"], invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   request_owner_review: rule(REVIEW_STATUSES, ["user_review"], { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha" }),
   escalate_cycle_limit_owner_review: rule(["lead_review"], ["user_review"], { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha" }),
@@ -276,7 +282,12 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
   }
   const actor = normalizeActor(command.actorContext);
   const assignedRole = String(aggregate.assignedAgentRole || "").trim();
-  const actorAllowed = ruleValue.actors.some(([actorType, role]) => (
+  const targetStatus = String(command.evidence?.targetStatus || ruleValue.to[0] || "").trim();
+  const edgeActorPolicy = ruleValue.edgeActors.find(([source, target]) => (
+    source === aggregate.status && target === targetStatus
+  ));
+  const allowedActors = edgeActorPolicy?.[2] || ruleValue.actors;
+  const actorAllowed = allowedActors.some(([actorType, role]) => (
     actorType === actor.actorType
     && (role === actor.role || (role === "assigned-reviewer" && actor.role === assignedRole))
   ));
@@ -284,7 +295,6 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
   if (ruleValue.assignment === "required" && actor.role !== assignedRole) {
     throw new Error(`Lifecycle actor ${actor.role} is not assigned to task ${taskId}.`);
   }
-  const targetStatus = String(command.evidence?.targetStatus || ruleValue.to[0] || "").trim();
   const edgeAllowed = ruleValue.edges.some(([source, target]) => source === aggregate.status && target === targetStatus);
   if (!edgeAllowed) {
     throw new Error(`Lifecycle action ${action} prohibits ${aggregate.status || "(missing)"} -> ${targetStatus || "(missing)"}.`);

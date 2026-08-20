@@ -95,6 +95,7 @@ test("the action matrix is explicit and every status participates in a fail-clos
     assert.ok(entry.actorTypes.length, `${action} needs actor types`);
     assert.ok(entry.roles.length, `${action} needs roles`);
     assert.ok(entry.actors.length, `${action} needs actor type/role pairs`);
+    assert.ok(Array.isArray(entry.edgeActors));
     assert.equal(typeof entry.assignment, "string");
     assert.equal(typeof entry.activeRun, "boolean");
     assert.equal(typeof entry.workflowLease, "boolean");
@@ -206,6 +207,52 @@ test("an owner can reject user review and bind one corrected builder candidate",
   assert.equal(resubmitted.task.reviewCycle, 3);
   assert.equal(resubmitted.task.reviewSubjectCycle, 3);
   assert.equal(resubmitted.task.reviewSubjectSha, correctedSha);
+});
+
+test("user review changes accept only a trusted owner or workflow engine actor", () => {
+  const task = {
+    id: "task_1",
+    status: "user_review",
+    stateVersion: 7,
+    assignedAgentRole: "owner",
+    reviewCycle: 2,
+    reviewSubjectCycle: 2,
+    reviewSubjectSha: SHA,
+  };
+  const commandFor = (actorContext) => ({
+    action: "request_changes",
+    taskId: task.id,
+    expectedStateVersion: task.stateVersion,
+    actorContext,
+    evidence: {
+      targetStatus: "needs_changes",
+      candidateCycle: 2,
+      subjectSha: SHA,
+    },
+  });
+
+  for (const actorContext of [
+    { actorId: "local-owner", actorType: "owner", role: "owner", trusted: true },
+    { actorId: "workflow-engine", actorType: "system", role: "workflow-engine", trusted: true },
+  ]) {
+    assert.equal(
+      evaluateLifecycleTransition(commandFor(actorContext), task, { candidates: [], nowMs: NOW }).task.status,
+      "needs_changes",
+    );
+  }
+
+  assert.throws(
+    () => evaluateLifecycleTransition(commandFor({
+      actorId: "spoofed-owner", actorType: "owner", role: "owner", trusted: false,
+    }), task, { candidates: [], nowMs: NOW }),
+    /not trusted/,
+  );
+  assert.throws(
+    () => evaluateLifecycleTransition(commandFor({
+      actorId: "review-worker", actorType: "worker", role: "owner", trusted: true,
+    }), task, { candidates: [], nowMs: NOW }),
+    /cannot perform request_changes/,
+  );
 });
 
 test("stale, untrusted, unassigned, wrong-role, wrong-run, expired-lease, wrong-cycle, wrong-SHA, and prohibited edges fail closed", () => {
