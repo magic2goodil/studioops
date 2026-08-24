@@ -467,6 +467,9 @@ Task fields:
   --trust-lead-approvals        Alias for --trust-leads
   --no-trust-leads              Disable Trust Leads for a project
   --integration-branch          Non-production branch used for QA integration bundles
+  --max-active-runs             Project WIP guard for concurrent builder/reviewer runs
+  --max-runs-per-window         Project WIP guard for worker runs in a rolling window
+  --run-window-minutes          Rolling-window length for --max-runs-per-window (default 60)
   --subject-sha                 Exact full source SHA submitted for the current review cycle
   --tree-sha                    Exact candidate tree SHA for fast-lane review intake
   --base-sha                    Exact protected-base SHA for fast-lane review intake
@@ -677,6 +680,11 @@ Automation:
       contextLinks: args.context,
       standards: args.standards,
       safetyRules: args.safety,
+      wipPolicy: {
+        ...(Object.prototype.hasOwnProperty.call(args, "max-active-runs") ? { maxActiveRuns: args["max-active-runs"] } : {}),
+        ...(Object.prototype.hasOwnProperty.call(args, "max-runs-per-window") ? { maxRunsPerWindow: args["max-runs-per-window"] } : {}),
+        ...(Object.prototype.hasOwnProperty.call(args, "run-window-minutes") ? { runWindowMinutes: args["run-window-minutes"] } : {}),
+      },
       reviewPolicy: {
         trustLeadApprovals,
         integrationBranch,
@@ -701,6 +709,17 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "context")) patch.contextLinks = args.context;
     if (Object.prototype.hasOwnProperty.call(args, "standards")) patch.standards = args.standards;
     if (Object.prototype.hasOwnProperty.call(args, "safety")) patch.safetyRules = args.safety;
+    if (
+      Object.prototype.hasOwnProperty.call(args, "max-active-runs")
+      || Object.prototype.hasOwnProperty.call(args, "max-runs-per-window")
+      || Object.prototype.hasOwnProperty.call(args, "run-window-minutes")
+    ) {
+      patch.wipPolicy = {
+        ...(Object.prototype.hasOwnProperty.call(args, "max-active-runs") ? { maxActiveRuns: args["max-active-runs"] } : {}),
+        ...(Object.prototype.hasOwnProperty.call(args, "max-runs-per-window") ? { maxRunsPerWindow: args["max-runs-per-window"] } : {}),
+        ...(Object.prototype.hasOwnProperty.call(args, "run-window-minutes") ? { runWindowMinutes: args["run-window-minutes"] } : {}),
+      };
+    }
     const reviewPolicy = {};
     if (Object.prototype.hasOwnProperty.call(args, "trust-leads")) reviewPolicy.trustLeadApprovals = true;
     if (Object.prototype.hasOwnProperty.call(args, "trust-lead-approvals")) reviewPolicy.trustLeadApprovals = args["trust-lead-approvals"];

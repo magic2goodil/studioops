@@ -171,6 +171,56 @@ function projectWipLimit(project) {
   return Number.isInteger(configured) && configured > 0 ? configured : 0;
 }
 
+function projectRunBudget(project) {
+  const policy = project?.wipPolicy || {};
+  const maxActiveRuns = Number(policy.maxActiveRuns || 0);
+  const maxRunsPerWindow = Number(policy.maxRunsPerWindow || 0);
+  const runWindowMinutes = Number(policy.runWindowMinutes || 60);
+  return {
+    maxActiveRuns: Number.isInteger(maxActiveRuns) && maxActiveRuns > 0 ? maxActiveRuns : 0,
+    maxRunsPerWindow: Number.isInteger(maxRunsPerWindow) && maxRunsPerWindow > 0 ? maxRunsPerWindow : 0,
+    runWindowMinutes: Number.isFinite(runWindowMinutes) && runWindowMinutes > 0 ? runWindowMinutes : 60,
+  };
+}
+
+function isWorkerRun(run) {
+  return ACTIVE_RUN_STATUSES.has(run.status) || FINAL_RUN_STATUSES.has(run.status);
+}
+
+function projectRunCounts(state, projectId, nowMs) {
+  const projectRuns = (state.runs || []).filter((run) => (
+    run.projectId === projectId
+    && run.group !== "owner"
+    && isWorkerRun(run)
+  ));
+  const active = projectRuns.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)).length;
+  return { active, runs: projectRuns.filter((run) => {
+    const created = Date.parse(run.createdAt || run.startedAt || "");
+    return Number.isFinite(created) && nowMs - created >= 0;
+  }) };
+}
+
+function projectRunBudgetReason(state, project, action, selectedProjectRuns, nowMs) {
+  if (runGroupFor(action) === "owner") return "";
+  if (!project) return "";
+  const budget = projectRunBudget(project);
+  if (!budget.maxActiveRuns && !budget.maxRunsPerWindow) return "";
+  const existing = projectRunCounts(state, project.id, nowMs);
+  const selected = Number(selectedProjectRuns.get(project.id) || 0);
+  if (budget.maxActiveRuns && existing.active + selected >= budget.maxActiveRuns) {
+    return "project_active_run_limit";
+  }
+  if (budget.maxRunsPerWindow) {
+    const windowStart = nowMs - budget.runWindowMinutes * 60 * 1000;
+    const recent = existing.runs.filter((run) => {
+      const created = Date.parse(run.createdAt || run.startedAt || "");
+      return Number.isFinite(created) && created >= windowStart;
+    }).length;
+    if (recent + selected >= budget.maxRunsPerWindow) return "project_run_window_limit";
+  }
+  return "";
+}
+
 function activeProjectTaskCount(state, projectId) {
   return new Set((state.tasks || [])
     .filter((task) => task.projectId === projectId)
@@ -764,11 +814,13 @@ function makeRun(state, task, action, options, now) {
 
 export function planDispatches(state, actions, input = {}) {
   const options = { ...DEFAULTS, ...input };
+  const nowMs = Number(options.nowMs || Date.now());
   const counts = activeCounts(state);
   const initialCounts = { ...counts };
   const maxDispatches = Math.max(1, Number(options.maxDispatchesPerSweep || DEFAULTS.maxDispatchesPerSweep));
   const selected = [];
   const skipped = [];
+  const selectedProjectRuns = new Map();
 
   for (const action of actions || []) {
     if (selected.length >= maxDispatches) {
@@ -797,6 +849,11 @@ export function planDispatches(state, actions, input = {}) {
       continue;
     }
     const project = state.projects?.find((item) => item.id === task.projectId);
+    const runBudgetReason = projectRunBudgetReason(state, project, action, selectedProjectRuns, nowMs);
+    if (runBudgetReason) {
+      skipped.push({ action, reason: runBudgetReason, projectId: task.projectId });
+      continue;
+    }
     const wipLimit = projectWipLimit(project);
     if (wipLimit && ["builder", "architect"].includes(runGroupFor(action))) {
       const active = activeProjectTaskCount(state, task.projectId);
@@ -836,6 +893,9 @@ export function planDispatches(state, actions, input = {}) {
     }
     selected.push({ action, task, group, profile });
     counts[group] = (counts[group] || 0) + 1;
+    if (group !== "owner") {
+      selectedProjectRuns.set(task.projectId, Number(selectedProjectRuns.get(task.projectId) || 0) + 1);
+    }
   }
 
   return {
