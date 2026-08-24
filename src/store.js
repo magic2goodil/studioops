@@ -1497,6 +1497,9 @@ export async function addProject(input) {
       reviewPolicy,
       wipPolicy: {
         maxActiveTasks: Number(input.wipPolicy?.maxActiveTasks || input.maxActiveTasks || 0),
+        maxActiveRuns: Number(input.wipPolicy?.maxActiveRuns || input.maxActiveRuns || 0),
+        maxRunsPerWindow: Number(input.wipPolicy?.maxRunsPerWindow || input.maxRunsPerWindow || 0),
+        runWindowMinutes: Number(input.wipPolicy?.runWindowMinutes || input.runWindowMinutes || 60),
         weights: input.wipPolicy?.weights || {},
         agePromotionMs: Number(input.wipPolicy?.agePromotionMs || 24 * 60 * 60 * 1000),
       },
@@ -1582,9 +1585,22 @@ export async function updateProject(projectId, patch = {}) {
       project.integrationBranch = project.reviewPolicy.integrationBranch;
     }
     if (Object.prototype.hasOwnProperty.call(patch, "wipPolicy")) {
+      const policyPatch = patch.wipPolicy || {};
       project.wipPolicy = {
         ...(project.wipPolicy || {}),
-        ...(patch.wipPolicy || {}),
+        ...policyPatch,
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "maxActiveTasks")
+          ? { maxActiveTasks: Number(policyPatch.maxActiveTasks || 0) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "maxActiveRuns")
+          ? { maxActiveRuns: Number(policyPatch.maxActiveRuns || 0) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "maxRunsPerWindow")
+          ? { maxRunsPerWindow: Number(policyPatch.maxRunsPerWindow || 0) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "runWindowMinutes")
+          ? { runWindowMinutes: Number(policyPatch.runWindowMinutes || 60) }
+          : {}),
       };
     }
     if (Object.prototype.hasOwnProperty.call(patch, "deliveryPolicy")) {

@@ -294,6 +294,72 @@ test("queued runs still block duplicate dispatches", () => {
   assert.equal(report.skipped[0].reason, "already_dispatched");
 });
 
+test("project run budget limits concurrent worker dispatches", async () => {
+  const state = fixtureState();
+  state.projects[0].wipPolicy = { maxActiveRuns: 1 };
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+  };
+  state.tasks[1] = {
+    ...state.tasks[1],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+  };
+  const actions = ["task_1", "task_2"].map((taskId) => ({
+    id: `${taskId}:start_builder`,
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId,
+    taskTitle: taskId,
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  }));
+
+  const report = await dispatchSupervisorActions(actions, { state });
+
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.skipped.filter((item) => item.reason === "project_active_run_limit").length, 1);
+  assert.equal(state.runs.filter((run) => run.group !== "owner").length, 1);
+});
+
+test("project run budget limits recent worker runs while allowing the window to expire", () => {
+  const state = fixtureState();
+  state.projects[0].wipPolicy = { maxRunsPerWindow: 2, runWindowMinutes: 60 };
+  state.runs.push(
+    { id: "run_old", taskId: "task_1", projectId: "project_1", group: "builder", status: "completed", createdAt: "2026-01-01T00:00:00.000Z" },
+    { id: "run_recent", taskId: "task_1", projectId: "project_1", group: "builder", status: "completed", createdAt: "2026-01-01T00:30:00.000Z" },
+  );
+  const action = {
+    id: "task_2:qa_integration_blocked",
+    type: "qa_integration_blocked",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_2",
+    taskTitle: "Blocked integration task",
+    taskStatus: "qa_review",
+  };
+
+  const blocked = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T00:45:00.000Z"),
+  });
+  assert.equal(blocked.selected.length, 0);
+  assert.equal(blocked.skipped[0].reason, "project_run_window_limit");
+
+  const afterWindow = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T02:00:00.000Z"),
+  });
+  assert.equal(afterWindow.selected.length, 1);
+});
+
 test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {
   for (const status of ["queued", "running"]) {
     const { state, action } = finalAttemptReviewFixture(status);
