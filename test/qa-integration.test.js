@@ -248,6 +248,11 @@ if (args[0] === "pr" && args[1] === "close") {
   process.exit(0);
 }
 if (args[0] === "pr" && args[1] === "list") {
+  if (process.env.FAKE_GH_RESOURCE_DENIED) {
+    console.error("GraphQL: Resource not accessible by integration (repository.pullRequest.statusCheckRollup)");
+    console.error("credential=ghs_should_not_escape repository-list=private/example,private/other");
+    process.exit(1);
+  }
   const head = args[args.indexOf("--head") + 1];
   const base = args[args.indexOf("--base") + 1];
   const record = readPrs()
@@ -263,10 +268,19 @@ if (args[0] === "pr" && args[1] === "list") {
     ? "failed"
     : process.env.FAKE_GH_CHECK_STATE || "pending";
   const checks = checkMode === "failed"
-    ? [{ name: "integration-test", status: "COMPLETED", conclusion: "FAILURE", detailsUrl: "https://example.test/check" }]
+    ? [
+        { name: "integration-test", status: "COMPLETED", conclusion: "FAILURE", detailsUrl: "https://example.test/check" },
+        { context: "legacy-status", state: "SUCCESS", targetUrl: "https://example.test/status" }
+      ]
     : checkMode === "passed"
-      ? [{ name: "integration-test", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://example.test/check" }]
-      : [{ name: "integration-test", status: "IN_PROGRESS", conclusion: "", detailsUrl: "https://example.test/check" }];
+      ? [
+          { name: "integration-test", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://example.test/check" },
+          { context: "legacy-status", state: "SUCCESS", targetUrl: "https://example.test/status" }
+        ]
+      : [
+          { name: "integration-test", status: "IN_PROGRESS", conclusion: "", detailsUrl: "https://example.test/check" },
+          { context: "legacy-status", state: "PENDING", targetUrl: "https://example.test/status" }
+        ];
   console.log(JSON.stringify([{
     number: record.number,
     url: record.url,
@@ -1735,6 +1749,12 @@ test("protected QA branches use one idempotent integration PR and advance only a
     assert.equal(pendingProject.integrationCandidateCommit, pendingProject.commit);
     assert.equal(pendingProject.integrationPr.url, "https://github.com/example/demo/pull/42");
     assert.equal(pendingProject.integrationCheckState.state, "pending");
+    assert.equal(pendingProject.integrationCheckState.total, 2);
+    assert.equal(pendingProject.integrationCheckState.pending, 2);
+    assert.deepEqual(
+      pendingProject.integrationCheckState.checks.map((check) => check.name),
+      ["integration-test", "legacy-status"],
+    );
     assert.match(pendingProject.integrationBlocker, /required human review/);
     assert.equal(
       await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
@@ -1752,6 +1772,28 @@ test("protected QA branches use one idempotent integration PR and advance only a
     assert.match(persisted.tasks[0].integrationBlocker, /required human review/);
     assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
 
+    const denied = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_RESOURCE_DENIED: "1",
+      },
+    });
+    const denial = denied.projects[0];
+    assert.equal(denial.status, "blocked");
+    assert.match(denial.output, /Resource not accessible by integration/);
+    assert.match(denial.output, /checks:read/);
+    assert.match(denial.output, /statuses:read/);
+    assert.match(denial.output, /approve the updated App permissions/i);
+    assert.match(denial.output, /install or re-approve the App/i);
+    assert.match(denial.output, /freshly minted installation token/i);
+    assert.match(denial.output, /npm run qa-integrate -- --project demo --force/);
+    assert.match(denial.output, /bypasses only the StudioOps retry cooldown/);
+    assert.doesNotMatch(denial.output, /ghs_should_not_escape/);
+    assert.doesNotMatch(denial.output, /private\/example|private\/other/);
+    assert.ok(denial.output.length < 1_000);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+
     const failed = await runQaIntegrationFixture(root, {
       input: { force: true },
       env: {
@@ -1764,6 +1806,7 @@ test("protected QA branches use one idempotent integration PR and advance only a
     assert.equal(failed.projects[0].commit, pendingProject.commit);
     assert.equal(failed.projects[0].integrationCandidateBranch, pendingProject.integrationCandidateBranch);
     assert.equal(failed.projects[0].integrationCheckState.failed, 1);
+    assert.equal(failed.projects[0].integrationCheckState.passed, 1);
     assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
 
     const checksPassed = await runQaIntegrationFixture(root, {
@@ -1776,7 +1819,25 @@ test("protected QA branches use one idempotent integration PR and advance only a
     });
     assert.equal(checksPassed.projects[0].status, "pr_waiting");
     assert.equal(checksPassed.projects[0].integrationCheckState.state, "passed");
+    assert.equal(checksPassed.projects[0].integrationCheckState.passed, 2);
     assert.match(checksPassed.projects[0].integrationBlocker, /required human review/);
+
+    const closed = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_PR_STATE: "CLOSED",
+        FAKE_GH_CHECK_STATE: "passed",
+        FAKE_GH_REVIEW_DECISION: "APPROVED",
+      },
+    });
+    assert.equal(closed.projects[0].status, "pr_closed");
+    assert.match(closed.projects[0].integrationBlocker, /closed without merging/i);
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      fixture.baseSha,
+    );
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
 
     await rm(fixture.hookPath);
     await git(fixture.repoPath, [

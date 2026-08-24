@@ -257,6 +257,25 @@ function integrationPrStatus(pr, checkState) {
   return "pr_waiting";
 }
 
+function resourceNotAccessibleByIntegration(value) {
+  return /resource not accessible by integration/i.test(String(value || ""));
+}
+
+function protectedPrPermissionGuidance(projectPlan) {
+  const projectKey = safeRefSegment(projectPlan.projectKey || projectPlan.projectId || "project");
+  return [
+    "QA integration cannot inspect the protected integration PR because GitHub returned Resource not accessible by integration.",
+    "Grant the QA GitHub App checks:read and statuses:read, approve the updated App permissions and install or re-approve the App on the target repository, then use a freshly minted installation token.",
+    `Retry with \`npm run qa-integrate -- --project ${projectKey} --force\`. The flag bypasses only the StudioOps retry cooldown; it does not force-push, merge, or bypass branch protection, checks, or reviews.`,
+  ].join(" ");
+}
+
+function protectedPrPermissionError(projectPlan) {
+  const error = new Error(protectedPrPermissionGuidance(projectPlan));
+  error.code = "qa_github_app_check_permissions_missing";
+  return error;
+}
+
 async function findIntegrationPr(repoPath, projectPlan, candidateBranch, options = {}) {
   const result = await runCommand("gh", [
     "pr",
@@ -279,6 +298,9 @@ async function findIntegrationPr(repoPath, projectPlan, candidateBranch, options
     allowFailure: true,
   });
   if (!result.ok) {
+    if (resourceNotAccessibleByIntegration(result.output)) {
+      throw protectedPrPermissionError(projectPlan);
+    }
     throw new Error(`Could not inspect the integration pull request: ${truncateOutput(result.output)}`);
   }
   const prs = parseJsonOutput(result, "gh pr list");
@@ -2103,17 +2125,37 @@ async function integrateProject(projectPlan, options = {}) {
 }
 
 function authFailureProjectResult(projectPlan, error) {
-  const output = `GitHub App auth failed for QA integration: ${error.message}`;
+  const permissionDenied = error?.code === "qa_github_app_check_permissions_missing";
+  const output = permissionDenied
+    ? error.message
+    : `GitHub App auth failed for QA integration: ${error.message}`;
+  const handoff = permissionDenied ? pendingProtectedHandoff(projectPlan) : null;
+  const handoffTask = handoff?.tasks?.[0] || null;
+  const tasks = handoff?.tasks?.length ? handoff.tasks : projectPlan.tasks;
   return {
     ...projectPlan,
-    tasks: allTaskResults(projectPlan.tasks, "blocked", output),
+    tasks: allTaskResults(tasks, "blocked", output),
     status: "blocked",
     output: truncateOutput(output),
-    commit: "",
+    commit: handoff?.commit || "",
     validation: [],
     sourceRepoPath: projectPlan.repoPath || "",
     workspacePath: "",
     workspaceStrategy: "",
+    protectedBranchFallback: Boolean(handoff),
+    integrationCandidateBranch: handoff?.branch || "",
+    integrationCandidateCommit: handoff?.commit || "",
+    integrationPr: handoff ? {
+      url: handoff.prUrl,
+      number: Number(handoffTask?.integrationPrNumber || 0),
+      state: handoffTask?.integrationPrState || "",
+      headRefOid: handoffTask?.integrationPrHeadSha || "",
+      mergeStateStatus: handoffTask?.integrationPrMergeState || "",
+      reviewDecision: handoffTask?.integrationPrReviewDecision || "",
+    } : null,
+    integrationCheckState: handoffTask?.integrationCheckState || null,
+    integrationBlocker: permissionDenied ? output : "",
+    deferredTaskIds: handoff?.deferredTasks?.map((task) => task.id) || [],
   };
 }
 
