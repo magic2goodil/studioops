@@ -56,20 +56,29 @@ function baseState(overrides = {}) {
   };
 }
 
-function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen" }) {
+function candidateFixture({
+  baseSha,
+  sourceSha,
+  integrationSha,
+  status = "frozen",
+  candidateId = "candidate_1",
+  taskId = "task_1",
+  qaBundleId = "qa_bundle_1",
+  sourceRef = "refs/heads/feature/task",
+}) {
   const candidate = createCandidateEnvelope({
-    qaBundleId: "qa_bundle_1",
+    qaBundleId,
     manifest: {
-      candidateId: "candidate_1",
+      candidateId,
       projectId: "project_1",
       base: { branch: "main", sha: baseSha },
       sources: [{
-        taskId: "task_1",
-        sourceRef: "refs/heads/feature/task",
+        taskId,
+        sourceRef,
         headSha: sourceSha,
         candidateCycle: 1,
         reviews: [{
-          id: "review_1",
+          id: `review_${candidateId}`,
           stageKey: "lead",
           role: "lead-reviewer",
           outcome: "approved",
@@ -100,14 +109,14 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
       },
       assembly: {
         mode: "atomic",
-        requestedTaskIds: ["task_1"],
-        includedTaskIds: ["task_1"],
+        requestedTaskIds: [taskId],
+        includedTaskIds: [taskId],
         excludedTaskIds: [],
       },
     },
     createdAt: "2026-07-25T12:00:00.000Z",
   });
-  candidate.qaBundleId = "qa_bundle_1";
+  candidate.qaBundleId = qaBundleId;
   candidate.status = status;
   if (status === "qa_passed") {
     candidate.qaDecision = {
@@ -115,7 +124,7 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
       candidateId: candidate.id,
       manifestDigest: candidate.manifestDigest,
       integrationSha,
-      taskIds: ["task_1"],
+      taskIds: [taskId],
       author: "Owner QA",
       notes: "",
       repositoryVerifiedAt: "2026-07-25T12:29:59.000Z",
@@ -885,6 +894,208 @@ test("promotion reconciliation closes a superseded candidate when a trusted merg
 
     const second = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
     assert.equal(second.projects.length, 0);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("one trusted atomic release reconciles two older deployed candidates without duplicate release work", async () => {
+  const fixture = await reconciliationFixture("CLOSED");
+  const ghLog = path.join(fixture.root, "gh.log");
+  const validationMarker = path.join(fixture.root, "validation-ran");
+  try {
+    await git(fixture.repoPath, ["checkout", "-b", "feature/replacement", fixture.sourceSha]);
+    await writeFile(path.join(fixture.repoPath, "replacement.txt"), "replacement\n", "utf8");
+    await git(fixture.repoPath, ["add", "replacement.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "atomic replacement"]);
+    const replacementSha = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "feature/replacement"]);
+    await git(fixture.repoPath, ["push", "origin", "HEAD:qa/candidate-replacement"]);
+    await git(fixture.repoPath, ["checkout", "main"]);
+    await git(fixture.repoPath, ["merge", "--no-ff", replacementSha, "-m", "merge atomic replacement"]);
+    const replacementMerge = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "main"]);
+
+    const state = JSON.parse(await readFile(path.join(fixture.root, "data", "mission-control.json"), "utf8"));
+    const first = state.candidates[0];
+    first.status = "qa_passed";
+    delete first.promotion;
+    state.tasks[0].status = "deployed";
+    state.tasks[0].deploymentEvidence = { deploymentId: "deployment_1", immutable: true };
+    state.qaBundles[0].status = "qa_passed";
+    const second = candidateFixture({
+      baseSha: first.manifest.base.sha,
+      sourceSha: fixture.sourceSha,
+      integrationSha: fixture.sourceSha,
+      status: "qa_passed",
+      candidateId: "candidate_old_2",
+      taskId: "task_old_2",
+      qaBundleId: "qa_bundle_old_2",
+    });
+    state.tasks.push({
+      id: "task_old_2",
+      projectId: "project_1",
+      title: "Second deployed feature",
+      status: "deployed",
+      stateVersion: 4,
+      reviewCycle: 1,
+      reviewSubjectCycle: 1,
+      reviewSubjectSha: fixture.sourceSha,
+      branchName: "feature/task",
+      candidateId: second.id,
+      qaBundleId: second.qaBundleId,
+      deploymentEvidence: { deploymentId: "deployment_2", immutable: true },
+    });
+    state.qaBundles.push({
+      id: second.qaBundleId,
+      projectId: "project_1",
+      status: "qa_passed",
+      candidateId: second.id,
+      manifestDigest: second.manifestDigest,
+      tasks: [{ id: "task_old_2", title: "Second deployed feature" }],
+    });
+    state.candidates.push(second, mergedCandidateFixture({
+      baseSha: first.manifest.base.sha,
+      sourceSha: replacementSha,
+      integrationSha: replacementSha,
+      mergeCommit: replacementMerge,
+      prUrl: "https://github.com/example/demo/pull/43",
+    }));
+    state.projects[0].promotion.validationCommands = [
+      `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync(${JSON.stringify(validationMarker)}, 'ran')"`,
+    ];
+    await writeState(fixture.root, state);
+    await writeFile(fixture.fakeBin + "/gh", `#!/bin/sh\nprintf '%s\\n' "$*" >> "$FAKE_GH_LOG"\nexit 97\n`, "utf8");
+    await chmod(fixture.fakeBin + "/gh", 0o755);
+    const refsBefore = await git(fixture.repoPath, ["ls-remote", "--heads", "origin"]);
+    const script = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        env: {
+          PATH: ${JSON.stringify(`${fixture.fakeBin}:/usr/local/bin:/usr/bin:/bin`)},
+          FAKE_GH_LOG: ${JSON.stringify(ghLog)}
+        }
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const report = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    const refsAfter = await git(fixture.repoPath, ["ls-remote", "--heads", "origin"]);
+    const persisted = readPersistedState(fixture.root);
+
+    assert.deepEqual(report.projects.map((project) => project.status), ["merged", "merged"]);
+    assert.equal(refsAfter, refsBefore);
+    await assert.rejects(readFile(ghLog, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(validationMarker, "utf8"), /ENOENT/);
+    for (const [index, taskId] of ["task_1", "task_old_2"].entries()) {
+      const task = persisted.tasks.find((item) => item.id === taskId);
+      const candidate = persisted.candidates.find((item) => item.id === task.candidateId);
+      const bundle = persisted.qaBundles.find((item) => item.id === task.qaBundleId);
+      assert.equal(task.status, "deployed");
+      assert.deepEqual(task.deploymentEvidence, { deploymentId: `deployment_${index + 1}`, immutable: true });
+      assert.equal(task.mergeEvidence.reconciledByCandidateId, "candidate_2");
+      assert.equal(task.mergeEvidence.observedTargetSha, replacementMerge);
+      assert.equal(candidate.status, "merged");
+      assert.equal(candidate.promotionMerge.prUrl, "https://github.com/example/demo/pull/43");
+      assert.equal(bundle.status, "merged");
+      assert.equal(bundle.mergeEvidence.observedTargetSha, replacementMerge);
+    }
+
+    const repeated = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    assert.equal(repeated.projects.length, 0);
+    assert.equal(await git(fixture.repoPath, ["ls-remote", "--heads", "origin"]), refsBefore);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("missing containment audit evidence routes to owner operations while genuine base drift fails closed", async () => {
+  const fixture = await reconciliationFixture("CLOSED");
+  const ghLog = path.join(fixture.root, "gh.log");
+  const validationMarker = path.join(fixture.root, "validation-ran");
+  try {
+    await git(fixture.repoPath, ["checkout", "main"]);
+    await writeFile(path.join(fixture.repoPath, "drift.txt"), "uncontained drift\n", "utf8");
+    await git(fixture.repoPath, ["add", "drift.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "advance protected target"]);
+    const driftHead = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "main"]);
+
+    const state = JSON.parse(await readFile(path.join(fixture.root, "data", "mission-control.json"), "utf8"));
+    const candidate = state.candidates[0];
+    candidate.status = "qa_passed";
+    delete candidate.promotion;
+    state.tasks[0].status = "approved_for_main";
+    state.tasks[0].assignedAgentRole = "promotion-worker";
+    state.qaBundles[0].status = "qa_passed";
+    const incompleteReplacement = candidateFixture({
+      baseSha: candidate.manifest.base.sha,
+      sourceSha: fixture.sourceSha,
+      integrationSha: fixture.sourceSha,
+      status: "qa_passed",
+      candidateId: "candidate_incomplete_merge",
+      taskId: "task_incomplete_merge",
+      qaBundleId: "qa_bundle_incomplete_merge",
+    });
+    incompleteReplacement.status = "merged";
+    incompleteReplacement.promotion = {
+      prUrl: "https://github.com/example/demo/pull/43",
+      commitSha: candidate.manifest.integration.sha,
+      manifestDigest: incompleteReplacement.manifestDigest,
+    };
+    delete incompleteReplacement.promotionMerge;
+    state.candidates.push(incompleteReplacement);
+    state.projects[0].promotion.validationCommands = [
+      `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync(${JSON.stringify(validationMarker)}, 'ran')"`,
+    ];
+    await writeState(fixture.root, state);
+    await writeFile(fixture.fakeBin + "/gh", `#!/bin/sh\nprintf '%s\\n' "$*" >> "$FAKE_GH_LOG"\nexit 97\n`, "utf8");
+    await chmod(fixture.fakeBin + "/gh", 0o755);
+    const refsBefore = await git(fixture.repoPath, ["ls-remote", "--heads", "origin"]);
+    const script = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        env: {
+          PATH: ${JSON.stringify(`${fixture.fakeBin}:/usr/local/bin:/usr/bin:/bin`)},
+          FAKE_GH_LOG: ${JSON.stringify(ghLog)}
+        }
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const unavailable = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    let persisted = readPersistedState(fixture.root);
+    assert.equal(unavailable.projects[0].status, "containment_unavailable");
+    assert.equal(persisted.tasks[0].status, "approved_for_main");
+    assert.equal(persisted.tasks[0].assignedAgentRole, "owner");
+    assert.equal(persisted.candidates[0].status, "qa_passed");
+    assert.equal(persisted.candidates[0].invalidation, null);
+    assert.equal(await git(fixture.repoPath, ["ls-remote", "--heads", "origin"]), refsBefore);
+    await assert.rejects(readFile(ghLog, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(validationMarker, "utf8"), /ENOENT/);
+
+    const repairAudit = `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        const replacement = state.candidates.find((item) => item.id === ${JSON.stringify(incompleteReplacement.id)});
+        replacement.promotionMerge = {
+          mergeCommit: ${JSON.stringify(driftHead)},
+          mergedAt: "2026-07-25T14:00:00.000Z",
+          reconciledAt: "2026-07-25T14:01:00.000Z"
+        };
+        state.tasks[0].assignedAgentRole = "promotion-worker";
+      });
+    `;
+    await run(process.execPath, ["--input-type=module", "-e", repairAudit], { cwd: fixture.root });
+    const uncontained = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
+    persisted = readPersistedState(fixture.root);
+    assert.equal(uncontained.projects[0].status, "blocked");
+    assert.match(uncontained.projects[0].output, /base ref drift|base drift/i);
+    assert.equal(persisted.tasks[0].status, "needs_changes");
+    assert.ok(persisted.candidates[0].invalidation);
+    assert.equal(await git(fixture.repoPath, ["ls-remote", "--heads", "origin"]), refsBefore);
+    await assert.rejects(readFile(ghLog, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(validationMarker, "utf8"), /ENOENT/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

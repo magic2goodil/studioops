@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "feature": "release-containment-reconciliation",
+  "workflowImpact": "full-regression",
+  "policyAuthority": "release-containment-policy",
+  "publicContract": {
+    "module": "src/release-containment.js",
+    "exports": [
+      "RELEASE_CONTAINMENT_OUTCOMES",
+      "compareCandidateSubject",
+      "evaluateExactTargetContainment",
+      "evaluateTrustedCandidateContainment"
+    ],
+    "outcomes": ["exact", "stale", "contained", "not_contained", "unavailable"],
+    "copiedIdentityOrContainmentPolicyAllowed": false
+  },
+  "components": [
+    {
+      "id": "release-containment-policy",
+      "classification": "shared-release-policy",
+      "owner": "backend-release-orchestration",
+      "paths": ["src/release-containment.js", "test/release-containment.test.js"],
+      "ownsData": [],
+      "publicContracts": ["exact candidate identity decision", "exact commit containment decision", "trusted replacement evidence decision"],
+      "allowedDependencies": ["candidate-manifest-public-contract"],
+      "testLayers": {
+        "unit": ["test/release-containment.test.js"],
+        "contract": ["test/release-containment.test.js"],
+        "persistence": [],
+        "adapter": [],
+        "composition": ["test/modular-architecture-standard.test.js", "npm run check"]
+      }
+    },
+    {
+      "id": "qa-integration-adapter",
+      "classification": "release-adapter",
+      "owner": "backend-qa-integration",
+      "paths": ["src/qa-integration.js", "test/qa-integration.test.js"],
+      "ownsData": ["additive task integration-handoff history and candidate JSON evidence"],
+      "publicContracts": ["planQaIntegrations", "runQaIntegration", "protected QA handoff lifecycle"],
+      "allowedDependencies": ["release-containment-policy", "store-lifecycle-contract"],
+      "testLayers": {
+        "unit": [],
+        "contract": ["test/qa-integration.test.js"],
+        "persistence": ["test/qa-integration.test.js"],
+        "adapter": ["test/qa-integration.test.js"],
+        "composition": ["npm run check"]
+      }
+    },
+    {
+      "id": "promotion-adapter",
+      "classification": "release-adapter",
+      "owner": "backend-promotion",
+      "paths": ["src/promotion.js", "test/promotion.test.js"],
+      "ownsData": ["additive task, candidate, and QA-bundle merge-evidence JSON fields"],
+      "publicContracts": ["planPromotions", "runPromotion", "release-candidate lifecycle"],
+      "allowedDependencies": ["release-containment-policy", "store-lifecycle-contract"],
+      "testLayers": {
+        "unit": [],
+        "contract": ["test/promotion.test.js"],
+        "persistence": ["test/promotion.test.js"],
+        "adapter": ["test/promotion.test.js"],
+        "composition": ["npm run check"]
+      }
+    },
+    {
+      "id": "store-lifecycle-contract",
+      "classification": "existing-downstream-contract",
+      "owner": "backend-state-lifecycle",
+      "paths": ["src/store.js"],
+      "ownsData": ["existing SQLite rows containing JSON payloads for tasks, candidates, QA bundles, comments, and events"],
+      "publicContracts": ["mutateState", "applyLifecycleTransitionInState"],
+      "allowedDependencies": [],
+      "testLayers": {
+        "unit": [],
+        "contract": [],
+        "persistence": ["test/qa-integration.test.js", "test/promotion.test.js"],
+        "adapter": [],
+        "composition": ["npm run check"]
+      }
+    },
+    {
+      "id": "release-validation-composition",
+      "classification": "workflow-and-architecture-contract",
+      "owner": "engineering-enablement",
+      "paths": ["package.json", "test/modular-architecture-standard.test.js", "docs/architecture/release-containment.components.json"],
+      "ownsData": [],
+      "publicContracts": ["package syntax coverage", "deterministic impact classification", "one aggregate full-regression check"],
+      "allowedDependencies": ["release-containment-policy", "qa-integration-adapter", "promotion-adapter", "store-lifecycle-contract"],
+      "testLayers": {
+        "unit": [],
+        "contract": ["test/modular-architecture-standard.test.js"],
+        "persistence": [],
+        "adapter": [],
+        "composition": ["npm run check"]
+      }
+    }
+  ],
+  "dependencyEdges": [
+    { "from": "qa-integration-adapter", "to": "release-containment-policy" },
+    { "from": "qa-integration-adapter", "to": "store-lifecycle-contract" },
+    { "from": "promotion-adapter", "to": "release-containment-policy" },
+    { "from": "promotion-adapter", "to": "store-lifecycle-contract" },
+    { "from": "release-validation-composition", "to": "release-containment-policy" },
+    { "from": "release-validation-composition", "to": "qa-integration-adapter" },
+    { "from": "release-validation-composition", "to": "promotion-adapter" },
+    { "from": "release-validation-composition", "to": "store-lifecycle-contract" }
+  ],
+  "impactClassifier": {
+    "input": "base/head diff plus this executable ownership and dependency manifest",
+    "pathRules": [
+      { "pattern": "src/release-containment.js", "component": "release-containment-policy", "surface": "public-contract", "selection": "full_regression" },
+      { "pattern": "src/qa-integration.js", "component": "qa-integration-adapter", "surface": "workflow-adapter", "selection": "full_regression" },
+      { "pattern": "src/promotion.js", "component": "promotion-adapter", "surface": "workflow-adapter", "selection": "full_regression" },
+      { "pattern": "src/store.js", "component": "store-lifecycle-contract", "surface": "persistence-contract", "selection": "full_regression" },
+      { "pattern": "test/release-containment.test.js", "component": "release-containment-policy", "surface": "test", "selection": "full_regression" },
+      { "pattern": "test/qa-integration.test.js", "component": "qa-integration-adapter", "surface": "test", "selection": "full_regression" },
+      { "pattern": "test/promotion.test.js", "component": "promotion-adapter", "surface": "test", "selection": "full_regression" },
+      { "pattern": "test/modular-architecture-standard.test.js", "component": "release-validation-composition", "surface": "architecture-test", "selection": "full_regression" },
+      { "pattern": "docs/architecture/release-containment.components.json", "component": "release-validation-composition", "surface": "ownership-manifest", "selection": "full_regression" },
+      { "pattern": "package.json", "component": "release-validation-composition", "surface": "validation-workflow", "selection": "full_regression" }
+    ],
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "fullRegressionTriggers": ["shared release public contract", "multi-component release workflow", "additive persistence payload contract", "ownership manifest or validation workflow", "ambiguous or unclassified path"],
+    "aggregateCommand": "npm run check",
+    "duplicateEquivalentWorkflowCount": 0
+  },
+  "compatibility": {
+    "schemaOrIndexChange": false,
+    "newServiceQueueCacheOrEndpoint": false,
+    "sqliteJsonPayloadsRemainReadable": true,
+    "persistenceMutationOwner": "store-lifecycle-contract"
+  },
+  "releaseEvidence": {
+    "bindings": ["sourceSha", "manifestDigest", "selectedComponents", "commands", "outcomes", "durations", "retriesAndSkips", "environmentContract", "artifactDigests"],
+    "prePushContainmentBudgetSecondsExcludingFetch": 30,
+    "expandedTargetedSuiteBudgetSeconds": 120,
+    "fullRegressionBudgetSeconds": 480,
+    "duplicateBranchPushCountOnContainedPath": 0,
+    "duplicatePullRequestCreateCountOnContainedPath": 0,
+    "duplicateEquivalentWorkflowTriggerCountOnContainedPath": 0
+  },
+  "prohibited": ["adapter-specific source SHA or candidate-cycle policy", "adapter-specific commit-containment policy", "schema migration", "new service, queue, cache, endpoint, UI, or external notification", "force push or duplicate release validation on a contained path"],
+  "rollback": "One commit reverts the release-containment policy and adapter calls; additive SQLite JSON payload evidence remains readable and existing candidate, task, bundle, merge, release, and deployment evidence is not rewritten."
+}

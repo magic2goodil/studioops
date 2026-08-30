@@ -14,6 +14,7 @@ import {
 
 const SUBJECT_SHA = "a".repeat(40);
 const CREDIT_ADMISSION_MANIFEST = "docs/architecture/credit-admission-impact.json";
+const RELEASE_CONTAINMENT_MANIFEST = "docs/architecture/release-containment.components.json";
 
 function fixtureState(projectPatch = {}, taskPatch = {}) {
   return {
@@ -284,6 +285,94 @@ test("the credit-admission ownership manifest is complete, acyclic, and fail clo
       "fallback rule definitions must not be copied outside the policy authority",
     );
   }
+});
+
+test("release containment ownership is deterministic, acyclic, and fail closed to full regression", async () => {
+  const manifest = JSON.parse(await readFile(RELEASE_CONTAINMENT_MANIFEST, "utf8"));
+  const changedPaths = [
+    "src/release-containment.js",
+    "src/qa-integration.js",
+    "src/promotion.js",
+    "test/release-containment.test.js",
+    "test/qa-integration.test.js",
+    "test/promotion.test.js",
+    "test/modular-architecture-standard.test.js",
+    RELEASE_CONTAINMENT_MANIFEST,
+    "package.json",
+  ];
+  const componentIds = new Set(manifest.components.map((component) => component.id));
+
+  assert.equal(manifest.schemaVersion, 1);
+  assert.equal(manifest.workflowImpact, "full-regression");
+  assert.equal(manifest.policyAuthority, "release-containment-policy");
+  assert.equal(manifest.publicContract.module, "src/release-containment.js");
+  assert.deepEqual(manifest.publicContract.outcomes, [
+    "exact",
+    "stale",
+    "contained",
+    "not_contained",
+    "unavailable",
+  ]);
+  assert.equal(manifest.publicContract.copiedIdentityOrContainmentPolicyAllowed, false);
+  assert.equal(manifest.impactClassifier.ambiguousPathSelection, "full_regression");
+  assert.equal(manifest.impactClassifier.unclassifiedPathSelection, "full_regression");
+  assert.equal(manifest.impactClassifier.aggregateCommand, "npm run check");
+  assert.equal(manifest.impactClassifier.duplicateEquivalentWorkflowCount, 0);
+  assert.equal(manifest.compatibility.schemaOrIndexChange, false);
+  assert.equal(manifest.compatibility.newServiceQueueCacheOrEndpoint, false);
+  assert.equal(manifest.compatibility.persistenceMutationOwner, "store-lifecycle-contract");
+
+  for (const changedPath of changedPaths) {
+    const rule = matchingPathRule(manifest, changedPath);
+    assert.ok(rule, `${changedPath} must have one release-containment owner`);
+    assert.ok(componentIds.has(rule.component), `${changedPath} references an unknown component`);
+    assert.equal(rule.selection, "full_regression");
+    assert.equal(
+      manifest.impactClassifier.pathRules.filter((item) => item.pattern === changedPath).length,
+      1,
+      `${changedPath} must not have ambiguous ownership`,
+    );
+  }
+  assert.ok(manifest.impactClassifier.pathRules.some((rule) => rule.surface === "public-contract"));
+  assert.ok(manifest.impactClassifier.pathRules.some((rule) => rule.surface === "workflow-adapter"));
+  assert.ok(manifest.impactClassifier.pathRules.some((rule) => rule.surface === "persistence-contract"));
+  assert.ok(manifest.impactClassifier.pathRules.some((rule) => rule.surface === "validation-workflow"));
+  assert.ok(manifest.impactClassifier.pathRules.some((rule) => rule.surface === "test"));
+
+  const graph = new Map([...componentIds].map((id) => [id, []]));
+  for (const edge of manifest.dependencyEdges) {
+    assert.ok(componentIds.has(edge.from), `unknown dependency source ${edge.from}`);
+    assert.ok(componentIds.has(edge.to), `unknown dependency target ${edge.to}`);
+    graph.get(edge.from).push(edge.to);
+  }
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (component) => {
+    assert.equal(visiting.has(component), false, `dependency cycle includes ${component}`);
+    if (visited.has(component)) return;
+    visiting.add(component);
+    for (const dependency of graph.get(component)) visit(dependency);
+    visiting.delete(component);
+    visited.add(component);
+  };
+  for (const component of componentIds) visit(component);
+  for (const adapterId of ["qa-integration-adapter", "promotion-adapter"]) {
+    const adapter = manifest.components.find((component) => component.id === adapterId);
+    assert.ok(adapter.allowedDependencies.includes(manifest.policyAuthority));
+    assert.ok(adapter.allowedDependencies.includes("store-lifecycle-contract"));
+  }
+
+  const [qaSource, promotionSource, packageJson] = await Promise.all([
+    readFile("src/qa-integration.js", "utf8"),
+    readFile("src/promotion.js", "utf8"),
+    readFile("package.json", "utf8"),
+  ]);
+  assert.match(qaSource, /from "\.\/release-containment\.js"/);
+  assert.match(promotionSource, /from "\.\/release-containment\.js"/);
+  assert.doesNotMatch(qaSource, /integrationSourceHeadSha\s*!==|integrationSourceCandidateCycle\s*!==/);
+  assert.doesNotMatch(promotionSource, /candidateIncluded|sourceChecks/);
+  assert.match(packageJson, /node --check src\/release-containment\.js/);
+  assert.match(manifest.rollback, /One commit reverts.*additive SQLite JSON payload evidence remains readable/i);
 });
 
 test("run workspace retention manifest is complete and acyclic", async () => {
