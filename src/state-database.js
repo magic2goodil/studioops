@@ -1,6 +1,6 @@
 import { backup, DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
 import { lifecycleEvidenceChanged, positiveStateVersion } from "./lifecycle-policy.js";
@@ -18,15 +18,25 @@ const STATE_INTEGRITY_VERSION = 5;
 const LIFECYCLE_SCHEMA_VERSION = 1;
 export const COORDINATION_SCHEMA_VERSION = 2;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
-const ACTIVE_QA_COMMENTS_PER_TASK = 20;
-const ACTIVE_QA_EVENTS_PER_TASK = 40;
-const ACTIVE_MACHINE_COMMENTS_PER_TASK = 12;
-const ACTIVE_TERMINAL_RUNS_PER_WORKFLOW_ACTION = 3;
 const SQLITE_BUSY_TIMEOUT_MS = 250;
 const DEFAULT_MUTATION_RETRIES = 4;
 const MAX_MUTATION_RETRIES = 8;
-const CONTENTION_EVENT_RETENTION_MS = 24 * 60 * 60 * 1000;
-const MAX_CONTENTION_EVENTS = 1_000;
+const ACTIVE_INCIDENT_STATUSES = new Set(["open", "acknowledged", "mitigating"]);
+export const DEFAULT_OPERATIONAL_RETENTION_POLICY = Object.freeze({
+  qaCommentsPerTask: 20,
+  machineCommentsPerTask: 12,
+  eventsPerStream: 40,
+  terminalRunsPerWorkflowAction: 3,
+  notificationDays: 30,
+  notificationMaxRows: 2_000,
+  archiveDays: 90,
+  incidentTimelineDays: 90,
+  resolvedIncidentDays: 365,
+  contentionHours: 24,
+  contentionMaxRows: 1_000,
+  runOutputDays: 14,
+  runOutputMaxFiles: 2_000,
+});
 const VALID_TASK_STATUSES = new Set([
   "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
   "ready", "queued", "in_progress", "blocked", "builder_review", "backend_review",
@@ -41,6 +51,72 @@ export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
 let database = null;
 let integrityMigrated = false;
 let integrityMigrationPromise = null;
+
+function boundedInteger(value, fallback, minimum = 1, maximum = 1_000_000) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.min(maximum, Math.max(minimum, Math.floor(parsed)))
+    : fallback;
+}
+
+export function operationalRetentionPolicy(input = {}, env = process.env) {
+  return {
+    qaCommentsPerTask: boundedInteger(
+      input.qaCommentsPerTask ?? input.commentLimit ?? env.STUDIOOPS_RETENTION_QA_COMMENTS_PER_TASK,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.qaCommentsPerTask,
+    ),
+    machineCommentsPerTask: boundedInteger(
+      input.machineCommentsPerTask ?? input.machineCommentLimit ?? env.STUDIOOPS_RETENTION_MACHINE_COMMENTS_PER_TASK,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.machineCommentsPerTask,
+    ),
+    eventsPerStream: boundedInteger(
+      input.eventsPerStream ?? input.eventLimit ?? env.STUDIOOPS_RETENTION_EVENTS_PER_STREAM,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.eventsPerStream,
+    ),
+    terminalRunsPerWorkflowAction: boundedInteger(
+      input.terminalRunsPerWorkflowAction ?? input.terminalRunLimit ?? env.STUDIOOPS_RETENTION_TERMINAL_RUNS_PER_ACTION,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.terminalRunsPerWorkflowAction,
+    ),
+    notificationDays: boundedInteger(
+      input.notificationDays ?? env.STUDIOOPS_RETENTION_NOTIFICATION_DAYS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.notificationDays,
+    ),
+    notificationMaxRows: boundedInteger(
+      input.notificationMaxRows ?? env.STUDIOOPS_RETENTION_NOTIFICATION_MAX_ROWS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.notificationMaxRows,
+    ),
+    archiveDays: boundedInteger(
+      input.archiveDays ?? env.STUDIOOPS_RETENTION_ARCHIVE_DAYS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.archiveDays,
+    ),
+    incidentTimelineDays: boundedInteger(
+      input.incidentTimelineDays ?? env.STUDIOOPS_RETENTION_INCIDENT_TIMELINE_DAYS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.incidentTimelineDays,
+    ),
+    resolvedIncidentDays: boundedInteger(
+      input.resolvedIncidentDays ?? env.STUDIOOPS_RETENTION_RESOLVED_INCIDENT_DAYS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.resolvedIncidentDays,
+    ),
+    contentionHours: boundedInteger(
+      input.contentionHours ?? env.STUDIOOPS_RETENTION_CONTENTION_HOURS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.contentionHours,
+      1,
+      24 * 365,
+    ),
+    contentionMaxRows: boundedInteger(
+      input.contentionMaxRows ?? env.STUDIOOPS_RETENTION_CONTENTION_MAX_ROWS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.contentionMaxRows,
+    ),
+    runOutputDays: boundedInteger(
+      input.runOutputDays ?? env.STUDIOOPS_RETENTION_RUN_OUTPUT_DAYS,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.runOutputDays,
+    ),
+    runOutputMaxFiles: boundedInteger(
+      input.runOutputMaxFiles ?? env.STUDIOOPS_RETENTION_RUN_OUTPUT_MAX_FILES,
+      DEFAULT_OPERATIONAL_RETENTION_POLICY.runOutputMaxFiles,
+    ),
+  };
+}
 
 async function secureStoragePaths() {
   await chmod(DATA_DIR, 0o700).catch(() => {});
@@ -173,11 +249,35 @@ function openDatabase() {
       retry_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS operational_incidents (
+      id TEXT PRIMARY KEY,
+      identity_key TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('open', 'acknowledged', 'mitigating', 'resolved')),
+      owner TEXT NOT NULL DEFAULT '',
+      opened_at TEXT NOT NULL,
+      acknowledged_at TEXT NOT NULL DEFAULT '',
+      resolved_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL,
+      resolution_evidence TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS incident_timeline (
+      id TEXT PRIMARY KEY,
+      incident_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      actor TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      payload TEXT NOT NULL DEFAULT '{}',
+      FOREIGN KEY(incident_id) REFERENCES operational_incidents(id) ON DELETE CASCADE
+    );
     CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
     CREATE INDEX IF NOT EXISTS idx_comments_task_created ON comments(task_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_reviews_task_created ON reviews(task_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_events_project_created ON events(project_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(type, created_at);
     CREATE INDEX IF NOT EXISTS idx_runs_status_updated ON runs(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_runs_task_status ON runs(task_id, status);
     CREATE INDEX IF NOT EXISTS idx_qa_bundles_project_status ON qa_bundles(project_id, status, updated_at);
@@ -186,6 +286,8 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_notification_outbox_status ON notification_outbox(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_database_contention_created ON database_contention_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_operational_incidents_status_updated ON operational_incidents(status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_incident_timeline_incident_created ON incident_timeline(incident_id, created_at);
   `);
   const contentionColumns = new Set(
     database.prepare("PRAGMA table_info(database_contention_events)").all().map((column) => column.name),
@@ -242,7 +344,8 @@ function recordContentionEvent(db, input = {}) {
     Math.max(0, Math.floor(Number(input.retryCount) || 0)),
     createdAt,
   );
-  const retentionCutoff = new Date(Date.now() - CONTENTION_EVENT_RETENTION_MS).toISOString();
+  const retention = operationalRetentionPolicy(input.retentionPolicy);
+  const retentionCutoff = new Date(Date.now() - retention.contentionHours * 60 * 60 * 1000).toISOString();
   db.prepare("DELETE FROM database_contention_events WHERE created_at < ?").run(retentionCutoff);
   db.prepare(`
     DELETE FROM database_contention_events
@@ -251,7 +354,7 @@ function recordContentionEvent(db, input = {}) {
       ORDER BY created_at DESC, id DESC
       LIMIT -1 OFFSET ?
     )
-  `).run(MAX_CONTENTION_EVENTS);
+  `).run(retention.contentionMaxRows);
 }
 
 function readStateSnapshot(db) {
@@ -391,12 +494,9 @@ function archiveOldestBeyondLimit(items, matches, groupKey, limit) {
 }
 
 export function compactOperationalHistory(state, input = {}) {
-  const commentLimit = Math.max(1, Number(input.commentLimit || ACTIVE_QA_COMMENTS_PER_TASK));
-  const machineCommentLimit = Math.max(
-    1,
-    Number(input.machineCommentLimit || ACTIVE_MACHINE_COMMENTS_PER_TASK),
-  );
-  const eventLimit = Math.max(1, Number(input.eventLimit || ACTIVE_QA_EVENTS_PER_TASK));
+  const policy = operationalRetentionPolicy(input);
+  const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
+  const notificationCutoff = nowMs - policy.notificationDays * 24 * 60 * 60 * 1000;
   const qaEventEvidence = new Set((Array.isArray(state.events) ? state.events : [])
     .filter((event) => /^qa_integration_/.test(event.type || ""))
     .map((event) => `${event.taskId || ""}|${event.createdAt || ""}`));
@@ -420,7 +520,9 @@ export function compactOperationalHistory(state, input = {}) {
     (comment) => isQaIntegrationComment(comment)
       ? `qa:${comment.taskId || "unassigned"}`
       : `machine:${comment.taskId || "unassigned"}`,
-    (comment) => isQaIntegrationComment(comment) ? commentLimit : machineCommentLimit,
+    (comment) => isQaIntegrationComment(comment)
+      ? policy.qaCommentsPerTask
+      : policy.machineCommentsPerTask,
   );
   const events = archiveOldestBeyondLimit(
     Array.isArray(state.events) ? state.events : [],
@@ -431,7 +533,7 @@ export function compactOperationalHistory(state, input = {}) {
       || event.attemptKey
       || event.dispatchKey
       || `${event.taskId || event.projectId || "unassigned"}:${event.type || "machine"}`,
-    eventLimit,
+    policy.eventsPerStream,
   );
   const runs = archiveOldestBeyondLimit(
     Array.isArray(state.runs) ? state.runs : [],
@@ -439,14 +541,46 @@ export function compactOperationalHistory(state, input = {}) {
     (run) => `${run.taskId || "unassigned"}:${run.actionType || "run"}:${run.role || "worker"}`,
     (run) => Math.max(
       1,
-      Number(input.terminalRunLimit || ACTIVE_TERMINAL_RUNS_PER_WORKFLOW_ACTION),
+      policy.terminalRunsPerWorkflowAction,
       Number(run.maxAttempts || 0) + 1,
     ),
   );
+  const notifications = {
+    active: [],
+    archived: [],
+  };
+  const notificationItems = Array.isArray(state.notificationOutbox) ? state.notificationOutbox : [];
+  const notificationIsRetentionTerminal = (item) => (
+    item.status === "acknowledged"
+    || (
+      item.status === "failed"
+      && Number(item.attempts || 0) >= Number(item.policy?.maxAttempts || 3)
+    )
+  );
+  const terminalNotificationIds = new Set(notificationItems
+    .filter(notificationIsRetentionTerminal)
+    .slice(-policy.notificationMaxRows)
+    .map((item) => item.id));
+  for (const item of notificationItems) {
+    const timestamp = Date.parse(item.acknowledgedAt || item.deliveredAt || item.updatedAt || item.createdAt || "");
+    const terminal = notificationIsRetentionTerminal(item);
+    (terminal && (
+      !terminalNotificationIds.has(item.id)
+      || (Number.isFinite(timestamp) && timestamp < notificationCutoff)
+    )
+      ? notifications.archived
+      : notifications.active).push(item);
+  }
   state.comments = comments.active;
   state.events = events.active;
   state.runs = runs.active;
-  return { comments: comments.archived, events: events.archived, runs: runs.archived };
+  state.notificationOutbox = notifications.active;
+  return {
+    comments: comments.archived,
+    events: events.archived,
+    runs: runs.archived,
+    notificationOutbox: notifications.archived,
+  };
 }
 
 function archivePayload(entityType, item) {
@@ -486,6 +620,29 @@ function archivedItemCount(archived) {
   return Object.values(archived).reduce((count, items) => count + items.length, 0);
 }
 
+function enforceDatabaseRetention(db, input = {}) {
+  const policy = operationalRetentionPolicy(input.policy || input);
+  const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
+  const cutoff = (days) => new Date(nowMs - days * 24 * 60 * 60 * 1000).toISOString();
+  const archive = db.prepare("DELETE FROM operational_archive WHERE archived_at < ?")
+    .run(cutoff(policy.archiveDays));
+  const timeline = db.prepare(`
+    DELETE FROM incident_timeline
+    WHERE created_at < ?
+      AND incident_id IN (SELECT id FROM operational_incidents WHERE status = 'resolved')
+  `).run(cutoff(policy.incidentTimelineDays));
+  const incidents = db.prepare("DELETE FROM operational_incidents WHERE status = 'resolved' AND resolved_at < ?")
+    .run(cutoff(policy.resolvedIncidentDays));
+  const contention = db.prepare("DELETE FROM database_contention_events WHERE created_at < ?")
+    .run(new Date(nowMs - policy.contentionHours * 60 * 60 * 1000).toISOString());
+  return {
+    archiveRows: Number(archive.changes || 0),
+    timelineRows: Number(timeline.changes || 0),
+    incidentRows: Number(incidents.changes || 0),
+    contentionRows: Number(contention.changes || 0),
+  };
+}
+
 function recordOperationalArchiveMetadata(state, archived, now, backupPath = "") {
   const previous = state.meta?.operationalArchive || {};
   state.meta.operationalArchive = {
@@ -495,10 +652,9 @@ function recordOperationalArchiveMetadata(state, archived, now, backupPath = "")
     comments: Number(previous.comments || 0) + (archived.comments || []).length,
     events: Number(previous.events || 0) + (archived.events || []).length,
     runs: Number(previous.runs || 0) + (archived.runs || []).length,
-    activeQaCommentsPerTask: ACTIVE_QA_COMMENTS_PER_TASK,
-    activeQaEventsPerTask: ACTIVE_QA_EVENTS_PER_TASK,
-    activeMachineCommentsPerTask: ACTIVE_MACHINE_COMMENTS_PER_TASK,
-    activeTerminalRunsPerWorkflowAction: ACTIVE_TERMINAL_RUNS_PER_WORKFLOW_ACTION,
+    notificationOutbox: Number(previous.notificationOutbox || 0)
+      + (archived.notificationOutbox || []).length,
+    retentionPolicy: operationalRetentionPolicy(),
   };
 }
 
@@ -1121,7 +1277,7 @@ export async function ensureStateDatabase() {
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   await secureStoragePaths();
   const db = openDatabase();
-  if (!readStateFromOpenDatabase(db)) {
+  if (!db.prepare("SELECT 1 initialized FROM state_meta WHERE singleton_id = 1").get()) {
     const state = await initialState();
     state.meta = {
       ...(state.meta || {}),
@@ -1178,17 +1334,19 @@ export async function readDatabaseStateReadOnly() {
 }
 
 export function maintenanceWriteBlocker(state, input = {}) {
-  const lease = state?.meta?.selfUpdateLease;
-  if (!lease || typeof lease !== "object") return null;
   const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
-  const expiresAt = Date.parse(lease.expiresAt || "");
-  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) return null;
   const ownerPid = String(input.ownerPid || process.pid);
   const authorizedLeaseId = String(
     input.leaseId || process.env.STUDIOOPS_MAINTENANCE_LEASE_ID || "",
   );
-  if (String(lease.ownerPid || "") === ownerPid || authorizedLeaseId === String(lease.id || "")) return null;
-  return lease;
+  for (const lease of [state?.meta?.selfUpdateLease, state?.meta?.databaseMaintenanceLease]) {
+    if (!lease || typeof lease !== "object") continue;
+    const expiresAt = Date.parse(lease.expiresAt || "");
+    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) continue;
+    if (String(lease.ownerPid || "") === ownerPid || authorizedLeaseId === String(lease.id || "")) continue;
+    return lease;
+  }
+  return null;
 }
 
 function assertMaintenanceWriteAllowed(state) {
@@ -1217,6 +1375,7 @@ export async function writeDatabaseState(state) {
       recordOperationalArchiveMetadata(state, archived, now);
     }
     writeStateToOpenDatabase(db, state);
+    enforceDatabaseRetention(db);
     db.exec("COMMIT");
     await secureStoragePaths();
   } catch (error) {
@@ -1277,6 +1436,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
       assertMaintenanceWriteAllowed({ meta: currentMeta });
       if (archivedItemCount(archived)) archiveOperationalHistory(db, archived, now);
       writeMutationToOpenDatabase(db, state, snapshot, options);
+      enforceDatabaseRetention(db, { policy: options.retentionPolicy });
       recordContentionEvent(db, {
         operationName,
         outcome: "committed",
@@ -1345,6 +1505,475 @@ export async function databaseContentionHealth(input = {}) {
   };
 }
 
+function ageFromTimestamp(value, nowMs) {
+  const parsed = Date.parse(value || "");
+  return Number.isFinite(parsed) ? Math.max(0, nowMs - parsed) : 0;
+}
+
+export async function databaseReadinessHealth(input = {}) {
+  const startedAt = Date.now();
+  const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
+  const databaseLatencySloMs = boundedInteger(input.databaseLatencySloMs, 100, 1, 60_000);
+  const maxQueueAgeMs = boundedInteger(input.maxQueueAgeMs, 5 * 60 * 1000, 1_000, 7 * 24 * 60 * 60 * 1000);
+  try {
+    const db = await ensureStateDatabase();
+    const meta = db.prepare("SELECT version, updated_at FROM state_meta WHERE singleton_id = 1").get();
+    const queued = db.prepare(`
+      SELECT count(*) count,
+        min(coalesce(json_extract(payload, '$.createdAt'), updated_at)) oldest_at
+      FROM runs WHERE status = 'queued'
+    `).get();
+    const activeLeases = db.prepare(`
+      SELECT count(*) count,
+        sum(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END) expired_count,
+        min(acquired_at) oldest_at,
+        min(heartbeat_at) oldest_heartbeat_at
+      FROM coordination_leases WHERE status = 'active'
+    `).get(new Date(nowMs).toISOString());
+    const latencyMs = Date.now() - startedAt;
+    const queueAgeMs = ageFromTimestamp(queued.oldest_at, nowMs);
+    const database = {
+      ok: Boolean(meta) && latencyMs <= databaseLatencySloMs,
+      latencyMs,
+      latencySloMs: databaseLatencySloMs,
+      version: Number(meta?.version || 0),
+      updatedAt: meta?.updated_at || "",
+    };
+    const queue = {
+      ok: queueAgeMs <= maxQueueAgeMs,
+      queuedCount: Number(queued.count || 0),
+      oldestAgeMs: queueAgeMs,
+      maxAgeMs: maxQueueAgeMs,
+    };
+    const leases = {
+      ok: Number(activeLeases.expired_count || 0) === 0,
+      activeCount: Number(activeLeases.count || 0),
+      expiredCount: Number(activeLeases.expired_count || 0),
+      oldestAgeMs: ageFromTimestamp(activeLeases.oldest_at, nowMs),
+      oldestHeartbeatAgeMs: ageFromTimestamp(activeLeases.oldest_heartbeat_at, nowMs),
+    };
+    return { ok: database.ok && queue.ok && leases.ok, database, queue, leases };
+  } catch (error) {
+    return {
+      ok: false,
+      database: {
+        ok: false,
+        latencyMs: Date.now() - startedAt,
+        latencySloMs: databaseLatencySloMs,
+        reason: String(error?.code || error?.message || "database_unavailable").slice(0, 160),
+      },
+      queue: { ok: false, queuedCount: 0, oldestAgeMs: 0, maxAgeMs: maxQueueAgeMs },
+      leases: { ok: false, activeCount: 0, expiredCount: 0, oldestAgeMs: 0, oldestHeartbeatAgeMs: 0 },
+    };
+  }
+}
+
+export async function operationalMetrics(input = {}) {
+  const startedAt = Date.now();
+  const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
+  const db = await ensureStateDatabase();
+  const readiness = await databaseReadinessHealth({ ...input, nowMs });
+  const runs = db.prepare(`
+    SELECT count(*) total,
+      sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) failures,
+      sum(CASE
+        WHEN coalesce(CAST(json_extract(payload, '$.attempt') AS INTEGER), 1) > 1
+        THEN CAST(json_extract(payload, '$.attempt') AS INTEGER) - 1
+        ELSE 0
+      END) retries,
+      sum(coalesce(CAST(json_extract(payload, '$.costTelemetry.inputTokens') AS INTEGER), 0)) input_tokens,
+      sum(coalesce(CAST(json_extract(payload, '$.costTelemetry.outputTokens') AS INTEGER), 0)) output_tokens,
+      sum(coalesce(CAST(json_extract(payload, '$.costTelemetry.cachedInputTokens') AS INTEGER), 0)) cached_input_tokens,
+      sum(coalesce(CAST(json_extract(payload, '$.costTelemetry.reasoningOutputTokens') AS INTEGER), 0)) reasoning_tokens
+    FROM runs
+  `).get();
+  const loops = db.prepare(`
+    SELECT count(*) count FROM events
+    WHERE type = 'automation_tick' AND created_at >= ?
+  `).get(new Date(nowMs - 24 * 60 * 60 * 1000).toISOString());
+  const contention = db.prepare(`
+    SELECT coalesce(sum(retry_count), 0) retries,
+      coalesce(round(avg(duration_ms)), 0) average_latency_ms,
+      coalesce(max(duration_ms), 0) max_latency_ms
+    FROM database_contention_events WHERE created_at >= ?
+  `).get(new Date(nowMs - 60 * 60 * 1000).toISOString());
+  const notificationRows = db.prepare(`
+    SELECT status, count(*) count, coalesce(sum(CAST(json_extract(payload, '$.attempts') AS INTEGER)), 0) attempts
+    FROM notification_outbox GROUP BY status ORDER BY status
+  `).all();
+  const incidentRows = db.prepare(`
+    SELECT status, count(*) count FROM operational_incidents GROUP BY status ORDER BY status
+  `).all();
+  const pageCount = Number(db.prepare("PRAGMA page_count").get()?.page_count || 0);
+  const freePages = Number(db.prepare("PRAGMA freelist_count").get()?.freelist_count || 0);
+  return {
+    generatedAt: new Date(nowMs).toISOString(),
+    queue: readiness.queue,
+    leases: readiness.leases,
+    retries: {
+      runRetries: Number(runs.retries || 0),
+      databaseRetries: Number(contention.retries || 0),
+    },
+    loops: { automationTicks24h: Number(loops.count || 0) },
+    tokens: {
+      input: Number(runs.input_tokens || 0),
+      output: Number(runs.output_tokens || 0),
+      cachedInput: Number(runs.cached_input_tokens || 0),
+      reasoningOutput: Number(runs.reasoning_tokens || 0),
+    },
+    notifications: Object.fromEntries(notificationRows.map((row) => [row.status, {
+      count: Number(row.count || 0),
+      attempts: Number(row.attempts || 0),
+    }])),
+    incidents: Object.fromEntries(incidentRows.map((row) => [row.status, Number(row.count || 0)])),
+    database: {
+      latencyMs: readiness.database.latencyMs,
+      latencySloMs: readiness.database.latencySloMs,
+      averageMutationLatencyMs: Number(contention.average_latency_ms || 0),
+      maxMutationLatencyMs: Number(contention.max_latency_ms || 0),
+      pageCount,
+      freePages,
+      freePagePercent: pageCount ? Number(((freePages / pageCount) * 100).toFixed(2)) : 0,
+      collectionLatencyMs: Date.now() - startedAt,
+    },
+  };
+}
+
+function boundedIncidentValue(value, maximum = 1_000) {
+  return String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maximum);
+}
+
+function incidentPayload(value = {}) {
+  const serialized = JSON.stringify(value || {});
+  if (serialized.length <= 32_000) return serialized;
+  return JSON.stringify({ truncated: true, byteLength: Buffer.byteLength(serialized) });
+}
+
+function appendIncidentTimeline(db, incidentId, eventType, actor, payload, createdAt) {
+  db.prepare(`
+    INSERT INTO incident_timeline(id, incident_id, event_type, actor, created_at, payload)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(randomUUID(), incidentId, eventType, boundedIncidentValue(actor, 160), createdAt, incidentPayload(payload));
+}
+
+function incidentFromRow(db, row, includeTimeline = true) {
+  if (!row) return null;
+  const incident = {
+    id: row.id,
+    identityKey: row.identity_key,
+    kind: row.kind,
+    severity: row.severity,
+    status: row.status,
+    owner: row.owner,
+    openedAt: row.opened_at,
+    acknowledgedAt: row.acknowledged_at,
+    resolvedAt: row.resolved_at,
+    updatedAt: row.updated_at,
+    resolutionEvidence: row.resolution_evidence,
+    detail: parsePayload(row.payload, {}),
+  };
+  if (includeTimeline) {
+    incident.timeline = db.prepare(`
+      SELECT event_type, actor, created_at, payload FROM incident_timeline
+      WHERE incident_id = ? ORDER BY created_at ASC, rowid ASC LIMIT 500
+    `).all(row.id).map((item) => ({
+      type: item.event_type,
+      actor: item.actor,
+      createdAt: item.created_at,
+      detail: parsePayload(item.payload, {}),
+    }));
+  }
+  return incident;
+}
+
+export async function upsertOperationalIncident(input = {}) {
+  const db = await ensureStateDatabase();
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  const kind = boundedIncidentValue(input.kind || "operational", 120);
+  const identityKey = boundedIncidentValue(input.identityKey || input.id || `${kind}:active`, 240);
+  if (!identityKey) throw new Error("Operational incident identityKey is required.");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+    assertMaintenanceWriteAllowed({ meta });
+    let row = db.prepare("SELECT * FROM operational_incidents WHERE identity_key = ?").get(identityKey);
+    if (!row) {
+      const id = boundedIncidentValue(input.id || `incident_${randomUUID()}`, 180);
+      db.prepare(`
+        INSERT INTO operational_incidents(
+          id, identity_key, kind, severity, status, owner, opened_at, updated_at, payload
+        ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)
+      `).run(
+        id,
+        identityKey,
+        kind,
+        boundedIncidentValue(input.severity || "warning", 40),
+        boundedIncidentValue(input.owner, 160),
+        now,
+        now,
+        incidentPayload(input.detail),
+      );
+      appendIncidentTimeline(db, id, "opened", input.actor || "system", input.detail, now);
+      row = db.prepare("SELECT * FROM operational_incidents WHERE id = ?").get(id);
+    } else if (row.status !== "resolved") {
+      const severity = boundedIncidentValue(input.severity || row.severity, 40);
+      const owner = boundedIncidentValue(input.owner ?? row.owner, 160);
+      db.prepare(`
+        UPDATE operational_incidents SET severity = ?, owner = ?, updated_at = ?, payload = ? WHERE id = ?
+      `).run(severity, owner, now, incidentPayload(input.detail), row.id);
+      if (input.timelineType) {
+        appendIncidentTimeline(db, row.id, boundedIncidentValue(input.timelineType, 80), input.actor || "system", input.detail, now);
+      }
+      row = db.prepare("SELECT * FROM operational_incidents WHERE id = ?").get(row.id);
+    }
+    db.exec("COMMIT");
+    return incidentFromRow(db, row);
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export async function updateOperationalIncident(id, input = {}) {
+  const db = await ensureStateDatabase();
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+    assertMaintenanceWriteAllowed({ meta });
+    const row = db.prepare("SELECT * FROM operational_incidents WHERE id = ?").get(String(id));
+    if (!row) throw new Error(`Unknown operational incident: ${id}`);
+    let status = row.status;
+    let owner = row.owner;
+    let acknowledgedAt = row.acknowledged_at;
+    let resolvedAt = row.resolved_at;
+    let resolutionEvidence = row.resolution_evidence;
+    let eventType = "updated";
+    if (Object.prototype.hasOwnProperty.call(input, "owner")) {
+      owner = boundedIncidentValue(input.owner, 160);
+      eventType = "ownership_changed";
+    }
+    if (input.acknowledge === true) {
+      if (!ACTIVE_INCIDENT_STATUSES.has(status)) throw new Error("Resolved incidents cannot be acknowledged again.");
+      status = "acknowledged";
+      acknowledgedAt = acknowledgedAt || now;
+      eventType = "acknowledged";
+    }
+    if (input.status === "mitigating") {
+      if (!ACTIVE_INCIDENT_STATUSES.has(status)) throw new Error("Resolved incidents cannot re-enter mitigation.");
+      status = "mitigating";
+      eventType = "mitigation_started";
+    }
+    if (input.resolve === true) {
+      resolutionEvidence = boundedIncidentValue(input.resolutionEvidence, 4_000);
+      if (!resolutionEvidence) throw new Error("Resolution evidence is required to resolve an incident.");
+      status = "resolved";
+      resolvedAt = now;
+      eventType = "resolved";
+    }
+    db.prepare(`
+      UPDATE operational_incidents SET status = ?, owner = ?, acknowledged_at = ?, resolved_at = ?,
+        updated_at = ?, resolution_evidence = ?, payload = ? WHERE id = ?
+    `).run(
+      status,
+      owner,
+      acknowledgedAt,
+      resolvedAt,
+      now,
+      resolutionEvidence,
+      incidentPayload(input.detail || parsePayload(row.payload, {})),
+      row.id,
+    );
+    appendIncidentTimeline(db, row.id, eventType, input.actor || "operator", {
+      note: boundedIncidentValue(input.note, 2_000),
+      owner,
+      resolutionEvidence,
+    }, now);
+    enforceDatabaseRetention(db, { nowMs: Date.parse(now), policy: input.retentionPolicy });
+    const updated = db.prepare("SELECT * FROM operational_incidents WHERE id = ?").get(row.id);
+    db.exec("COMMIT");
+    return incidentFromRow(db, updated);
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export async function listOperationalIncidents(input = {}) {
+  const db = await ensureStateDatabase();
+  const limit = boundedInteger(input.limit, 100, 1, 500);
+  const statuses = input.status
+    ? String(input.status).split(",").map((status) => status.trim()).filter(Boolean)
+    : [];
+  const rows = statuses.length
+    ? db.prepare(`
+      SELECT * FROM operational_incidents WHERE status IN (${statuses.map(() => "?").join(",")})
+      ORDER BY updated_at DESC LIMIT ?
+    `).all(...statuses, limit)
+    : db.prepare("SELECT * FROM operational_incidents ORDER BY updated_at DESC LIMIT ?").all(limit);
+  return rows.map((row) => incidentFromRow(db, row));
+}
+
+function databaseTableCounts(db) {
+  const tables = db.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name
+  `).all();
+  return Object.fromEntries(tables.map(({ name }) => [
+    name,
+    Number(db.prepare(`SELECT count(*) count FROM "${name.replaceAll('"', '""')}"`).get()?.count || 0),
+  ]));
+}
+
+async function verifyBackupDatabase(outputPath, expectedCounts = null) {
+  const verification = new DatabaseSync(outputPath, { readOnly: true });
+  try {
+    const integrity = verification.prepare("PRAGMA integrity_check").get()?.integrity_check;
+    if (integrity !== "ok") throw new Error(`Backup integrity check failed: ${integrity || "unknown"}`);
+    const counts = databaseTableCounts(verification);
+    if (expectedCounts && JSON.stringify(counts) !== JSON.stringify(expectedCounts)) {
+      throw new Error("Backup row counts do not match the source database snapshot.");
+    }
+    return counts;
+  } finally {
+    verification.close();
+  }
+}
+
+function writeDatabaseMaintenanceLease(db, lease) {
+  const row = db.prepare("SELECT payload, version FROM state_meta WHERE singleton_id = 1").get();
+  const meta = parsePayload(row?.payload, {});
+  if (lease) meta.databaseMaintenanceLease = lease;
+  else delete meta.databaseMaintenanceLease;
+  meta.updatedAt = new Date().toISOString();
+  db.prepare("UPDATE state_meta SET payload = ?, version = ?, updated_at = ? WHERE singleton_id = 1")
+    .run(JSON.stringify(meta), Number(row?.version || 0) + 1, meta.updatedAt);
+}
+
+export async function compactStateDatabase(input = {}) {
+  const db = await ensureStateDatabase();
+  const backupPath = await backupStateDatabase(input.backupPath || "");
+  const leaseId = `database_maintenance_${randomUUID()}`;
+  const leaseMs = boundedInteger(input.leaseMs, 5 * 60 * 1000, 30_000, 60 * 60 * 1000);
+  const acquiredAt = new Date().toISOString();
+  const lease = {
+    id: leaseId,
+    kind: "database_compaction",
+    ownerPid: String(process.pid),
+    acquiredAt,
+    expiresAt: new Date(Date.now() + leaseMs).toISOString(),
+  };
+  let acquired = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+    const blocker = maintenanceWriteBlocker({ meta }, { ownerPid: "database-maintenance-probe" });
+    if (blocker) throw new Error(`Database maintenance is already active until ${blocker.expiresAt}.`);
+    writeDatabaseMaintenanceLease(db, lease);
+    db.exec("COMMIT");
+    acquired = true;
+
+    db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").all();
+    const beforeCounts = databaseTableCounts(db);
+    const before = {
+      pageCount: Number(db.prepare("PRAGMA page_count").get()?.page_count || 0),
+      freePages: Number(db.prepare("PRAGMA freelist_count").get()?.freelist_count || 0),
+      pageSize: Number(db.prepare("PRAGMA page_size").get()?.page_size || 0),
+      bytes: (await stat(DATABASE_FILE)).size,
+    };
+    db.exec("VACUUM");
+    db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").all();
+    db.exec("PRAGMA optimize");
+    const integrity = db.prepare("PRAGMA integrity_check").get()?.integrity_check;
+    if (integrity !== "ok") throw new Error(`Post-compaction integrity check failed: ${integrity || "unknown"}`);
+    const afterCounts = databaseTableCounts(db);
+    if (JSON.stringify(beforeCounts) !== JSON.stringify(afterCounts)) {
+      throw new Error("Database row counts changed during compaction.");
+    }
+    const after = {
+      pageCount: Number(db.prepare("PRAGMA page_count").get()?.page_count || 0),
+      freePages: Number(db.prepare("PRAGMA freelist_count").get()?.freelist_count || 0),
+      bytes: (await stat(DATABASE_FILE)).size,
+    };
+    return {
+      backupPath,
+      integrity,
+      before,
+      after,
+      reclaimedBytes: Math.max(0, before.pageCount - after.pageCount) * before.pageSize,
+      physicalReclaimedBytes: Math.max(0, before.bytes - after.bytes),
+      rowCounts: afterCounts,
+    };
+  } finally {
+    if (acquired) {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+        if (meta.databaseMaintenanceLease?.id === leaseId) writeDatabaseMaintenanceLease(db, null);
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+  }
+}
+
+export async function enforceOperationalRetention(input = {}) {
+  const db = await ensureStateDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+    assertMaintenanceWriteAllowed({ meta });
+    const removed = enforceDatabaseRetention(db, input);
+    db.exec("COMMIT");
+    return { policy: operationalRetentionPolicy(input.policy || input), removed };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export async function pruneRunOutputFiles(input = {}) {
+  const db = await ensureStateDatabase();
+  const policy = operationalRetentionPolicy(input.policy || input);
+  const outputDir = path.resolve(input.outputDir || path.join(DATA_DIR, "run-outputs"));
+  const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
+  const cutoffMs = nowMs - policy.runOutputDays * 24 * 60 * 60 * 1000;
+  const protectedPaths = new Set(db.prepare(`
+    SELECT payload FROM runs WHERE status IN ('queued', 'running')
+  `).all().flatMap(({ payload }) => {
+    const run = parsePayload(payload, {});
+    return [run.outputPath, run.lastMessagePath].filter(Boolean).map((value) => path.resolve(value));
+  }));
+  let entries = [];
+  try {
+    entries = await readdir(outputDir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return { policy, inspected: 0, removed: [], reclaimedBytes: 0 };
+    throw error;
+  }
+  const files = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.isSymbolicLink()) continue;
+    const filePath = path.resolve(outputDir, entry.name);
+    if (path.dirname(filePath) !== outputDir || protectedPaths.has(filePath)) continue;
+    const info = await lstat(filePath);
+    if (!info.isFile() || info.isSymbolicLink()) continue;
+    files.push({ filePath, mtimeMs: info.mtimeMs, size: info.size });
+  }
+  files.sort((left, right) => right.mtimeMs - left.mtimeMs || left.filePath.localeCompare(right.filePath));
+  const removed = [];
+  let reclaimedBytes = 0;
+  for (const [index, file] of files.entries()) {
+    if (file.mtimeMs >= cutoffMs && index < policy.runOutputMaxFiles) continue;
+    await rm(file.filePath);
+    removed.push(file.filePath);
+    reclaimedBytes += file.size;
+  }
+  return { policy, inspected: files.length, removed, reclaimedBytes };
+}
+
 export async function backupStateDatabase(destination = "") {
   const db = await ensureStateDatabase();
   const backupDir = path.join(DATA_DIR, "backups");
@@ -1353,5 +1982,6 @@ export async function backupStateDatabase(destination = "") {
   await mkdir(path.dirname(outputPath), { recursive: true, mode: 0o700 });
   await backup(db, outputPath);
   await chmod(outputPath, 0o600);
+  await verifyBackupDatabase(outputPath);
   return outputPath;
 }
