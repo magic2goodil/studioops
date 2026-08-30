@@ -17,6 +17,7 @@ const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "
 const STATE_INTEGRITY_VERSION = 5;
 const LIFECYCLE_SCHEMA_VERSION = 1;
 export const COORDINATION_SCHEMA_VERSION = 2;
+export const DELIVERY_TELEMETRY_SCHEMA_VERSION = 1;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
 const ACTIVE_QA_COMMENTS_PER_TASK = 20;
 const ACTIVE_QA_EVENTS_PER_TASK = 40;
@@ -41,6 +42,8 @@ export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
 let database = null;
 let integrityMigrated = false;
 let integrityMigrationPromise = null;
+let deliveryTelemetryMigrated = false;
+let deliveryTelemetryMigrationPromise = null;
 
 async function secureStoragePaths() {
   await chmod(DATA_DIR, 0o700).catch(() => {});
@@ -350,6 +353,219 @@ function coordinationSchemaIsCurrent(db, meta = {}) {
     && leaseColumns.has("aggregate_id")
     && operationColumns.has("aggregate_type")
     && operationColumns.has("aggregate_id");
+}
+
+const DELIVERY_TELEMETRY_TABLES = [
+  "delivery_events",
+  "validation_evidence",
+  "criterion_evidence",
+  "metric_definitions",
+  "metric_snapshots",
+  "retrospective_jobs",
+  "retrospectives",
+  "improvement_proposals",
+  "experiments",
+  "journal_exports",
+];
+
+function ensureDeliveryTelemetrySchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS delivery_events (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL DEFAULT '',
+      run_id TEXT NOT NULL DEFAULT '',
+      candidate_id TEXT NOT NULL DEFAULT '',
+      commit_sha TEXT NOT NULL DEFAULT '',
+      stage TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      received_at TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      source_reference TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      measures_json TEXT NOT NULL DEFAULT '{}',
+      attributes_json TEXT NOT NULL DEFAULT '{}',
+      record_json TEXT NOT NULL,
+      UNIQUE(source_kind, source_reference)
+    );
+    CREATE INDEX IF NOT EXISTS idx_delivery_events_project_time
+      ON delivery_events(project_id, occurred_at, id);
+    CREATE INDEX IF NOT EXISTS idx_delivery_events_task_time
+      ON delivery_events(task_id, occurred_at, id) WHERE task_id <> '';
+    CREATE INDEX IF NOT EXISTS idx_delivery_events_run_time
+      ON delivery_events(run_id, occurred_at, id) WHERE run_id <> '';
+    CREATE INDEX IF NOT EXISTS idx_delivery_events_type_time
+      ON delivery_events(event_type, occurred_at, id);
+
+    CREATE TABLE IF NOT EXISTS validation_evidence (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      event_id TEXT NOT NULL REFERENCES delivery_events(id) ON DELETE RESTRICT,
+      check_name TEXT NOT NULL,
+      subject_sha TEXT NOT NULL DEFAULT '',
+      outcome TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      source_reference TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL,
+      UNIQUE(event_id, check_name, subject_sha, source_reference)
+    );
+    CREATE INDEX IF NOT EXISTS idx_validation_evidence_exact
+      ON validation_evidence(event_id, subject_sha, check_name, observed_at, id);
+
+    CREATE TABLE IF NOT EXISTS criterion_evidence (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      event_id TEXT NOT NULL REFERENCES delivery_events(id) ON DELETE RESTRICT,
+      criterion_key TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      evidence_reference TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL,
+      UNIQUE(event_id, criterion_key, evidence_reference)
+    );
+    CREATE INDEX IF NOT EXISTS idx_criterion_evidence_exact
+      ON criterion_evidence(event_id, criterion_key, observed_at, id);
+
+    CREATE TABLE IF NOT EXISTS metric_definitions (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      metric_key TEXT NOT NULL,
+      definition_version INTEGER NOT NULL CHECK (definition_version > 0),
+      numerator TEXT NOT NULL,
+      denominator TEXT NOT NULL DEFAULT '',
+      unit TEXT NOT NULL,
+      inclusion_rules_json TEXT NOT NULL,
+      exclusion_rules_json TEXT NOT NULL,
+      source_event_types_json TEXT NOT NULL,
+      minimum_sample_size INTEGER NOT NULL CHECK (minimum_sample_size > 0),
+      percentile_method TEXT NOT NULL DEFAULT '',
+      target_direction TEXT NOT NULL CHECK (target_direction IN ('increase', 'decrease', 'maintain')),
+      compatible_from TEXT NOT NULL,
+      recorded_at TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL,
+      UNIQUE(metric_key, definition_version)
+    );
+
+    CREATE TABLE IF NOT EXISTS metric_snapshots (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      metric_definition_id TEXT NOT NULL REFERENCES metric_definitions(id) ON DELETE RESTRICT,
+      project_id TEXT NOT NULL,
+      window_started_at TEXT NOT NULL,
+      window_ended_at TEXT NOT NULL,
+      value REAL NOT NULL,
+      numerator_value REAL NOT NULL,
+      denominator_value REAL,
+      sample_size INTEGER NOT NULL CHECK (sample_size >= 0),
+      computed_at TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_metric_snapshots_metric_time
+      ON metric_snapshots(metric_definition_id, computed_at, id);
+
+    CREATE TABLE IF NOT EXISTS retrospective_jobs (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      project_id TEXT NOT NULL,
+      event_id TEXT REFERENCES delivery_events(id) ON DELETE RESTRICT,
+      status TEXT NOT NULL,
+      due_at TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt > 0),
+      recorded_at TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_retrospective_jobs_pending
+      ON retrospective_jobs(status, due_at, id) WHERE status = 'pending';
+
+    CREATE TABLE IF NOT EXISTS retrospectives (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      project_id TEXT NOT NULL,
+      event_id TEXT NOT NULL REFERENCES delivery_events(id) ON DELETE RESTRICT,
+      job_id TEXT REFERENCES retrospective_jobs(id) ON DELETE RESTRICT,
+      journal_date TEXT NOT NULL,
+      title TEXT NOT NULL,
+      recorded_at TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_retrospectives_journal_date
+      ON retrospectives(journal_date, recorded_at, id);
+
+    CREATE TABLE IF NOT EXISTS improvement_proposals (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      project_id TEXT NOT NULL,
+      retrospective_id TEXT NOT NULL REFERENCES retrospectives(id) ON DELETE RESTRICT,
+      fingerprint TEXT NOT NULL,
+      status TEXT NOT NULL,
+      recorded_at TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL,
+      UNIQUE(project_id, fingerprint)
+    );
+    CREATE INDEX IF NOT EXISTS idx_improvement_proposals_open
+      ON improvement_proposals(project_id, status, fingerprint, recorded_at, id)
+      WHERE status = 'open';
+
+    CREATE TABLE IF NOT EXISTS experiments (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      project_id TEXT NOT NULL,
+      proposal_id TEXT NOT NULL REFERENCES improvement_proposals(id) ON DELETE RESTRICT,
+      status TEXT NOT NULL,
+      due_at TEXT NOT NULL,
+      recorded_at TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_experiments_due
+      ON experiments(status, due_at, id) WHERE status IN ('planned', 'running');
+
+    CREATE TABLE IF NOT EXISTS journal_exports (
+      id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+      journal_date TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      content_sha256 TEXT NOT NULL,
+      entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+      through_recorded_at TEXT NOT NULL DEFAULT '',
+      through_id TEXT NOT NULL DEFAULT '',
+      exported_at TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      record_json TEXT NOT NULL,
+      UNIQUE(journal_date, content_sha256)
+    );
+    CREATE INDEX IF NOT EXISTS idx_journal_exports_date
+      ON journal_exports(journal_date, exported_at, id);
+  `);
+  for (const table of DELIVERY_TELEMETRY_TABLES) {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS ${table}_append_only_update
+      BEFORE UPDATE ON ${table}
+      BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS ${table}_append_only_delete
+      BEFORE DELETE ON ${table}
+      BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
+    `);
+  }
+}
+
+function deliveryTelemetrySchemaIsCurrent(db, meta = {}) {
+  const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+  const triggers = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all().map((row) => row.name));
+  return Number(meta.deliveryTelemetryMigration?.schemaVersion || 0) >= DELIVERY_TELEMETRY_SCHEMA_VERSION
+    && DELIVERY_TELEMETRY_TABLES.every((table) => tables.has(table))
+    && DELIVERY_TELEMETRY_TABLES.every((table) => (
+      triggers.has(`${table}_append_only_update`) && triggers.has(`${table}_append_only_delete`)
+    ));
 }
 
 function ensureLifecycleSchema(db) {
@@ -1093,6 +1309,67 @@ async function migrateStateIntegrity(db) {
   return integrityMigrationPromise;
 }
 
+async function runDeliveryTelemetryMigration(db) {
+  if (deliveryTelemetryMigrated) return;
+  const currentMetaRow = db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
+  const currentMeta = parsePayload(currentMetaRow?.payload, {});
+  if (deliveryTelemetrySchemaIsCurrent(db, currentMeta)) {
+    deliveryTelemetryMigrated = true;
+    return;
+  }
+  const backupPath = await preMigrationBackup(db);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const lockedRow = db.prepare("SELECT payload, version FROM state_meta WHERE singleton_id = 1").get();
+    const lockedMeta = parsePayload(lockedRow?.payload, {});
+    if (deliveryTelemetrySchemaIsCurrent(db, lockedMeta)) {
+      db.exec("COMMIT");
+      deliveryTelemetryMigrated = true;
+      return;
+    }
+    ensureDeliveryTelemetrySchema(db);
+    if (process.env.STUDIOOPS_TEST_FAIL_DELIVERY_TELEMETRY_MIGRATION === "after_schema") {
+      if (!process.env.NODE_TEST_CONTEXT && !process.env.STUDIOOPS_TEST_ISOLATION) {
+        throw new Error("Delivery telemetry migration fault injection is restricted to isolated tests.");
+      }
+      assertIsolatedTestEnvironment();
+      throw new Error("Injected delivery telemetry migration failure after schema change.");
+    }
+    const now = new Date().toISOString();
+    const nextMeta = {
+      ...lockedMeta,
+      deliveryTelemetryMigration: {
+        schemaVersion: DELIVERY_TELEMETRY_SCHEMA_VERSION,
+        migratedAt: now,
+        backupPath,
+        backupVerified: true,
+        writerEnabled: true,
+      },
+      updatedAt: now,
+    };
+    db.prepare(`
+      UPDATE state_meta
+      SET payload = ?, version = ?, updated_at = ?
+      WHERE singleton_id = 1
+    `).run(JSON.stringify(nextMeta), Number(lockedRow?.version || 0) + 1, now);
+    db.exec("COMMIT");
+    deliveryTelemetryMigrated = true;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+async function migrateDeliveryTelemetry(db) {
+  if (deliveryTelemetryMigrated) return;
+  if (!deliveryTelemetryMigrationPromise) {
+    deliveryTelemetryMigrationPromise = runDeliveryTelemetryMigration(db).finally(() => {
+      deliveryTelemetryMigrationPromise = null;
+    });
+  }
+  return deliveryTelemetryMigrationPromise;
+}
+
 async function initialState() {
   const candidates = [
     LEGACY_DATA_FILE,
@@ -1139,6 +1416,7 @@ export async function ensureStateDatabase() {
     }
   }
   await migrateStateIntegrity(db);
+  await migrateDeliveryTelemetry(db);
   await secureStoragePaths();
   return db;
 }

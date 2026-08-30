@@ -57,6 +57,10 @@ export function missionControlDataDir() {
   ));
 }
 
+export function improvementJournalRoot() {
+  return path.join(missionControlRoot(), "improvement-journal");
+}
+
 export function missionControlConfigRoot() {
   return path.resolve(expandLocalPath(
     process.env.STUDIOOPS_CONFIG_ROOT || process.env.MISSION_CONTROL_CONFIG_ROOT || missionControlRoot(),

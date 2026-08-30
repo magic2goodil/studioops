@@ -1,0 +1,101 @@
+{
+  "manifestVersion": 1,
+  "component": "continuous-improvement-ledger",
+  "owner": "StudioOps delivery-truth maintainers",
+  "classification": "shared public contract and additive SQLite migration",
+  "fullRegressionRequired": true,
+  "reason": "The change adds versioned public event contracts, shared persistence schema, migration behavior, and a filesystem projection.",
+  "publicContracts": [
+    "delivery telemetry repository contract v1",
+    "delivery event and evidence DTOs v1",
+    "metric definition and snapshot DTOs v1",
+    "retrospective, proposal, experiment, and journal checkpoint DTOs v1",
+    "deterministic improvement-journal Markdown projection v1"
+  ],
+  "components": [
+    {
+      "id": "continuous-improvement-ledger",
+      "owns": [
+        "src/delivery-telemetry.js",
+        "src/delivery-telemetry-repository.js",
+        "src/improvement-journal.js",
+        "docs/CONTINUOUS_IMPROVEMENT.md",
+        "test/delivery-telemetry.test.js",
+        "test/improvement-journal.test.js"
+      ],
+      "ownedTables": [
+        "delivery_events",
+        "validation_evidence",
+        "criterion_evidence",
+        "metric_definitions",
+        "metric_snapshots",
+        "retrospective_jobs",
+        "retrospectives",
+        "improvement_proposals",
+        "experiments",
+        "journal_exports"
+      ],
+      "ownedJobs": ["retrospective job contract", "date-indexed journal materialization contract"],
+      "ownedEvents": ["versioned delivery event contract; downstream instrumentation defines event types through adapters"],
+      "plannedRoutes": [],
+      "plannedWorkers": [],
+      "plannedUi": [],
+      "allowedDependencies": ["state-database", "runtime-paths", "node:sqlite", "local filesystem"],
+      "prohibitedDependencies": ["workflow status policy", "analysis policy", "enforcement policy", "HTTP/UI internals", "external analytics", "second database", "broker", "Redis", "correctness cache"],
+      "adapters": [
+        "task_79 completion evidence adapter",
+        "task_80 immutable owner-handoff adapter",
+        "task_631 cost-admission evidence adapter",
+        "task_550-shaped exact-SHA attestation adapter"
+      ],
+      "testLayers": ["unit", "public contract", "persistence", "migration", "idempotency", "concurrency", "filesystem projection"]
+    },
+    {
+      "id": "state-database",
+      "classification": "shared-kernel",
+      "owns": ["src/state-database.js", "test/state-database-telemetry.test.js"],
+      "ownedMigrations": ["delivery telemetry schema v1 using the verified pre-migration backup path and targeted state_meta update"],
+      "dependencyDirection": "continuous-improvement-ledger -> state-database; state-database never imports improvement policy",
+      "testLayers": ["migration", "backup verification", "append-only trigger persistence", "full regression"]
+    },
+    {
+      "id": "runtime-paths",
+      "classification": "shared-kernel",
+      "owns": ["src/runtime-paths.js"],
+      "publicContracts": ["improvementJournalRoot()"],
+      "dependencyDirection": "continuous-improvement-ledger -> runtime-paths",
+      "testLayers": ["composition through journal materialization", "full regression"]
+    },
+    {
+      "id": "continuous-improvement-ownership-manifest",
+      "classification": "release-sensitive",
+      "owns": ["docs/architecture/continuous-improvement.components.json"],
+      "testLayers": ["JSON parse", "full regression"]
+    }
+  ],
+  "dependencyRules": {
+    "direction": [
+      "workflow completion, owner handoff, cost admission, and exact-SHA producers -> public adapter inputs -> continuous-improvement-ledger",
+      "continuous-improvement-ledger -> state-database and runtime-paths shared kernels",
+      "journal Markdown <- deterministic read-only projection from SQLite"
+    ],
+    "forbidden": [
+      "raw telemetry-table access outside the repository contract",
+      "policy copied from upstream evidence producers",
+      "Markdown treated as writable authority",
+      "dependency cycles"
+    ]
+  },
+  "rollbackBoundary": {
+    "procedure": "Set state_meta.deliveryTelemetryMigration.writerEnabled to false or deploy a runtime with repository writers disabled. Leave all additive tables and triggers readable. Rebuild or remove journal projections only after verifying SQLite remains intact.",
+    "compatibility": "Older runtimes ignore additive tables. Contract-v1 readers reject newer writer schema versions and ignore unknown additive fields supplied by future readers.",
+    "dataRecovery": "Restore the verified pre-migration SQLite backup only for migration failure; otherwise retain the append-only ledger and reconstruct journal files from retrospectives."
+  },
+  "impactSelection": {
+    "changedComponents": ["continuous-improvement-ledger", "state-database", "runtime-paths", "continuous-improvement-ownership-manifest"],
+    "transitivelyAffected": ["all SQLite state consumers", "backup and recovery", "self-update restart behavior"],
+    "classifierDecision": "full-regression",
+    "fullRegressionTriggers": ["schema/migration", "shared-kernel", "public-contract", "event-version", "multi-component", "ownership-manifest"],
+    "ambiguousOrUnclassified": "fail closed to full regression"
+  }
+}
