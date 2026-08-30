@@ -25,11 +25,44 @@ import {
   staleWorkerNames,
   writeWorkerHeartbeat,
 } from "./worker-heartbeat.js";
+import {
+  databaseReadinessHealth,
+  updateOperationalIncident,
+  upsertOperationalIncident,
+} from "./state-database.js";
 
 const execFileAsync = promisify(execFile);
 const WORKERS = ["dispatcher", "runner", "supervisor", "notifier"];
 const LABEL_PREFIX = "com.codex.mission-control.";
 const DEFAULT_WORK_WAIT_MS = 45 * 1000;
+
+async function persistDiskIncident(incident, input = {}, transition = "observe") {
+  if (!incident || input.state) return null;
+  const upsert = input.upsertOperationalIncident || upsertOperationalIncident;
+  const update = input.updateOperationalIncident || updateOperationalIncident;
+  if (transition === "resolved") {
+    return update(incident.id, {
+      resolve: true,
+      actor: "watchdog",
+      resolutionEvidence: JSON.stringify({
+        recoveredAt: incident.recoveredAt || "",
+        durationMs: Number(incident.durationMs || 0),
+        health: incident.health || {},
+        cleanupTotals: incident.cleanupTotals || {},
+      }),
+      detail: { source: "disk_pressure_recovery", incident },
+    });
+  }
+  return upsert({
+    id: incident.id,
+    identityKey: `disk-pressure:${incident.id}`,
+    kind: "disk_pressure",
+    severity: "critical",
+    actor: "watchdog",
+    timelineType: transition === "opened" ? "recovery_started" : "",
+    detail: { source: "disk_pressure_recovery", incident },
+  });
+}
 
 function ageMs(value, nowMs) {
   const parsed = Date.parse(value || "");
@@ -238,6 +271,7 @@ export async function runWatchdog(input = {}) {
   let incident = initialPressure
     ? await openIncident({ ...input, nowMs, data: initial.data, workspace: initial.workspace })
     : activeIncident;
+  await persistDiskIncident(incident, input, "opened");
   let workspaceRetention = input.workspaceRetention;
   if (!workspaceRetention && !input.state) {
     try {
@@ -254,21 +288,26 @@ export async function runWatchdog(input = {}) {
     workspaceRetention,
   });
   const postCleanup = cleanup.after || initial;
-  let databaseHealth;
-  let state;
-  try {
-    state = await stateReader();
-    databaseHealth = {
-      ok: true,
-      checkedAt: new Date().toISOString(),
-      projectCount: (state.projects || []).length,
-      taskCount: (state.tasks || []).length,
-      runCount: (state.runs || []).length,
-    };
-  } catch (error) {
-    state = initialState;
-    databaseHealth = { ok: false, checkedAt: new Date().toISOString(), reason: "complete_state_read_failed" };
+  const state = initialState;
+  let databaseProbe;
+  if (input.state && input.readState && !input.databaseReadinessHealth) {
+    try {
+      await stateReader();
+      databaseProbe = { database: { ok: true, latencyMs: 0, latencySloMs: input.databaseLatencySloMs || 100 } };
+    } catch {
+      databaseProbe = { database: { ok: false, reason: "injected_state_read_failed" } };
+    }
+  } else {
+    databaseProbe = await (input.databaseReadinessHealth || databaseReadinessHealth)({
+      nowMs,
+      databaseLatencySloMs: input.databaseLatencySloMs || 100,
+      maxQueueAgeMs: input.maxQueueAgeMs || 7 * 24 * 60 * 60 * 1000,
+    });
   }
+  const databaseHealth = {
+    ...(databaseProbe.database || {}),
+    checkedAt: new Date().toISOString(),
+  };
   const heartbeats = await (input.readWorkerHeartbeats || readWorkerHeartbeats)(input).catch(() => []);
   const workerHealth = managedWorkerHealth(heartbeats, { ...input, nowMs });
   const final = await readDiskPair(input);
@@ -293,6 +332,7 @@ export async function runWatchdog(input = {}) {
       cleanup,
       health,
     });
+    await persistDiskIncident(recovered, input, "resolved");
     const reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
     await heartbeatWriter("watchdog", {
       status: "idle",
@@ -347,6 +387,7 @@ export async function runWatchdog(input = {}) {
     restartedWorkers: restartAttempts,
     remediation: recoveryRemediation(cleanup, workerHealth, disksHealthy),
   });
+  await persistDiskIncident(incident, input);
   await heartbeatWriter("watchdog", {
     status: "idle",
     lastError: results.filter((item) => !item.ok).map((item) => item.output).join("; "),

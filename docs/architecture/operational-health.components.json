@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "workflowImpact": "full-regression",
+  "reason": "shared SQLite schema, persistence policy, health HTTP composition root, and watchdog dependency change",
+  "components": {
+    "operational-persistence": {
+      "paths": ["src/state-database.js", "test/state-database.test.js", "test/operational-health.test.js"],
+      "owner": "backend-operational-persistence",
+      "publicContracts": ["operationalRetentionPolicy", "compactOperationalHistory", "databaseReadinessHealth", "operationalMetrics", "upsertOperationalIncident", "updateOperationalIncident", "listOperationalIncidents", "backupStateDatabase", "compactStateDatabase", "enforceOperationalRetention", "pruneRunOutputFiles"],
+      "ownedData": ["operational_archive", "database_contention_events", "operational_incidents", "incident_timeline", "state_meta.databaseMaintenanceLease", "data/run-outputs", "data/backups"],
+      "ownedMigrations": ["additive operational_incidents and incident_timeline tables plus health query indexes"],
+      "allowedDependencyDirection": ["server-health-adapter -> operational-persistence", "watchdog-recovery-adapter -> operational-persistence", "maintenance-adapter -> operational-persistence"],
+      "rollback": "stop adapters and maintenance execution; additive tables/indexes and retained evidence remain readable and older releases ignore them",
+      "testLayers": ["unit", "HTTP contract", "persistence", "migration", "maintenance", "soak", "composition"]
+    },
+    "server-health-adapter": {
+      "paths": ["src/server.js"],
+      "owner": "local-control-plane-http",
+      "publicContracts": ["/api/live", "/api/ready", "/api/health", "/api/metrics", "/api/incidents", "livenessReport", "readinessReport", "metricsReport"],
+      "ownedData": [],
+      "dependsOn": ["operational-persistence", "worker-heartbeats", "runtime-config"],
+      "rollback": "restore the previous /api/health adapter; persistence additions remain inert"
+    },
+    "watchdog-recovery-adapter": {
+      "paths": ["src/watchdog.js"],
+      "owner": "watchdog",
+      "publicContracts": ["disk-pressure incident mirroring", "direct database readiness probe"],
+      "ownedData": [],
+      "dependsOn": ["operational-persistence"],
+      "rollback": "stop generic incident mirroring; existing disk-pressure state machine remains authoritative"
+    },
+    "maintenance-adapter": {
+      "paths": ["scripts/operational-maintenance.js", "scripts/operational-soak.js"],
+      "owner": "local-operations",
+      "publicContracts": ["read-only maintenance preview", "explicit --apply maintenance", "accelerated 24-hour soak"],
+      "ownedData": [],
+      "dependsOn": ["operational-persistence", "watchdog-recovery-adapter"],
+      "rollback": "stop invoking scripts; no background service or external dependency was added"
+    },
+    "architecture-validation": {
+      "paths": ["docs/OPERATIONAL_HEALTH.md", "docs/architecture/operational-health.components.json"],
+      "owner": "shared-validation",
+      "publicContracts": ["operator SLO, retention, maintenance, incident, and validation contract"],
+      "ownedData": [],
+      "testLayers": ["composition"]
+    }
+  },
+  "dependencyEdges": [
+    { "from": "server-health-adapter", "to": "operational-persistence" },
+    { "from": "watchdog-recovery-adapter", "to": "operational-persistence" },
+    { "from": "maintenance-adapter", "to": "operational-persistence" },
+    { "from": "maintenance-adapter", "to": "watchdog-recovery-adapter" }
+  ],
+  "prohibited": ["second database", "external metrics service", "duplicate retention policy", "raw server mutation of incident tables", "unverified backup", "unleased compaction", "cleanup of active or symlinked run output"],
+  "impactClassifier": {
+    "input": "base/head diff plus this ownership and dependency manifest",
+    "selection": "full_regression",
+    "fullRegressionTriggers": ["schema change", "shared persistence contract", "HTTP composition root", "watchdog dependency", "multi-component change", "manifest change"],
+    "aggregateCommand": "npm run check"
+  },
+  "performanceBudgets": {
+    "liveness": "no database or filesystem access",
+    "readinessEndToEndMs": 250,
+    "databaseReadinessMs": 100,
+    "boundedQueries": true
+  }
+}

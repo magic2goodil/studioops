@@ -42,6 +42,8 @@ StudioOps accepts `STUDIOOPS_ROOT`, `STUDIOOPS_DATA_DIR`, and `STUDIOOPS_CONFIG_
 
 `npm run backup` uses SQLite's online backup API, so it remains consistent while workers are active.
 
+Operational health, retention, incident evidence, run-output cleanup, and maintenance-safe compaction are documented in [Operational health and maintenance](OPERATIONAL_HEALTH.md). Liveness is process-only; readiness and metrics use bounded direct SQL plus heartbeat/disk adapters instead of deserializing full workflow state.
+
 Postgres is a future backend option when StudioOps needs multiple machines or remote team access. Local installations do not need a database daemon.
 
 ## Runtime
