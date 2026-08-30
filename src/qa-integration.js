@@ -31,6 +31,10 @@ import {
   normalizeGitSha,
 } from "./candidate-manifest.js";
 import { verifyCandidateRepositoryState } from "./candidate-repository.js";
+import {
+  compareCandidateSubject,
+  RELEASE_CONTAINMENT_OUTCOMES,
+} from "./release-containment.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
 
 const execFileAsync = promisify(execFile);
@@ -1528,25 +1532,40 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
       pr: inspectedPr,
     };
   }
-  const changedSources = projectPlan.tasks.filter((task) => (
-    task.integrationSourceHeadSha
-    && task.expectedHeadSha
-    && task.integrationSourceHeadSha !== task.expectedHeadSha
-  ));
-  const missingSourceSnapshots = projectPlan.tasks.filter((task) => !task.integrationSourceHeadSha);
-  if (inspectedPr.workflowStatus !== "merged" && changedSources.length) {
-    if (missingSourceSnapshots.length) {
-      return {
-        status: "candidate_drift",
-        blocker: `Newly reviewed source evidence is available, but the previous handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not replace the open PR without auditable evidence.`,
-        pr: inspectedPr,
-      };
-    }
-    const changedSummary = changedSources
-      .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
+  const identityAssessments = projectPlan.tasks.map((task) => ({
+    task,
+    assessment: compareCandidateSubject({
+      taskId: task.id,
+      sourceSha: task.integrationSourceHeadSha,
+      candidateCycle: task.integrationSourceCandidateCycle,
+    }, {
+      taskId: task.id,
+      sourceSha: task.expectedHeadSha,
+      candidateCycle: task.candidateCycle,
+    }),
+  }));
+  const unavailableIdentity = identityAssessments.find(
+    ({ assessment }) => assessment.outcome === RELEASE_CONTAINMENT_OUTCOMES.UNAVAILABLE,
+  );
+  if (unavailableIdentity) {
+    return {
+      status: "candidate_drift",
+      blocker: `The previous handoff lacks exact source SHA or candidate-cycle evidence for ${unavailableIdentity.task.id}: ${unavailableIdentity.assessment.reason} StudioOps will not reuse or replace it without auditable evidence.`,
+      pr: inspectedPr,
+    };
+  }
+  const staleIdentities = identityAssessments.filter(
+    ({ assessment }) => assessment.outcome === RELEASE_CONTAINMENT_OUTCOMES.STALE,
+  );
+  if (staleIdentities.length) {
+    const changedSummary = staleIdentities
+      .map(({ task, assessment }) => (
+        `${task.id} [${assessment.mismatches.join(", ")}] ${assessment.recorded.sourceSha}@${assessment.recorded.candidateCycle} -> ${assessment.current.sourceSha}@${assessment.current.candidateCycle}`
+      ))
       .join(", ");
-    const reason = `StudioOps is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
-    const closed = String(inspectedPr.state || "").toUpperCase() === "CLOSED"
+    const reason = `StudioOps is superseding this immutable QA candidate because its exact reviewed identity is stale: ${changedSummary}. The old candidate remains recorded on each affected task.`;
+    const mergedPr = inspectedPr.workflowStatus === "merged";
+    const closed = mergedPr || String(inspectedPr.state || "").toUpperCase() === "CLOSED"
       ? { ok: true, pr: inspectedPr, output: "" }
       : await closeIntegrationPr(repoPath, projectPlan, inspectedPr, reason, options);
     if (!closed.ok) {
@@ -1567,25 +1586,26 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
       blocker: "",
       pr: {
         ...inspectedPr,
-        state: "CLOSED",
+        state: mergedPr ? inspectedPr.state : "CLOSED",
       },
       supersededHandoff: {
         candidateBranch: handoff.branch,
         candidateCommit: handoff.commit,
         prUrl: handoff.prUrl,
         prNumber: Number(inspectedPr.number || 0),
-        prState: "CLOSED",
+        prState: mergedPr ? inspectedPr.state : "CLOSED",
         workflowStatus: inspectedPr.workflowStatus,
         checkState: inspectedPr.checkState,
         reviewDecision: inspectedPr.reviewDecision || "",
         blocker: inspectedPr.blocker || "",
         taskIds: projectPlan.tasks.map((task) => task.id),
-        sources: projectPlan.tasks.map((task) => ({
-          taskId: task.id,
-          headSha: task.integrationSourceHeadSha,
-          candidateCycle: task.integrationSourceCandidateCycle || 0,
-          replacementHeadSha: task.expectedHeadSha,
-          replacementCandidateCycle: task.candidateCycle || 0,
+        sources: identityAssessments.map(({ assessment }) => ({
+          taskId: assessment.recorded.taskId,
+          headSha: assessment.recorded.sourceSha,
+          candidateCycle: assessment.recorded.candidateCycle,
+          replacementHeadSha: assessment.current.sourceSha,
+          replacementCandidateCycle: assessment.current.candidateCycle,
+          mismatches: assessment.mismatches,
         })),
         reason,
         cleanup: cleanup.ok
@@ -1853,6 +1873,22 @@ async function integrateProject(projectPlan, options = {}) {
       result.status = failedTaskMerge.status === "conflict" ? "conflict" : "blocked";
       result.output = failedTaskMerge.output || `QA integration stopped before push because ${failedTaskMerge.taskId} could not be merged.`;
       return result;
+    }
+
+    if (result.supersededHandoff) {
+      const replacementHead = await branchHead(executionRepoPath, "HEAD", gitOptions);
+      if (replacementHead === result.supersededHandoff.candidateCommit) {
+        await git(executionRepoPath, [
+          "commit",
+          "--allow-empty",
+          "-m",
+          `StudioOps QA candidate ${candidateId}`,
+        ], gitOptions);
+        result.output = appendOutput(
+          result.output,
+          "Created a distinct immutable candidate commit for the replacement review cycle.",
+        );
+      }
     }
 
     if (!mergedTasks.length && !branchChanged) {

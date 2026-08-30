@@ -2064,6 +2064,67 @@ test("failed protected handoffs are audited and safely replaced after new source
   }
 });
 
+test("cycle-only review drift archives a merged protected handoff and never reuses its PR or candidate commit", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-cycle-replacement-"));
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    const previous = pending.projects[0];
+    const reviewedSha = readPersistedState(root).tasks[0].reviewSubjectSha;
+
+    await rm(fixture.hookPath);
+    await git(fixture.repoPath, [
+      "fetch",
+      "origin",
+      `refs/heads/${previous.integrationCandidateBranch}`,
+    ]);
+    await git(fixture.repoPath, [
+      "checkout",
+      "-B",
+      "cycle-merge",
+      "refs/remotes/origin/qa/integration",
+    ]);
+    await git(fixture.repoPath, ["merge", "--no-ff", "--no-edit", "FETCH_HEAD"]);
+    const mergeCommit = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "HEAD:refs/heads/qa/integration"]);
+    await advanceReviewedQaTask(root, "task_1", reviewedSha);
+
+    const replacement = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_PR_STATE: "MERGED",
+        FAKE_GH_CHECK_STATE: "passed",
+        FAKE_GH_REVIEW_DECISION: "APPROVED",
+        FAKE_GH_MERGE_STATE: "CLEAN",
+        FAKE_GH_MERGE_COMMIT: mergeCommit,
+      },
+    });
+    const project = replacement.projects[0];
+    const persisted = readPersistedState(root);
+    const history = persisted.tasks[0].integrationHandoffHistory;
+
+    assert.equal(project.status, "preview_missing");
+    assert.notEqual(project.commit, previous.integrationCandidateCommit);
+    assert.equal(project.integrationPr, null);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+    await assert.rejects(readFile(fixture.prCloseLog, "utf8"), /ENOENT/);
+    assert.equal(history.length, 1);
+    assert.equal(history[0].prState, "MERGED");
+    assert.deepEqual(history[0].sources[0].mismatches, ["candidate_cycle"]);
+    assert.equal(history[0].sources[0].headSha, reviewedSha);
+    assert.equal(history[0].sources[0].replacementHeadSha, reviewedSha);
+    assert.equal(history[0].sources[0].candidateCycle, 1);
+    assert.equal(history[0].sources[0].replacementCandidateCycle, 2);
+    assert.equal(
+      await git(fixture.remotePath, ["for-each-ref", "--format=%(refname)", `refs/heads/${previous.integrationCandidateBranch}`]),
+      "",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("protected QA handoff refuses changed candidate heads without force-pushing", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-drift-"));
 
