@@ -525,6 +525,35 @@ data/run-outputs/
 
 The always-on stack may create branches, run validation, commit, push, and open or update pull requests. It may assemble owner-QA-passed task heads on a release-candidate branch, but it does not merge that branch into the protected target.
 
+### Project run budgets
+
+Projects that use GitHub Actions can opt into a project-level worker budget in
+`wipPolicy`:
+
+```json
+{
+  "wipPolicy": {
+    "maxActiveRuns": 1,
+    "maxRunsPerWindow": 8,
+    "runWindowMinutes": 60
+  }
+}
+```
+
+These limits apply to queued, running, and completed builder/reviewer/QA-worker
+runs; owner handoffs are intentionally exempt. `maxActiveRuns` prevents a
+single project from fanning out several Actions-triggering branches at once,
+while `maxRunsPerWindow` prevents a retry or review loop from creating an
+unbounded burst after the active slot clears. The dispatcher records explicit
+`project_active_run_limit` or `project_run_window_limit` skips and leaves the
+task state intact for the next sweep.
+
+Configure them with `studioops update-project PROJECT --max-active-runs 1
+--max-runs-per-window 8 --run-window-minutes 60`. This is a StudioOps safety
+valve; it does not replace repository workflow design. Target repositories
+should still keep expensive validation on pull requests and their canonical QA
+branch rather than on every feature-branch push.
+
 It must not:
 
 - press GitHub's pull-request merge button or bypass the configured owner-QA gate
