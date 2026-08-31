@@ -29,6 +29,41 @@ export const DEFAULT_EXECUTION_POLICY = Object.freeze({
 const COMPLEX_WORK_PATTERN = /\b(architecture|architectural|security|privacy|pii|consent|oauth|authentication|authorization|migration|schema|database|index|deployment|release|production|infrastructure|data loss)\b/i;
 const ROUTINE_CONFIG_PATTERN = /(^|\/)(?:\.editorconfig|\.prettier(?:rc|ignore)?|\.eslintignore|prettier\.config\.[^/]+|eslint\.config\.[^/]+|markdownlint(?:\.json|\.yaml|\.yml)?|\.markdownlint(?:\.json|\.yaml|\.yml)?)$/i;
 
+function nonNegativeUsageNumber(value) {
+  return Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : 0;
+}
+
+/**
+ * Normalize provider telemetry without treating cached tokens as an extra
+ * billable input or guessing credits from token volume. Providers report
+ * input_tokens as the complete context volume, which can include cached and
+ * replayed transcript context; output_tokens is the provider's total output
+ * volume, including reasoning when the provider supplies a combined field.
+ */
+export function normalizeExecutionUsage(value = {}) {
+  const inputTokens = nonNegativeUsageNumber(value.input_tokens ?? value.inputTokens);
+  const outputTokens = nonNegativeUsageNumber(value.output_tokens ?? value.outputTokens);
+  const cachedInputTokens = Math.min(
+    inputTokens,
+    nonNegativeUsageNumber(value.cached_input_tokens ?? value.cachedInputTokens),
+  );
+  const reasoningOutputTokens = nonNegativeUsageNumber(value.reasoning_output_tokens ?? value.reasoningOutputTokens);
+  const actualCreditsValue = value.actual_credits ?? value.actualCredits;
+  const actualCredits = Number.isFinite(Number(actualCreditsValue)) && Number(actualCreditsValue) >= 0
+    ? Number(actualCreditsValue)
+    : null;
+  return {
+    inputTokens,
+    uncachedInputTokens: inputTokens - cachedInputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    actualTokens: inputTokens + outputTokens,
+    actualCredits,
+    creditTelemetryStatus: actualCredits === null ? "unavailable" : "recorded",
+  };
+}
+
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;

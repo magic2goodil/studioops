@@ -72,6 +72,62 @@ test("authoritative provider usage blocks automatic retry when a run exceeds its
   assert.equal(state.tasks[0].retryNotBefore, "");
 });
 
+test("over-budget GitHub builder completion preserves the exact review handoff and pauses continuation", async () => {
+  const subjectSha = "a".repeat(40);
+  const state = {
+    projects: [{ id: "project_budget_builder", workflowMode: "github" }],
+    tasks: [{ id: "task_budget_builder", projectId: "project_budget_builder", status: "in_progress", branchName: "codex/task-budget-builder", prUrl: "https://github.com/example/repo/pull/1", reviewSubjectSha: subjectSha, reviewSubjectCycle: 1 }],
+    runs: [{ id: "run_budget_builder", taskId: "task_budget_builder", projectId: "project_budget_builder", group: "builder", role: "builder", actionType: "start_builder", status: "running", workflowMode: "github", tokenBudget: 100 }],
+    reviews: [], comments: [], events: [],
+  };
+
+  const run = await completeRun("run_budget_builder", {
+    state, status: "completed",
+    usage: { input_tokens: 90, cached_input_tokens: 80, output_tokens: 30, actual_credits: 2 },
+  });
+
+  assert.equal(run.status, "completed");
+  assert.equal(run.completionDisposition, "completed_over_budget");
+  assert.equal(run.exitCode, "token_budget_exceeded");
+  assert.equal(state.tasks[0].status, "builder_review");
+  assert.equal(state.tasks[0].reviewSubjectSha, subjectSha);
+  assert.equal(state.tasks[0].budgetTelemetry.disposition, "handoff_preserved");
+  assert.equal(state.tasks[0].budgetPause.resumeStatus, "builder_review");
+});
+
+test("over-budget completed architecture handoff preserves the governed graph", async () => {
+  const state = {
+    projects: [{ id: "project_budget_arch", workflowMode: "local" }],
+    tasks: [{ id: "task_budget_arch", projectId: "project_budget_arch", status: "architecture_ready", architectureRequired: true, architectureStatus: "completed", architectureDecisionTaskIds: ["task_budget_child"] }, {
+      id: "task_budget_child", projectId: "project_budget_arch", parentTaskId: "task_budget_arch", architectureParentTaskId: "task_budget_arch", architectureRequired: true, architectureStatus: "inherited", description: "Implement the governed architecture slice.", userStory: "As an owner, I need the architecture slice implemented.", expectedOutcome: "The governed implementation is ready for builder work.", acceptanceCriteria: ["The implementation is validated."], lane: "backend", workAreas: ["src/runner.js"], dependsOnTaskIds: [],
+    }],
+    runs: [{ id: "run_budget_arch", taskId: "task_budget_arch", projectId: "project_budget_arch", group: "architect", role: "systems-architect", actionType: "start_architecture", status: "running", tokenBudget: 100 }],
+    reviews: [], comments: [], events: [],
+  };
+
+  const run = await completeRun("run_budget_arch", {
+    state, status: "completed", usage: { input_tokens: 101, output_tokens: 1 },
+  });
+
+  assert.equal(run.status, "completed");
+  assert.equal(run.completionDisposition, "completed_over_budget");
+  assert.equal(state.tasks[0].architectureStatus, "completed");
+  assert.deepEqual(state.tasks[0].architectureDecisionTaskIds, ["task_budget_child"]);
+  assert.equal(state.tasks[0].budgetTelemetry.continuationStopped, true);
+  assert.equal(state.tasks[1].budgetPause.runId, "run_budget_arch");
+});
+
+test("runner does not launch queued work for a task paused after preserving an over-budget handoff", () => {
+  const state = {
+    projects: [{ id: "project_budget_pause" }],
+    tasks: [{ id: "task_budget_pause", projectId: "project_budget_pause", status: "builder_review", budgetPause: { runId: "run_old" } }],
+    runs: [{ id: "run_next", taskId: "task_budget_pause", projectId: "project_budget_pause", group: "reviewer", status: "queued" }],
+  };
+  const report = planRunnableRuns(state, { limit: 1 });
+  assert.deepEqual(report.runnable, []);
+  assert.equal(report.skipped[0].reason, "budget_pause");
+});
+
 async function git(repoPath, args) {
   const result = await execFileAsync("git", args, { cwd: repoPath });
   return String(result.stdout || "").trim();
