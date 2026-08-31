@@ -360,6 +360,39 @@ test("project run budget limits recent worker runs while allowing the window to 
   assert.equal(afterWindow.selected.length, 1);
 });
 
+test("project run budgets do not block owner handoffs", () => {
+  const state = fixtureState();
+  state.projects[0].wipPolicy = { maxActiveRuns: 1, maxRunsPerWindow: 1, runWindowMinutes: 60 };
+  state.runs.push({
+    id: "run_worker",
+    taskId: "task_2",
+    projectId: "project_1",
+    group: "builder",
+    status: "running",
+    createdAt: "2026-01-01T00:30:00.000Z",
+  });
+
+  const plan = planDispatches(state, [{
+    id: "task_1:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_1",
+    taskTitle: "QA-ready task",
+    taskStatus: "qa_review",
+    taskUrl: "http://127.0.0.1:4317/tasks/task_1",
+    reason: "QA integration branch is validated and ready for local owner testing.",
+    integrationBranch: "qa/demo",
+    integrationBranchUrl: "https://github.com/example/demo/tree/qa/demo",
+  }], { nowMs: Date.parse("2026-01-01T00:45:00.000Z") });
+
+  assert.equal(plan.selected.length, 1);
+  assert.equal(plan.selected[0].group, "owner");
+  assert.equal(plan.skipped.length, 0);
+});
+
 test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {
   for (const status of ["queued", "running"]) {
     const { state, action } = finalAttemptReviewFixture(status);
