@@ -147,6 +147,8 @@ test("recorded changes create an exact-candidate builder handoff without another
   assert.match(prompt, /candidate branch: codex\/exact-candidate/);
   assert.match(prompt, /Context efficiency contract:/);
   assert.match(prompt, /Cap ordinary inspection output at roughly 200 lines or 12 KB per command/);
+  assert.match(prompt, /Do not push intermediate commits/);
+  assert.match(prompt, /state-only updates must not push/);
 });
 
 test("superseded candidate findings are archived and excluded from later prompts", () => {

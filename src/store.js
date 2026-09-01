@@ -1202,6 +1202,7 @@ function contextEfficiencyContract() {
     "- Redirect noisy validation output to a temporary log and return only the exit status plus a short failure excerpt or final summary. Preserve the full local log for debugging without replaying it into the model.",
     "- Cap ordinary inspection output at roughly 200 lines or 12 KB per command. If more evidence is needed, read the next targeted slice instead of repeating prior output.",
     "- Do not reread unchanged project instructions, standards, task payloads, or prior command output during the same run.",
+    "- Do not push intermediate commits. Finish the scoped implementation, run the configured local validation once, and push one exact candidate only after it passes. Review comments and state-only updates must not push at all.",
     "- Preserve required safety rules, acceptance criteria, exact candidate identity, and validation evidence; context efficiency never authorizes omitting a governing requirement.",
   ].join("\n");
 }
