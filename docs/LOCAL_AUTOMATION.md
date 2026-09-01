@@ -585,6 +585,27 @@ valve; it does not replace repository workflow design. Target repositories
 should still keep expensive validation on pull requests and their canonical QA
 branch rather than on every feature-branch push.
 
+StudioOps also applies an installation-wide metered-work brake. The conservative
+default admits one worker across all projects at a time and at most twelve worker
+runs per rolling hour; owner handoffs remain visible and unmetered. Configure it
+under `defaults.globalRunAdmission` with `maxActiveMeteredRuns`,
+`maxMeteredRunsPerWindow`, and `runWindowMinutes`. Deferred work remains queued
+with `global_active_run_limit` or `global_run_window_limit` evidence.
+
+Exact candidate-stage duplicates and unchanged failed retries are suppressed as
+`duplicate_candidate_stage` and `unchanged_retry`. Before a GitHub push, the
+runner installs a local pre-push hook that executes the project's deterministic
+`validationCommands`, keeps full output in a local log, emits only a bounded
+failure excerpt, and caches success by exact Git tree and validation-policy
+digest. Review comments and other state-only work never push.
+
+Finally, `defaults.runner.outputGuard` mechanically stops a worker when one
+command exceeds 24,000 characters or cumulative command output exceeds 160,000
+characters. This prevents a single broad search or test dump from expanding into
+a multi-million-token transcript. The task is blocked with explicit output-budget
+evidence and is not retried until the command is rewritten to use targeted reads
+or local log files.
+
 It must not:
 
 - press GitHub's pull-request merge button or bypass the configured owner-QA gate

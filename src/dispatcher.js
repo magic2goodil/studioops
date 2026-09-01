@@ -17,7 +17,10 @@ import {
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { compactPromptPacket, executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 import { assessCreditAdmission, requestCodexCreditSnapshot } from "./credit-policy.js";
-import { INSTALLED_AUTOMATION_CAPACITY } from "./config.js";
+import {
+  INSTALLED_AUTOMATION_CAPACITY,
+  normalizeGlobalRunAdmission,
+} from "./config.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_architecture",
@@ -219,6 +222,47 @@ function projectRunBudgetReason(state, project, action, selectedProjectRuns, now
     if (recent + selected >= budget.maxRunsPerWindow) return "project_run_window_limit";
   }
   return "";
+}
+
+function globalRunBudgetReason(state, action, selectedWorkerRuns, nowMs, options) {
+  if (runGroupFor(action) === "owner") return "";
+  if (!options.globalRunAdmission) return "";
+  const budget = normalizeGlobalRunAdmission(options.globalRunAdmission);
+  const workerRuns = (state.runs || []).filter((run) => run.group !== "owner");
+  const active = workerRuns.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)).length;
+  if (active + selectedWorkerRuns >= budget.maxActiveMeteredRuns) {
+    return "global_active_run_limit";
+  }
+  const windowStart = nowMs - budget.runWindowMinutes * 60 * 1000;
+  const recent = workerRuns.filter((run) => {
+    if (!isWorkerRun(run)) return false;
+    const created = Date.parse(run.createdAt || run.startedAt || "");
+    return Number.isFinite(created) && created >= windowStart && created <= nowMs;
+  }).length;
+  if (recent + selectedWorkerRuns >= budget.maxMeteredRunsPerWindow) {
+    return "global_run_window_limit";
+  }
+  return "";
+}
+
+function recentDuplicateCandidateStageReason(state, task, action, nowMs, options) {
+  if (runGroupFor(action) === "owner") return "";
+  if (!options.globalRunAdmission) return "";
+  const key = dispatchKeyFor(task, action);
+  const windowMinutes = normalizeGlobalRunAdmission(options.globalRunAdmission).runWindowMinutes;
+  const windowStart = nowMs - windowMinutes * 60 * 1000;
+  const duplicate = (state.runs || []).find((run) => {
+    if (run.dispatchKey !== key || !FINAL_RUN_STATUSES.has(run.status)) return false;
+    const finished = Date.parse(run.completedAt || run.updatedAt || run.createdAt || "");
+    return Number.isFinite(finished) && finished >= windowStart && finished <= nowMs;
+  });
+  if (!duplicate) return "";
+  if (
+    duplicate.status === "failed"
+    && duplicate.exitCode
+    && duplicate.exitCode === task.lastAutomationFailure
+  ) return "unchanged_retry";
+  return duplicate.status === "completed" ? "duplicate_candidate_stage" : "";
 }
 
 function activeProjectTaskCount(state, projectId) {
@@ -838,6 +882,7 @@ export function planDispatches(state, actions, input = {}) {
   const selected = [];
   const skipped = [];
   const selectedProjectRuns = new Map();
+  let selectedWorkerRuns = 0;
 
   for (const action of actions || []) {
     if (selected.length >= maxDispatches) {
@@ -861,11 +906,21 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: "already_dispatched" });
       continue;
     }
+    const duplicateReason = recentDuplicateCandidateStageReason(state, task, action, nowMs, options);
+    if (duplicateReason) {
+      skipped.push({ action, reason: duplicateReason });
+      continue;
+    }
     if (action.taskStatus && task.status !== action.taskStatus) {
       skipped.push({ action, reason: `task_status_changed:${action.taskStatus}->${task.status}` });
       continue;
     }
     const project = state.projects?.find((item) => item.id === task.projectId);
+    const globalBudgetReason = globalRunBudgetReason(state, action, selectedWorkerRuns, nowMs, options);
+    if (globalBudgetReason) {
+      skipped.push({ action, reason: globalBudgetReason });
+      continue;
+    }
     const runBudgetReason = projectRunBudgetReason(state, project, action, selectedProjectRuns, nowMs);
     if (runBudgetReason) {
       skipped.push({ action, reason: runBudgetReason, projectId: task.projectId });
@@ -911,6 +966,7 @@ export function planDispatches(state, actions, input = {}) {
     selected.push({ action, task, group, profile });
     counts[group] = (counts[group] || 0) + 1;
     if (group !== "owner") {
+      selectedWorkerRuns += 1;
       selectedProjectRuns.set(task.projectId, Number(selectedProjectRuns.get(task.projectId) || 0) + 1);
     }
   }
@@ -918,6 +974,9 @@ export function planDispatches(state, actions, input = {}) {
   return {
     effectiveCapacity: {
       maxDispatchesPerSweep: maxDispatches,
+      globalRunAdmission: options.globalRunAdmission
+        ? normalizeGlobalRunAdmission(options.globalRunAdmission)
+        : null,
       groups: effectiveGroupCapacity(options, initialCounts, counts),
     },
     selected: selected.map(({ action, task, group, profile }) => ({
