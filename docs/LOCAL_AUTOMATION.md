@@ -527,6 +527,25 @@ The always-on stack may create branches, run validation, commit, push, and open 
 
 ### Project run budgets
 
+#### Completed runs over budget
+
+Provider usage is recorded on both the run and its task. `input_tokens` is the
+complete reported context volume, including cached input and any replayed
+transcript context; cached input is recorded separately and is not added again
+to `actualTokens`. `output_tokens` is counted once (and may include reasoning
+output when the provider supplies a combined total). `actual_credits` is kept
+as provider credit telemetry and is never inferred from token volume, so cached
+tokens are not silently treated as free or conflated with cost.
+
+If a completed builder or architecture run has already atomically recorded a
+valid handoff, exceeding its token or credit budget preserves the completed
+run, exact candidate/PR or architecture graph, and reviewable task status. The
+task records `budgetTelemetry` and a `budgetPause`; automatic reviewer, QA,
+retry, and continuation work remains paused until an owner-authorized next
+action. A completion without valid handoff evidence still fails closed and
+becomes owner-blocked. Budget telemetry is audit evidence, not permission to
+continue spending.
+
 Projects that use GitHub Actions can opt into a project-level worker budget in
 `wipPolicy`:
 

@@ -1,6 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { executionAttemptKey, resolveExecutionPolicy } from "../src/execution-policy.js";
+import { executionAttemptKey, normalizeExecutionUsage, resolveExecutionPolicy } from "../src/execution-policy.js";
+
+test("usage accounting keeps cached context visible without double-counting token volume or guessing credits", () => {
+  assert.deepEqual(normalizeExecutionUsage({
+    input_tokens: 100,
+    cached_input_tokens: 80,
+    output_tokens: 25,
+    reasoning_output_tokens: 10,
+  }), {
+    inputTokens: 100,
+    uncachedInputTokens: 20,
+    cachedInputTokens: 80,
+    outputTokens: 25,
+    reasoningOutputTokens: 10,
+    actualTokens: 125,
+    actualCredits: null,
+    creditTelemetryStatus: "unavailable",
+  });
+});
 
 test("execution policy pins Sol high reasoning for ordinary builder work", () => {
   const policy = resolveExecutionPolicy(
