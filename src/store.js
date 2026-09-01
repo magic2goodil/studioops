@@ -110,9 +110,18 @@ function readinessValuePresent(field, value) {
 
 export function evaluateTaskReadiness(task = {}, state = null) {
   const missing = [];
+  const inheritedArchitectureDecision = state
+    && task.architectureStatus === "inherited"
+    && architectureIsCompleteInState(state, task)
+    ? (() => {
+        const parent = findTask(state, task.architectureParentTaskId || task.parentTaskId);
+        return parent?.architectureDecision || parent?.architectureSummary || "";
+      })()
+    : "";
   const aliases = {
     affectedSurfaces: task.affectedSurfaces || task.workAreas,
     architectureDecision: task.architectureDecision || task.architectureSummary
+      || inheritedArchitectureDecision
       || (task.architectureWaiver ? "waived" : "")
       || (task.architectureStatus === "not_required" ? "not_required" : ""),
   };

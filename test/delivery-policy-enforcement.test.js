@@ -49,6 +49,30 @@ test("new ready tasks validate themselves in the dependency graph and require no
   );
 });
 
+test("governed child readiness inherits the completed parent architecture decision", () => {
+  const parent = {
+    id: "task_parent",
+    projectId: "project_arch",
+    architectureStatus: "completed",
+    architectureSummary: "Use the existing local control plane with bounded worker admission and durable task state.",
+    architectureDecisionTaskIds: ["task_child"],
+  };
+  const child = readyInput("project_arch", {
+    id: "task_child",
+    projectId: "project_arch",
+    parentTaskId: parent.id,
+    architectureParentTaskId: parent.id,
+    architectureRequired: true,
+    architectureStatus: "inherited",
+    architectureDecision: "",
+    description: "Implement the governed runtime correction.",
+    lane: "backend",
+  });
+  const state = { tasks: [parent, child] };
+  assert.equal(evaluateTaskReadiness(child, state).ready, true);
+  assert.equal(evaluateTaskReadiness(child, state).missing.includes("architectureDecision"), false);
+});
+
 test("dependency validation rejects cycles and cross-project edges", async () => {
   const one = await addProject({ key: "dag-one", name: "DAG one" });
   const two = await addProject({ key: "dag-two", name: "DAG two" });

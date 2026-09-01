@@ -586,8 +586,9 @@ should still keep expensive validation on pull requests and their canonical QA
 branch rather than on every feature-branch push.
 
 StudioOps also applies an installation-wide metered-work brake. The conservative
-default admits one worker across all projects at a time and at most twelve worker
-runs per rolling hour; owner handoffs remain visible and unmetered. Configure it
+default admits two workers across the installation at a time and at most twelve
+worker runs per rolling hour; per-project limits still keep one configured project
+from running overlapping work, and owner handoffs remain visible and unmetered. Configure it
 under `defaults.globalRunAdmission` with `maxActiveMeteredRuns`,
 `maxMeteredRunsPerWindow`, and `runWindowMinutes`. Deferred work remains queued
 with `global_active_run_limit` or `global_run_window_limit` evidence.
@@ -599,12 +600,13 @@ runner installs a local pre-push hook that executes the project's deterministic
 failure excerpt, and caches success by exact Git tree and validation-policy
 digest. Review comments and other state-only work never push.
 
-Finally, `defaults.runner.outputGuard` mechanically stops a worker when one
-command exceeds 24,000 characters or cumulative command output exceeds 160,000
-characters. This prevents a single broad search or test dump from expanding into
-a multi-million-token transcript. The task is blocked with explicit output-budget
-evidence and is not retried until the command is rewritten to use targeted reads
-or local log files.
+Finally, `defaults.runner.outputGuard` records guidance and bounds the stored event
+when one command exceeds 24,000 characters. The first broad read does not discard
+an otherwise useful run. Cumulative command output above 160,000 characters remains
+a hard circuit breaker, preventing repeated broad searches or test dumps from
+expanding into a multi-million-token transcript. A cumulative violation blocks the
+task with explicit output-budget evidence until the work is resumed with targeted
+reads or local log files.
 
 It must not:
 
