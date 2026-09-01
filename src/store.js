@@ -1184,16 +1184,26 @@ function boundedPromptText(value, limit = 4000) {
 function candidateIdentityPrompt(task) {
   const candidate = task.candidateIdentity || {};
   const values = [
-    ["candidate commit", candidate.commit || task.reviewSubjectSha],
-    ["candidate tree", candidate.tree],
-    ["candidate base", candidate.base],
+    ["candidate commit", candidate.commitSha || task.reviewSubjectSha],
+    ["candidate tree", candidate.treeSha],
+    ["candidate base", candidate.baseSha],
     ["candidate branch", candidate.branch || task.branchName],
-    ["candidate cycle", candidate.cycle || currentReviewCandidateCycle(task)],
+    ["candidate cycle", candidate.candidateCycle || currentReviewCandidateCycle(task)],
     ["impact evidence digest", candidate.impactEvidenceDigest || task.impactEvidence?.digest],
   ].filter(([, value]) => String(value || "").trim());
   return values.length
     ? values.map(([label, value]) => `- ${label}: ${boundedPromptText(value, 180)}`).join("\n")
     : "- No verified candidate identity recorded.";
+}
+
+function contextEfficiencyContract() {
+  return [
+    "- Keep command output entering the model context bounded: prefer targeted rg/find queries and narrow line ranges; do not dump whole files, logs, state snapshots, or test suites.",
+    "- Redirect noisy validation output to a temporary log and return only the exit status plus a short failure excerpt or final summary. Preserve the full local log for debugging without replaying it into the model.",
+    "- Cap ordinary inspection output at roughly 200 lines or 12 KB per command. If more evidence is needed, read the next targeted slice instead of repeating prior output.",
+    "- Do not reread unchanged project instructions, standards, task payloads, or prior command output during the same run.",
+    "- Preserve required safety rules, acceptance criteria, exact candidate identity, and validation evidence; context efficiency never authorizes omitting a governing requirement.",
+  ].join("\n");
 }
 
 function currentStageEvidencePrompt(state, task, role) {
@@ -4337,6 +4347,9 @@ ${context.standards}
 Project safety rules:
 ${context.safety}
 
+Context efficiency contract:
+${contextEfficiencyContract()}
+
 Modular architecture and impact-scoped validation contract:
 ${modularArchitectureAndValidationContract()}
 
@@ -4439,6 +4452,9 @@ ${standards}
 Configured validation commands:
 ${validation}
 
+Context efficiency contract:
+${contextEfficiencyContract()}
+
 Modular architecture and impact-scoped validation contract:
 ${modularArchitectureAndValidationContract()}
 
@@ -4512,6 +4528,9 @@ ${candidateIdentity}
 Current-stage evidence (bounded):
 ${currentStageEvidencePrompt(state, task, role)}
 
+Context efficiency contract:
+${contextEfficiencyContract()}
+
 Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
@@ -4581,6 +4600,9 @@ ${candidateIdentity}
 
 Current-stage evidence (bounded):
 ${currentStageEvidencePrompt(state, task, role)}
+
+Context efficiency contract:
+${contextEfficiencyContract()}
 
 Task:
 ${task.title}

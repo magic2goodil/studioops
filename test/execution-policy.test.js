@@ -26,14 +26,14 @@ test("usage accounting keeps cached context visible without double-counting toke
 
 test("effective usage excludes cached input while retaining raw replay volume", () => {
   const usage = normalizeExecutionUsage({
-    input_tokens: 2_256_384,
+    input_tokens: 2_371_308,
     cached_input_tokens: 2_256_384,
-    output_tokens: 123_722,
+    output_tokens: 8_798,
     actual_credits: 4.5,
   });
   assert.equal(usage.rawTotalTokens, 2_380_106);
   assert.equal(usage.cachedInputTokens, 2_256_384);
-  assert.equal(usage.uncachedInputTokens, 0);
+  assert.equal(usage.uncachedInputTokens, 114_924);
   assert.equal(usage.effectiveBudgetTokens, 123_722);
   assert.equal(usage.authoritativeCreditStatus, "recorded");
 });
