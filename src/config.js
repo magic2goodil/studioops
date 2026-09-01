@@ -312,6 +312,10 @@ export function projectFromConfig(rawProject, defaults = {}) {
     standards: withDefaultProjectStandards(configuredStandards),
     safetyRules: rawProject.safetyRules || defaults.safetyRules || [],
     reviewPipeline: rawProject.reviewPipeline || defaults.reviewPipeline || [],
+    wipPolicy: {
+      ...(defaults.wipPolicy || {}),
+      ...(rawProject.wipPolicy || {}),
+    },
     reviewPolicy,
     qaIntegration: {
       ...(defaults.qaIntegration || {}),

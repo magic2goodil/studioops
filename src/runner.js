@@ -43,7 +43,7 @@ import {
 } from "./store.js";
 import { loadConfig, normalizeWorkspaceRetention } from "./config.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
-import { DEFAULT_EXECUTION_POLICY, resolveExecutionPolicy } from "./execution-policy.js";
+import { DEFAULT_EXECUTION_POLICY, normalizeExecutionUsage, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
 import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
 import { normalizeProjectWorkflowMode } from "./config.js";
@@ -1085,6 +1085,10 @@ export function planRunnableRuns(state, input = {}) {
       continue;
     }
     const task = findTask(state, run.taskId);
+    if (task?.budgetPause?.runId) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: "budget_pause" });
+      continue;
+    }
     if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: "operator_pause" });
       continue;
@@ -1292,31 +1296,13 @@ function applySuccessfulHandoff(state, run, task, now, options = {}) {
   }
 }
 
-function normalizedUsage(value = {}) {
-  const number = (item) => Number.isFinite(Number(item)) && Number(item) >= 0 ? Number(item) : 0;
-  const inputTokens = number(value.input_tokens ?? value.inputTokens);
-  const outputTokens = number(value.output_tokens ?? value.outputTokens);
-  const cachedInputTokens = number(value.cached_input_tokens ?? value.cachedInputTokens);
-  const reasoningOutputTokens = number(value.reasoning_output_tokens ?? value.reasoningOutputTokens);
-  const actualCreditsValue = value.actual_credits ?? value.actualCredits;
-  const actualCredits = Number.isFinite(Number(actualCreditsValue)) && Number(actualCreditsValue) >= 0
-    ? Number(actualCreditsValue)
-    : null;
-  return {
-    inputTokens,
-    outputTokens,
-    cachedInputTokens,
-    reasoningOutputTokens,
-    actualTokens: inputTokens + outputTokens,
-    actualCredits,
-  };
-}
-
 function recordRunUsage(run, usage, now) {
-  const normalized = normalizedUsage(usage || {});
+  const normalized = normalizeExecutionUsage(usage || {});
   const tokenBudget = Math.max(0, Number(run.tokenBudget || run.costTelemetry?.tokenBudget || 0));
+  const rawContextTokenBudget = Math.max(0, Number(run.rawContextTokenBudget || run.costTelemetry?.rawContextTokenBudget || DEFAULT_EXECUTION_POLICY.rawContextTokenBudget));
   const costBudget = Math.max(0, Number(run.costBudget || 0));
-  const tokenExceeded = tokenBudget > 0 && normalized.actualTokens > tokenBudget;
+  const tokenExceeded = tokenBudget > 0 && normalized.effectiveBudgetTokens > tokenBudget;
+  const rawContextExceeded = rawContextTokenBudget > 0 && normalized.rawTotalTokens > rawContextTokenBudget;
   const costExceeded = costBudget > 0
     && normalized.actualCredits !== null
     && normalized.actualCredits > costBudget;
@@ -1324,13 +1310,18 @@ function recordRunUsage(run, usage, now) {
     ...(run.costTelemetry || {}),
     ...normalized,
     tokenBudget,
+    effectiveTokenBudget: tokenBudget,
+    rawContextTokenBudget,
     costBudget,
     tokenExceeded,
+    effectiveBudgetExceeded: tokenExceeded,
+    rawContextExceeded,
     costExceeded,
-    creditTelemetryStatus: normalized.actualCredits === null ? "unavailable" : "recorded",
+    creditTelemetryStatus: normalized.creditTelemetryStatus,
+    authoritativeCreditStatus: normalized.authoritativeCreditStatus,
     recordedAt: now,
   };
-  return { tokenExceeded, costExceeded };
+  return { tokenExceeded, rawContextExceeded, costExceeded };
 }
 
 function applyBudgetExceededToTask(task, run, now) {
@@ -1350,6 +1341,32 @@ function applyBudgetExceededToTask(task, run, now) {
     telemetry: run.costTelemetry,
   };
   task.updatedAt = now;
+}
+
+function preserveBudgetTelemetryOnTask(state, task, run, now) {
+  if (!task) return;
+  const pausedTasks = run.group === "architect"
+    ? [task, ...(state.tasks || []).filter((candidate) => (
+      (task.architectureDecisionTaskIds || []).includes(candidate.id)
+    ))]
+    : [task];
+  for (const pausedTask of pausedTasks) {
+    pausedTask.budgetTelemetry = {
+      ...run.costTelemetry,
+      runId: run.id,
+      disposition: "handoff_preserved",
+      continuationStopped: true,
+      recordedAt: now,
+    };
+    pausedTask.budgetPause = {
+      runId: run.id,
+      reason: run.exitCode,
+      resumeStatus: pausedTask.status,
+      pausedAt: now,
+      message: "Automatic continuation is paused pending owner review of the preserved handoff.",
+    };
+    pausedTask.updatedAt = now;
+  }
 }
 
 export function applyFailedRunToTask(task, run, reason, now) {
@@ -1682,6 +1699,9 @@ export async function claimRuns(input = {}) {
       run.modelTier = run.modelTier || executionPolicy.modelTier || "";
       run.modelReasoningEffort = run.modelReasoningEffort || executionPolicy.reasoningEffort || input.modelReasoningEffort;
       run.modelSelectionReason = run.modelSelectionReason || executionPolicy.selectionReason;
+      run.tokenBudget = Math.max(1, Number(run.tokenBudget || executionPolicy.tokenBudget));
+      run.rawContextTokenBudget = Math.max(1, Number(run.rawContextTokenBudget || executionPolicy.rawContextTokenBudget));
+      run.maxPromptChars = Math.max(1, Number(run.maxPromptChars || executionPolicy.maxPromptChars));
       run.attempt = Math.max(1, Number(run.attempt || 1));
       run.maxAttempts = Math.max(1, Number(run.maxAttempts || executionPolicy.maxAttempts));
       run.retryBackoffMs = Math.max(1_000, Number(run.retryBackoffMs || executionPolicy.retryBackoffMs));
@@ -1746,14 +1766,6 @@ export async function completeRun(runId, input = {}) {
     run.lastMessagePath = input.lastMessagePath || run.lastMessagePath || "";
     run.notes = String(input.notes || run.notes || "").trim();
     const budget = recordRunUsage(run, input.usage, now);
-    if (run.status === "completed" && (budget.tokenExceeded || budget.costExceeded)) {
-      run.status = "failed";
-      run.exitCode = budget.tokenExceeded ? "token_budget_exceeded" : "cost_budget_exceeded";
-      run.notes = [run.notes, `StudioOps stopped automatic continuation because ${run.exitCode}.`]
-        .filter(Boolean)
-        .join("\n\n");
-    }
-
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
     if (run.status === "completed") {
@@ -1776,8 +1788,30 @@ export async function completeRun(runId, input = {}) {
       }
     }
 
+    const budgetExceeded = budget.tokenExceeded || budget.rawContextExceeded || budget.costExceeded;
+    if (budgetExceeded && run.status === "completed") {
+      run.exitCode = budget.rawContextExceeded
+        ? "raw_context_budget_exceeded"
+        : budget.tokenExceeded ? "effective_token_budget_exceeded" : "cost_budget_exceeded";
+      run.completionDisposition = "completed_over_budget";
+      run.notes = [run.notes, `StudioOps stopped automatic continuation because ${run.exitCode}; the valid handoff was preserved.`]
+        .filter(Boolean)
+        .join("\n\n");
+      preserveBudgetTelemetryOnTask(state, task, run, now);
+    }
+
     let failureDisposition = null;
-    if (run.status === "failed" && ["token_budget_exceeded", "cost_budget_exceeded"].includes(run.exitCode)) {
+    if (budgetExceeded && handoffFailure) {
+      run.status = "failed";
+      run.exitCode = budget.rawContextExceeded
+        ? "raw_context_budget_exceeded"
+        : budget.tokenExceeded ? "effective_token_budget_exceeded" : "cost_budget_exceeded";
+      run.completionDisposition = "over_budget_incomplete_handoff";
+      run.notes = [run.notes, handoffFailure, `StudioOps stopped automatic continuation because ${run.exitCode}.`]
+        .filter(Boolean)
+        .join("\n\n");
+      applyBudgetExceededToTask(task, run, now);
+    } else if (run.status === "failed" && ["token_budget_exceeded", "effective_token_budget_exceeded", "raw_context_budget_exceeded", "cost_budget_exceeded"].includes(run.exitCode)) {
       applyBudgetExceededToTask(task, run, now);
     } else if (run.status === "failed") {
       failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);

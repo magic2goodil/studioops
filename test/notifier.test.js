@@ -94,8 +94,8 @@ test("QA bundles produce one checklist notification with the preview URL", () =>
   });
 
   assert.equal(notification.title, "StudioOps QA bundle ready");
-  assert.match(notification.body, /task_126 Fix map categories/);
-  assert.match(notification.body, /task_127 Clarify Discover and Map/);
+  assert.match(notification.body, /Ready to test locally: Fix map categories; Clarify Discover and Map/);
+  assert.doesNotMatch(notification.body, /task_126|task_127/);
   assert.match(notification.body, /127\.0\.0\.1:4174/);
 });
 
@@ -124,6 +124,7 @@ test("QA notification enqueue is manifest-idempotent and desktop text is exact-S
   assert.equal(state.notificationOutbox.length, 2);
   assert.deepEqual(candidate.qaPacket.actions.map((item) => item.action), ["pass", "fail", "request_changes", "defer", "open_candidate"]);
   const notification = notificationForOwnerQaPacket(candidate.qaPacket);
+  assert.match(notification.body, /Ready to test: Verify notification handoff/);
   assert.match(notification.body, /Approval applies only to tested SHA c{12}/);
   assert.doesNotMatch(notification.body, /127\.0\.0\.1|Users\//);
 });

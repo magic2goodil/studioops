@@ -9,11 +9,13 @@ import {
   generatePrompt,
   mutateState,
   readState,
+  resetAutomationCircuitInState,
   reviewStagesForTask,
+  taskAutomationCircuitIsCurrent,
   workflowSnapshotForTask,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
-import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
+import { compactPromptPacket, executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 import { assessCreditAdmission, requestCodexCreditSnapshot } from "./credit-policy.js";
 import { INSTALLED_AUTOMATION_CAPACITY } from "./config.js";
 
@@ -167,6 +169,56 @@ function activeCounts(state) {
 function projectWipLimit(project) {
   const configured = Number(project?.wipPolicy?.maxActiveTasks || project?.maxActiveTasks || 0);
   return Number.isInteger(configured) && configured > 0 ? configured : 0;
+}
+
+function projectRunBudget(project) {
+  const policy = project?.wipPolicy || {};
+  const maxActiveRuns = Number(policy.maxActiveRuns || 0);
+  const maxRunsPerWindow = Number(policy.maxRunsPerWindow || 0);
+  const runWindowMinutes = Number(policy.runWindowMinutes || 60);
+  return {
+    maxActiveRuns: Number.isInteger(maxActiveRuns) && maxActiveRuns > 0 ? maxActiveRuns : 0,
+    maxRunsPerWindow: Number.isInteger(maxRunsPerWindow) && maxRunsPerWindow > 0 ? maxRunsPerWindow : 0,
+    runWindowMinutes: Number.isFinite(runWindowMinutes) && runWindowMinutes > 0 ? runWindowMinutes : 60,
+  };
+}
+
+function isWorkerRun(run) {
+  return ACTIVE_RUN_STATUSES.has(run.status) || FINAL_RUN_STATUSES.has(run.status);
+}
+
+function projectRunCounts(state, projectId, nowMs) {
+  const projectRuns = (state.runs || []).filter((run) => (
+    run.projectId === projectId
+    && run.group !== "owner"
+    && isWorkerRun(run)
+  ));
+  const active = projectRuns.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)).length;
+  return { active, runs: projectRuns.filter((run) => {
+    const created = Date.parse(run.createdAt || run.startedAt || "");
+    return Number.isFinite(created) && nowMs - created >= 0;
+  }) };
+}
+
+function projectRunBudgetReason(state, project, action, selectedProjectRuns, nowMs) {
+  if (runGroupFor(action) === "owner") return "";
+  if (!project) return "";
+  const budget = projectRunBudget(project);
+  if (!budget.maxActiveRuns && !budget.maxRunsPerWindow) return "";
+  const existing = projectRunCounts(state, project.id, nowMs);
+  const selected = Number(selectedProjectRuns.get(project.id) || 0);
+  if (budget.maxActiveRuns && existing.active + selected >= budget.maxActiveRuns) {
+    return "project_active_run_limit";
+  }
+  if (budget.maxRunsPerWindow) {
+    const windowStart = nowMs - budget.runWindowMinutes * 60 * 1000;
+    const recent = existing.runs.filter((run) => {
+      const created = Date.parse(run.createdAt || run.startedAt || "");
+      return Number.isFinite(created) && created >= windowStart;
+    }).length;
+    if (recent + selected >= budget.maxRunsPerWindow) return "project_run_window_limit";
+  }
+  return "";
 }
 
 function activeProjectTaskCount(state, projectId) {
@@ -384,6 +436,60 @@ function openCreditAdmissionCircuits(state, actions, skipped, options, now) {
     openedTaskIds.add(task.id);
   }
   return openedTaskIds;
+}
+
+export function recoverAffordableCreditCircuitsInState(state, options = {}, input = {}) {
+  const snapshot = options.creditSnapshot;
+  if (!options.creditPolicy?.enabled || snapshot?.status !== "available") return [];
+  const now = input.now || new Date().toISOString();
+  const recovered = [];
+
+  for (const task of state.tasks || []) {
+    const circuit = task.automationCircuit;
+    const blocker = task.automationBlocker;
+    if (
+      circuit?.state !== "open"
+      || circuit.reasonCode !== "credit_budget_insufficient"
+      || blocker?.type !== "circuit"
+      || !taskAutomationCircuitIsCurrent(task)
+    ) continue;
+
+    const admission = assessCreditAdmission(
+      snapshot,
+      { modelTier: blocker.modelTier },
+      options.creditPolicy,
+    );
+    if (!admission.allowed) continue;
+
+    resetAutomationCircuitInState(state, {
+      task: task.id,
+      expectedOpenedAt: circuit.openedAt,
+      reason: `Fresh credit telemetry admitted the unchanged ${admission.tier} workflow at ${admission.remainingPercent}% remaining quota.`,
+      author: "StudioOps Budget Controller",
+      automatic: true,
+      now,
+    });
+    task.automationCircuit.recoveryEvidence = {
+      snapshotStatus: admission.snapshotStatus,
+      snapshotSource: admission.snapshotSource,
+      snapshotObservedAt: admission.snapshotObservedAt,
+      tier: admission.tier,
+      remainingPercent: Number.isFinite(admission.remainingPercent)
+        ? admission.remainingPercent
+        : null,
+      decision: admission.code,
+    };
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "credit_admission_recovered",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title}: fresh credit telemetry restored ${task.status}; dispatch remains eligible for the next sweep.`,
+      createdAt: now,
+    });
+    recovered.push(task.id);
+  }
+  return recovered;
 }
 
 function resolveReviewTargetStage(stages, task, action) {
@@ -637,6 +743,7 @@ function makeRun(state, task, action, options, now) {
     : requestedThreadId;
   const profile = laneProfile(task, action);
   const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const promptPacket = compactPromptPacket(prompt, executionPolicy.maxPromptChars);
   const creditAdmission = assessCreditAdmission(
     options.creditSnapshot,
     executionPolicy,
@@ -663,12 +770,28 @@ function makeRun(state, task, action, options, now) {
     modelReasoningEffort: executionPolicy.reasoningEffort,
     modelSelectionReason: executionPolicy.selectionReason,
     tokenBudget: executionPolicy.tokenBudget,
+    rawContextTokenBudget: executionPolicy.rawContextTokenBudget,
+    maxPromptChars: executionPolicy.maxPromptChars,
+    promptChars: promptPacket.prompt.length,
+    promptOriginalChars: promptPacket.originalChars,
+    promptCompacted: promptPacket.compacted,
     costBudget: executionPolicy.costBudget,
     costTelemetry: {
       estimatedCredits: creditAdmission.estimatedCredits,
       tokenBudget: executionPolicy.tokenBudget,
+      effectiveTokenBudget: executionPolicy.tokenBudget,
+      rawContextTokenBudget: executionPolicy.rawContextTokenBudget,
+      rawInputTokens: null,
+      cachedInputTokens: null,
+      uncachedInputTokens: null,
+      outputTokens: null,
+      reasoningOutputTokens: null,
+      rawTotalTokens: null,
+      effectiveBudgetTokens: null,
       actualCredits: null,
       actualTokens: null,
+      authoritativeCreditStatus: "unavailable",
+      creditTelemetryStatus: "unavailable",
       recordedAt: now,
     },
     reviewerIdentity: action.reviewerIdentity || "",
@@ -688,7 +811,7 @@ function makeRun(state, task, action, options, now) {
     retryBackoffMs: executionPolicy.retryBackoffMs,
     staleRunMs: executionPolicy.staleRunMs,
     status: dispatchStatusFor(action),
-    prompt,
+    prompt: promptPacket.prompt,
     promptCommand: action.promptCommand || "",
     reviewCommand: action.reviewCommand || "",
     taskUrl: action.taskUrl || "",
@@ -708,11 +831,13 @@ function makeRun(state, task, action, options, now) {
 
 export function planDispatches(state, actions, input = {}) {
   const options = { ...DEFAULTS, ...input };
+  const nowMs = Number(options.nowMs || Date.now());
   const counts = activeCounts(state);
   const initialCounts = { ...counts };
   const maxDispatches = Math.max(1, Number(options.maxDispatchesPerSweep || DEFAULTS.maxDispatchesPerSweep));
   const selected = [];
   const skipped = [];
+  const selectedProjectRuns = new Map();
 
   for (const action of actions || []) {
     if (selected.length >= maxDispatches) {
@@ -741,6 +866,11 @@ export function planDispatches(state, actions, input = {}) {
       continue;
     }
     const project = state.projects?.find((item) => item.id === task.projectId);
+    const runBudgetReason = projectRunBudgetReason(state, project, action, selectedProjectRuns, nowMs);
+    if (runBudgetReason) {
+      skipped.push({ action, reason: runBudgetReason, projectId: task.projectId });
+      continue;
+    }
     const wipLimit = projectWipLimit(project);
     if (wipLimit && ["builder", "architect"].includes(runGroupFor(action))) {
       const active = activeProjectTaskCount(state, task.projectId);
@@ -780,6 +910,9 @@ export function planDispatches(state, actions, input = {}) {
     }
     selected.push({ action, task, group, profile });
     counts[group] = (counts[group] || 0) + 1;
+    if (group !== "owner") {
+      selectedProjectRuns.set(task.projectId, Number(selectedProjectRuns.get(task.projectId) || 0) + 1);
+    }
   }
 
   return {
@@ -829,6 +962,9 @@ export async function dispatchSupervisorActions(actions, input = {}) {
 
     const now = new Date().toISOString();
     const options = { ...DEFAULTS, ...dispatchInput };
+    const recoveredCreditCircuitTaskIds = options.dryRun
+      ? []
+      : recoverAffordableCreditCircuitsInState(state, options, { now });
     const plan = planDispatches(state, actions, options);
     const runs = [];
 
@@ -840,6 +976,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
         effectiveCapacity: plan.effectiveCapacity,
         selected: plan.selected,
         skipped: plan.skipped,
+        recoveredCreditCircuitTaskIds,
       };
     }
 
@@ -911,6 +1048,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       effectiveCapacity: plan.effectiveCapacity,
       selected,
       skipped,
+      recoveredCreditCircuitTaskIds,
     };
   });
 }

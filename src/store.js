@@ -1176,6 +1176,47 @@ function renderAttachments(attachments) {
     : "- None recorded.";
 }
 
+function boundedPromptText(value, limit = 4000) {
+  const text = String(value || "").trim();
+  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 40))}\n[context truncated by StudioOps]`;
+}
+
+function candidateIdentityPrompt(task) {
+  const candidate = task.candidateIdentity || {};
+  const values = [
+    ["candidate commit", candidate.commitSha || task.reviewSubjectSha],
+    ["candidate tree", candidate.treeSha],
+    ["candidate base", candidate.baseSha],
+    ["candidate branch", candidate.branch || task.branchName],
+    ["candidate cycle", candidate.candidateCycle || currentReviewCandidateCycle(task)],
+    ["impact evidence digest", candidate.impactEvidenceDigest || task.impactEvidence?.digest],
+  ].filter(([, value]) => String(value || "").trim());
+  return values.length
+    ? values.map(([label, value]) => `- ${label}: ${boundedPromptText(value, 180)}`).join("\n")
+    : "- No verified candidate identity recorded.";
+}
+
+function contextEfficiencyContract() {
+  return [
+    "- Keep command output entering the model context bounded: prefer targeted rg/find queries and narrow line ranges; do not dump whole files, logs, state snapshots, or test suites.",
+    "- Redirect noisy validation output to a temporary log and return only the exit status plus a short failure excerpt or final summary. Preserve the full local log for debugging without replaying it into the model.",
+    "- Cap ordinary inspection output at roughly 200 lines or 12 KB per command. If more evidence is needed, read the next targeted slice instead of repeating prior output.",
+    "- Do not reread unchanged project instructions, standards, task payloads, or prior command output during the same run.",
+    "- Preserve required safety rules, acceptance criteria, exact candidate identity, and validation evidence; context efficiency never authorizes omitting a governing requirement.",
+  ].join("\n");
+}
+
+function currentStageEvidencePrompt(state, task, role) {
+  const current = (state.reviews || [])
+    .filter((review) => review.taskId === task.id && reviewMatchesCurrentCandidate(task, review))
+    .filter((review) => !role || review.role === role || review.stageKey === role)
+    .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")))
+    .slice(0, 1);
+  if (!current.length) return "- No prior evidence for this stage; inspect the current checkout.";
+  const review = current[0];
+  return `- ${review.stageKey || review.role}: ${review.outcome || "recorded"}${review.outcome === "changes_requested" && review.body ? `\n  Finding: ${boundedPromptText(review.body, 1800)}` : ""}`;
+}
+
 function standardReference(item) {
   const value = String(item || "").trim();
   if (!value) return "";
@@ -1497,6 +1538,9 @@ export async function addProject(input) {
       reviewPolicy,
       wipPolicy: {
         maxActiveTasks: Number(input.wipPolicy?.maxActiveTasks || input.maxActiveTasks || 0),
+        maxActiveRuns: Number(input.wipPolicy?.maxActiveRuns || input.maxActiveRuns || 0),
+        maxRunsPerWindow: Number(input.wipPolicy?.maxRunsPerWindow || input.maxRunsPerWindow || 0),
+        runWindowMinutes: Number(input.wipPolicy?.runWindowMinutes || input.runWindowMinutes || 60),
         weights: input.wipPolicy?.weights || {},
         agePromotionMs: Number(input.wipPolicy?.agePromotionMs || 24 * 60 * 60 * 1000),
       },
@@ -1582,9 +1626,22 @@ export async function updateProject(projectId, patch = {}) {
       project.integrationBranch = project.reviewPolicy.integrationBranch;
     }
     if (Object.prototype.hasOwnProperty.call(patch, "wipPolicy")) {
+      const policyPatch = patch.wipPolicy || {};
       project.wipPolicy = {
         ...(project.wipPolicy || {}),
-        ...(patch.wipPolicy || {}),
+        ...policyPatch,
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "maxActiveTasks")
+          ? { maxActiveTasks: Number(policyPatch.maxActiveTasks || 0) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "maxActiveRuns")
+          ? { maxActiveRuns: Number(policyPatch.maxActiveRuns || 0) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "maxRunsPerWindow")
+          ? { maxRunsPerWindow: Number(policyPatch.maxRunsPerWindow || 0) }
+          : {}),
+        ...(Object.prototype.hasOwnProperty.call(policyPatch, "runWindowMinutes")
+          ? { runWindowMinutes: Number(policyPatch.runWindowMinutes || 60) }
+          : {}),
       };
     }
     if (Object.prototype.hasOwnProperty.call(patch, "deliveryPolicy")) {
@@ -3428,7 +3485,7 @@ export function resetAutomationCircuitInState(state, input = {}) {
     addAutomationComment(
       state,
       task,
-      `Automation circuit reset after owner verification. New execution epoch ${task.automationAttemptEpoch}. Reason: ${target.automationCircuit.closeReason}`,
+      `${input.automatic ? "Automation circuit reset after fresh policy verification" : "Automation circuit reset after owner verification"}. New execution epoch ${task.automationAttemptEpoch}. Reason: ${target.automationCircuit.closeReason}`,
       now,
       target.automationCircuit.closedBy,
     );
@@ -4290,6 +4347,9 @@ ${context.standards}
 Project safety rules:
 ${context.safety}
 
+Context efficiency contract:
+${contextEfficiencyContract()}
+
 Modular architecture and impact-scoped validation contract:
 ${modularArchitectureAndValidationContract()}
 
@@ -4307,6 +4367,7 @@ Architecture mandate:
 - Design one authoritative pull-request validation path and one stable aggregate check. Ambiguous or shared impact must fail closed to full regression, and protected integration evidence must be reusable only at the exact immutable SHA.
 - Capture material decisions and rejected alternatives with concise reasons.
 - Break broad work into dependency-linked StudioOps child tasks. Each child must include the architectural constraints it consumes, observable acceptance criteria, validation commands/expectations, correct attachments, a narrow lane/work area, \`--parent ${task.id}\`, and \`--architecture-approved\`.
+- Declare a dependency only when the downstream implementation cannot be built or validated without the upstream contract or artifact. Do not use parent epics, review gates, release slices, or preferred ordering as hard dependencies; keep those as tracking or candidate-level gates so independent implementation can proceed in parallel.
 - Preserve a single coherent architecture across those child tasks. Builders must not independently reinvent infrastructure or data contracts.
 
 Required durable handoff:
@@ -4352,6 +4413,7 @@ export function generatePrompt(state, taskId, role = "builder") {
     `- Lead-approved integration branch: ${reviewPolicy.integrationBranch || "(not configured)"}`,
   ].join("\n");
   const remediationHandoff = remediationPromptSection(task);
+  const candidateIdentity = candidateIdentityPrompt(task);
 
   if (role === "systems-architect" || role === "architect") {
     return systemsArchitectPrompt(task, project, {
@@ -4389,6 +4451,9 @@ ${standards}
 
 Configured validation commands:
 ${validation}
+
+Context efficiency contract:
+${contextEfficiencyContract()}
 
 Modular architecture and impact-scoped validation contract:
 ${modularArchitectureAndValidationContract()}
@@ -4457,6 +4522,15 @@ ${reviewPolicyText}
 Current reviewer remediation handoff:
 ${remediationHandoff}
 
+Exact candidate identity:
+${candidateIdentity}
+
+Current-stage evidence (bounded):
+${currentStageEvidencePrompt(state, task, role)}
+
+Context efficiency contract:
+${contextEfficiencyContract()}
+
 Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
@@ -4520,6 +4594,15 @@ ${reviewPolicyText}
 
 Current reviewer remediation handoff:
 ${remediationHandoff}
+
+Exact candidate identity:
+${candidateIdentity}
+
+Current-stage evidence (bounded):
+${currentStageEvidencePrompt(state, task, role)}
+
+Context efficiency contract:
+${contextEfficiencyContract()}
 
 Task:
 ${task.title}

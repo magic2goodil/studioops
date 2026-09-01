@@ -1,6 +1,57 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { executionAttemptKey, resolveExecutionPolicy } from "../src/execution-policy.js";
+import { compactPromptPacket, executionAttemptKey, normalizeExecutionUsage, resolveExecutionPolicy } from "../src/execution-policy.js";
+
+test("usage accounting keeps cached context visible without double-counting token volume or guessing credits", () => {
+  assert.deepEqual(normalizeExecutionUsage({
+    input_tokens: 100,
+    cached_input_tokens: 80,
+    output_tokens: 25,
+    reasoning_output_tokens: 10,
+  }), {
+    rawInputTokens: 100,
+    inputTokens: 100,
+    uncachedInputTokens: 20,
+    cachedInputTokens: 80,
+    outputTokens: 25,
+    reasoningOutputTokens: 10,
+    rawTotalTokens: 125,
+    effectiveBudgetTokens: 45,
+    actualTokens: 125,
+    actualCredits: null,
+    authoritativeCreditStatus: "unavailable",
+    creditTelemetryStatus: "unavailable",
+  });
+});
+
+test("effective usage excludes cached input while retaining raw replay volume", () => {
+  const usage = normalizeExecutionUsage({
+    input_tokens: 2_371_308,
+    cached_input_tokens: 2_256_384,
+    output_tokens: 8_798,
+    actual_credits: 4.5,
+  });
+  assert.equal(usage.rawTotalTokens, 2_380_106);
+  assert.equal(usage.cachedInputTokens, 2_256_384);
+  assert.equal(usage.uncachedInputTokens, 114_924);
+  assert.equal(usage.effectiveBudgetTokens, 123_722);
+  assert.equal(usage.authoritativeCreditStatus, "recorded");
+});
+
+test("provider credit status stays unavailable when credit telemetry is missing", () => {
+  const usage = normalizeExecutionUsage({ input_tokens: 12, output_tokens: 3 });
+  assert.equal(usage.actualCredits, null);
+  assert.equal(usage.authoritativeCreditStatus, "unavailable");
+});
+
+test("oversized prompt packets are compacted deterministically", () => {
+  const packet = ("header\n" + "x".repeat(200) + "\nfooter");
+  const first = compactPromptPacket(packet, 80);
+  const second = compactPromptPacket(packet, 80);
+  assert.equal(first.compacted, true);
+  assert.equal(first.prompt.length, 80);
+  assert.equal(first.prompt, second.prompt);
+});
 
 test("execution policy pins Sol high reasoning for ordinary builder work", () => {
   const policy = resolveExecutionPolicy(
@@ -90,6 +141,52 @@ test("tiered routing keeps risky work on Sol while using Luna and Terra for rout
   assert.equal(risky.model, "gpt-5.6-sol");
   assert.equal(risky.reasoningEffort, "high");
   assert.equal(risky.selectionReason, "complex_task");
+});
+
+test("exact routine documentation uses proportionate lead review while security documentation remains critical", () => {
+  const executionPolicy = {
+    modelTiers: {
+      balanced: { model: "gpt-5.6-terra", reasoningEffort: "high" },
+      critical: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+    },
+    tierRouting: {
+      defaultTier: "balanced",
+      leadTier: "critical",
+      complexTier: "critical",
+      routineReviewTier: "balanced",
+    },
+  };
+  const routine = resolveExecutionPolicy(
+    {
+      id: "task_docs",
+      title: "Clarify contributor wording",
+      impactEvidence: {
+        unknown: false,
+        changedFiles: ["docs/contributing.md", "README.md"],
+      },
+    },
+    { type: "start_review", role: "lead-reviewer" },
+    { executionPolicy },
+  );
+  const risky = resolveExecutionPolicy(
+    {
+      id: "task_security_docs",
+      title: "Document OAuth deployment security",
+      impactEvidence: {
+        unknown: false,
+        changedFiles: ["docs/oauth.md"],
+      },
+    },
+    { type: "start_review", role: "lead-reviewer" },
+    { executionPolicy },
+  );
+
+  assert.equal(routine.modelTier, "balanced");
+  assert.equal(routine.model, "gpt-5.6-terra");
+  assert.equal(routine.selectionReason, "proportionate_exact_diff");
+  assert.equal(risky.modelTier, "critical");
+  assert.equal(risky.model, "gpt-5.6-sol");
+  assert.equal(risky.selectionReason, "lead_role");
 });
 
 test("Spark requires an explicit mechanical label and never overrides risky work", () => {

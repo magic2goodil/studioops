@@ -106,6 +106,7 @@ recorded on each run so the cost and quality decision remains auditable.
         "architectTier": "critical",
         "leadTier": "critical",
         "complexTier": "critical",
+        "routineReviewTier": "balanced",
         "escalationTier": "frontier"
       },
       "roles": {
@@ -127,6 +128,11 @@ recorded on each run so the cost and quality decision remains auditable.
 Tier names are stable policy concepts; model IDs and reasoning effort are
 replaceable local configuration. Architecture, lead, and complex work take
 precedence over cheaper routes.
+Lead review of an exact, classified documentation-only or routine formatting
+configuration diff uses the configurable `routineReviewTier` (balanced by
+default). Security, privacy, authentication, migration, deployment, release,
+production, infrastructure, and data-loss semantics remain critical regardless
+of file type.
 Complex work includes security, privacy, consent, authentication, database,
 migration, deployment, release, production, infrastructure, and data-loss
 terms. Spark is never selected implicitly: a low-risk builder task must carry
@@ -161,11 +167,11 @@ It does not store account identity or authentication tokens.
         },
         "balanced": {
           "estimatedCredits": 15,
-          "minRemainingPercent": 10
+          "minRemainingPercent": 5
         },
         "critical": {
           "estimatedCredits": 30,
-          "minRemainingPercent": 20
+          "minRemainingPercent": 5
         },
         "frontier": {
           "estimatedCredits": 40,
@@ -228,8 +234,11 @@ included quota, StudioOps uses remaining quota percentage instead.
 
 The controller never lowers a task below its quality-required tier. A failed
 critical or frontier admission opens one owner-visible task circuit before any
-model launch. Wait for a reset, add credits, or deliberately update the local
-budget, then use the circuit-reset command shown on the task. If the account
+model launch. A credit-only circuit is automatically closed when a later fresh
+snapshot admits the same required tier and the captured workflow and candidate
+identity are unchanged; the restored task becomes eligible on the following
+dispatcher sweep. Cost-budget circuits and any circuit whose identity drifted
+still require explicit operator review. If the account
 snapshot is unavailable or stale, the versioned
 `degradedTelemetryFallback.rules` contract is keyed only by stable execution
 risk tier. Frontier work fails closed by default. Ordinary critical work uses
@@ -515,6 +524,66 @@ data/run-outputs/
 ## Safety
 
 The always-on stack may create branches, run validation, commit, push, and open or update pull requests. It may assemble owner-QA-passed task heads on a release-candidate branch, but it does not merge that branch into the protected target.
+
+### Project run budgets
+
+#### Completed runs over budget
+
+Provider usage is recorded on both the run and its task. The telemetry fields
+are deliberately separate: `rawInputTokens`, `cachedInputTokens`,
+`uncachedInputTokens`, `outputTokens`, `reasoningOutputTokens`,
+`rawTotalTokens`, `effectiveBudgetTokens`, and authoritative provider credit
+status (`actualCredits`, `authoritativeCreditStatus`). `rawTotalTokens` is the
+provider's complete input-plus-output volume, including cached input and any
+replayed context. `effectiveBudgetTokens` is uncached input plus output, so
+cached input is not charged at face value but is also not treated as free.
+The effective token budget and `rawContextTokenBudget` are independent: the
+latter catches pathological transcript or board-history replay. Missing credit
+telemetry remains `unavailable`; StudioOps never infers credits from tokens.
+
+Before launch, each worker receives a bounded packet containing only the
+current task contract, exact candidate identity, applicable standards, current
+stage evidence, and a small remediation/failure slice. Full board snapshots,
+unrelated tasks, completed review history, raw transcripts, and prior model
+prose are excluded. `promptChars`, `promptOriginalChars`, and
+`promptCompacted` record the deterministic packet-size decision; an oversized
+packet is compacted before a paid provider run can start.
+
+If a completed builder or architecture run has already atomically recorded a
+valid handoff, exceeding its effective-work, raw-context, or credit budget preserves the completed
+run, exact candidate/PR or architecture graph, and reviewable task status. The
+task records `budgetTelemetry` and a `budgetPause`; automatic reviewer, QA,
+retry, and continuation work remains paused until an owner-authorized next
+action. A completion without valid handoff evidence still fails closed and
+becomes owner-blocked. Budget telemetry is audit evidence, not permission to
+continue spending.
+
+Projects that use GitHub Actions can opt into a project-level worker budget in
+`wipPolicy`:
+
+```json
+{
+  "wipPolicy": {
+    "maxActiveRuns": 1,
+    "maxRunsPerWindow": 8,
+    "runWindowMinutes": 60
+  }
+}
+```
+
+These limits apply to queued, running, and completed builder/reviewer/QA-worker
+runs; owner handoffs are intentionally exempt. `maxActiveRuns` prevents a
+single project from fanning out several Actions-triggering branches at once,
+while `maxRunsPerWindow` prevents a retry or review loop from creating an
+unbounded burst after the active slot clears. The dispatcher records explicit
+`project_active_run_limit` or `project_run_window_limit` skips and leaves the
+task state intact for the next sweep.
+
+Configure them with `studioops update-project PROJECT --max-active-runs 1
+--max-runs-per-window 8 --run-window-minutes 60`. This is a StudioOps safety
+valve; it does not replace repository workflow design. Target repositories
+should still keep expensive validation on pull requests and their canonical QA
+branch rather than on every feature-branch push.
 
 It must not:
 

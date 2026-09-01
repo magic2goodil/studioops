@@ -36,6 +36,19 @@ const creditPolicy = {
   },
 };
 
+test("default balanced and critical admission preserve quality down to five percent headroom", () => {
+  const policy = normalizeCreditPolicy({ enabled: true });
+  assert.equal(policy.tierBudgets.balanced.minRemainingPercent, 5);
+  assert.equal(policy.tierBudgets.critical.minRemainingPercent, 5);
+  const admitted = assessCreditAdmission(
+    availableSnapshot({ remainingPercent: 5 }),
+    { modelTier: "critical", model: "gpt-5.6-sol" },
+    policy,
+  );
+  assert.equal(admitted.allowed, true);
+  assert.equal(admitted.tier, "critical");
+});
+
 const evaluation = { evaluatedAt: "2026-08-16T12:05:00.000Z" };
 
 test("Codex rate-limit responses are reduced to a sanitized admission snapshot", () => {

@@ -76,6 +76,7 @@ export function buildOwnerQaPacket(state, candidate, input = {}) {
     manifestDigest: candidate.manifestDigest,
     projectId: candidate.projectId,
     projectKey: project.key || "",
+    projectName: project.name || project.key || "",
     taskUrlBase: input.baseUrl ? String(input.baseUrl).replace(/\/+$/, "") : "",
     candidateUrl: input.candidateUrl || "",
     previewUrl: candidate.manifest.preview.url,
@@ -83,6 +84,7 @@ export function buildOwnerQaPacket(state, candidate, input = {}) {
     tasks: tasks.map((task) => ({
       id: task.id,
       title: task.title,
+      expectedOutcome: task.expectedOutcome || task.title,
       taskUrl: taskUrl(input.baseUrl, task.id),
       prUrl: task.prUrl || "",
       affectedSurfaces: Array.isArray(task.affectedSurfaces) ? task.affectedSurfaces : (task.workAreas || []),
@@ -544,8 +546,12 @@ function currentBundleDecisionItem(state, bundle, input = {}) {
     severity: "action",
     ...record,
     title: releaseReady
-      ? `${record.tasks.length} change${record.tasks.length === 1 ? "" : "s"} ready for release approval`
-      : `${record.tasks.length} change${record.tasks.length === 1 ? "" : "s"} ready for local QA`,
+      ? `${project?.name || record.projectName}: release candidate ready`
+      : `${project?.name || record.projectName}: local QA ready`,
+    summary: tasks
+      .slice(0, 3)
+      .map((task) => task.expectedOutcome || task.title)
+      .join("; "),
     status: bundle.status,
     prUrl,
     previewUrl: releaseReady ? "" : previewUrl,

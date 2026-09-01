@@ -8,6 +8,8 @@ export const DEFAULT_EXECUTION_POLICY = Object.freeze({
   complexReasoningEffort: "xhigh",
   ultraReasoningEffort: "ultra",
   tokenBudget: 120000,
+  rawContextTokenBudget: 2500000,
+  maxPromptChars: 80000,
   costBudget: 0,
   roleTokenBudgets: {
     builder: 120000,
@@ -27,6 +29,74 @@ export const DEFAULT_EXECUTION_POLICY = Object.freeze({
 });
 
 const COMPLEX_WORK_PATTERN = /\b(architecture|architectural|security|privacy|pii|consent|oauth|authentication|authorization|migration|schema|database|index|deployment|release|production|infrastructure|data loss)\b/i;
+const ROUTINE_CONFIG_PATTERN = /(^|\/)(?:\.editorconfig|\.prettier(?:rc|ignore)?|\.eslintignore|prettier\.config\.[^/]+|eslint\.config\.[^/]+|markdownlint(?:\.json|\.yaml|\.yml)?|\.markdownlint(?:\.json|\.yaml|\.yml)?)$/i;
+
+function nonNegativeUsageNumber(value) {
+  return Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : 0;
+}
+
+/**
+ * Normalize provider telemetry without treating cached tokens as an extra
+ * billable input or guessing credits from token volume. Providers report
+ * input_tokens as the complete context volume, which can include cached and
+ * replayed transcript context; output_tokens is the provider's total output
+ * volume, including reasoning when the provider supplies a combined field.
+ */
+export function normalizeExecutionUsage(value = {}) {
+  const inputTokens = nonNegativeUsageNumber(value.input_tokens ?? value.inputTokens);
+  const outputTokens = nonNegativeUsageNumber(value.output_tokens ?? value.outputTokens);
+  const cachedInputTokens = Math.min(
+    inputTokens,
+    nonNegativeUsageNumber(value.cached_input_tokens ?? value.cachedInputTokens),
+  );
+  const reasoningOutputTokens = nonNegativeUsageNumber(value.reasoning_output_tokens ?? value.reasoningOutputTokens);
+  const actualCreditsValue = value.actual_credits ?? value.actualCredits;
+  const actualCredits = Number.isFinite(Number(actualCreditsValue)) && Number(actualCreditsValue) >= 0
+    ? Number(actualCreditsValue)
+    : null;
+  const rawTotalTokens = inputTokens + outputTokens;
+  const effectiveBudgetTokens = (inputTokens - cachedInputTokens) + outputTokens;
+  const providerCreditStatus = String(
+    value.authoritative_credit_status
+      ?? value.authoritativeCreditStatus
+      ?? value.credit_telemetry_status
+      ?? "",
+  ).trim().toLowerCase();
+  return {
+    rawInputTokens: inputTokens,
+    inputTokens,
+    uncachedInputTokens: inputTokens - cachedInputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens,
+    rawTotalTokens,
+    effectiveBudgetTokens,
+    // Compatibility alias retained for existing run/task consumers. New
+    // budget decisions use effectiveBudgetTokens and rawTotalTokens.
+    actualTokens: rawTotalTokens,
+    actualCredits,
+    authoritativeCreditStatus: providerCreditStatus || (actualCredits === null ? "unavailable" : "recorded"),
+    creditTelemetryStatus: providerCreditStatus || (actualCredits === null ? "unavailable" : "recorded"),
+  };
+}
+
+export function compactPromptPacket(prompt, limit = DEFAULT_EXECUTION_POLICY.maxPromptChars) {
+  const source = String(prompt || "");
+  const maxChars = Math.max(1, Number(limit) || DEFAULT_EXECUTION_POLICY.maxPromptChars);
+  if (source.length <= maxChars) return { prompt: source, originalChars: source.length, compacted: false };
+  const marker = "\n\n[StudioOps compacted oversized context packet; full board history, transcript, and prior model prose omitted.]\n\n";
+  if (maxChars <= marker.length) {
+    return { prompt: marker.slice(0, maxChars), originalChars: source.length, compacted: true };
+  }
+  const available = Math.max(0, maxChars - marker.length);
+  const headChars = Math.ceil(available * 0.62);
+  const tailChars = available - headChars;
+  return {
+    prompt: `${source.slice(0, headChars)}${marker}${source.slice(-tailChars)}`,
+    originalChars: source.length,
+    compacted: true,
+  };
+}
 
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
@@ -65,6 +135,19 @@ function configuredTier(configured, name) {
   return tier && typeof tier === "object" ? tier : {};
 }
 
+function exactRoutineImpact(task = {}, complex = false) {
+  if (complex || task.impactEvidence?.unknown !== false) return false;
+  const files = Array.isArray(task.impactEvidence?.changedFiles)
+    ? task.impactEvidence.changedFiles.map((file) => String(file).replaceAll("\\", "/"))
+    : [];
+  if (!files.length) return false;
+  return files.every((file) => (
+    /(^|\/)(?:docs?\/|readme(?:\.[^/]*)?$|changelog(?:\.[^/]*)?$|contributing(?:\.[^/]*)?$|license(?:\.[^/]*)?$)/i.test(file)
+    || /\.mdx?$/i.test(file)
+    || ROUTINE_CONFIG_PATTERN.test(file)
+  ));
+}
+
 export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const configured = {
     ...DEFAULT_EXECUTION_POLICY,
@@ -75,6 +158,7 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
   const systemsArchitect = role.includes("architect");
   const lead = role.includes("lead");
   const complex = COMPLEX_WORK_PATTERN.test(taskText(task));
+  const proportionateReview = lead && exactRoutineImpact(task, complex);
   const mechanicalLabels = normalizedLabels(configured.mechanicalLabels);
   const escalationLabels = normalizedLabels(configured.escalationLabels);
   const taskLabels = normalizedLabels(task.labels);
@@ -90,7 +174,9 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
     : systemsArchitect
       ? routing.architectTier
       : lead
-        ? routing.leadTier
+        ? proportionateReview
+          ? routing.routineReviewTier || "balanced"
+          : routing.leadTier
         : complex
           ? routing.complexTier
           : mechanical
@@ -103,7 +189,7 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
       || (escalated ? configured.ultraReasoningEffort : "")
       || tierPolicy.reasoningEffort
       || (systemsArchitect ? configured.architectReasoningEffort : "")
-      || (lead ? configured.leadReasoningEffort : "")
+      || (lead && !proportionateReview ? configured.leadReasoningEffort : "")
       || (complex ? configured.complexReasoningEffort : "")
       || rolePolicy.reasoningEffort
       || configured.reasoningEffort,
@@ -131,6 +217,22 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
         || configured.tokenBudget,
       DEFAULT_EXECUTION_POLICY.tokenBudget,
     ),
+    rawContextTokenBudget: positiveInteger(
+      task.rawContextTokenBudget
+        || task.reasoningBudget?.rawContextTokenBudget
+        || tierPolicy.rawContextTokenBudget
+        || rolePolicy.rawContextTokenBudget
+        || configured.rawContextTokenBudget,
+      DEFAULT_EXECUTION_POLICY.rawContextTokenBudget,
+    ),
+    maxPromptChars: positiveInteger(
+      task.maxPromptChars
+        || task.reasoningBudget?.maxPromptChars
+        || tierPolicy.maxPromptChars
+        || rolePolicy.maxPromptChars
+        || configured.maxPromptChars,
+      DEFAULT_EXECUTION_POLICY.maxPromptChars,
+    ),
     costBudget: nonNegativeNumber(
       task.costBudget
         ?? task.reasoningBudget?.costBudget
@@ -146,8 +248,8 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
       ? "explicit_escalation"
       : systemsArchitect
         ? "systems_architect_role"
-        : lead
-          ? "lead_role"
+      : lead
+          ? proportionateReview ? "proportionate_exact_diff" : "lead_role"
           : complex
             ? "complex_task"
             : mechanical
@@ -165,6 +267,8 @@ export function reasoningBudgetForTask(task = {}, action = {}, input = {}) {
     modelTier: policy.modelTier,
     reasoningEffort: policy.reasoningEffort,
     tokenBudget: policy.tokenBudget,
+    rawContextTokenBudget: policy.rawContextTokenBudget,
+    maxPromptChars: policy.maxPromptChars,
     costBudget: policy.costBudget,
   };
 }
