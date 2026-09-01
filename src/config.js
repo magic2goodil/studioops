@@ -16,6 +16,38 @@ export const INSTALLED_AUTOMATION_CAPACITY = Object.freeze({
   reviewerConcurrency: 3,
   runnerLimit: 3,
 });
+export const DEFAULT_RUN_OUTPUT_GUARD = Object.freeze({
+  maxCommandOutputChars: 24_000,
+  maxCumulativeCommandOutputChars: 160_000,
+});
+export const DEFAULT_GLOBAL_RUN_ADMISSION = Object.freeze({
+  maxActiveMeteredRuns: 1,
+  maxMeteredRunsPerWindow: 12,
+  runWindowMinutes: 60,
+});
+
+export function normalizeRunOutputGuard(value = {}) {
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    maxCommandOutputChars: positiveInteger(
+      raw.maxCommandOutputChars,
+      DEFAULT_RUN_OUTPUT_GUARD.maxCommandOutputChars,
+    ),
+    maxCumulativeCommandOutputChars: positiveInteger(
+      raw.maxCumulativeCommandOutputChars,
+      DEFAULT_RUN_OUTPUT_GUARD.maxCumulativeCommandOutputChars,
+    ),
+  };
+}
+
+export function normalizeGlobalRunAdmission(value = {}) {
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    maxActiveMeteredRuns: positiveInteger(raw.maxActiveMeteredRuns ?? raw.globalActiveRunLimit, DEFAULT_GLOBAL_RUN_ADMISSION.maxActiveMeteredRuns),
+    maxMeteredRunsPerWindow: positiveInteger(raw.maxMeteredRunsPerWindow ?? raw.globalRunWindowLimit, DEFAULT_GLOBAL_RUN_ADMISSION.maxMeteredRunsPerWindow),
+    runWindowMinutes: positiveInteger(raw.runWindowMinutes, DEFAULT_GLOBAL_RUN_ADMISSION.runWindowMinutes),
+  };
+}
 
 export function normalizeCreditPolicyConfig(value = {}) {
   return normalizeCreditPolicy(value);
@@ -174,7 +206,11 @@ export function normalizeConfig(config = {}) {
           INSTALLED_AUTOMATION_CAPACITY.runnerLimit,
         ),
         workspaceRetention: normalizeWorkspaceRetention(runner.workspaceRetention),
+        outputGuard: normalizeRunOutputGuard(runner.outputGuard),
       },
+      globalRunAdmission: normalizeGlobalRunAdmission(
+        config.globalRunAdmission || defaults.globalRunAdmission || {},
+      ),
     },
   };
 }

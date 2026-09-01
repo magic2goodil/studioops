@@ -393,6 +393,100 @@ test("project run budgets do not block owner handoffs", () => {
   assert.equal(plan.skipped.length, 0);
 });
 
+test("global run admission limits workers across projects without hiding owner handoffs", () => {
+  const state = fixtureState();
+  state.projects.push({ id: "project_2", key: "other", name: "Other" });
+  state.tasks[1] = {
+    ...state.tasks[1],
+    projectId: "project_2",
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+  };
+  state.runs.push({
+    id: "run_active_other",
+    taskId: "task_1",
+    projectId: "project_1",
+    group: "builder",
+    status: "running",
+    createdAt: "2026-01-01T00:30:00.000Z",
+  });
+  const worker = {
+    id: "task_2:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_2",
+    projectKey: "other",
+    taskId: "task_2",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+  const owner = {
+    id: "task_1:notify_owner",
+    type: "notify_owner",
+    role: "owner",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskStatus: state.tasks[0].status,
+  };
+  const report = planDispatches(state, [worker, owner], {
+    nowMs: Date.parse("2026-01-01T00:45:00.000Z"),
+    globalRunAdmission: { maxActiveMeteredRuns: 1, maxMeteredRunsPerWindow: 12, runWindowMinutes: 60 },
+  });
+  assert.equal(report.skipped[0].reason, "global_active_run_limit");
+  assert.equal(report.selected[0].group, "owner");
+});
+
+test("global rolling window and exact recent candidate-stage suppress redundant work", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+  };
+  const action = {
+    id: "task_1:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+  state.runs.push({
+    id: "run_recent",
+    taskId: "task_other",
+    projectId: "project_other",
+    group: "builder",
+    status: "completed",
+    createdAt: "2026-01-01T00:30:00.000Z",
+  });
+  const windowBlocked = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T00:45:00.000Z"),
+    globalRunAdmission: { maxActiveMeteredRuns: 2, maxMeteredRunsPerWindow: 1, runWindowMinutes: 60 },
+  });
+  assert.equal(windowBlocked.skipped[0].reason, "global_run_window_limit");
+
+  state.runs = [{
+    id: "run_same_stage",
+    taskId: "task_1",
+    projectId: "project_1",
+    dispatchKey: "task_1:0:0:no-subject:start_builder:builder:in_progress",
+    group: "builder",
+    role: "builder",
+    status: "completed",
+    completedAt: "2026-01-01T00:40:00.000Z",
+  }];
+  const duplicate = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T00:45:00.000Z"),
+    globalRunAdmission: { maxActiveMeteredRuns: 2, maxMeteredRunsPerWindow: 12, runWindowMinutes: 60 },
+  });
+  assert.equal(duplicate.skipped[0].reason, "duplicate_candidate_stage");
+});
+
 test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {
   for (const status of ["queued", "running"]) {
     const { state, action } = finalAttemptReviewFixture(status);

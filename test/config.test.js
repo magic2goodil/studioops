@@ -10,6 +10,7 @@ import {
   extractConfigJson,
   normalizeConfig,
   normalizeCreditPolicyConfig,
+  normalizeRunOutputGuard,
   normalizeWorkspaceRetention,
   projectFromConfig,
   renderConfigMarkdown,
@@ -18,6 +19,18 @@ import {
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 
 const execFileAsync = promisify(execFile);
+
+test("runner output guard defaults are finite and configurable", () => {
+  assert.deepEqual(normalizeRunOutputGuard(), {
+    maxCommandOutputChars: 24_000,
+    maxCumulativeCommandOutputChars: 160_000,
+  });
+  const config = normalizeConfig({
+    defaults: { runner: { outputGuard: { maxCommandOutputChars: 12_000 } } },
+  });
+  assert.equal(config.defaults.runner.outputGuard.maxCommandOutputChars, 12_000);
+  assert.equal(config.defaults.runner.outputGuard.maxCumulativeCommandOutputChars, 160_000);
+});
 
 test("credit policy config emits the canonical versioned degraded-telemetry contract", () => {
   const config = normalizeConfig({

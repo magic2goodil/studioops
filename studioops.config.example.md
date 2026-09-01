@@ -161,6 +161,10 @@ The app reads the first fenced `json studioops-config` block in this file.
       "modelReasoningEffort": "high",
       "useWorkspaces": true,
       "workspaceRoot": "~/.codex/studioops/run-workspaces",
+      "outputGuard": {
+        "maxCommandOutputChars": 24000,
+        "maxCumulativeCommandOutputChars": 160000
+      },
       "workspaceRetention": {
         "enabled": true,
         "retainForHours": { "completed": 168, "failed": 336, "cancelled": 168 },
@@ -179,6 +183,11 @@ The app reads the first fenced `json studioops-config` block in this file.
         "staleMs": 900000,
         "pollMs": 750
       }
+    },
+    "globalRunAdmission": {
+      "maxActiveMeteredRuns": 1,
+      "maxMeteredRunsPerWindow": 12,
+      "runWindowMinutes": 60
     },
     "qaIntegration": {
       "intervalSeconds": 300,
