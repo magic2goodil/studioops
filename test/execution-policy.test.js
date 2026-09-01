@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { executionAttemptKey, normalizeExecutionUsage, resolveExecutionPolicy } from "../src/execution-policy.js";
+import { compactPromptPacket, executionAttemptKey, normalizeExecutionUsage, resolveExecutionPolicy } from "../src/execution-policy.js";
 
 test("usage accounting keeps cached context visible without double-counting token volume or guessing credits", () => {
   assert.deepEqual(normalizeExecutionUsage({
@@ -9,15 +9,48 @@ test("usage accounting keeps cached context visible without double-counting toke
     output_tokens: 25,
     reasoning_output_tokens: 10,
   }), {
+    rawInputTokens: 100,
     inputTokens: 100,
     uncachedInputTokens: 20,
     cachedInputTokens: 80,
     outputTokens: 25,
     reasoningOutputTokens: 10,
+    rawTotalTokens: 125,
+    effectiveBudgetTokens: 45,
     actualTokens: 125,
     actualCredits: null,
+    authoritativeCreditStatus: "unavailable",
     creditTelemetryStatus: "unavailable",
   });
+});
+
+test("effective usage excludes cached input while retaining raw replay volume", () => {
+  const usage = normalizeExecutionUsage({
+    input_tokens: 2_256_384,
+    cached_input_tokens: 2_256_384,
+    output_tokens: 123_722,
+    actual_credits: 4.5,
+  });
+  assert.equal(usage.rawTotalTokens, 2_380_106);
+  assert.equal(usage.cachedInputTokens, 2_256_384);
+  assert.equal(usage.uncachedInputTokens, 0);
+  assert.equal(usage.effectiveBudgetTokens, 123_722);
+  assert.equal(usage.authoritativeCreditStatus, "recorded");
+});
+
+test("provider credit status stays unavailable when credit telemetry is missing", () => {
+  const usage = normalizeExecutionUsage({ input_tokens: 12, output_tokens: 3 });
+  assert.equal(usage.actualCredits, null);
+  assert.equal(usage.authoritativeCreditStatus, "unavailable");
+});
+
+test("oversized prompt packets are compacted deterministically", () => {
+  const packet = ("header\n" + "x".repeat(200) + "\nfooter");
+  const first = compactPromptPacket(packet, 80);
+  const second = compactPromptPacket(packet, 80);
+  assert.equal(first.compacted, true);
+  assert.equal(first.prompt.length, 80);
+  assert.equal(first.prompt, second.prompt);
 });
 
 test("execution policy pins Sol high reasoning for ordinary builder work", () => {

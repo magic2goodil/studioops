@@ -15,7 +15,7 @@ import {
   workflowSnapshotForTask,
 } from "./store.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
-import { executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
+import { compactPromptPacket, executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 import { assessCreditAdmission, requestCodexCreditSnapshot } from "./credit-policy.js";
 import { INSTALLED_AUTOMATION_CAPACITY } from "./config.js";
 
@@ -743,6 +743,7 @@ function makeRun(state, task, action, options, now) {
     : requestedThreadId;
   const profile = laneProfile(task, action);
   const executionPolicy = resolveExecutionPolicy(task, action, options);
+  const promptPacket = compactPromptPacket(prompt, executionPolicy.maxPromptChars);
   const creditAdmission = assessCreditAdmission(
     options.creditSnapshot,
     executionPolicy,
@@ -769,12 +770,28 @@ function makeRun(state, task, action, options, now) {
     modelReasoningEffort: executionPolicy.reasoningEffort,
     modelSelectionReason: executionPolicy.selectionReason,
     tokenBudget: executionPolicy.tokenBudget,
+    rawContextTokenBudget: executionPolicy.rawContextTokenBudget,
+    maxPromptChars: executionPolicy.maxPromptChars,
+    promptChars: promptPacket.prompt.length,
+    promptOriginalChars: promptPacket.originalChars,
+    promptCompacted: promptPacket.compacted,
     costBudget: executionPolicy.costBudget,
     costTelemetry: {
       estimatedCredits: creditAdmission.estimatedCredits,
       tokenBudget: executionPolicy.tokenBudget,
+      effectiveTokenBudget: executionPolicy.tokenBudget,
+      rawContextTokenBudget: executionPolicy.rawContextTokenBudget,
+      rawInputTokens: null,
+      cachedInputTokens: null,
+      uncachedInputTokens: null,
+      outputTokens: null,
+      reasoningOutputTokens: null,
+      rawTotalTokens: null,
+      effectiveBudgetTokens: null,
       actualCredits: null,
       actualTokens: null,
+      authoritativeCreditStatus: "unavailable",
+      creditTelemetryStatus: "unavailable",
       recordedAt: now,
     },
     reviewerIdentity: action.reviewerIdentity || "",
@@ -794,7 +811,7 @@ function makeRun(state, task, action, options, now) {
     retryBackoffMs: executionPolicy.retryBackoffMs,
     staleRunMs: executionPolicy.staleRunMs,
     status: dispatchStatusFor(action),
-    prompt,
+    prompt: promptPacket.prompt,
     promptCommand: action.promptCommand || "",
     reviewCommand: action.reviewCommand || "",
     taskUrl: action.taskUrl || "",

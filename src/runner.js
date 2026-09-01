@@ -1299,8 +1299,10 @@ function applySuccessfulHandoff(state, run, task, now, options = {}) {
 function recordRunUsage(run, usage, now) {
   const normalized = normalizeExecutionUsage(usage || {});
   const tokenBudget = Math.max(0, Number(run.tokenBudget || run.costTelemetry?.tokenBudget || 0));
+  const rawContextTokenBudget = Math.max(0, Number(run.rawContextTokenBudget || run.costTelemetry?.rawContextTokenBudget || DEFAULT_EXECUTION_POLICY.rawContextTokenBudget));
   const costBudget = Math.max(0, Number(run.costBudget || 0));
-  const tokenExceeded = tokenBudget > 0 && normalized.actualTokens > tokenBudget;
+  const tokenExceeded = tokenBudget > 0 && normalized.effectiveBudgetTokens > tokenBudget;
+  const rawContextExceeded = rawContextTokenBudget > 0 && normalized.rawTotalTokens > rawContextTokenBudget;
   const costExceeded = costBudget > 0
     && normalized.actualCredits !== null
     && normalized.actualCredits > costBudget;
@@ -1308,13 +1310,18 @@ function recordRunUsage(run, usage, now) {
     ...(run.costTelemetry || {}),
     ...normalized,
     tokenBudget,
+    effectiveTokenBudget: tokenBudget,
+    rawContextTokenBudget,
     costBudget,
     tokenExceeded,
+    effectiveBudgetExceeded: tokenExceeded,
+    rawContextExceeded,
     costExceeded,
     creditTelemetryStatus: normalized.creditTelemetryStatus,
+    authoritativeCreditStatus: normalized.authoritativeCreditStatus,
     recordedAt: now,
   };
-  return { tokenExceeded, costExceeded };
+  return { tokenExceeded, rawContextExceeded, costExceeded };
 }
 
 function applyBudgetExceededToTask(task, run, now) {
@@ -1692,6 +1699,9 @@ export async function claimRuns(input = {}) {
       run.modelTier = run.modelTier || executionPolicy.modelTier || "";
       run.modelReasoningEffort = run.modelReasoningEffort || executionPolicy.reasoningEffort || input.modelReasoningEffort;
       run.modelSelectionReason = run.modelSelectionReason || executionPolicy.selectionReason;
+      run.tokenBudget = Math.max(1, Number(run.tokenBudget || executionPolicy.tokenBudget));
+      run.rawContextTokenBudget = Math.max(1, Number(run.rawContextTokenBudget || executionPolicy.rawContextTokenBudget));
+      run.maxPromptChars = Math.max(1, Number(run.maxPromptChars || executionPolicy.maxPromptChars));
       run.attempt = Math.max(1, Number(run.attempt || 1));
       run.maxAttempts = Math.max(1, Number(run.maxAttempts || executionPolicy.maxAttempts));
       run.retryBackoffMs = Math.max(1_000, Number(run.retryBackoffMs || executionPolicy.retryBackoffMs));
@@ -1778,9 +1788,11 @@ export async function completeRun(runId, input = {}) {
       }
     }
 
-    const budgetExceeded = budget.tokenExceeded || budget.costExceeded;
+    const budgetExceeded = budget.tokenExceeded || budget.rawContextExceeded || budget.costExceeded;
     if (budgetExceeded && run.status === "completed") {
-      run.exitCode = budget.tokenExceeded ? "token_budget_exceeded" : "cost_budget_exceeded";
+      run.exitCode = budget.rawContextExceeded
+        ? "raw_context_budget_exceeded"
+        : budget.tokenExceeded ? "effective_token_budget_exceeded" : "cost_budget_exceeded";
       run.completionDisposition = "completed_over_budget";
       run.notes = [run.notes, `StudioOps stopped automatic continuation because ${run.exitCode}; the valid handoff was preserved.`]
         .filter(Boolean)
@@ -1791,13 +1803,15 @@ export async function completeRun(runId, input = {}) {
     let failureDisposition = null;
     if (budgetExceeded && handoffFailure) {
       run.status = "failed";
-      run.exitCode = budget.tokenExceeded ? "token_budget_exceeded" : "cost_budget_exceeded";
+      run.exitCode = budget.rawContextExceeded
+        ? "raw_context_budget_exceeded"
+        : budget.tokenExceeded ? "effective_token_budget_exceeded" : "cost_budget_exceeded";
       run.completionDisposition = "over_budget_incomplete_handoff";
       run.notes = [run.notes, handoffFailure, `StudioOps stopped automatic continuation because ${run.exitCode}.`]
         .filter(Boolean)
         .join("\n\n");
       applyBudgetExceededToTask(task, run, now);
-    } else if (run.status === "failed" && ["token_budget_exceeded", "cost_budget_exceeded"].includes(run.exitCode)) {
+    } else if (run.status === "failed" && ["token_budget_exceeded", "effective_token_budget_exceeded", "raw_context_budget_exceeded", "cost_budget_exceeded"].includes(run.exitCode)) {
       applyBudgetExceededToTask(task, run, now);
     } else if (run.status === "failed") {
       failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);

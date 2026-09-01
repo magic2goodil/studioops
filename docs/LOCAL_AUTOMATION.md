@@ -529,16 +529,28 @@ The always-on stack may create branches, run validation, commit, push, and open 
 
 #### Completed runs over budget
 
-Provider usage is recorded on both the run and its task. `input_tokens` is the
-complete reported context volume, including cached input and any replayed
-transcript context; cached input is recorded separately and is not added again
-to `actualTokens`. `output_tokens` is counted once (and may include reasoning
-output when the provider supplies a combined total). `actual_credits` is kept
-as provider credit telemetry and is never inferred from token volume, so cached
-tokens are not silently treated as free or conflated with cost.
+Provider usage is recorded on both the run and its task. The telemetry fields
+are deliberately separate: `rawInputTokens`, `cachedInputTokens`,
+`uncachedInputTokens`, `outputTokens`, `reasoningOutputTokens`,
+`rawTotalTokens`, `effectiveBudgetTokens`, and authoritative provider credit
+status (`actualCredits`, `authoritativeCreditStatus`). `rawTotalTokens` is the
+provider's complete input-plus-output volume, including cached input and any
+replayed context. `effectiveBudgetTokens` is uncached input plus output, so
+cached input is not charged at face value but is also not treated as free.
+The effective token budget and `rawContextTokenBudget` are independent: the
+latter catches pathological transcript or board-history replay. Missing credit
+telemetry remains `unavailable`; StudioOps never infers credits from tokens.
+
+Before launch, each worker receives a bounded packet containing only the
+current task contract, exact candidate identity, applicable standards, current
+stage evidence, and a small remediation/failure slice. Full board snapshots,
+unrelated tasks, completed review history, raw transcripts, and prior model
+prose are excluded. `promptChars`, `promptOriginalChars`, and
+`promptCompacted` record the deterministic packet-size decision; an oversized
+packet is compacted before a paid provider run can start.
 
 If a completed builder or architecture run has already atomically recorded a
-valid handoff, exceeding its token or credit budget preserves the completed
+valid handoff, exceeding its effective-work, raw-context, or credit budget preserves the completed
 run, exact candidate/PR or architecture graph, and reviewable task status. The
 task records `budgetTelemetry` and a `budgetPause`; automatic reviewer, QA,
 retry, and continuation work remains paused until an owner-authorized next

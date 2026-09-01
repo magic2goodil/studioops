@@ -1176,6 +1176,37 @@ function renderAttachments(attachments) {
     : "- None recorded.";
 }
 
+function boundedPromptText(value, limit = 4000) {
+  const text = String(value || "").trim();
+  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 40))}\n[context truncated by StudioOps]`;
+}
+
+function candidateIdentityPrompt(task) {
+  const candidate = task.candidateIdentity || {};
+  const values = [
+    ["candidate commit", candidate.commit || task.reviewSubjectSha],
+    ["candidate tree", candidate.tree],
+    ["candidate base", candidate.base],
+    ["candidate branch", candidate.branch || task.branchName],
+    ["candidate cycle", candidate.cycle || currentReviewCandidateCycle(task)],
+    ["impact evidence digest", candidate.impactEvidenceDigest || task.impactEvidence?.digest],
+  ].filter(([, value]) => String(value || "").trim());
+  return values.length
+    ? values.map(([label, value]) => `- ${label}: ${boundedPromptText(value, 180)}`).join("\n")
+    : "- No verified candidate identity recorded.";
+}
+
+function currentStageEvidencePrompt(state, task, role) {
+  const current = (state.reviews || [])
+    .filter((review) => review.taskId === task.id && reviewMatchesCurrentCandidate(task, review))
+    .filter((review) => !role || review.role === role || review.stageKey === role)
+    .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")))
+    .slice(0, 1);
+  if (!current.length) return "- No prior evidence for this stage; inspect the current checkout.";
+  const review = current[0];
+  return `- ${review.stageKey || review.role}: ${review.outcome || "recorded"}${review.outcome === "changes_requested" && review.body ? `\n  Finding: ${boundedPromptText(review.body, 1800)}` : ""}`;
+}
+
 function standardReference(item) {
   const value = String(item || "").trim();
   if (!value) return "";
@@ -4369,6 +4400,7 @@ export function generatePrompt(state, taskId, role = "builder") {
     `- Lead-approved integration branch: ${reviewPolicy.integrationBranch || "(not configured)"}`,
   ].join("\n");
   const remediationHandoff = remediationPromptSection(task);
+  const candidateIdentity = candidateIdentityPrompt(task);
 
   if (role === "systems-architect" || role === "architect") {
     return systemsArchitectPrompt(task, project, {
@@ -4474,6 +4506,12 @@ ${reviewPolicyText}
 Current reviewer remediation handoff:
 ${remediationHandoff}
 
+Exact candidate identity:
+${candidateIdentity}
+
+Current-stage evidence (bounded):
+${currentStageEvidencePrompt(state, task, role)}
+
 Functional delivery contract:
 ${functionalDeliveryContract(task)}
 
@@ -4537,6 +4575,12 @@ ${reviewPolicyText}
 
 Current reviewer remediation handoff:
 ${remediationHandoff}
+
+Exact candidate identity:
+${candidateIdentity}
+
+Current-stage evidence (bounded):
+${currentStageEvidencePrompt(state, task, role)}
 
 Task:
 ${task.title}
