@@ -111,6 +111,13 @@ test("handoffs deduplicate findings, preserve attribution, order severity, and r
 
 test("recorded changes create an exact-candidate builder handoff without another discovery pass", () => {
   const state = fixtureState();
+  state.tasks[0].candidateIdentity = {
+    commitSha: SUBJECT_SHA,
+    treeSha: "b".repeat(40),
+    baseSha: "c".repeat(40),
+    branch: "codex/exact-candidate",
+    candidateCycle: 1,
+  };
   const result = recordReviewInState(state, "task_1", {
     stage: "backend",
     outcome: "changes_requested",
@@ -135,6 +142,11 @@ test("recorded changes create an exact-candidate builder handoff without another
   assert.match(prompt, /Approved patch boundary: src\/retry\.js only/);
   assert.match(prompt, /backend\/backend-reviewer \(review_1\)/);
   assert.match(prompt, new RegExp(SUBJECT_SHA));
+  assert.match(prompt, /candidate tree: b{40}/);
+  assert.match(prompt, /candidate base: c{40}/);
+  assert.match(prompt, /candidate branch: codex\/exact-candidate/);
+  assert.match(prompt, /Context efficiency contract:/);
+  assert.match(prompt, /Cap ordinary inspection output at roughly 200 lines or 12 KB per command/);
 });
 
 test("superseded candidate findings are archived and excluded from later prompts", () => {

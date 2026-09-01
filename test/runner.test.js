@@ -57,14 +57,14 @@ test("authoritative provider usage blocks automatic retry when a run exceeds its
     status: "completed",
     usage: {
       input_tokens: 80,
-      cached_input_tokens: 20,
+      cached_input_tokens: 0,
       output_tokens: 30,
       reasoning_output_tokens: 10,
       actual_credits: 1.25,
     },
   });
   assert.equal(run.status, "failed");
-  assert.equal(run.exitCode, "token_budget_exceeded");
+  assert.equal(run.exitCode, "effective_token_budget_exceeded");
   assert.equal(run.costTelemetry.actualTokens, 110);
   assert.equal(run.costTelemetry.actualCredits, 1.25);
   assert.equal(state.tasks[0].status, "blocked");
@@ -83,12 +83,12 @@ test("over-budget GitHub builder completion preserves the exact review handoff a
 
   const run = await completeRun("run_budget_builder", {
     state, status: "completed",
-    usage: { input_tokens: 90, cached_input_tokens: 80, output_tokens: 30, actual_credits: 2 },
+    usage: { input_tokens: 90, cached_input_tokens: 0, output_tokens: 30, actual_credits: 2 },
   });
 
   assert.equal(run.status, "completed");
   assert.equal(run.completionDisposition, "completed_over_budget");
-  assert.equal(run.exitCode, "token_budget_exceeded");
+  assert.equal(run.exitCode, "effective_token_budget_exceeded");
   assert.equal(state.tasks[0].status, "builder_review");
   assert.equal(state.tasks[0].reviewSubjectSha, subjectSha);
   assert.equal(state.tasks[0].budgetTelemetry.disposition, "handoff_preserved");

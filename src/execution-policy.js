@@ -8,6 +8,8 @@ export const DEFAULT_EXECUTION_POLICY = Object.freeze({
   complexReasoningEffort: "xhigh",
   ultraReasoningEffort: "ultra",
   tokenBudget: 120000,
+  rawContextTokenBudget: 2500000,
+  maxPromptChars: 80000,
   costBudget: 0,
   roleTokenBudgets: {
     builder: 120000,
@@ -52,15 +54,47 @@ export function normalizeExecutionUsage(value = {}) {
   const actualCredits = Number.isFinite(Number(actualCreditsValue)) && Number(actualCreditsValue) >= 0
     ? Number(actualCreditsValue)
     : null;
+  const rawTotalTokens = inputTokens + outputTokens;
+  const effectiveBudgetTokens = (inputTokens - cachedInputTokens) + outputTokens;
+  const providerCreditStatus = String(
+    value.authoritative_credit_status
+      ?? value.authoritativeCreditStatus
+      ?? value.credit_telemetry_status
+      ?? "",
+  ).trim().toLowerCase();
   return {
+    rawInputTokens: inputTokens,
     inputTokens,
     uncachedInputTokens: inputTokens - cachedInputTokens,
     cachedInputTokens,
     outputTokens,
     reasoningOutputTokens,
-    actualTokens: inputTokens + outputTokens,
+    rawTotalTokens,
+    effectiveBudgetTokens,
+    // Compatibility alias retained for existing run/task consumers. New
+    // budget decisions use effectiveBudgetTokens and rawTotalTokens.
+    actualTokens: rawTotalTokens,
     actualCredits,
-    creditTelemetryStatus: actualCredits === null ? "unavailable" : "recorded",
+    authoritativeCreditStatus: providerCreditStatus || (actualCredits === null ? "unavailable" : "recorded"),
+    creditTelemetryStatus: providerCreditStatus || (actualCredits === null ? "unavailable" : "recorded"),
+  };
+}
+
+export function compactPromptPacket(prompt, limit = DEFAULT_EXECUTION_POLICY.maxPromptChars) {
+  const source = String(prompt || "");
+  const maxChars = Math.max(1, Number(limit) || DEFAULT_EXECUTION_POLICY.maxPromptChars);
+  if (source.length <= maxChars) return { prompt: source, originalChars: source.length, compacted: false };
+  const marker = "\n\n[StudioOps compacted oversized context packet; full board history, transcript, and prior model prose omitted.]\n\n";
+  if (maxChars <= marker.length) {
+    return { prompt: marker.slice(0, maxChars), originalChars: source.length, compacted: true };
+  }
+  const available = Math.max(0, maxChars - marker.length);
+  const headChars = Math.ceil(available * 0.62);
+  const tailChars = available - headChars;
+  return {
+    prompt: `${source.slice(0, headChars)}${marker}${source.slice(-tailChars)}`,
+    originalChars: source.length,
+    compacted: true,
   };
 }
 
@@ -183,6 +217,22 @@ export function resolveExecutionPolicy(task = {}, action = {}, input = {}) {
         || configured.tokenBudget,
       DEFAULT_EXECUTION_POLICY.tokenBudget,
     ),
+    rawContextTokenBudget: positiveInteger(
+      task.rawContextTokenBudget
+        || task.reasoningBudget?.rawContextTokenBudget
+        || tierPolicy.rawContextTokenBudget
+        || rolePolicy.rawContextTokenBudget
+        || configured.rawContextTokenBudget,
+      DEFAULT_EXECUTION_POLICY.rawContextTokenBudget,
+    ),
+    maxPromptChars: positiveInteger(
+      task.maxPromptChars
+        || task.reasoningBudget?.maxPromptChars
+        || tierPolicy.maxPromptChars
+        || rolePolicy.maxPromptChars
+        || configured.maxPromptChars,
+      DEFAULT_EXECUTION_POLICY.maxPromptChars,
+    ),
     costBudget: nonNegativeNumber(
       task.costBudget
         ?? task.reasoningBudget?.costBudget
@@ -217,6 +267,8 @@ export function reasoningBudgetForTask(task = {}, action = {}, input = {}) {
     modelTier: policy.modelTier,
     reasoningEffort: policy.reasoningEffort,
     tokenBudget: policy.tokenBudget,
+    rawContextTokenBudget: policy.rawContextTokenBudget,
+    maxPromptChars: policy.maxPromptChars,
     costBudget: policy.costBudget,
   };
 }
