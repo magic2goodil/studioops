@@ -102,15 +102,6 @@ export function observeRunOutput(event, state = {}, policy = {}) {
     0,
     Number(nextState.cumulativeCommandOutputChars || 0),
   ) + commandOutputChars;
-  if (commandOutputChars > guard.maxCommandOutputChars) {
-    return {
-      state: nextState,
-      violation: {
-        code: "command_output_budget_exceeded",
-        message: `A worker command returned ${commandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCommandOutputChars.toLocaleString()}-character per-command limit. Redirect noisy output to a local file and inspect only a bounded summary or failure excerpt.`,
-      },
-    };
-  }
   if (nextState.cumulativeCommandOutputChars > guard.maxCumulativeCommandOutputChars) {
     return {
       state: nextState,
@@ -118,9 +109,39 @@ export function observeRunOutput(event, state = {}, policy = {}) {
         code: "cumulative_command_output_budget_exceeded",
         message: `Worker command output reached ${nextState.cumulativeCommandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCumulativeCommandOutputChars.toLocaleString()}-character run limit. Continue in a new run using targeted reads and local log files.`,
       },
+      warning: null,
     };
   }
-  return { state: nextState, violation: null };
+  if (commandOutputChars > guard.maxCommandOutputChars) {
+    return {
+      state: nextState,
+      violation: null,
+      warning: {
+        code: "command_output_budget_warning",
+        message: `A worker command returned ${commandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCommandOutputChars.toLocaleString()}-character per-command guidance. StudioOps kept the run alive, bounded the stored event, and expects subsequent reads to use targeted excerpts or local log files.`,
+      },
+    };
+  }
+  return { state: nextState, violation: null, warning: null };
+}
+
+export function boundedRunOutputEvent(event, maxOutputChars) {
+  if (event?.type !== "item.completed" || event.item?.type !== "command_execution") return event;
+  const output = String(event.item.aggregated_output || "");
+  const limit = Math.max(1, Number(maxOutputChars || DEFAULT_RUN_OUTPUT_GUARD.maxCommandOutputChars));
+  if (output.length <= limit) return event;
+  const fullMarker = `\n… StudioOps bounded ${output.length - limit} additional command-output characters …\n`;
+  const marker = fullMarker.length <= limit ? fullMarker : fullMarker.slice(0, limit);
+  const available = Math.max(0, limit - marker.length);
+  const headChars = Math.ceil(available * 0.75);
+  const tailChars = Math.max(0, available - headChars);
+  return {
+    ...event,
+    item: {
+      ...event.item,
+      aggregated_output: `${output.slice(0, headChars)}${marker}${tailChars ? output.slice(-tailChars) : ""}`,
+    },
+  };
 }
 
 function shellQuote(value) {
@@ -2160,7 +2181,13 @@ async function runClaimedRunWithSdk(run, input = {}) {
         controller.abort();
         throw error;
       }
-      log.write(`${redactSecrets(JSON.stringify(event), githubAppAuthSecrets(authContext))}\n`);
+      if (observation.warning) {
+        log.write(`\nStudioOps output guidance: ${observation.warning.message}\n`);
+      }
+      const loggedEvent = observation.warning
+        ? boundedRunOutputEvent(event, outputGuard.maxCommandOutputChars)
+        : event;
+      log.write(`${redactSecrets(JSON.stringify(loggedEvent), githubAppAuthSecrets(authContext))}\n`);
       if (event.type === "thread.started") {
         await persistRunThread(run, event.thread_id);
       } else if (event.type === "item.completed" && event.item?.type === "agent_message") {

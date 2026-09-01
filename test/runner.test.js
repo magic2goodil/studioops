@@ -10,6 +10,7 @@ import {
   activeRunStaleReason,
   applyFailedRunToTask,
   branchReuseSafetyReason,
+  boundedRunOutputEvent,
   claimRuns,
   cloneFallbackSource,
   completeRun,
@@ -30,7 +31,7 @@ import { eligibleRunWorkspaceSnapshotsInState } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
-test("worker output circuit breaker stops oversized and cumulative command dumps", () => {
+test("worker output guard warns and bounds one oversized command but stops cumulative dumps", () => {
   const event = (size) => ({
     type: "item.completed",
     item: { type: "command_execution", aggregated_output: "x".repeat(size) },
@@ -39,7 +40,11 @@ test("worker output circuit breaker stops oversized and cumulative command dumps
     maxCommandOutputChars: 10,
     maxCumulativeCommandOutputChars: 30,
   });
-  assert.equal(oversized.violation.code, "command_output_budget_exceeded");
+  assert.equal(oversized.violation, null);
+  assert.equal(oversized.warning.code, "command_output_budget_warning");
+  const bounded = boundedRunOutputEvent(event(30), 20);
+  assert.ok(bounded.item.aggregated_output.length <= 20);
+  assert.match(bounded.item.aggregated_output, /StudioOps bounded/);
 
   const cumulative = { cumulativeCommandOutputChars: 0 };
   assert.equal(observeRunOutput(event(8), cumulative, {
