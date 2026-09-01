@@ -2061,6 +2061,10 @@ export async function updateTask(taskId, patch) {
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     const aggregateBeforePatch = structuredClone(task);
+    const repairedConfigurationBlocker = task.status === "blocked"
+      && task.automationBlocker?.type === "configuration"
+      && Object.prototype.hasOwnProperty.call(patch, "status")
+      && String(patch.status || "").trim() !== "blocked";
     const candidateIdentityBeforePatch = candidateIdentityForTask(task);
     const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
     const previousNormalizedStatus = typeof task.status === "string" ? task.status.trim() : "";
@@ -2326,6 +2330,15 @@ export async function updateTask(taskId, patch) {
       && task.automationBlocker
     ) {
       delete task.automationBlocker;
+    }
+    if (repairedConfigurationBlocker) {
+      if (!Object.prototype.hasOwnProperty.call(patch, "assignedAgentRole")) {
+        task.assignedAgentRole = "";
+      }
+      task.retryNotBefore = "";
+      task.lastAutomationFailure = "";
+      task.lastAutomationFailureRunId = "";
+      task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
     }
     const updatedAt = new Date().toISOString();
     supersedeStaleTaskCircuitInState(state, task, { now: updatedAt, author: "StudioOps Workflow" });
