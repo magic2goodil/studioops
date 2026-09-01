@@ -1,5 +1,6 @@
 import { createWriteStream, existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, lstat, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rm, lstat, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -41,7 +42,12 @@ import {
   scheduleGitHubRemoteRecoveryProbeInState,
   taskHasExactReviewSubject,
 } from "./store.js";
-import { loadConfig, normalizeWorkspaceRetention } from "./config.js";
+import {
+  DEFAULT_RUN_OUTPUT_GUARD,
+  loadConfig,
+  normalizeRunOutputGuard,
+  normalizeWorkspaceRetention,
+} from "./config.js";
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, normalizeExecutionUsage, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
@@ -80,6 +86,97 @@ const DEFAULT_RUNNER_PATH = [
 ].join(":");
 
 const WORKSPACE_CLEANUP_LIMIT = 25;
+
+export function observeRunOutput(event, state = {}, policy = {}) {
+  const guard = normalizeRunOutputGuard({
+    ...DEFAULT_RUN_OUTPUT_GUARD,
+    ...policy,
+  });
+  const nextState = state;
+  if (event?.type !== "item.completed" || event.item?.type !== "command_execution") {
+    return { state: nextState, violation: null };
+  }
+  const output = String(event.item.aggregated_output || "");
+  const commandOutputChars = output.length;
+  nextState.cumulativeCommandOutputChars = Math.max(
+    0,
+    Number(nextState.cumulativeCommandOutputChars || 0),
+  ) + commandOutputChars;
+  if (commandOutputChars > guard.maxCommandOutputChars) {
+    return {
+      state: nextState,
+      violation: {
+        code: "command_output_budget_exceeded",
+        message: `A worker command returned ${commandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCommandOutputChars.toLocaleString()}-character per-command limit. Redirect noisy output to a local file and inspect only a bounded summary or failure excerpt.`,
+      },
+    };
+  }
+  if (nextState.cumulativeCommandOutputChars > guard.maxCumulativeCommandOutputChars) {
+    return {
+      state: nextState,
+      violation: {
+        code: "cumulative_command_output_budget_exceeded",
+        message: `Worker command output reached ${nextState.cumulativeCommandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCumulativeCommandOutputChars.toLocaleString()}-character run limit. Continue in a new run using targeted reads and local log files.`,
+      },
+    };
+  }
+  return { state: nextState, violation: null };
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+export function prePushValidationScript(run = {}, root = missionControlRoot()) {
+  const commands = (run.project?.validationCommands || [])
+    .map((command) => String(command || "").trim())
+    .filter(Boolean);
+  const effectiveCommands = commands.length ? commands : ["git show --check --oneline --no-renames HEAD"];
+  const projectKey = slugify(run.project?.key || run.projectId || "project");
+  const policyDigest = createHash("sha256").update(effectiveCommands.join("\n")).digest("hex").slice(0, 16);
+  const cacheRoot = path.join(root, "validation-cache", projectKey, policyDigest);
+  const commandLines = effectiveCommands.map((command, index) => {
+    const label = `validation-${index + 1}`;
+    return `echo "StudioOps pre-push: ${label}"\nif ! /bin/sh -lc ${shellQuote(command)} > "$log_file" 2>&1; then\n  echo "StudioOps blocked this push because ${label} failed." >&2\n  tail -n 80 "$log_file" >&2\n  exit 1\nfi`;
+  }).join("\n");
+  return `#!/bin/sh
+set -eu
+tree="$(git rev-parse 'HEAD^{tree}')"
+cache_root=${shellQuote(cacheRoot)}
+marker="$cache_root/$tree.ok"
+log_file="$cache_root/$tree.log"
+if [ -f "$marker" ]; then
+  echo "StudioOps pre-push: cached local validation passed for $tree"
+  exit 0
+fi
+mkdir -p "$cache_root"
+${commandLines}
+: > "$marker"
+echo "StudioOps pre-push: local validation passed for $tree"
+`;
+}
+
+async function installPrePushValidationHook(run, log) {
+  if ((run.workflowMode || resolveProjectWorkflowMode(run.project)) === "local") return "";
+  const hooksPath = path.join(missionControlRoot(), "validation-hooks", slugify(run.id));
+  await mkdir(hooksPath, { recursive: true });
+  const hookPath = path.join(hooksPath, "pre-push");
+  await writeFile(hookPath, prePushValidationScript(run), "utf8");
+  await chmod(hookPath, 0o700);
+  log.write(`Pre-push validation hook: ${hookPath}\n`);
+  return hooksPath;
+}
+
+function withGitHooksEnv(env, hooksPath) {
+  if (!hooksPath) return env;
+  const count = Math.max(0, Number(env.GIT_CONFIG_COUNT || 0));
+  return {
+    ...env,
+    GIT_CONFIG_COUNT: String(count + 1),
+    [`GIT_CONFIG_KEY_${count}`]: "core.hooksPath",
+    [`GIT_CONFIG_VALUE_${count}`]: hooksPath,
+  };
+}
 
 function diskShortfall(report = {}) {
   const bytes = Math.max(0, Number(report.minAvailableBytes || 0) - Number(report.availableBytes || 0));
@@ -975,6 +1072,11 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
   const defaultBranch = run.project.defaultBranch || "main";
   const projectKey = slugify(run.project.key || run.projectId || "project");
   const workspacePath = path.join(workspaceRoot, projectKey, `${slugify(run.id)}-${slugify(branch)}`);
+  const persistPreparedWorkspace = async (workspace) => {
+    workspace.gitHooksPath = await installPrePushValidationHook(run, log);
+    await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
+    return workspace;
+  };
 
   await mkdir(path.dirname(workspacePath), { recursive: true });
   await safeRemoveWorkspace(workspacePath, workspaceRoot);
@@ -1017,23 +1119,20 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
         log,
       });
       const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "local-clone" };
-      await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
-      return workspace;
+      return persistPreparedWorkspace(workspace);
     }
 
     try {
       await createWorktreeWorkspace(run, workspacePath, branch, startRef, log, gitEnv);
       const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "worktree" };
-      await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
-      return workspace;
+      return persistPreparedWorkspace(workspace);
     } catch (error) {
       log.write(`Worktree preparation fell back to clone: ${error.message}\n`);
       await safeRemoveWorkspace(workspacePath, workspaceRoot);
       await mkdir(path.dirname(workspacePath), { recursive: true });
       await createCloneWorkspace(run, workspacePath, branch, startRef, log, gitEnv);
       const workspace = { executionRepoPath: workspacePath, workspacePath, strategy: "clone" };
-      await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
-      return workspace;
+      return persistPreparedWorkspace(workspace);
     }
   }, input.gitLock || {});
 }
@@ -1044,6 +1143,7 @@ function withExecutionWorkspace(run, workspace) {
     executionRepoPath: workspace.executionRepoPath,
     workspacePath: workspace.workspacePath,
     workspaceStrategy: workspace.strategy,
+    gitHooksPath: workspace.gitHooksPath || "",
     project: {
       ...run.project,
       sourceRepoPath: run.project.repoPath,
@@ -1982,7 +2082,7 @@ export function sdkThreadOptions(run, input = {}) {
 export function sdkClientOptions(input = {}, authContext = null) {
   const codexPathOverride = resolveCodexBin(input);
   const childPath = input.path || process.env.MISSION_CONTROL_RUNNER_PATH || DEFAULT_RUNNER_PATH;
-  const env = workflowAuthEnv(input.workflowMode, authContext, {
+  const env = withGitHooksEnv(workflowAuthEnv(input.workflowMode, authContext, {
     ...process.env,
     PATH: childPath,
     STUDIOOPS_ROOT: process.env.STUDIOOPS_ROOT || missionControlRoot(),
@@ -1990,7 +2090,7 @@ export function sdkClientOptions(input = {}, authContext = null) {
     STUDIOOPS_CONFIG_ROOT: process.env.STUDIOOPS_CONFIG_ROOT || missionControlRoot(),
     MISSION_CONTROL_CONFIG_ROOT: process.env.MISSION_CONTROL_CONFIG_ROOT || missionControlRoot(),
     MISSION_CONTROL_DATA_DIR: DATA_DIR,
-  });
+  }), input.gitHooksPath);
   if (!booleanOption(input.allowApiKeyAuth, false)) {
     delete env.OPENAI_API_KEY;
     delete env.CODEX_API_KEY;
@@ -2016,6 +2116,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
   let executionRun = run;
   let authContext = null;
   let usage = null;
+  const outputGuardState = { cumulativeCommandOutputChars: 0 };
+  const outputGuard = normalizeRunOutputGuard(input.outputGuard);
 
   const timeout = setTimeout(() => {
     log.write(`\nRunner timeout after ${Math.round(timeoutMs / 1000)}s. Aborting Codex SDK turn.\n`);
@@ -2038,7 +2140,11 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(`Timeout: ${Math.round(timeoutMs / 1000)}s\n\n`);
 
     const { Codex } = await import("@openai/codex-sdk");
-    const codex = new Codex(sdkClientOptions({ ...input, workflowMode: run.workflowMode }, authContext));
+    const codex = new Codex(sdkClientOptions({
+      ...input,
+      workflowMode: run.workflowMode,
+      gitHooksPath: executionRun.gitHooksPath,
+    }, authContext));
     const options = sdkThreadOptions(executionRun, input);
     const thread = run.threadId
       ? codex.resumeThread(run.threadId, options)
@@ -2046,6 +2152,14 @@ async function runClaimedRunWithSdk(run, input = {}) {
     const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
 
     for await (const event of events) {
+      const observation = observeRunOutput(event, outputGuardState, outputGuard);
+      if (observation.violation) {
+        const error = new Error(observation.violation.message);
+        error.code = observation.violation.code;
+        log.write(`\nStudioOps output circuit breaker: ${observation.violation.message}\n`);
+        controller.abort();
+        throw error;
+      }
       log.write(`${redactSecrets(JSON.stringify(event), githubAppAuthSecrets(authContext))}\n`);
       if (event.type === "thread.started") {
         await persistRunThread(run, event.thread_id);
@@ -2066,7 +2180,12 @@ async function runClaimedRunWithSdk(run, input = {}) {
   } catch (error) {
     status = "failed";
     notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
-    pauseReason = nonRetryableWorkspaceFailureReason(notes);
+    pauseReason = [
+      "command_output_budget_exceeded",
+      "cumulative_command_output_budget_exceeded",
+    ].includes(error?.code)
+      ? error.code
+      : nonRetryableWorkspaceFailureReason(notes);
     exitCode = pauseReason || (error?.name === "AbortError" ? "timeout" : "sdk_error");
     log.write(`\nCodex SDK runner error: ${notes}\n`);
     try {
@@ -2148,6 +2267,9 @@ async function runClaimedRunWithCli(run, input = {}) {
 
   return new Promise((resolve) => {
     let settled = false;
+    let streamedOutputChars = 0;
+    let outputBudgetViolation = "";
+    const outputGuard = normalizeRunOutputGuard(input.outputGuard);
     const secrets = githubAppAuthSecrets(authContext);
     const stdoutRedactor = createSecretRedactor(secrets);
     const stderrRedactor = createSecretRedactor(secrets);
@@ -2161,7 +2283,7 @@ async function runClaimedRunWithCli(run, input = {}) {
     const child = spawn(codexBin, args, {
       cwd: executionRun.project.repoPath,
       stdio: ["pipe", "pipe", "pipe"],
-      env: workflowAuthEnv(run.workflowMode, authContext, {
+      env: withGitHooksEnv(workflowAuthEnv(run.workflowMode, authContext, {
         ...process.env,
         PATH: childPath,
         MISSION_CONTROL_RUN_ID: run.id,
@@ -2176,8 +2298,19 @@ async function runClaimedRunWithCli(run, input = {}) {
         MISSION_CONTROL_DATA_DIR: DATA_DIR,
         MISSION_CONTROL_RUN_MODEL: run.model || input.model || DEFAULT_EXECUTION_POLICY.model,
         MISSION_CONTROL_RUN_REASONING_EFFORT: run.modelReasoningEffort || input.modelReasoningEffort || DEFAULT_EXECUTION_POLICY.reasoningEffort,
-      }),
+      }), executionRun.gitHooksPath),
     });
+    const writeBoundedOutput = (text) => {
+      if (outputBudgetViolation) return;
+      streamedOutputChars += String(text || "").length;
+      if (streamedOutputChars > outputGuard.maxCumulativeCommandOutputChars) {
+        outputBudgetViolation = "cumulative_command_output_budget_exceeded";
+        log.write(`\nStudioOps output circuit breaker: CLI output exceeded ${outputGuard.maxCumulativeCommandOutputChars.toLocaleString()} characters. Redirect noisy commands to local files and print only bounded summaries.\n`);
+        child.kill("SIGTERM");
+        return;
+      }
+      log.write(text);
+    };
 
     const timeout = setTimeout(() => {
       if (settled) return;
@@ -2192,13 +2325,13 @@ async function runClaimedRunWithCli(run, input = {}) {
     }, timeoutMs);
     timeout.unref();
 
-    child.stdout.on("data", (chunk) => stdoutRedactor.write(chunk, (text) => log.write(text)));
-    child.stderr.on("data", (chunk) => stderrRedactor.write(chunk, (text) => log.write(text)));
+    child.stdout.on("data", (chunk) => stdoutRedactor.write(chunk, writeBoundedOutput));
+    child.stderr.on("data", (chunk) => stderrRedactor.write(chunk, writeBoundedOutput));
     child.on("error", async (error) => {
       settled = true;
       clearTimeout(timeout);
-      stdoutRedactor.flush((text) => log.write(text));
-      stderrRedactor.flush((text) => log.write(text));
+      stdoutRedactor.flush(writeBoundedOutput);
+      stderrRedactor.flush(writeBoundedOutput);
       const notes = redactSecrets(error.message, secrets);
       log.write(`\nRunner spawn error: ${notes}\n`);
       log.end();
@@ -2222,19 +2355,26 @@ async function runClaimedRunWithCli(run, input = {}) {
       } catch {
         notes = "";
       }
-      stdoutRedactor.flush((text) => log.write(text));
-      stderrRedactor.flush((text) => log.write(text));
+      stdoutRedactor.flush(writeBoundedOutput);
+      stderrRedactor.flush(writeBoundedOutput);
       log.write(`\nStudioOps Runner finished ${run.id} at ${new Date().toISOString()} with code ${code}\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
       const completed = await completeRunAfterExecution(run, {
-        status: code === 0 ? "completed" : "failed",
-        exitCode: code,
+        status: outputBudgetViolation ? "failed" : code === 0 ? "completed" : "failed",
+        exitCode: outputBudgetViolation || code,
         outputPath,
         lastMessagePath,
         notes,
         workspaceRoot: input.workspaceRoot,
       }, executionRun);
+      if (outputBudgetViolation) {
+        await pauseTaskForAutomationConfig(
+          run,
+          outputBudgetViolation,
+          `CLI output exceeded ${outputGuard.maxCumulativeCommandOutputChars.toLocaleString()} characters.`,
+        );
+      }
       resolve(completed);
     });
     child.stdin.end(prompt);

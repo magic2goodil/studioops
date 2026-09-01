@@ -73,6 +73,10 @@ async function optionsFrom(args) {
       ...(config?.defaults?.executionPolicy || {}),
       ...(config?.executionPolicy || {}),
     },
+    outputGuard: {
+      ...(defaults.outputGuard || {}),
+      ...(config?.runner?.outputGuard || {}),
+    },
     useWorkspaces: args["no-workspace"] ? false : (args.workspaces || defaults.useWorkspaces || defaults.isolatedWorkspaces),
     workspaceRoot: args["workspace-root"] || defaults.workspaceRoot,
     timeoutMs: numberFrom(args["timeout-ms"] || defaults.timeoutMs, 0) || undefined,

@@ -69,6 +69,10 @@ function optionsFrom(args, config) {
       ...(config?.defaults?.creditPolicy || {}),
       ...(config?.creditPolicy || {}),
     },
+    globalRunAdmission: {
+      ...(config?.defaults?.globalRunAdmission || {}),
+      ...(config?.globalRunAdmission || {}),
+    },
     project: args.project || args.projects || defaults.projects || defaults.enabledProjects,
     dryRun: Boolean(args["dry-run"] || args.dryRun),
     intervalSeconds,

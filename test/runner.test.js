@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,8 +14,10 @@ import {
   cloneFallbackSource,
   completeRun,
   completeRunAfterExecution,
+  observeRunOutput,
   performGitHubRemoteRecoveryProbe,
   planRunnableRuns,
+  prePushValidationScript,
   preflightRun,
   prepareRunWorkspace,
   resolveProjectWorkflowMode,
@@ -27,6 +29,65 @@ import { materializeLocalCandidate } from "../src/workspace.js";
 import { eligibleRunWorkspaceSnapshotsInState } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
+
+test("worker output circuit breaker stops oversized and cumulative command dumps", () => {
+  const event = (size) => ({
+    type: "item.completed",
+    item: { type: "command_execution", aggregated_output: "x".repeat(size) },
+  });
+  const oversized = observeRunOutput(event(12), { cumulativeCommandOutputChars: 0 }, {
+    maxCommandOutputChars: 10,
+    maxCumulativeCommandOutputChars: 30,
+  });
+  assert.equal(oversized.violation.code, "command_output_budget_exceeded");
+
+  const cumulative = { cumulativeCommandOutputChars: 0 };
+  assert.equal(observeRunOutput(event(8), cumulative, {
+    maxCommandOutputChars: 10,
+    maxCumulativeCommandOutputChars: 15,
+  }).violation, null);
+  assert.equal(observeRunOutput(event(8), cumulative, {
+    maxCommandOutputChars: 10,
+    maxCumulativeCommandOutputChars: 15,
+  }).violation.code, "cumulative_command_output_budget_exceeded");
+});
+
+test("pre-push validation is local, bounded on failure, and cached by exact tree", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-prepush-"));
+  const repo = path.join(root, "repo");
+  const hook = path.join(root, "pre-push");
+  const counter = path.join(root, "counter.txt");
+  await mkdir(repo);
+  await execFileAsync("git", ["init"], { cwd: repo });
+  await execFileAsync("git", ["config", "user.email", "studioops@example.invalid"], { cwd: repo });
+  await execFileAsync("git", ["config", "user.name", "StudioOps Test"], { cwd: repo });
+  await writeFile(path.join(repo, "file.txt"), "ok\n");
+  await execFileAsync("git", ["add", "file.txt"], { cwd: repo });
+  await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: repo });
+  await writeFile(hook, prePushValidationScript({
+    id: "run_hook",
+    projectId: "project_hook",
+    project: {
+      key: "hook",
+      validationCommands: [`printf run >> ${JSON.stringify(counter)}`],
+    },
+  }, root));
+  await chmod(hook, 0o700);
+  await execFileAsync(hook, [], { cwd: repo });
+  await execFileAsync(hook, [], { cwd: repo });
+  assert.equal(await readFile(counter, "utf8"), "run");
+
+  await writeFile(hook, prePushValidationScript({
+    id: "run_hook_fail",
+    projectId: "project_hook_fail",
+    project: { key: "hook-fail", validationCommands: ["printf failure-line; exit 7"] },
+  }, root));
+  await assert.rejects(
+    execFileAsync(hook, [], { cwd: repo }),
+    (error) => error.code === 1 && /failure-line/.test(error.stderr),
+  );
+  await rm(root, { recursive: true, force: true });
+});
 
 test("authoritative provider usage blocks automatic retry when a run exceeds its token budget", async () => {
   const state = {

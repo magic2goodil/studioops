@@ -236,10 +236,19 @@ async function setup() {
           modelReasoningEffort: "high",
           useWorkspaces: true,
           workspaceRoot: defaultStudioOpsWorkspaceRoot("run"),
+          outputGuard: {
+            maxCommandOutputChars: 24000,
+            maxCumulativeCommandOutputChars: 160000,
+          },
           gitLock: {
             lockRoot: defaultStudioOpsGitLockRoot(),
           },
           timeoutMs: 7200000,
+        },
+        globalRunAdmission: {
+          maxActiveMeteredRuns: 1,
+          maxMeteredRunsPerWindow: 12,
+          runWindowMinutes: 60,
         },
         qaIntegration: {
           intervalSeconds: 300,
@@ -1005,9 +1014,16 @@ Automation:
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
       },
+      outputGuard: {
+        ...(runnerDefaults.outputGuard || {}),
+      },
       creditPolicy: {
         ...(config?.defaults?.creditPolicy || {}),
         ...(config?.creditPolicy || {}),
+      },
+      globalRunAdmission: {
+        ...(config?.defaults?.globalRunAdmission || {}),
+        ...(config?.globalRunAdmission || {}),
       },
     };
     options.creditSnapshot = await getCodexCreditSnapshot(options.creditPolicy);
