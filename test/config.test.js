@@ -32,6 +32,15 @@ test("runner output guard defaults are finite and configurable", () => {
   assert.equal(config.defaults.runner.outputGuard.maxCumulativeCommandOutputChars, 160_000);
 });
 
+test("CLI wires output guard only inside the runner command scope", async () => {
+  const source = await readFile("src/mission-control-cli.js", "utf8");
+  const dispatcherSection = source.split('if (command === "dispatcher" || command === "dispatch")')[1]
+    .split('if (command === "runner" || command === "run")')[0];
+  const runnerSection = source.split('if (command === "runner" || command === "run")')[1];
+  assert.doesNotMatch(dispatcherSection, /runnerDefaults\.outputGuard/);
+  assert.match(runnerSection, /runnerDefaults\.outputGuard/);
+});
+
 test("credit policy config emits the canonical versioned degraded-telemetry contract", () => {
   const config = normalizeConfig({
     defaults: {

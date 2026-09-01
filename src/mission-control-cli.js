@@ -1014,9 +1014,6 @@ Automation:
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
       },
-      outputGuard: {
-        ...(runnerDefaults.outputGuard || {}),
-      },
       creditPolicy: {
         ...(config?.defaults?.creditPolicy || {}),
         ...(config?.creditPolicy || {}),
@@ -1064,6 +1061,9 @@ Automation:
       executionPolicy: {
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
+      },
+      outputGuard: {
+        ...(runnerDefaults.outputGuard || {}),
       },
       useWorkspaces: args["no-workspace"] ? false : args.workspaces,
       workspaceRoot: args["workspace-root"],
