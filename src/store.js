@@ -1953,6 +1953,10 @@ function lifecycleEvidenceForTask(state, task, targetStatus, evidence = {}) {
 
 function defaultLifecycleAction(task, targetStatus) {
   if (targetStatus === task.status) return "mutate_evidence";
+  // A blocked task is being restored to its recorded workflow stage. This must
+  // use the explicit owner-authorized resume transition even when that stage
+  // normally has a more specific entry action (for example architecture).
+  if (task.status === "blocked" && targetStatus !== "blocked") return "resume_workflow";
   if (targetStatus === "architecture_pending") return "require_architecture";
   if (targetStatus === "architecture_ready") return "record_architecture_completion";
   if (targetStatus === "builder_review") return "record_builder_handoff";
@@ -1964,7 +1968,6 @@ function defaultLifecycleAction(task, targetStatus) {
   if (targetStatus === "qa_review") return "request_qa_review";
   if (targetStatus === "blocked") return "block_workflow";
   if (targetStatus === "queued") {
-    if (task.status === "blocked") return "resume_workflow";
     if (task.status === "in_progress") return "recover_workflow";
     return "queue_task";
   }
