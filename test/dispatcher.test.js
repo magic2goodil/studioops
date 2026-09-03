@@ -626,6 +626,72 @@ test("an unchanged failed stage retries after its bounded backoff instead of dis
   assert.equal(afterBackoff.selected.length, 1);
 });
 
+test("retry backoff follows the newest same-stage failure when failure codes differ", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+    lastAutomationFailure: "sdk_error",
+    retryNotBefore: "2026-01-01T13:05:00.000Z",
+  };
+  const action = {
+    id: "task_1:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+  const dispatchKey = "task_1:0:0:no-subject:start_builder:builder:in_progress";
+  state.runs.push({
+    id: "run_older_failure",
+    taskId: "task_1",
+    projectId: "project_1",
+    dispatchKey,
+    attemptKey: "task_1:0:start_builder:builder",
+    group: "builder",
+    role: "builder",
+    status: "failed",
+    exitCode: "cli_error",
+    completedAt: "2026-01-01T12:50:00.000Z",
+  }, {
+    id: "run_newer_failure",
+    taskId: "task_1",
+    projectId: "project_1",
+    dispatchKey,
+    attemptKey: "task_1:0:start_builder:builder",
+    group: "builder",
+    role: "builder",
+    status: "failed",
+    exitCode: "sdk_error",
+    completedAt: "2026-01-01T12:59:00.000Z",
+  });
+  const admission = {
+    maxActiveMeteredRuns: 2,
+    maxMeteredRunsPerWindow: 12,
+    runWindowMinutes: 60,
+  };
+
+  const duringNewestBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T13:00:00.000Z"),
+    globalRunAdmission: admission,
+    executionPolicy: { maxAttempts: 4 },
+  });
+  assert.equal(duringNewestBackoff.selected.length, 0);
+  assert.equal(duringNewestBackoff.skipped[0].reason, "retry_backoff");
+
+  const afterNewestBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T13:06:00.000Z"),
+    globalRunAdmission: admission,
+    executionPolicy: { maxAttempts: 4 },
+  });
+  assert.equal(afterNewestBackoff.selected.length, 1);
+});
+
 test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {
   for (const status of ["queued", "running"]) {
     const { state, action } = finalAttemptReviewFixture(status);

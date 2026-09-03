@@ -252,11 +252,13 @@ function recentDuplicateCandidateStageReason(state, task, action, nowMs, options
   const key = dispatchKeyFor(task, action);
   const windowMinutes = normalizeGlobalRunAdmission(options.globalRunAdmission).runWindowMinutes;
   const windowStart = nowMs - windowMinutes * 60 * 1000;
-  const duplicate = (state.runs || []).find((run) => {
-    if (run.dispatchKey !== key || !FINAL_RUN_STATUSES.has(run.status)) return false;
+  const duplicate = (state.runs || []).reduce((latest, run) => {
+    if (run.dispatchKey !== key || !FINAL_RUN_STATUSES.has(run.status)) return latest;
     const finished = Date.parse(run.completedAt || run.updatedAt || run.createdAt || "");
-    return Number.isFinite(finished) && finished >= windowStart && finished <= nowMs;
-  });
+    if (!Number.isFinite(finished) || finished < windowStart || finished > nowMs) return latest;
+    if (!latest || finished >= latest.finished) return { run, finished };
+    return latest;
+  }, null)?.run;
   if (!duplicate) return "";
   if (
     duplicate.status === "failed"
