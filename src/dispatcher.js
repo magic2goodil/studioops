@@ -262,7 +262,10 @@ function recentDuplicateCandidateStageReason(state, task, action, nowMs, options
     duplicate.status === "failed"
     && duplicate.exitCode
     && duplicate.exitCode === task.lastAutomationFailure
-  ) return "unchanged_retry";
+  ) {
+    const retryAt = Date.parse(task.retryNotBefore || "");
+    return Number.isFinite(retryAt) && retryAt > nowMs ? "retry_backoff" : "";
+  }
   return duplicate.status === "completed" ? "duplicate_candidate_stage" : "";
 }
 

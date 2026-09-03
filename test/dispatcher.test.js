@@ -573,6 +573,59 @@ test("global rolling window and exact recent candidate-stage suppress redundant 
   assert.equal(duplicate.skipped[0].reason, "duplicate_candidate_stage");
 });
 
+test("an unchanged failed stage retries after its bounded backoff instead of disappearing for the full run window", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+    lastAutomationFailure: "sdk_error",
+    retryNotBefore: "2026-01-01T00:35:00.000Z",
+  };
+  const action = {
+    id: "task_1:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+  state.runs.push({
+    id: "run_failed",
+    taskId: "task_1",
+    projectId: "project_1",
+    dispatchKey: "task_1:0:0:no-subject:start_builder:builder:in_progress",
+    attemptKey: "task_1:0:start_builder:builder",
+    group: "builder",
+    role: "builder",
+    status: "failed",
+    exitCode: "sdk_error",
+    createdAt: "2026-01-01T00:30:00.000Z",
+    completedAt: "2026-01-01T00:30:10.000Z",
+  });
+  const admission = {
+    maxActiveMeteredRuns: 2,
+    maxMeteredRunsPerWindow: 12,
+    runWindowMinutes: 60,
+  };
+
+  const duringBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T00:34:00.000Z"),
+    globalRunAdmission: admission,
+  });
+  assert.equal(duringBackoff.selected.length, 0);
+  assert.equal(duringBackoff.skipped[0].reason, "retry_backoff");
+
+  const afterBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T00:36:00.000Z"),
+    globalRunAdmission: admission,
+  });
+  assert.equal(afterBackoff.selected.length, 1);
+});
+
 test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {
   for (const status of ["queued", "running"]) {
     const { state, action } = finalAttemptReviewFixture(status);
