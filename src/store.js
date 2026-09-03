@@ -3437,6 +3437,55 @@ export async function resumeOperatorAutomation(input = {}) {
   });
 }
 
+export function resumeBudgetPauseInState(state, input = {}) {
+  const now = input.now || new Date().toISOString();
+  const task = findTask(state, input.task);
+  if (!task) throw new Error(`Unknown task: ${input.task || "(missing)"}`);
+  const pause = task.budgetPause;
+  if (!pause?.runId) throw new Error(`${task.id} does not have a preserved budget pause.`);
+  const expectedRunId = String(input.expectedRunId || "").trim();
+  if (expectedRunId && expectedRunId !== String(pause.runId)) {
+    throw new Error("Budget pause resume compare-and-set failed: preserved run changed.");
+  }
+  delete task.budgetPause;
+  task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
+  task.retryNotBefore = "";
+  task.updatedAt = now;
+  applyStoreLifecycleTransition(state, task, task.status, {
+    action: "mutate_assignment",
+    force: true,
+    now,
+  });
+  state.comments = state.comments || [];
+  addAutomationComment(
+    state,
+    task,
+    `Budget continuation resumed after owner review. New execution epoch ${task.automationAttemptEpoch}. Reason: ${String(input.reason || "Preserved handoff and task contract verified.").trim()}`,
+    now,
+    String(input.author || "StudioOps Owner").trim(),
+  );
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "budget_pause_resumed",
+    projectId: task.projectId,
+    taskId: task.id,
+    runId: pause.runId,
+    message: `${task.id} budget continuation resumed after owner review.`,
+    createdAt: now,
+  });
+  return task;
+}
+
+export async function resumeBudgetPause(input = {}) {
+  if (!String(input.expectedRunId || "").trim()) {
+    throw new Error("Budget pause resume requires --expected-run-id for compare-and-set safety.");
+  }
+  return mutateState(async (state) => resumeBudgetPauseInState(state, input), {
+    operationName: "automation.resume_budget_pause",
+  });
+}
+
 export function resetAutomationCircuitInState(state, input = {}) {
   const now = input.now || new Date().toISOString();
   const task = input.task ? findTask(state, input.task) : null;
