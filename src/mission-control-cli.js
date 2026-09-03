@@ -870,6 +870,8 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "validation")) patch.validationPlan = args.validation;
     if (Object.prototype.hasOwnProperty.call(args, "risk-classification")) patch.riskClassification = args["risk-classification"];
     if (Object.prototype.hasOwnProperty.call(args, "risk")) patch.riskClassification = args.risk;
+    if (Object.prototype.hasOwnProperty.call(args, "privacy")) patch.privacyNotes = args.privacy;
+    if (Object.prototype.hasOwnProperty.call(args, "security")) patch.securityNotes = args.security;
     if (Object.prototype.hasOwnProperty.call(args, "criteria")) patch.acceptanceCriteria = args.criteria;
     if (Object.prototype.hasOwnProperty.call(args, "attachment")) patch.attachments = args.attachment;
     if (Object.prototype.hasOwnProperty.call(args, "delivery-mode")) patch.deliveryMode = args["delivery-mode"];
