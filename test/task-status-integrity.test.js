@@ -144,11 +144,15 @@ test("task CLI preserves and updates required readiness evidence", async () => {
       "--surfaces", "checkout",
       "--validation", "smoke test",
       "--risk", "high",
+      "--privacy", "No identity data.",
+      "--security", "Fail closed.",
     ], { cwd: root, env });
     state = await readPersistedState(root, env);
     assert.deepEqual(state.tasks[0].affectedSurfaces, ["checkout"]);
     assert.deepEqual(state.tasks[0].validationPlan, ["smoke test"]);
     assert.equal(state.tasks[0].riskClassification, "high");
+    assert.equal(state.tasks[0].privacyNotes, "No identity data.");
+    assert.equal(state.tasks[0].securityNotes, "Fail closed.");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
