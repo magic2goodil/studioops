@@ -29,6 +29,96 @@ function policyFor(project, input = {}) {
 
 export function notificationStatusIsValid(status) { return OUTBOX_STATUSES.has(status); }
 
+function pipelineStallFingerprint(assessment = {}) {
+  return String(assessment.fingerprint || `${assessment.taskId || "unknown"}:${assessment.cause || "unknown"}`)
+    .slice(0, 500);
+}
+
+export function pipelineLivenessNotificationNeedsUpdate(state, assessment = {}) {
+  const current = state.meta?.pipelineLiveness;
+  if (!assessment.stalled) return current?.active === true;
+  return current?.active !== true || current.fingerprint !== pipelineStallFingerprint(assessment);
+}
+
+export function reconcilePipelineLivenessNotificationInState(state, assessment = {}, input = {}) {
+  state.meta = state.meta || {};
+  state.notificationOutbox = state.notificationOutbox || [];
+  const current = state.meta.pipelineLiveness || {};
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  if (!assessment.stalled) {
+    if (current.active) {
+      state.meta.pipelineLiveness = { ...current, active: false, resolvedAt: now };
+    }
+    return { incident: state.meta.pipelineLiveness || null, notifications: [] };
+  }
+
+  const fingerprint = pipelineStallFingerprint(assessment);
+  if (current.active && current.fingerprint === fingerprint) {
+    return {
+      incident: structuredClone(current),
+      notifications: state.notificationOutbox
+        .filter((item) => item.pipelineStallId === current.id)
+        .map((item) => structuredClone(item)),
+    };
+  }
+
+  const project = findProject(state, assessment.projectId);
+  const notificationPolicy = policyFor(project, input);
+  const channels = [...new Set(notificationPolicy.channels.map((channel) => String(channel).trim()).filter(Boolean))];
+  const incident = {
+    id: `pipeline_stall_${randomUUID()}`,
+    active: true,
+    fingerprint,
+    projectId: String(assessment.projectId || ""),
+    projectKey: String(assessment.projectKey || project?.key || ""),
+    taskId: String(assessment.taskId || ""),
+    taskTitle: String(assessment.taskTitle || "Automation work"),
+    taskUrl: String(assessment.taskUrl || ""),
+    cause: String(assessment.cause || "No executable run can advance eligible work."),
+    recoveryAction: String(assessment.recoveryAction || "Open StudioOps and inspect worker admission and task blockers."),
+    detectedAt: now,
+  };
+  const notifications = channels.map((channel) => {
+    const item = {
+      id: `notification_${randomUUID()}`,
+      idempotencyKey: `${incident.id}:${channel}`,
+      kind: "pipeline_stall",
+      pipelineStallId: incident.id,
+      projectId: incident.projectId,
+      taskId: incident.taskId,
+      channel,
+      status: "queued",
+      attempts: 0,
+      packet: incident,
+      policy: notificationPolicy,
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.notificationOutbox.push(item);
+    return structuredClone(item);
+  });
+  state.meta.pipelineLiveness = incident;
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "pipeline_stall_detected",
+    projectId: incident.projectId,
+    taskId: incident.taskId,
+    message: `${incident.taskId || "Pipeline"} stalled: ${incident.cause}`,
+    createdAt: now,
+  });
+  return { incident: structuredClone(incident), notifications };
+}
+
+export async function reconcilePipelineLivenessNotification(assessment = {}, input = {}) {
+  const mutate = input.state
+    ? async (mutator) => mutator(input.state)
+    : mutateState;
+  return mutate(async (state) => (
+    reconcilePipelineLivenessNotificationInState(state, assessment, input)
+  ), { operationName: "notification.pipeline_liveness" });
+}
+
 /** Enqueue once per candidate/channel. The manifest digest is the idempotency key. */
 export function enqueueOwnerQaNotificationsInState(state, candidate, input = {}) {
   const persistedCandidate = (state.candidates || []).find((item) => item.id === candidate.id);
@@ -275,8 +365,23 @@ export function notificationForOwnerQaPacket(packet = {}) {
   };
 }
 
+export function notificationForPipelineStall(item = {}) {
+  const stall = item.packet || item;
+  return {
+    title: "StudioOps pipeline stalled",
+    subtitle: `${stall.projectKey || stall.projectId || "StudioOps"} · ${stall.taskId || "automation"}`,
+    body: `${stall.taskTitle || "Eligible work is waiting"}. Cause: ${stall.cause || "No executable run can make progress."} Recovery: ${stall.recoveryAction || "Open StudioOps and inspect the automation workers."}${stall.taskUrl ? ` · ${stall.taskUrl}` : ""}`,
+  };
+}
+
+function notificationForOutboxItem(item) {
+  return item.kind === "pipeline_stall"
+    ? notificationForPipelineStall(item)
+    : notificationForOwnerQaPacket(item.packet);
+}
+
 export async function deliverNotificationOutboxItem(item, input = {}) {
-  const notification = notificationForOwnerQaPacket(item.packet);
+  const notification = notificationForOutboxItem(item);
   if (item.channel === "macos") {
     await (input.sendMac || sendMacNotification)(notification);
     return;
@@ -312,7 +417,7 @@ export async function sendMacNotification(notification) {
 }
 
 export async function planNotifications(input = {}) {
-  const state = await readState();
+  const state = input.state || await readState();
   const pending = [];
   const skipped = [];
   const limit = Math.max(1, Number(input.limit || input.maxNotifications || 10));
@@ -325,7 +430,7 @@ export async function planNotifications(input = {}) {
     pending.push({
       ...item,
       notificationType: "outbox",
-      notification: notificationForOwnerQaPacket(item.packet),
+      notification: notificationForOutboxItem(item),
     });
   }
   for (const bundle of state.qaBundles || []) {

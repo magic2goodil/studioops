@@ -7,7 +7,10 @@ import {
   escalateDueNotificationsInState,
   notificationForBundle,
   notificationForOwnerQaPacket,
+  notificationForPipelineStall,
   notificationRetryReady,
+  planNotifications,
+  reconcilePipelineLivenessNotificationInState,
 } from "../src/notifier.js";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
 
@@ -184,4 +187,44 @@ test("delivered notifications escalate once after their acknowledgement deadline
   assert.equal(escalated.length, 1);
   assert.equal(state.notificationOutbox[0].status, "escalated");
   assert.equal(duplicate.length, 0);
+});
+
+test("pipeline stall notifications include cause and recovery and deduplicate until progress resumes", async () => {
+  const state = {
+    meta: {},
+    projects: [{ id: "project_1", key: "demo", notificationPolicy: { channels: ["in_app"] } }],
+    notificationOutbox: [],
+    events: [],
+  };
+  const assessment = {
+    stalled: true,
+    fingerprint: "task_7:start_builder:no_executable_run_admitted",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_7",
+    taskTitle: "Advance accepted work",
+    taskUrl: "http://127.0.0.1:4317/tasks/task_7",
+    cause: "no_executable_run_admitted",
+    recoveryAction: "Inspect dispatcher admission and run it again.",
+  };
+
+  const first = reconcilePipelineLivenessNotificationInState(state, assessment, { now: "2026-09-03T13:00:00.000Z" });
+  const duplicate = reconcilePipelineLivenessNotificationInState(state, assessment, { now: "2026-09-03T13:01:00.000Z" });
+  const notification = notificationForPipelineStall(first.notifications[0]);
+
+  assert.equal(first.notifications.length, 1);
+  assert.equal(duplicate.notifications.length, 1);
+  assert.equal(state.notificationOutbox.length, 1);
+  assert.match(notification.subtitle, /task_7/);
+  assert.match(notification.body, /Cause: no_executable_run_admitted/);
+  assert.match(notification.body, /Recovery: Inspect dispatcher admission/);
+  const plan = await planNotifications({ state });
+  assert.equal(plan.pending.length, 1);
+  assert.equal(plan.pending[0].notification.title, "StudioOps pipeline stalled");
+  await deliverNotificationOutboxItem(plan.pending[0]);
+
+  reconcilePipelineLivenessNotificationInState(state, { stalled: false }, { now: "2026-09-03T13:02:00.000Z" });
+  const recurrence = reconcilePipelineLivenessNotificationInState(state, assessment, { now: "2026-09-03T13:03:00.000Z" });
+  assert.equal(recurrence.notifications.length, 1);
+  assert.equal(state.notificationOutbox.length, 2);
 });

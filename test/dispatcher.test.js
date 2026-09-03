@@ -12,6 +12,7 @@ import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { fileScopesMayOverlap } from "../src/work-lanes.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+import { claimRuns, planRunnableRuns } from "../src/runner.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -438,6 +439,91 @@ test("global run admission limits workers across projects without hiding owner h
   assert.equal(report.selected[0].group, "owner");
 });
 
+test("three budget-paused queued runs free admission for unrelated eligible work end to end", async () => {
+  const now = "2026-09-03T13:00:00.000Z";
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      workflowMode: "local",
+      wipPolicy: { maxActiveRuns: 1 },
+    }],
+    tasks: [1, 2, 3].map((index) => ({
+      id: `task_paused_${index}`,
+      projectId: "project_1",
+      title: `Paused review ${index}`,
+      status: "backend_review",
+      assignedAgentRole: "backend-reviewer",
+      budgetPause: { runId: `run_preserved_${index}`, resumeStatus: "backend_review" },
+    })).concat({
+      id: "task_ready",
+      projectId: "project_1",
+      title: "Unrelated eligible builder",
+      status: "ready",
+      architectureRequired: false,
+      architectureStatus: "not_required",
+      lane: "backend",
+      workAreas: ["src/unrelated.js"],
+    }),
+    runs: [1, 2, 3].map((index) => ({
+      id: `run_paused_${index}`,
+      taskId: `task_paused_${index}`,
+      projectId: "project_1",
+      group: "reviewer",
+      role: "backend-reviewer",
+      actionType: "continue_review",
+      status: "queued",
+      createdAt: now,
+    })),
+    reviews: [],
+    comments: [],
+    events: [],
+  };
+  const action = {
+    id: "task_ready:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_ready",
+    taskTitle: "Unrelated eligible builder",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+
+  const dispatched = await dispatchSupervisorActions([action], {
+    state,
+    nowMs: Date.parse(now),
+    globalRunAdmission: {
+      maxActiveMeteredRuns: 3,
+      maxMeteredRunsPerWindow: 12,
+      runWindowMinutes: 60,
+    },
+  });
+  assert.equal(dispatched.runs.length, 1);
+  assert.equal(dispatched.runs[0].taskId, "task_ready");
+  const planned = planRunnableRuns(state, { limit: 3 });
+  assert.deepEqual(planned.runnable.map((run) => run.taskId), ["task_ready"]);
+  assert.equal(planned.skipped.filter((item) => item.reason === "budget_pause").length, 3);
+
+  const claimed = await claimRuns({
+    state,
+    limit: 3,
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "local",
+      originUrl: "",
+      baseRef: "HEAD",
+      baseCommit: "test-commit",
+    }),
+  });
+  assert.deepEqual(claimed.map((run) => run.taskId), ["task_ready"]);
+  assert.equal(state.tasks.find((task) => task.id === "task_ready").status, "in_progress");
+  assert.equal(state.runs.filter((run) => run.taskId.startsWith("task_paused_")).every((run) => run.status === "queued"), true);
+});
+
 test("global rolling window and exact recent candidate-stage suppress redundant work", () => {
   const state = fixtureState();
   state.tasks[0] = {
@@ -485,6 +571,125 @@ test("global rolling window and exact recent candidate-stage suppress redundant 
     globalRunAdmission: { maxActiveMeteredRuns: 2, maxMeteredRunsPerWindow: 12, runWindowMinutes: 60 },
   });
   assert.equal(duplicate.skipped[0].reason, "duplicate_candidate_stage");
+});
+
+test("an unchanged failed stage retries after its bounded backoff instead of disappearing for the full run window", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+    lastAutomationFailure: "sdk_error",
+    retryNotBefore: "2026-01-01T00:35:00.000Z",
+  };
+  const action = {
+    id: "task_1:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+  state.runs.push({
+    id: "run_failed",
+    taskId: "task_1",
+    projectId: "project_1",
+    dispatchKey: "task_1:0:0:no-subject:start_builder:builder:in_progress",
+    attemptKey: "task_1:0:start_builder:builder",
+    group: "builder",
+    role: "builder",
+    status: "failed",
+    exitCode: "sdk_error",
+    createdAt: "2026-01-01T00:30:00.000Z",
+    completedAt: "2026-01-01T00:30:10.000Z",
+  });
+  const admission = {
+    maxActiveMeteredRuns: 2,
+    maxMeteredRunsPerWindow: 12,
+    runWindowMinutes: 60,
+  };
+
+  const duringBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T00:34:00.000Z"),
+    globalRunAdmission: admission,
+  });
+  assert.equal(duringBackoff.selected.length, 0);
+  assert.equal(duringBackoff.skipped[0].reason, "retry_backoff");
+
+  const afterBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T00:36:00.000Z"),
+    globalRunAdmission: admission,
+  });
+  assert.equal(afterBackoff.selected.length, 1);
+});
+
+test("retry backoff follows the newest same-stage failure when failure codes differ", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+    lastAutomationFailure: "sdk_error",
+    retryNotBefore: "2026-01-01T13:05:00.000Z",
+  };
+  const action = {
+    id: "task_1:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+  const dispatchKey = "task_1:0:0:no-subject:start_builder:builder:in_progress";
+  state.runs.push({
+    id: "run_older_failure",
+    taskId: "task_1",
+    projectId: "project_1",
+    dispatchKey,
+    attemptKey: "task_1:0:start_builder:builder",
+    group: "builder",
+    role: "builder",
+    status: "failed",
+    exitCode: "cli_error",
+    completedAt: "2026-01-01T12:50:00.000Z",
+  }, {
+    id: "run_newer_failure",
+    taskId: "task_1",
+    projectId: "project_1",
+    dispatchKey,
+    attemptKey: "task_1:0:start_builder:builder",
+    group: "builder",
+    role: "builder",
+    status: "failed",
+    exitCode: "sdk_error",
+    completedAt: "2026-01-01T12:59:00.000Z",
+  });
+  const admission = {
+    maxActiveMeteredRuns: 2,
+    maxMeteredRunsPerWindow: 12,
+    runWindowMinutes: 60,
+  };
+
+  const duringNewestBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T13:00:00.000Z"),
+    globalRunAdmission: admission,
+    executionPolicy: { maxAttempts: 4 },
+  });
+  assert.equal(duringNewestBackoff.selected.length, 0);
+  assert.equal(duringNewestBackoff.skipped[0].reason, "retry_backoff");
+
+  const afterNewestBackoff = planDispatches(state, [action], {
+    nowMs: Date.parse("2026-01-01T13:06:00.000Z"),
+    globalRunAdmission: admission,
+    executionPolicy: { maxAttempts: 4 },
+  });
+  assert.equal(afterNewestBackoff.selected.length, 1);
 });
 
 test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {

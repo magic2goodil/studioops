@@ -12,8 +12,13 @@ import {
   updateDiskPressureIncident,
   updateDiskPressureIncidentInState,
 } from "./store.js";
-import { runWorkspaceCleanup } from "./runner.js";
+import { activeRunStaleReason, planRunnableRuns, runWorkspaceCleanup } from "./runner.js";
 import { loadConfig } from "./config.js";
+import { createSupervisorReport } from "./supervisor.js";
+import {
+  pipelineLivenessNotificationNeedsUpdate,
+  reconcilePipelineLivenessNotification,
+} from "./notifier.js";
 import {
   defaultStudioOpsWorkspaceRoot,
   missionControlDataDir,
@@ -30,6 +35,16 @@ const execFileAsync = promisify(execFile);
 const WORKERS = ["dispatcher", "runner", "supervisor", "notifier"];
 const LABEL_PREFIX = "com.codex.mission-control.";
 const DEFAULT_WORK_WAIT_MS = 45 * 1000;
+const PIPELINE_WORK_ACTIONS = new Set([
+  "start_architecture",
+  "start_builder",
+  "start_builder_fix",
+  "return_to_builder",
+  "start_review",
+  "continue_review",
+  "qa_integration_blocked",
+  "unblock_task",
+]);
 
 function ageMs(value, nowMs) {
   const parsed = Date.parse(value || "");
@@ -43,6 +58,106 @@ function workerSweepIsOverdue(heartbeats, worker, nowMs, workWaitMs) {
   if (!lastSweep) return false;
   const intervalMs = Math.max(1_000, Number(heartbeat.intervalSeconds || 15) * 1000);
   return ageMs(lastSweep, nowMs) > Math.max(workWaitMs, intervalMs * 2);
+}
+
+function deferredCoordination(error) {
+  if (!["STUDIOOPS_STATE_CONFLICT", "STALE_STATE_VERSION", "STUDIOOPS_MAINTENANCE"].includes(error?.code)) {
+    return null;
+  }
+  return {
+    actions: [],
+    deferred: true,
+    reason: error.code === "STUDIOOPS_MAINTENANCE" ? "maintenance_in_progress" : "concurrent_state_change",
+  };
+}
+
+export function assessPipelineLiveness(state, input = {}) {
+  const nowMs = Number(input.nowMs || Date.now());
+  const workWaitMs = Math.max(15_000, Number(input.workWaitMs || DEFAULT_WORK_WAIT_MS));
+  const selfUpdateExpiresAt = Date.parse(state.meta?.selfUpdateLease?.expiresAt || "");
+  if (
+    state.meta?.operatorPause?.active
+    || diskPressureIncidentIsActive(state.meta?.diskPressureIncident)
+    || (Number.isFinite(selfUpdateExpiresAt) && selfUpdateExpiresAt > nowMs)
+  ) {
+    return { stalled: false, reason: "automation_intentionally_paused" };
+  }
+
+  const supervisor = (input.createSupervisorReport || createSupervisorReport)(state, input);
+  const eligibleActions = (supervisor.actions || []).filter((action) => {
+    if (!PIPELINE_WORK_ACTIONS.has(action.type)) return false;
+    const task = (state.tasks || []).find((item) => item.id === action.taskId);
+    const project = (state.projects || []).find((item) => item.id === task?.projectId);
+    if (!task || task.budgetPause?.runId || task.automationCircuit?.state === "open") return false;
+    if (project?.automationCircuit?.state === "open") return false;
+    const retryAt = Date.parse(task.retryNotBefore || "");
+    return !Number.isFinite(retryAt) || retryAt <= nowMs;
+  });
+  const activeRuns = (state.runs || []).filter((run) => (
+    run.status === "running" && !activeRunStaleReason(run, input)
+  ));
+  const runPlan = (input.planRunnableRuns || planRunnableRuns)(state, {
+    ...input,
+    limit: Math.max(1, (state.runs || []).length + 1),
+  });
+  if (!eligibleActions.length || activeRuns.length || runPlan.runnable.length) {
+    return {
+      stalled: false,
+      eligibleWorkCount: eligibleActions.length,
+      activeRunCount: activeRuns.length,
+      runnableRunCount: runPlan.runnable.length,
+    };
+  }
+
+  const action = eligibleActions.find((candidate) => {
+    const task = (state.tasks || []).find((item) => item.id === candidate.taskId);
+    return task && ageMs(task.updatedAt || task.createdAt, nowMs) > workWaitMs;
+  });
+  if (!action) {
+    return {
+      stalled: false,
+      reason: "eligible_work_within_grace_period",
+      eligibleWorkCount: eligibleActions.length,
+      activeRunCount: 0,
+      runnableRunCount: 0,
+    };
+  }
+
+  const task = (state.tasks || []).find((item) => item.id === action.taskId);
+  const queuedIds = new Set((state.runs || [])
+    .filter((run) => run.taskId === task.id && run.status === "queued")
+    .map((run) => run.id));
+  const blockedRun = (runPlan.skipped || []).find((item) => queuedIds.has(item.runId));
+  const cause = blockedRun?.reason || "no_executable_run_admitted";
+  const recoveryAction = blockedRun
+    ? `Inspect ${blockedRun.runId} and resolve its ${cause} blocker; then run \`npm run runner -- --plan\` to verify it is executable.`
+    : "Run `npm run dispatcher -- --plan`, inspect the reported admission constraint, then run `npm run dispatcher` after correcting it.";
+  return {
+    stalled: true,
+    fingerprint: `${task.id}:${action.type}:${cause}`,
+    projectId: task.projectId,
+    projectKey: action.projectKey || "",
+    taskId: task.id,
+    taskTitle: task.title,
+    taskUrl: action.taskUrl || "",
+    cause,
+    recoveryAction,
+    eligibleWorkCount: eligibleActions.length,
+    activeRunCount: 0,
+    runnableRunCount: 0,
+  };
+}
+
+async function updatePipelineLiveness(state, assessment, input) {
+  if (!pipelineLivenessNotificationNeedsUpdate(state, assessment)) return null;
+  const update = input.reconcilePipelineLivenessNotification || reconcilePipelineLivenessNotification;
+  try {
+    return await update(assessment, { ...input, state: input.state });
+  } catch (error) {
+    const deferred = deferredCoordination(error);
+    if (!deferred) throw error;
+    return deferred;
+  }
 }
 
 export function planWatchdogActions(state, heartbeats, input = {}) {
@@ -189,12 +304,8 @@ export async function runWatchdog(input = {}) {
     try {
       reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
     } catch (error) {
-      if (!["STUDIOOPS_STATE_CONFLICT", "STUDIOOPS_MAINTENANCE"].includes(error?.code)) throw error;
-      reconciliation = {
-        actions: [],
-        deferred: true,
-        reason: error.code === "STUDIOOPS_MAINTENANCE" ? "maintenance_in_progress" : "concurrent_state_change",
-      };
+      reconciliation = deferredCoordination(error);
+      if (!reconciliation) throw error;
       if (error.code === "STUDIOOPS_MAINTENANCE") {
         await heartbeatWriter("watchdog", {
           status: "idle",
@@ -208,6 +319,8 @@ export async function runWatchdog(input = {}) {
       }
     }
     const [state, heartbeats] = await Promise.all([stateReader(), (input.readWorkerHeartbeats || readWorkerHeartbeats)(input)]);
+    const liveness = assessPipelineLiveness(state, input);
+    const livenessNotification = await updatePipelineLiveness(state, liveness, input);
     const actions = planWatchdogActions(state, heartbeats, { ...input, disk: initial.data });
     const results = [];
     for (const action of actions) {
@@ -223,7 +336,15 @@ export async function runWatchdog(input = {}) {
       lastSweepCompletedAt: new Date().toISOString(),
       lastSuccessAt: results.every((item) => item.ok) ? new Date().toISOString() : "",
     }, { ...input, disk: initial.data }).catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
-    return { generatedAt: new Date().toISOString(), disk: initial.data, disks: initial, reconciliation, actions: results };
+    return {
+      generatedAt: new Date().toISOString(),
+      disk: initial.data,
+      disks: initial,
+      reconciliation,
+      liveness,
+      livenessNotification,
+      actions: results,
+    };
   }
 
   const openIncident = input.openDiskPressureIncident || (input.state
@@ -293,7 +414,13 @@ export async function runWatchdog(input = {}) {
       cleanup,
       health,
     });
-    const reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
+    let reconciliation;
+    try {
+      reconciliation = await (input.automationTick || automationTick)({ ...input, limit: input.limit || 100 });
+    } catch (error) {
+      reconciliation = deferredCoordination(error);
+      if (!reconciliation) throw error;
+    }
     await heartbeatWriter("watchdog", {
       status: "idle",
       lastError: "",

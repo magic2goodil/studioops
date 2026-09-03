@@ -609,6 +609,33 @@ function staleRunReason(state, run) {
   return "";
 }
 
+/**
+ * Authoritative, state-based eligibility policy for a queued worker run.
+ * Invocation-wide gates such as self-update, disk pressure, and lane capacity
+ * remain with the caller because they do not describe the run itself.
+ */
+export function queuedRunExecutionBlocker(state, run, input = {}) {
+  if (!RUNNABLE_STATUSES.has(run?.status)) return "not_queued";
+  if (!RUNNABLE_GROUPS.has(run.group)) return "not_runner_group";
+  const project = findProject(state, run.projectId);
+  if (!projectAllowed(run, project, input)) return "project_filter";
+  const task = findTask(state, run.taskId);
+  if (task?.budgetPause?.runId) return "budget_pause";
+  if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) return "operator_pause";
+  if (project?.automationCircuit?.state === "open") return "project_circuit_open";
+  if (task?.automationCircuit?.state === "open") return "task_circuit_open";
+  if (Number(run.attempt || 1) > Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts)) {
+    return "attempt_budget_exhausted";
+  }
+  const staleReason = staleRunReason(state, run);
+  return staleReason ? `stale_run:${staleReason}` : "";
+}
+
+export function runConsumesExecutionCapacity(state, run, input = {}) {
+  if (ACTIVE_STATUSES.has(run?.status)) return true;
+  return RUNNABLE_STATUSES.has(run?.status) && !queuedRunExecutionBlocker(state, run, input);
+}
+
 function booleanOption(value, fallback = true) {
   if (value === undefined || value === null || value === "") return fallback;
   if (typeof value === "boolean") return value;
@@ -1191,44 +1218,16 @@ export function planRunnableRuns(state, input = {}) {
   const plannedRuns = [];
 
   for (const run of state.runs || []) {
-    const project = findProject(state, run.projectId);
     if (!RUNNABLE_STATUSES.has(run.status)) continue;
-    if (!RUNNABLE_GROUPS.has(run.group)) {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "not_runner_group" });
-      continue;
-    }
     if (selfUpdateLease) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `self_update_in_progress:${selfUpdateLease.id}` });
       continue;
     }
-    if (!projectAllowed(run, project, input)) {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "project_filter" });
-      continue;
-    }
+    const project = findProject(state, run.projectId);
     const task = findTask(state, run.taskId);
-    if (task?.budgetPause?.runId) {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "budget_pause" });
-      continue;
-    }
-    if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "operator_pause" });
-      continue;
-    }
-    if (project?.automationCircuit?.state === "open") {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "project_circuit_open" });
-      continue;
-    }
-    if (task?.automationCircuit?.state === "open") {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "task_circuit_open" });
-      continue;
-    }
-    if (Number(run.attempt || 1) > Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts)) {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: "attempt_budget_exhausted" });
-      continue;
-    }
-    const staleReason = staleRunReason(state, run);
-    if (staleReason) {
-      skipped.push({ runId: run.id, taskId: run.taskId, reason: `stale_run:${staleReason}` });
+    const executionBlocker = queuedRunExecutionBlocker(state, run, input);
+    if (executionBlocker) {
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: executionBlocker });
       continue;
     }
     const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
@@ -1743,41 +1742,20 @@ export async function claimRuns(input = {}) {
       if (claimed.length >= available) break;
       const project = findProject(state, run.projectId);
       if (!RUNNABLE_STATUSES.has(run.status)) continue;
-      if (!RUNNABLE_GROUPS.has(run.group)) continue;
-      if (!projectAllowed(run, project, input)) continue;
-      if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) continue;
       const task = findTask(state, run.taskId);
-      const safetyReason = project?.automationCircuit?.state === "open"
-        ? "project_circuit_open"
-        : task?.automationCircuit?.state === "open"
-          ? "task_circuit_open"
-          : Number(run.attempt || 1) > Number(run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts)
-            ? "attempt_budget_exhausted"
-            : "";
-      if (safetyReason) {
-        run.status = "cancelled";
-        run.exitCode = safetyReason;
-        run.completedAt = now;
-        run.updatedAt = now;
-        const message = `${run.id} cancelled before launch: ${safetyReason.replaceAll("_", " ")}.`;
-        await appendTaskComment(state, run, message, now);
-        state.events.push({
-          id: nextId(state.events, "event"),
-          type: "run_cancelled",
-          projectId: run.projectId,
-          taskId: run.taskId,
-          message,
-          createdAt: now,
-        });
+      const executionBlocker = queuedRunExecutionBlocker(state, run, input);
+      if (["not_runner_group", "project_filter", "budget_pause", "operator_pause"].includes(executionBlocker)) {
         continue;
       }
-      const staleReason = staleRunReason(state, run);
-      if (staleReason) {
+      if (executionBlocker) {
         run.status = "cancelled";
-        run.exitCode = staleReason;
+        run.exitCode = executionBlocker.replace(/^stale_run:/, "");
         run.completedAt = now;
         run.updatedAt = now;
-        const message = `${run.id} cancelled before launch because its queued action is stale: ${staleReason}.`;
+        const stale = executionBlocker.startsWith("stale_run:");
+        const message = stale
+          ? `${run.id} cancelled before launch because its queued action is stale: ${run.exitCode}.`
+          : `${run.id} cancelled before launch: ${executionBlocker.replaceAll("_", " ")}.`;
         await appendTaskComment(state, run, message, now);
         state.events.push({
           id: nextId(state.events, "event"),
