@@ -114,6 +114,48 @@ test("explicit configuration repair clears stale retry suppression and assignmen
   assert.equal(repaired.automationBlocker, undefined);
 });
 
+test("explicit configuration repair can restore a blocked architecture run", async () => {
+  const project = await addProject({ key: "architecture-repair", name: "Architecture repair" });
+  const task = await addTask({
+    project: project.id,
+    title: "Resume architecture after output-policy repair",
+    status: "architecture_pending",
+    architectureRequired: true,
+    userStory: "As an operator, I want interrupted architecture work to resume at the same stage.",
+    expectedOutcome: "The repaired task is eligible for a fresh architecture dispatch.",
+    acceptanceCriteria: ["The configuration blocker is cleared without bypassing architecture."],
+    workAreas: ["src/store.js"],
+    affectedSurfaces: ["configuration recovery"],
+    validationPlan: ["Run the isolated automation-blocker test suite."],
+    riskClassification: "medium",
+    privacyNotes: "No personal data.",
+    securityNotes: "The repair remains an explicit owner action.",
+    dependsOnTaskIds: [],
+  });
+  await mutateState((state) => {
+    const stored = state.tasks.find((item) => item.id === task.id);
+    stored.status = "blocked";
+    stored.assignedAgentRole = "owner";
+    stored.lastAutomationFailure = "cumulative_command_output_budget_exceeded";
+    stored.lastAutomationFailureRunId = "run_architecture";
+    stored.automationBlocker = {
+      type: "configuration",
+      reason: "cumulative_command_output_budget_exceeded",
+      runId: "run_architecture",
+      resumeStatus: "architecture_pending",
+      blockedAt: "2026-09-03T12:00:00.000Z",
+    };
+  });
+
+  await updateTask(task.id, { status: "architecture_pending" });
+  const repaired = (await readState()).tasks.find((item) => item.id === task.id);
+  assert.equal(repaired.status, "architecture_pending");
+  assert.equal(repaired.assignedAgentRole, "");
+  assert.equal(repaired.lastAutomationFailure, "");
+  assert.equal(repaired.lastAutomationFailureRunId, "");
+  assert.equal(repaired.automationBlocker, undefined);
+});
+
 test("ordinary dependency blockers still return to the builder queue", async () => {
   const state = fixtureState();
 
