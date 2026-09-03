@@ -110,9 +110,18 @@ function readinessValuePresent(field, value) {
 
 export function evaluateTaskReadiness(task = {}, state = null) {
   const missing = [];
+  const inheritedArchitectureDecision = state
+    && task.architectureStatus === "inherited"
+    && architectureIsCompleteInState(state, task)
+    ? (() => {
+        const parent = findTask(state, task.architectureParentTaskId || task.parentTaskId);
+        return parent?.architectureDecision || parent?.architectureSummary || "";
+      })()
+    : "";
   const aliases = {
     affectedSurfaces: task.affectedSurfaces || task.workAreas,
     architectureDecision: task.architectureDecision || task.architectureSummary
+      || inheritedArchitectureDecision
       || (task.architectureWaiver ? "waived" : "")
       || (task.architectureStatus === "not_required" ? "not_required" : ""),
   };
@@ -1202,6 +1211,7 @@ function contextEfficiencyContract() {
     "- Redirect noisy validation output to a temporary log and return only the exit status plus a short failure excerpt or final summary. Preserve the full local log for debugging without replaying it into the model.",
     "- Cap ordinary inspection output at roughly 200 lines or 12 KB per command. If more evidence is needed, read the next targeted slice instead of repeating prior output.",
     "- Do not reread unchanged project instructions, standards, task payloads, or prior command output during the same run.",
+    "- Do not push intermediate commits. Finish the scoped implementation, run the configured local validation once, and push one exact candidate only after it passes. Review comments and state-only updates must not push at all.",
     "- Preserve required safety rules, acceptance criteria, exact candidate identity, and validation evidence; context efficiency never authorizes omitting a governing requirement.",
   ].join("\n");
 }
@@ -1943,6 +1953,10 @@ function lifecycleEvidenceForTask(state, task, targetStatus, evidence = {}) {
 
 function defaultLifecycleAction(task, targetStatus) {
   if (targetStatus === task.status) return "mutate_evidence";
+  // A blocked task is being restored to its recorded workflow stage. This must
+  // use the explicit owner-authorized resume transition even when that stage
+  // normally has a more specific entry action (for example architecture).
+  if (task.status === "blocked" && targetStatus !== "blocked") return "resume_workflow";
   if (targetStatus === "architecture_pending") return "require_architecture";
   if (targetStatus === "architecture_ready") return "record_architecture_completion";
   if (targetStatus === "builder_review") return "record_builder_handoff";
@@ -1954,7 +1968,6 @@ function defaultLifecycleAction(task, targetStatus) {
   if (targetStatus === "qa_review") return "request_qa_review";
   if (targetStatus === "blocked") return "block_workflow";
   if (targetStatus === "queued") {
-    if (task.status === "blocked") return "resume_workflow";
     if (task.status === "in_progress") return "recover_workflow";
     return "queue_task";
   }
@@ -2051,6 +2064,10 @@ export async function updateTask(taskId, patch) {
     const project = findProject(state, task.projectId);
     if (!project) throw new Error(`Task has missing project: ${task.projectId}`);
     const aggregateBeforePatch = structuredClone(task);
+    const repairedConfigurationBlocker = task.status === "blocked"
+      && task.automationBlocker?.type === "configuration"
+      && Object.prototype.hasOwnProperty.call(patch, "status")
+      && String(patch.status || "").trim() !== "blocked";
     const candidateIdentityBeforePatch = candidateIdentityForTask(task);
     const previousReviewSubjectSha = String(task.reviewSubjectSha || "");
     const previousNormalizedStatus = typeof task.status === "string" ? task.status.trim() : "";
@@ -2316,6 +2333,15 @@ export async function updateTask(taskId, patch) {
       && task.automationBlocker
     ) {
       delete task.automationBlocker;
+    }
+    if (repairedConfigurationBlocker) {
+      if (!Object.prototype.hasOwnProperty.call(patch, "assignedAgentRole")) {
+        task.assignedAgentRole = "";
+      }
+      task.retryNotBefore = "";
+      task.lastAutomationFailure = "";
+      task.lastAutomationFailureRunId = "";
+      task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
     }
     const updatedAt = new Date().toISOString();
     supersedeStaleTaskCircuitInState(state, task, { now: updatedAt, author: "StudioOps Workflow" });
@@ -3408,6 +3434,50 @@ export function resumeOperatorAutomationInState(state, input = {}) {
 export async function resumeOperatorAutomation(input = {}) {
   return mutateState(async (state) => resumeOperatorAutomationInState(state, input), {
     operationName: "automation.resume",
+  });
+}
+
+export function resumeBudgetPauseInState(state, input = {}) {
+  const now = input.now || new Date().toISOString();
+  const task = findTask(state, input.task);
+  if (!task) throw new Error(`Unknown task: ${input.task || "(missing)"}`);
+  const pause = task.budgetPause;
+  if (!pause?.runId) throw new Error(`${task.id} does not have a preserved budget pause.`);
+  const expectedRunId = String(input.expectedRunId || "").trim();
+  if (expectedRunId && expectedRunId !== String(pause.runId)) {
+    throw new Error("Budget pause resume compare-and-set failed: preserved run changed.");
+  }
+  delete task.budgetPause;
+  task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
+  task.retryNotBefore = "";
+  task.updatedAt = now;
+  state.comments = state.comments || [];
+  addAutomationComment(
+    state,
+    task,
+    `Budget continuation resumed after owner review. New execution epoch ${task.automationAttemptEpoch}. Reason: ${String(input.reason || "Preserved handoff and task contract verified.").trim()}`,
+    now,
+    String(input.author || "StudioOps Owner").trim(),
+  );
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "budget_pause_resumed",
+    projectId: task.projectId,
+    taskId: task.id,
+    runId: pause.runId,
+    message: `${task.id} budget continuation resumed after owner review.`,
+    createdAt: now,
+  });
+  return task;
+}
+
+export async function resumeBudgetPause(input = {}) {
+  if (!String(input.expectedRunId || "").trim()) {
+    throw new Error("Budget pause resume requires --expected-run-id for compare-and-set safety.");
+  }
+  return mutateState(async (state) => resumeBudgetPauseInState(state, input), {
+    operationName: "automation.resume_budget_pause",
   });
 }
 

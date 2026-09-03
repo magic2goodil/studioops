@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSupervisorReport } from "../src/supervisor.js";
-import { automationTick } from "../src/store.js";
+import {
+  addProject,
+  addTask,
+  automationTick,
+  mutateState,
+  readState,
+  updateTask,
+} from "../src/store.js";
 
 function fixtureState(taskPatch = {}) {
   return {
@@ -57,6 +64,96 @@ test("automation configuration blockers are not mistaken for completed dependenc
   assert.equal(report.actions[0].role, "owner");
   assert.equal(report.actions[0].nextStatus, "lead_review");
   assert.match(report.actions[0].reason, /invalid_github_app_credentials/);
+});
+
+test("explicit configuration repair clears stale retry suppression and assignment", async () => {
+  const project = await addProject({ key: "config-repair", name: "Configuration repair" });
+  const task = await addTask({
+    project: project.id,
+    title: "Resume after an output-policy repair",
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+    architectureDecision: "No architecture work is required for this bounded recovery fixture.",
+    userStory: "As an operator, I want repaired work to resume without stale suppression.",
+    expectedOutcome: "The repaired task is eligible for a fresh dispatch.",
+    acceptanceCriteria: ["The old failure fingerprint is cleared."],
+    workAreas: ["src/store.js"],
+    affectedSurfaces: ["configuration recovery"],
+    validationPlan: ["Run the isolated test suite."],
+    riskClassification: "medium",
+    privacyNotes: "No personal data.",
+    securityNotes: "The repair remains an explicit owner action.",
+    dependsOnTaskIds: [],
+  });
+  await mutateState((state) => {
+    const stored = state.tasks.find((item) => item.id === task.id);
+    stored.status = "blocked";
+    stored.assignedAgentRole = "owner";
+    stored.retryNotBefore = "2026-09-01T20:00:00.000Z";
+    stored.lastAutomationFailure = "command_output_budget_exceeded";
+    stored.lastAutomationFailureRunId = "run_old";
+    stored.automationAttemptEpoch = 2;
+    stored.automationBlocker = {
+      type: "configuration",
+      reason: "command_output_budget_exceeded",
+      runId: "run_old",
+      resumeStatus: "queued",
+      blockedAt: "2026-09-01T18:00:00.000Z",
+    };
+  });
+
+  await updateTask(task.id, { status: "queued" });
+  const repaired = (await readState()).tasks.find((item) => item.id === task.id);
+  assert.equal(repaired.status, "queued");
+  assert.equal(repaired.assignedAgentRole, "");
+  assert.equal(repaired.retryNotBefore, "");
+  assert.equal(repaired.lastAutomationFailure, "");
+  assert.equal(repaired.lastAutomationFailureRunId, "");
+  assert.equal(repaired.automationAttemptEpoch, 3);
+  assert.equal(repaired.automationBlocker, undefined);
+});
+
+test("explicit configuration repair can restore a blocked architecture run", async () => {
+  const project = await addProject({ key: "architecture-repair", name: "Architecture repair" });
+  const task = await addTask({
+    project: project.id,
+    title: "Resume architecture after output-policy repair",
+    status: "architecture_pending",
+    architectureRequired: true,
+    userStory: "As an operator, I want interrupted architecture work to resume at the same stage.",
+    expectedOutcome: "The repaired task is eligible for a fresh architecture dispatch.",
+    acceptanceCriteria: ["The configuration blocker is cleared without bypassing architecture."],
+    workAreas: ["src/store.js"],
+    affectedSurfaces: ["configuration recovery"],
+    validationPlan: ["Run the isolated automation-blocker test suite."],
+    riskClassification: "medium",
+    privacyNotes: "No personal data.",
+    securityNotes: "The repair remains an explicit owner action.",
+    dependsOnTaskIds: [],
+  });
+  await mutateState((state) => {
+    const stored = state.tasks.find((item) => item.id === task.id);
+    stored.status = "blocked";
+    stored.assignedAgentRole = "owner";
+    stored.lastAutomationFailure = "cumulative_command_output_budget_exceeded";
+    stored.lastAutomationFailureRunId = "run_architecture";
+    stored.automationBlocker = {
+      type: "configuration",
+      reason: "cumulative_command_output_budget_exceeded",
+      runId: "run_architecture",
+      resumeStatus: "architecture_pending",
+      blockedAt: "2026-09-03T12:00:00.000Z",
+    };
+  });
+
+  await updateTask(task.id, { status: "architecture_pending" });
+  const repaired = (await readState()).tasks.find((item) => item.id === task.id);
+  assert.equal(repaired.status, "architecture_pending");
+  assert.equal(repaired.assignedAgentRole, "");
+  assert.equal(repaired.lastAutomationFailure, "");
+  assert.equal(repaired.lastAutomationFailureRunId, "");
+  assert.equal(repaired.automationBlocker, undefined);
 });
 
 test("ordinary dependency blockers still return to the builder queue", async () => {

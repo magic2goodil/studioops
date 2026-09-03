@@ -114,6 +114,50 @@ async function databaseFileSnapshot(root) {
   return snapshot;
 }
 
+test("task CLI preserves and updates required readiness evidence", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-task-readiness-cli-"));
+  try {
+    await writeLegacyState(root, {
+      meta: { stateIntegrityVersion: 4 },
+      projects: [{ id: "project_1", key: "demo", name: "Demo" }],
+      tasks: [], comments: [], reviews: [], events: [], runs: [], qaBundles: [], candidates: [],
+    });
+    const env = await environmentForTestControlRoot(root);
+    await execFileAsync(process.execPath, [
+      cliPath,
+      "add-task",
+      "--project", "demo",
+      "--title", "Ready task",
+      "--affected-surfaces", "homepage,catalog",
+      "--validation-plan", "unit tests,visual QA",
+      "--risk-classification", "medium",
+    ], { cwd: root, env });
+
+    let state = await readPersistedState(root, env);
+    assert.deepEqual(state.tasks[0].affectedSurfaces, ["homepage", "catalog"]);
+    assert.deepEqual(state.tasks[0].validationPlan, ["unit tests", "visual QA"]);
+    assert.equal(state.tasks[0].riskClassification, "medium");
+
+    await execFileAsync(process.execPath, [
+      cliPath,
+      "update-task", state.tasks[0].id,
+      "--surfaces", "checkout",
+      "--validation", "smoke test",
+      "--risk", "high",
+      "--privacy", "No identity data.",
+      "--security", "Fail closed.",
+    ], { cwd: root, env });
+    state = await readPersistedState(root, env);
+    assert.deepEqual(state.tasks[0].affectedSurfaces, ["checkout"]);
+    assert.deepEqual(state.tasks[0].validationPlan, ["smoke test"]);
+    assert.equal(state.tasks[0].riskClassification, "high");
+    assert.equal(state.tasks[0].privacyNotes, "No identity data.");
+    assert.equal(state.tasks[0].securityNotes, "Fail closed.");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("status without a value and show-task leave the task unchanged", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-status-cli-"));
   try {

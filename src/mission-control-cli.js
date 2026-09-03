@@ -16,6 +16,7 @@ import {
   readState,
   readStateReadOnly,
   resetAutomationCircuit,
+  resumeBudgetPause,
   resumeOperatorAutomation,
   setOperatorPause,
   updateProject,
@@ -246,7 +247,7 @@ async function setup() {
           timeoutMs: 7200000,
         },
         globalRunAdmission: {
-          maxActiveMeteredRuns: 1,
+          maxActiveMeteredRuns: 2,
           maxMeteredRunsPerWindow: 12,
           runWindowMinutes: 60,
         },
@@ -440,6 +441,7 @@ Commands:
   automation-pause              Pause new builder and reviewer work
   automation-resume             Resume builder and reviewer work after verification
   circuit-reset                 Reset one verified task or project circuit using its expected generation
+  budget-resume TASK_ID         Resume a preserved over-budget handoff after owner review
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
@@ -462,6 +464,9 @@ Task fields:
   --story                       User story, such as "As a customer..."
   --expected                    Expected outcome or feature behavior
   --criteria                    Acceptance criteria, comma or newline separated
+  --affected-surfaces           User-facing or operational surfaces affected, comma or newline separated
+  --validation-plan             Required validation evidence, comma or newline separated
+  --risk-classification         Delivery risk classification
   --attachment                  Image, screenshot, mockup, URL, or reference path
   --delivery-mode               functional, prototype, or visual-only
   --architecture-required       Route this task through systems architecture before builders
@@ -496,6 +501,7 @@ Automation:
   studioops automation-pause --reason "Incident investigation"
   studioops automation-resume --reason "Database and workers verified"
   studioops circuit-reset --task task_101 --expected-opened-at 2026-01-01T00:00:00.000Z --reason "Credentials verified"
+  studioops budget-resume task_101 --expected-run-id run_55 --reason "Preserved handoff verified"
   studioops status task_1 --status builder_review --subject-sha SHA --tree-sha TREE --base-sha BASE --branch feature/x --impact-files src/x.js
   studioops supervisor --json
   studioops dispatcher --plan
@@ -800,6 +806,9 @@ Automation:
       dependsOnTaskIds: args["depends-on"] || args.dependencies,
       userStory: args.story || args["user-story"],
       expectedOutcome: args.expected || args["expected-outcome"],
+      affectedSurfaces: args["affected-surfaces"] || args.surfaces,
+      validationPlan: args["validation-plan"] || args.validation,
+      riskClassification: args["risk-classification"] || args.risk,
       attachments: args.attachment || args.attachments,
       acceptanceCriteria: args.criteria,
       deliveryMode: args["delivery-mode"],
@@ -858,6 +867,14 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "dependencies")) patch.dependsOnTaskIds = args.dependencies;
     if (Object.prototype.hasOwnProperty.call(args, "story")) patch.userStory = args.story;
     if (Object.prototype.hasOwnProperty.call(args, "expected")) patch.expectedOutcome = args.expected;
+    if (Object.prototype.hasOwnProperty.call(args, "affected-surfaces")) patch.affectedSurfaces = args["affected-surfaces"];
+    if (Object.prototype.hasOwnProperty.call(args, "surfaces")) patch.affectedSurfaces = args.surfaces;
+    if (Object.prototype.hasOwnProperty.call(args, "validation-plan")) patch.validationPlan = args["validation-plan"];
+    if (Object.prototype.hasOwnProperty.call(args, "validation")) patch.validationPlan = args.validation;
+    if (Object.prototype.hasOwnProperty.call(args, "risk-classification")) patch.riskClassification = args["risk-classification"];
+    if (Object.prototype.hasOwnProperty.call(args, "risk")) patch.riskClassification = args.risk;
+    if (Object.prototype.hasOwnProperty.call(args, "privacy")) patch.privacyNotes = args.privacy;
+    if (Object.prototype.hasOwnProperty.call(args, "security")) patch.securityNotes = args.security;
     if (Object.prototype.hasOwnProperty.call(args, "criteria")) patch.acceptanceCriteria = args.criteria;
     if (Object.prototype.hasOwnProperty.call(args, "attachment")) patch.attachments = args.attachment;
     if (Object.prototype.hasOwnProperty.call(args, "delivery-mode")) patch.deliveryMode = args["delivery-mode"];
@@ -908,6 +925,21 @@ Automation:
     }
     const task = await updateTask(taskId, patch);
     console.log(`${task.id} -> ${task.status}`);
+    return;
+  }
+
+  if (command === "budget-resume") {
+    const taskId = args._[1];
+    if (!taskId || !String(args["expected-run-id"] || "").trim()) {
+      throw new Error("Usage: budget-resume TASK_ID --expected-run-id RUN_ID --reason VERIFIED_REASON");
+    }
+    const task = await resumeBudgetPause({
+      task: taskId,
+      expectedRunId: args["expected-run-id"],
+      reason: args.reason,
+      author: args.author,
+    });
+    console.log(`Budget continuation resumed for ${task.id}: ${task.status}`);
     return;
   }
 
@@ -1014,9 +1046,6 @@ Automation:
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
       },
-      outputGuard: {
-        ...(runnerDefaults.outputGuard || {}),
-      },
       creditPolicy: {
         ...(config?.defaults?.creditPolicy || {}),
         ...(config?.creditPolicy || {}),
@@ -1064,6 +1093,9 @@ Automation:
       executionPolicy: {
         ...(config?.defaults?.executionPolicy || {}),
         ...(config?.executionPolicy || {}),
+      },
+      outputGuard: {
+        ...(runnerDefaults.outputGuard || {}),
       },
       useWorkspaces: args["no-workspace"] ? false : args.workspaces,
       workspaceRoot: args["workspace-root"],

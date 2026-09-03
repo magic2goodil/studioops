@@ -234,7 +234,7 @@ test("promotion planning requires a complete candidate-level QA pass, not a stat
       repoPath: "/tmp/demo",
       defaultBranch: "main",
     }],
-    tasks: [{ id: "task_1", projectId: "project_1", title: "Task" }],
+    tasks: [{ id: "task_1", projectId: "project_1", title: "Task", status: "user_review" }],
     candidates: [spoofed],
   });
   assert.equal(planPromotions(state).projects.length, 0);
@@ -267,6 +267,21 @@ test("promotion planning retains persisted release candidates for reconciliation
   assert.equal(plan.projects.length, 1);
   assert.equal(plan.projects[0].mode, "reconcile");
   assert.equal(plan.projects[0].candidate.promotion.prUrl, prUrl);
+});
+
+test("promotion planning drops stale release candidates after a source task returns to changes", () => {
+  const candidate = releaseCandidateFixture({
+    baseSha: "a".repeat(40),
+    sourceSha: "b".repeat(40),
+    integrationSha: "b".repeat(40),
+    prUrl: "https://github.com/example/demo/pull/42",
+  });
+  const state = baseState({
+    projects: [{ id: "project_1", key: "demo", name: "Demo", repoPath: "/tmp/demo", defaultBranch: "main" }],
+    tasks: [{ id: "task_1", projectId: "project_1", title: "Task", status: "needs_changes" }],
+    candidates: [candidate],
+  });
+  assert.equal(planPromotions(state).projects.length, 0);
 });
 
 async function writeState(root, state) {

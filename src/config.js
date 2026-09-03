@@ -21,7 +21,7 @@ export const DEFAULT_RUN_OUTPUT_GUARD = Object.freeze({
   maxCumulativeCommandOutputChars: 160_000,
 });
 export const DEFAULT_GLOBAL_RUN_ADMISSION = Object.freeze({
-  maxActiveMeteredRuns: 1,
+  maxActiveMeteredRuns: 2,
   maxMeteredRunsPerWindow: 12,
   runWindowMinutes: 60,
 });

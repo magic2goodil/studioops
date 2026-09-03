@@ -495,6 +495,22 @@ function candidateNeedsPromotionReconciliation(candidate) {
     && /^https:\/\/github\.com\/.+\/pull\/\d+$/i.test(String(candidate.promotion?.prUrl || ""));
 }
 
+const PROMOTABLE_TASK_STATUSES = new Set([
+  "user_review",
+  "approved_for_main",
+  "promotion_blocked",
+  "merged",
+  "deployed",
+  "done",
+]);
+
+function candidateTasksRemainPromotable(candidate, tasksById) {
+  return candidate.manifest.sources.every((source) => {
+    const task = tasksById.get(source.taskId);
+    return task && PROMOTABLE_TASK_STATUSES.has(task.status);
+  });
+}
+
 function candidateHasTrustedMerge(candidate) {
   if (!candidateHasTrustedQaPass(candidate, ["merged"])) return false;
   const promotion = candidate.promotion;
@@ -562,6 +578,7 @@ export function planPromotions(state, input = {}) {
       return (state.candidates || [])
         .filter((candidate) => candidate.projectId === project.id)
         .filter((candidate) => candidateHasValidQaPass(candidate) || candidateNeedsPromotionReconciliation(candidate))
+        .filter((candidate) => candidateTasksRemainPromotable(candidate, projectTasks))
         .filter((candidate) => {
           const candidateFilter = normalizeList(input.candidate || input.candidates || input.candidateId);
           if (candidateFilter.length && !candidateFilter.includes(candidate.id)) return false;
