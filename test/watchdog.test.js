@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  assessPipelineLiveness,
   managedWorkerHealth,
   planWatchdogActions,
   restartWorker,
@@ -195,6 +196,83 @@ test("watchdog defers a concurrent automation mutation while preserving worker h
     actions: [], deferred: true, reason: "concurrent_state_change",
   });
   assert.deepEqual(report.actions, []);
+});
+
+test("watchdog treats stale task stateVersion coordination as a deferred sweep", async () => {
+  const nowMs = Date.parse("2026-09-03T13:00:00.000Z");
+  const state = { meta: {}, projects: [], tasks: [], runs: [], events: [], comments: [], reviews: [], qaBundles: [] };
+  const conflict = Object.assign(
+    new Error("Stale lifecycle command: expected stateVersion 7, current version is 8."),
+    { code: "STALE_STATE_VERSION" },
+  );
+  const report = await runWatchdog({
+    state,
+    nowMs,
+    diskPair: { data: disk("/tmp/studioops-data", false), workspace: disk("/tmp/studioops-workspaces", false) },
+    automationTick: async () => { throw conflict; },
+    readWorkerHeartbeats: async () => healthyHeartbeats(nowMs),
+    writeWorkerHeartbeat: async () => ({}),
+  });
+
+  assert.deepEqual(report.reconciliation, {
+    actions: [], deferred: true, reason: "concurrent_state_change",
+  });
+  assert.deepEqual(report.actions, []);
+});
+
+test("watchdog detects one sustained no-progress incident and queues one deduplicated owner alert", async () => {
+  const nowMs = Date.parse("2026-09-03T13:00:00.000Z");
+  const state = {
+    meta: {},
+    projects: [{ id: "project_1", key: "demo", notificationPolicy: { channels: ["in_app"] } }],
+    tasks: [{
+      id: "task_waiting",
+      projectId: "project_1",
+      title: "Waiting builder task",
+      status: "ready",
+      updatedAt: "2026-09-03T12:00:00.000Z",
+    }],
+    runs: [],
+    events: [],
+    comments: [],
+    reviews: [],
+    qaBundles: [],
+    notificationOutbox: [],
+  };
+  const action = {
+    type: "start_builder",
+    projectKey: "demo",
+    taskId: "task_waiting",
+    taskTitle: "Waiting builder task",
+    taskUrl: "http://127.0.0.1:4317/tasks/task_waiting",
+  };
+  const assessment = assessPipelineLiveness(state, {
+    nowMs,
+    workWaitMs: 60_000,
+    createSupervisorReport: () => ({ actions: [action] }),
+  });
+  assert.equal(assessment.stalled, true);
+  assert.equal(assessment.cause, "no_executable_run_admitted");
+
+  const options = {
+    state,
+    nowMs,
+    workWaitMs: 60_000,
+    diskPair: { data: disk("/tmp/studioops-data", false), workspace: disk("/tmp/studioops-workspaces", false) },
+    automationTick: async () => ({ actions: [] }),
+    createSupervisorReport: () => ({ actions: [action] }),
+    readWorkerHeartbeats: async () => healthyHeartbeats(nowMs),
+    writeWorkerHeartbeat: async () => ({}),
+  };
+  const first = await runWatchdog(options);
+  const second = await runWatchdog(options);
+
+  assert.equal(first.liveness.stalled, true);
+  assert.equal(first.livenessNotification.notifications.length, 1);
+  assert.equal(second.liveness.stalled, true);
+  assert.equal(second.livenessNotification, null);
+  assert.equal(state.notificationOutbox.length, 1);
+  assert.equal(state.events.filter((event) => event.type === "pipeline_stall_detected").length, 1);
 });
 
 test("watchdog defers all restart activity during a verified maintenance lease", async () => {

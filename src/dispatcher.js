@@ -17,6 +17,7 @@ import {
 import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
 import { compactPromptPacket, executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 import { assessCreditAdmission, requestCodexCreditSnapshot } from "./credit-policy.js";
+import { runConsumesExecutionCapacity } from "./runner.js";
 import {
   INSTALLED_AUTOMATION_CAPACITY,
   normalizeGlobalRunAdmission,
@@ -162,7 +163,7 @@ function hasExistingDispatch(state, action, task) {
 
 function activeCounts(state) {
   return (state.runs || []).reduce((counts, run) => {
-    if (!ACTIVE_RUN_STATUSES.has(run.status)) return counts;
+    if (!runConsumesExecutionCapacity(state, run)) return counts;
     const group = run.group || "builder";
     counts[group] = (counts[group] || 0) + 1;
     return counts;
@@ -196,7 +197,7 @@ function projectRunCounts(state, projectId, nowMs) {
     && run.group !== "owner"
     && isWorkerRun(run)
   ));
-  const active = projectRuns.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)).length;
+  const active = projectRuns.filter((run) => runConsumesExecutionCapacity(state, run)).length;
   return { active, runs: projectRuns.filter((run) => {
     const created = Date.parse(run.createdAt || run.startedAt || "");
     return Number.isFinite(created) && nowMs - created >= 0;
@@ -229,7 +230,7 @@ function globalRunBudgetReason(state, action, selectedWorkerRuns, nowMs, options
   if (!options.globalRunAdmission) return "";
   const budget = normalizeGlobalRunAdmission(options.globalRunAdmission);
   const workerRuns = (state.runs || []).filter((run) => run.group !== "owner");
-  const active = workerRuns.filter((run) => ACTIVE_RUN_STATUSES.has(run.status)).length;
+  const active = workerRuns.filter((run) => runConsumesExecutionCapacity(state, run)).length;
   if (active + selectedWorkerRuns >= budget.maxActiveMeteredRuns) {
     return "global_active_run_limit";
   }
@@ -294,7 +295,7 @@ function skippedConstraint(reason) {
 
 function activeLaneProfiles(state, selected = []) {
   const activeRuns = (state.runs || [])
-    .filter((run) => ACTIVE_RUN_STATUSES.has(run.status))
+    .filter((run) => runConsumesExecutionCapacity(state, run))
     .map((run) => {
       const task = findTask(state, run.taskId);
       if (!task) return null;

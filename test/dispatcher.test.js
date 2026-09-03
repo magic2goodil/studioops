@@ -12,6 +12,7 @@ import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { fileScopesMayOverlap } from "../src/work-lanes.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+import { claimRuns, planRunnableRuns } from "../src/runner.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -436,6 +437,91 @@ test("global run admission limits workers across projects without hiding owner h
   });
   assert.equal(report.skipped[0].reason, "global_active_run_limit");
   assert.equal(report.selected[0].group, "owner");
+});
+
+test("three budget-paused queued runs free admission for unrelated eligible work end to end", async () => {
+  const now = "2026-09-03T13:00:00.000Z";
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      workflowMode: "local",
+      wipPolicy: { maxActiveRuns: 1 },
+    }],
+    tasks: [1, 2, 3].map((index) => ({
+      id: `task_paused_${index}`,
+      projectId: "project_1",
+      title: `Paused review ${index}`,
+      status: "backend_review",
+      assignedAgentRole: "backend-reviewer",
+      budgetPause: { runId: `run_preserved_${index}`, resumeStatus: "backend_review" },
+    })).concat({
+      id: "task_ready",
+      projectId: "project_1",
+      title: "Unrelated eligible builder",
+      status: "ready",
+      architectureRequired: false,
+      architectureStatus: "not_required",
+      lane: "backend",
+      workAreas: ["src/unrelated.js"],
+    }),
+    runs: [1, 2, 3].map((index) => ({
+      id: `run_paused_${index}`,
+      taskId: `task_paused_${index}`,
+      projectId: "project_1",
+      group: "reviewer",
+      role: "backend-reviewer",
+      actionType: "continue_review",
+      status: "queued",
+      createdAt: now,
+    })),
+    reviews: [],
+    comments: [],
+    events: [],
+  };
+  const action = {
+    id: "task_ready:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    projectName: "Demo",
+    taskId: "task_ready",
+    taskTitle: "Unrelated eligible builder",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+
+  const dispatched = await dispatchSupervisorActions([action], {
+    state,
+    nowMs: Date.parse(now),
+    globalRunAdmission: {
+      maxActiveMeteredRuns: 3,
+      maxMeteredRunsPerWindow: 12,
+      runWindowMinutes: 60,
+    },
+  });
+  assert.equal(dispatched.runs.length, 1);
+  assert.equal(dispatched.runs[0].taskId, "task_ready");
+  const planned = planRunnableRuns(state, { limit: 3 });
+  assert.deepEqual(planned.runnable.map((run) => run.taskId), ["task_ready"]);
+  assert.equal(planned.skipped.filter((item) => item.reason === "budget_pause").length, 3);
+
+  const claimed = await claimRuns({
+    state,
+    limit: 3,
+    preflightRun: async () => ({
+      ok: true,
+      workflowMode: "local",
+      originUrl: "",
+      baseRef: "HEAD",
+      baseCommit: "test-commit",
+    }),
+  });
+  assert.deepEqual(claimed.map((run) => run.taskId), ["task_ready"]);
+  assert.equal(state.tasks.find((task) => task.id === "task_ready").status, "in_progress");
+  assert.equal(state.runs.filter((run) => run.taskId.startsWith("task_paused_")).every((run) => run.status === "queued"), true);
 });
 
 test("global rolling window and exact recent candidate-stage suppress redundant work", () => {
