@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +18,21 @@ import {
 import { verifyCandidateRepositoryState } from "./candidate-repository.js";
 import { applyLifecycleTransitionInState, mutateState, readState } from "./store.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
+import {
+  assertPromotionAttemptClaimInState,
+  claimPromotionAttemptInState,
+  recordPromotionRecoveryReceiptInState,
+  renewPromotionAttemptClaimInState,
+  terminalPromotionAttemptClaimInState,
+  validPromotionRetryAuthorization,
+} from "./promotion-attempt-claim.js";
+import {
+  boundedHeadTail,
+  persistPromotionValidationEvidence,
+  promotionValidationPolicyDigest,
+  redactPromotionValidationText,
+  scrubProjectRepositoryCredentials,
+} from "./promotion-validation-evidence.js";
 
 const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 120_000;
@@ -29,6 +45,11 @@ const DEFAULT_PROMOTION_PATH = [
   "/usr/local/bin",
   process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
 ].join(":");
+const MAX_PROMOTION_VALIDATION_ATTEMPTS = 2;
+const PROMOTION_ATTEMPT_TTL_MS = 30 * 60_000;
+const MAX_VALIDATION_SUMMARIES = 20;
+const MAX_VALIDATION_COMMAND_CHARS = 500;
+const MAX_VALIDATION_OUTPUT_CHARS = 2_000;
 const PROMOTION_DEPENDENCY_COMPLETE_STATUSES = new Set([
   "approved",
   "merged",
@@ -43,6 +64,10 @@ function childEnv(options = {}) {
     PATH: options.path || process.env.MISSION_CONTROL_PROMOTION_PATH || DEFAULT_PROMOTION_PATH,
     ...(options.env || {}),
   };
+}
+
+function projectCommandEnv(options = {}) {
+  return scrubProjectRepositoryCredentials(childEnv(options));
 }
 
 function nextId(items, prefix) {
@@ -88,10 +113,8 @@ function booleanOption(value, fallback = false) {
   return fallback;
 }
 
-function truncateOutput(value, limit = MAX_OUTPUT_CHARS) {
-  const text = String(value || "").trim();
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n...[truncated]`;
+export function truncateOutput(value, limit = MAX_OUTPUT_CHARS) {
+  return boundedHeadTail(String(value || "").trim(), limit);
 }
 
 function normalizeBranchName(value) {
@@ -133,6 +156,10 @@ function normalizeSecrets(...values) {
   return [...new Set(secrets.map(String).filter(Boolean))];
 }
 
+function contentDigest(value) {
+  return `sha256:${createHash("sha256").update(String(value ?? "")).digest("hex")}`;
+}
+
 function redactCommandOutput(value, options = {}) {
   return redactSecrets(value, normalizeSecrets(options.secrets));
 }
@@ -141,7 +168,7 @@ async function runCommand(command, args, options = {}) {
   try {
     const result = await execFileAsync(command, args, {
       cwd: options.cwd,
-      env: childEnv(options),
+      env: options.projectCommand ? projectCommandEnv(options) : childEnv(options),
       timeout: Number(options.timeoutMs || COMMAND_TIMEOUT_MS),
       maxBuffer: 10 * 1024 * 1024,
     });
@@ -182,6 +209,41 @@ function git(repoPath, args, options = {}) {
 function prNumberFromUrl(value) {
   const match = String(value || "").match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/i);
   return match ? match[1] : "";
+}
+
+async function existingExactPromotionPullRequest(repoPath, projectPlan, branch, commit, options = {}) {
+  const response = await runCommand("gh", [
+    "pr",
+    "list",
+    "--base",
+    projectPlan.targetBranch,
+    "--head",
+    branch,
+    "--state",
+    "all",
+    "--limit",
+    "10",
+    "--json",
+    "url,state,headRefName,headRefOid",
+  ], {
+    cwd: repoPath,
+    env: options.env,
+    secrets: options.secrets,
+    timeoutMs: 60_000,
+    allowFailure: true,
+  });
+  if (!response.ok) return null;
+  try {
+    const matches = JSON.parse(response.output || "[]");
+    if (!Array.isArray(matches)) return null;
+    return matches.find((item) => (
+      item?.headRefName === branch
+      && item?.headRefOid === commit
+      && /^https:\/\/github\.com\/.+\/pull\/\d+$/i.test(String(item?.url || ""))
+    )) || null;
+  } catch {
+    return null;
+  }
 }
 
 function sourceLabel(task) {
@@ -391,24 +453,61 @@ async function mergeTaskSource(repoPath, task, options = {}) {
   };
 }
 
-async function runValidationCommands(repoPath, commands, options) {
-  const results = [];
+async function runValidationCommands(repoPath, commands, options, context) {
+  const completeResults = [];
   for (const command of commands) {
+    if (options.beforeValidationCommand) await options.beforeValidationCommand();
     const result = await runCommand("sh", ["-lc", command], {
       cwd: repoPath,
       env: options.env,
+      projectCommand: true,
       secrets: options.secrets,
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
       allowFailure: true,
     });
-    results.push({
-      command,
+    completeResults.push({
+      command: redactPromotionValidationText(redactCommandOutput(command, options)),
       ok: result.ok,
-      output: truncateOutput(result.output),
+      output: redactPromotionValidationText(result.output),
     });
     if (!result.ok) break;
   }
-  return results;
+  let evidence;
+  try {
+    evidence = await persistPromotionValidationEvidence({
+      root: options.validationEvidenceRoot,
+      candidateId: context.candidate.id,
+      manifestDigest: context.candidate.manifestDigest,
+      integrationSha: context.candidate.manifest.integration.sha,
+      attempt: context.attempt,
+      policyDigest: context.policyDigest,
+      commands: completeResults,
+    });
+  } catch (error) {
+    error.evidenceCauseCode = error.code || "";
+    error.code = "PROMOTION_VALIDATION_EVIDENCE_FAILED";
+    throw error;
+  }
+
+  const boundedResults = completeResults.map((result) => ({
+    command: truncateOutput(result.command, MAX_VALIDATION_COMMAND_CHARS),
+    ok: result.ok,
+    output: truncateOutput(result.output, MAX_VALIDATION_OUTPUT_CHARS),
+    outputDigest: contentDigest(result.output),
+  }));
+  const summaries = boundedResults.length <= MAX_VALIDATION_SUMMARIES
+    ? boundedResults
+    : [
+        ...boundedResults.slice(0, MAX_VALIDATION_SUMMARIES - 1),
+        boundedResults.at(-1),
+      ];
+  return {
+    summaries,
+    receiptResults: boundedResults.map(({ command, ok, outputDigest }) => ({ command, ok, outputDigest })),
+    evidence,
+    failed: boundedResults.find((item) => !item.ok) || null,
+    omittedSummaryCount: Math.max(0, boundedResults.length - summaries.length),
+  };
 }
 
 function projectMatches(project, options = {}) {
@@ -441,7 +540,10 @@ function promotionValidationCommands(project = {}) {
 
 function promotionBranchName(projectPlan) {
   const project = safeRefSegment(projectPlan.projectKey || projectPlan.projectId || "project");
-  return `qa/promotion-${project}-${Date.now()}`;
+  const candidateDigest = String(projectPlan.candidate?.manifestDigest || "")
+    .replace(/^sha256:/, "")
+    .slice(0, 16);
+  return `qa/promotion-${project}-${candidateDigest || "candidate"}`;
 }
 
 function candidateHasTrustedQaPass(candidate, allowedStatuses = ["qa_passed"]) {
@@ -504,11 +606,39 @@ const PROMOTABLE_TASK_STATUSES = new Set([
   "done",
 ]);
 
-function candidateTasksRemainPromotable(candidate, tasksById) {
+function promotionValidationAttemptsForCandidate(task, candidate) {
+  if (task?.promotionValidationCandidateId === candidate.id) {
+    const attempts = Number(task.promotionValidationAttempts || 0);
+    return Number.isInteger(attempts) && attempts >= 0 ? attempts : 0;
+  }
+  return 0;
+}
+
+function taskCanRetryPromotionValidation(task, candidate, source, policyDigest) {
+  const attempts = promotionValidationAttemptsForCandidate(task, candidate);
+  return Boolean(
+    validPromotionRetryAuthorization(task, candidate, source, policyDigest)
+    && attempts > 0
+    && attempts < MAX_PROMOTION_VALIDATION_ATTEMPTS
+  );
+}
+
+function candidateTasksRemainPromotable(candidate, tasksById, policyDigest) {
   return candidate.manifest.sources.every((source) => {
     const task = tasksById.get(source.taskId);
-    return task && PROMOTABLE_TASK_STATUSES.has(task.status);
+    if (!task) return false;
+    const attempts = promotionValidationAttemptsForCandidate(task, candidate);
+    if (candidate.status === "qa_passed" && attempts > 0) {
+      return taskCanRetryPromotionValidation(task, candidate, source, policyDigest);
+    }
+    return PROMOTABLE_TASK_STATUSES.has(task.status);
   });
+}
+
+function candidateUsesPromotionValidationRetry(candidate, tasksById, policyDigest) {
+  return candidate.manifest.sources.some((source) => (
+    taskCanRetryPromotionValidation(tasksById.get(source.taskId), candidate, source, policyDigest)
+  ));
 }
 
 function candidateHasTrustedMerge(candidate) {
@@ -570,6 +700,12 @@ export function planPromotions(state, input = {}) {
   const projectPlans = (state.projects || [])
     .filter((project) => projectMatches(project, input))
     .flatMap((project) => {
+      const validationCommands = promotionValidationCommands(project);
+      const validationTimeoutMs = Number(input.validationTimeoutMs || VALIDATION_TIMEOUT_MS);
+      const validationPolicyDigest = promotionValidationPolicyDigest({
+        commands: validationCommands,
+        timeoutMs: validationTimeoutMs,
+      });
       const projectTasks = new Map(
         (state.tasks || [])
           .filter((task) => task.projectId === project.id)
@@ -578,7 +714,7 @@ export function planPromotions(state, input = {}) {
       return (state.candidates || [])
         .filter((candidate) => candidate.projectId === project.id)
         .filter((candidate) => candidateHasValidQaPass(candidate) || candidateNeedsPromotionReconciliation(candidate))
-        .filter((candidate) => candidateTasksRemainPromotable(candidate, projectTasks))
+        .filter((candidate) => candidateTasksRemainPromotable(candidate, projectTasks, validationPolicyDigest))
         .filter((candidate) => {
           const candidateFilter = normalizeList(input.candidate || input.candidates || input.candidateId);
           if (candidateFilter.length && !candidateFilter.includes(candidate.id)) return false;
@@ -602,8 +738,14 @@ export function planPromotions(state, input = {}) {
             : promotionTargetBranch(project) !== candidate.manifest.base.branch
               ? `promotion target ${promotionTargetBranch(project)} does not match candidate base ${candidate.manifest.base.branch}; rebuild the candidate against the intended target.`
               : "",
-          validationCommands: promotionValidationCommands(project),
-          mode: candidate.status === "release_candidate_ready" ? "reconcile" : "create",
+          validationCommands,
+          validationTimeoutMs,
+          validationPolicyDigest,
+          mode: candidate.status === "release_candidate_ready"
+            ? "reconcile"
+            : candidateUsesPromotionValidationRetry(candidate, projectTasks, validationPolicyDigest)
+              ? "retry"
+              : "create",
           candidate,
           mergedCandidates: (state.candidates || [])
             .filter((item) => item.projectId === project.id)
@@ -630,6 +772,9 @@ export function planPromotions(state, input = {}) {
               dependsOnTaskIds: task?.dependsOnTaskIds || [],
               sourceRef: source.sourceRef,
               headSha: source.headSha,
+              stateVersion: Number(task?.stateVersion || 1),
+              promotionValidationAttempts: promotionValidationAttemptsForCandidate(task, candidate),
+              promotionRetryAuthorization: task?.promotionRetryAuthorization || null,
             };
           }),
           blockedTasks: [],
@@ -642,6 +787,73 @@ export function planPromotions(state, input = {}) {
     projects: projectPlans,
     taskCount: projectPlans.reduce((count, project) => count + project.tasks.length + project.blockedTasks.length, 0),
   };
+}
+
+function authoritativePromotionPolicyDigest(state, projectPlan) {
+  const project = (state.projects || []).find((item) => item.id === projectPlan.projectId);
+  if (!project) throw new Error(`Promotion project ${projectPlan.projectId} no longer exists.`);
+  return promotionValidationPolicyDigest({
+    commands: promotionValidationCommands(project),
+    timeoutMs: Number(projectPlan.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
+  });
+}
+
+function promotionClaimInput(projectPlan, input = {}, overrides = {}, state = null) {
+  const policyDigest = state
+    ? authoritativePromotionPolicyDigest(state, projectPlan)
+    : projectPlan.validationPolicyDigest;
+  if (policyDigest !== projectPlan.validationPolicyDigest) {
+    throw new Error("Promotion validation policy changed after planning.");
+  }
+  return {
+    projectId: projectPlan.projectId,
+    candidateId: projectPlan.candidate.id,
+    mode: projectPlan.mode,
+    policyDigest,
+    ttlMs: Number(input.promotionAttemptTtlMs || PROMOTION_ATTEMPT_TTL_MS),
+    claimIdFactory: input.promotionClaimIdFactory,
+    ...overrides,
+  };
+}
+
+async function claimProjectPromotionAttempt(projectPlan, input = {}) {
+  return mutateState((state) => claimPromotionAttemptInState(
+    state,
+    promotionClaimInput(projectPlan, input, {}, state),
+  ), { operationName: "promotion.claim_attempt" });
+}
+
+async function renewProjectPromotionAttempt(projectPlan, claim, input = {}) {
+  return mutateState((state) => renewPromotionAttemptClaimInState(
+    state,
+    claim,
+    promotionClaimInput(projectPlan, input, {}, state),
+  ), { operationName: "promotion.renew_attempt" });
+}
+
+async function assertProjectPromotionAttempt(projectPlan, claim, input = {}) {
+  const state = await readState();
+  try {
+    return assertPromotionAttemptClaimInState(
+      state,
+      claim,
+      promotionClaimInput(projectPlan, input, {}, state),
+    );
+  } catch (error) {
+    error.code = "PROMOTION_ATTEMPT_STALE";
+    throw error;
+  }
+}
+
+async function recordProjectPromotionRecoveryReceipt(projectPlan, claim, validationResults, input = {}) {
+  return mutateState((state) => recordPromotionRecoveryReceiptInState(
+    state,
+    claim,
+    {
+      ...promotionClaimInput(projectPlan, input, {}, state),
+      validationResults,
+    },
+  ), { operationName: "promotion.record_recovery_receipt" });
 }
 
 function allTaskResults(tasks, status, output) {
@@ -949,6 +1161,8 @@ async function promoteProject(projectPlan, options = {}) {
     output: "",
     commit: "",
     validation: [],
+    validationEvidence: null,
+    validationAttempt: Number(projectPlan.promotionClaim?.attempt || (projectPlan.mode === "retry" ? 2 : 1)),
     promotionBranch: "",
     prUrl: "",
     sourceRepoPath: repoPath,
@@ -992,10 +1206,41 @@ async function promoteProject(projectPlan, options = {}) {
     const gitOptions = { env: options.env, secrets: options.secrets };
 
     await checkoutExactCandidate(executionRepoPath, projectPlan, gitOptions);
+    if (options.renewPromotionClaim) {
+      const renewed = await options.renewPromotionClaim();
+      projectPlan.promotionClaim = renewed;
+      result.promotionClaim = renewed;
+    }
     const candidateTasks = allTaskResults(projectPlan.tasks, "candidate_verified", "Exact candidate identity verified.");
     result.tasks.push(...candidateTasks);
 
-    result.validation = await runValidationCommands(executionRepoPath, validationCommands, options);
+    let validationReceiptResults = [];
+    const reusableRecoveryReceipt = projectPlan.mode === "retry"
+      ? projectPlan.promotionRecoveryReceipt
+      : null;
+    if (reusableRecoveryReceipt) {
+      result.validation = [{
+        command: "[exact promotion recovery receipt]",
+        ok: true,
+        output: `Reused ${reusableRecoveryReceipt.validationResultDigest}.`,
+        outputDigest: reusableRecoveryReceipt.validationResultDigest,
+      }];
+    } else {
+      const validationRun = await runValidationCommands(
+        executionRepoPath,
+        validationCommands,
+        options,
+        {
+          candidate: projectPlan.candidate,
+          attempt: result.validationAttempt,
+          policyDigest: projectPlan.validationPolicyDigest,
+        },
+      );
+      result.validation = validationRun.summaries;
+      result.validationEvidence = validationRun.evidence;
+      result.validationOmittedSummaryCount = validationRun.omittedSummaryCount;
+      validationReceiptResults = validationRun.receiptResults;
+    }
     const failedValidation = result.validation.find((item) => !item.ok);
     if (failedValidation) {
       result.status = "validation_failed";
@@ -1027,6 +1272,16 @@ async function promoteProject(projectPlan, options = {}) {
       return result;
     }
 
+    if (projectPlan.mode === "retry" && !reusableRecoveryReceipt) {
+      const recorded = await options.recordRecoveryReceipt(validationReceiptResults);
+      projectPlan.promotionClaim = recorded.claim;
+      projectPlan.promotionRecoveryReceipt = recorded.receipt;
+      projectPlan.candidate.promotionValidationRecoveryReceipt = recorded.receipt;
+      result.promotionClaim = recorded.claim;
+      result.promotionRecoveryReceipt = recorded.receipt;
+    }
+    if (options.assertPromotionClaim) await options.assertPromotionClaim();
+
     result.promotionBranch = promotionBranchName(projectPlan);
     const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${result.promotionBranch}`], { ...gitOptions, allowFailure: true });
     if (!push.ok) {
@@ -1049,42 +1304,58 @@ async function promoteProject(projectPlan, options = {}) {
       }
       throw new Error(prePrVerification.reason);
     }
+    if (options.assertPromotionClaim) await options.assertPromotionClaim();
 
-    const taskList = projectPlan.tasks
-      .map((task) => `- ${task.id}: ${task.title}${task.prUrl ? ` (${task.prUrl})` : ""} at ${task.headSha}`)
-      .join("\n");
-    const pr = await runCommand("gh", [
-      "pr",
-      "create",
-      "--base",
-      projectPlan.targetBranch,
-      "--head",
+    const existingPr = await existingExactPromotionPullRequest(
+      executionRepoPath,
+      projectPlan,
       result.promotionBranch,
-      "--title",
-      `QA-approved release candidate: ${projectPlan.projectName || projectPlan.projectKey}`,
-      "--body",
-      `## Immutable StudioOps candidate\n\nCandidate: ${projectPlan.candidate.id}\nManifest: ${projectPlan.candidate.manifestDigest}\nIntegration SHA: ${projectPlan.candidate.manifest.integration.sha}\n\n## QA-approved tasks\n\n${taskList}\n\nValidation passed against the exact candidate in StudioOps. Production deployment remains release/tag gated.`,
-    ], {
-      cwd: executionRepoPath,
-      env: options.env,
-      secrets: options.secrets,
-      timeoutMs: 60_000,
-      allowFailure: true,
-    });
-    if (!pr.ok) {
-      result.status = "pr_failed";
-      result.output = `Release-candidate branch was pushed, but the pull request could not be created.\n${truncateOutput(pr.output)}`;
-      for (const task of candidateTasks) task.status = "pr_failed";
-      return result;
+      commit,
+      options,
+    );
+    let prOutput = existingPr?.url || "";
+    if (!existingPr) {
+      if (options.assertPromotionClaim) await options.assertPromotionClaim();
+      const taskList = projectPlan.tasks
+        .map((task) => `- ${task.id}: ${task.title}${task.prUrl ? ` (${task.prUrl})` : ""} at ${task.headSha}`)
+        .join("\n");
+      const pr = await runCommand("gh", [
+        "pr",
+        "create",
+        "--base",
+        projectPlan.targetBranch,
+        "--head",
+        result.promotionBranch,
+        "--title",
+        `QA-approved release candidate: ${projectPlan.projectName || projectPlan.projectKey}`,
+        "--body",
+        `## Immutable StudioOps candidate\n\nCandidate: ${projectPlan.candidate.id}\nManifest: ${projectPlan.candidate.manifestDigest}\nIntegration SHA: ${projectPlan.candidate.manifest.integration.sha}\n\n## QA-approved tasks\n\n${taskList}\n\nValidation passed against the exact candidate in StudioOps. Production deployment remains release/tag gated.`,
+      ], {
+        cwd: executionRepoPath,
+        env: options.env,
+        secrets: options.secrets,
+        timeoutMs: 60_000,
+        allowFailure: true,
+      });
+      if (!pr.ok) {
+        result.status = "pr_failed";
+        result.output = `Release-candidate branch was pushed, but the pull request could not be created.\n${truncateOutput(pr.output)}`;
+        for (const task of candidateTasks) task.status = "pr_failed";
+        return result;
+      }
+      prOutput = pr.output || "";
     }
 
-    result.prUrl = String(pr.output || "").trim().split(/\s+/).find((value) => /^https:\/\/github\.com\/.+\/pull\/\d+/.test(value)) || "";
+    result.prUrl = String(prOutput).trim().split(/\s+/).find((value) => /^https:\/\/github\.com\/.+\/pull\/\d+/.test(value)) || "";
     result.status = "pr_ready";
-    result.output = truncateOutput(pr.output || `Created release-candidate PR from ${result.promotionBranch}.`);
+    result.output = truncateOutput(prOutput || `Created release-candidate PR from ${result.promotionBranch}.`);
     for (const task of candidateTasks) task.status = "pr_ready";
     return result;
   } catch (error) {
-    result.status = "blocked";
+    const failureStatus = error.code === "PROMOTION_VALIDATION_EVIDENCE_FAILED"
+      ? "evidence_failed"
+      : "blocked";
+    result.status = failureStatus;
     result.output = truncateOutput(error.message);
     if (error.code === "CANDIDATE_INTEGRITY") {
       result.candidateInvalidation = {
@@ -1093,7 +1364,14 @@ async function promoteProject(projectPlan, options = {}) {
         observed: error.observed || "",
       };
     }
-    result.tasks = result.tasks.length ? result.tasks : allTaskResults(projectPlan.tasks, "blocked", error.message);
+    if (result.tasks.length) {
+      for (const task of result.tasks) {
+        task.status = failureStatus;
+        task.output = truncateOutput(error.message);
+      }
+    } else {
+      result.tasks = allTaskResults(projectPlan.tasks, failureStatus, error.message);
+    }
     return result;
   } finally {
     if (workspace?.workspacePath) {
@@ -1129,6 +1407,12 @@ function validationSummary(result) {
     .join("\n");
 }
 
+function validationEvidenceSummary(result) {
+  const evidence = result.validationEvidence;
+  if (!evidence?.path || !evidence?.digest) return "";
+  return `\n\nPrivate validation evidence: ${evidence.path}\nDigest: ${evidence.digest}`;
+}
+
 function branchWebUrl(projectResult) {
   const raw = String(projectResult.repoUrl || "").trim();
   const sshMatch = raw.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
@@ -1151,7 +1435,7 @@ function commentForTask(projectResult, taskResult) {
   const workspaceLine = workspaceSummary(projectResult);
 
   if (taskResult.status === "pr_ready") {
-    return `QA-approved release-candidate PR is ready for ${projectResult.targetBranch} at ${projectResult.commit}.${projectResult.prUrl ? `\n\nPR: ${projectResult.prUrl}` : ""}${targetLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}`;
+    return `QA-approved release-candidate PR is ready for ${projectResult.targetBranch} at ${projectResult.commit}.${projectResult.prUrl ? `\n\nPR: ${projectResult.prUrl}` : ""}${targetLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}${validationEvidenceSummary(projectResult)}`;
   }
 
   if (taskResult.status === "conflict") {
@@ -1160,7 +1444,11 @@ function commentForTask(projectResult, taskResult) {
   }
 
   if (taskResult.status === "validation_failed") {
-    return `Promotion validation failed after merging ${taskResult.source} into ${projectResult.targetBranch}. No changes were pushed.${targetLine}${workspaceLine}\n\nValidation:\n${validationSummary(projectResult)}`;
+    return `Promotion validation failed after merging ${taskResult.source} into ${projectResult.targetBranch}. No changes were pushed.${targetLine}${workspaceLine}\n\nValidation:\n${validationSummary(projectResult)}${validationEvidenceSummary(projectResult)}`;
+  }
+
+  if (taskResult.status === "evidence_failed") {
+    return `Promotion stopped before push because its private validation evidence could not be persisted and verified.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (taskResult.status === "push_failed") {
@@ -1186,7 +1474,28 @@ function commentForTask(projectResult, taskResult) {
   return `Promotion skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No promotion was attempted."}${workspaceLine}`;
 }
 
-function taskPatchForPromotion(projectResult, taskResult, now) {
+function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) {
+  const priorValidationAttempts = promotionValidationAttemptsForCandidate(task, candidate);
+  const validationAttempt = Number(projectResult.validationAttempt || 0);
+  const validationWasRecorded = Array.isArray(projectResult.validation) && projectResult.validation.length > 0;
+  const promotionValidationAttempts = validationWasRecorded
+    ? Math.max(priorValidationAttempts, validationAttempt)
+    : priorValidationAttempts;
+  const firstFailureAuthorization = (
+    taskResult.status === "validation_failed"
+    && validationAttempt === 1
+    && projectResult.validationEvidence?.digest
+  ) ? {
+      schemaVersion: "studioops.promotion-retry-authorization.v1",
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      integrationSha: candidate.manifest.integration.sha,
+      policyDigest: projectResult.validationPolicyDigest,
+      firstEvidenceDigest: projectResult.validationEvidence.digest,
+      independentResult: "validation_failed",
+      authorizedBy: "studioops-promotion-worker",
+      authorizedAt: now,
+    } : null;
   const patch = {
     promotionStatus: taskResult.status,
     promotionTargetBranch: projectResult.targetBranch,
@@ -1196,7 +1505,12 @@ function taskPatchForPromotion(projectResult, taskResult, now) {
     promotionValidation: {
       status: projectResult.status,
       commands: projectResult.validation || [],
+      evidence: projectResult.validationEvidence || null,
+      omittedSummaryCount: Number(projectResult.validationOmittedSummaryCount || 0),
     },
+    promotionValidationCandidateId: candidate.id,
+    promotionValidationAttempts,
+    promotionRetryAuthorization: firstFailureAuthorization || task.promotionRetryAuthorization || null,
     promotionConflictFiles: taskResult.conflicts || [],
   };
 
@@ -1221,6 +1535,15 @@ function taskPatchForPromotion(projectResult, taskResult, now) {
     };
   }
 
+  if (taskResult.status === "evidence_failed") {
+    return {
+      ...patch,
+      status: "promotion_blocked",
+      assignedAgentRole: "promotion-worker",
+      reviewerThreadId: "",
+    };
+  }
+
   if (["push_failed", "pr_failed"].includes(taskResult.status)) {
     return {
       ...patch,
@@ -1231,7 +1554,18 @@ function taskPatchForPromotion(projectResult, taskResult, now) {
     };
   }
 
-  if (["conflict", "blocked", "validation_failed"].includes(taskResult.status)) {
+  if (taskResult.status === "validation_failed") {
+    const retryAuthorized = promotionValidationAttempts < MAX_PROMOTION_VALIDATION_ATTEMPTS
+      && Boolean(firstFailureAuthorization || task.promotionRetryAuthorization);
+    return {
+      ...patch,
+      status: retryAuthorized ? "approved_for_main" : "needs_changes",
+      assignedAgentRole: retryAuthorized ? "promotion-worker" : "builder",
+      reviewerThreadId: "",
+    };
+  }
+
+  if (["conflict", "blocked"].includes(taskResult.status)) {
     return {
       ...patch,
       status: "needs_changes",
@@ -1274,6 +1608,23 @@ async function recordProjectResult(projectResult) {
     state.events = state.events || [];
     state.qaBundles = state.qaBundles || [];
     state.candidates = state.candidates || [];
+    if (projectResult.promotionClaim) {
+      try {
+        if (authoritativePromotionPolicyDigest(state, projectResult) !== projectResult.validationPolicyDigest) {
+          throw new Error("Promotion validation policy changed before result recording.");
+        }
+        terminalPromotionAttemptClaimInState(state, projectResult.promotionClaim, {
+          projectId: projectResult.projectId,
+          candidateId: projectResult.candidate?.id,
+          mode: projectResult.mode,
+          policyDigest: projectResult.validationPolicyDigest,
+          outcome: projectResult.status,
+        });
+      } catch (error) {
+        error.code = "PROMOTION_ATTEMPT_STALE";
+        throw error;
+      }
+    }
     const candidate = state.candidates.find((item) => item.id === projectResult.candidate?.id);
     if (!candidate) throw new Error(`Promotion result has no persisted candidate: ${projectResult.candidate?.id || "missing"}`);
     assertCandidateEnvelope(candidate);
@@ -1343,7 +1694,7 @@ async function recordProjectResult(projectResult) {
         mergedCount += 1;
         mergedTaskIds.add(task.id);
       } else {
-        const patch = taskPatchForPromotion(projectResult, taskResult, now);
+        const patch = taskPatchForPromotion(projectResult, taskResult, now, task, candidate);
         Object.assign(task, patch);
         task.updatedAt = now;
       }
@@ -1451,8 +1802,41 @@ export async function runPromotion(input = {}) {
   }
 
   const results = [];
-  for (const projectPlan of plan.projects) {
-    if (!projectPlan.tasks.length && !projectPlan.blockedTasks.length) continue;
+  for (const plannedProject of plan.projects) {
+    if (!plannedProject.tasks.length && !plannedProject.blockedTasks.length) continue;
+    let projectPlan = plannedProject;
+    if (projectPlan.mode !== "reconcile") {
+      let claimed;
+      try {
+        claimed = await claimProjectPromotionAttempt(projectPlan, input);
+      } catch (error) {
+        results.push({
+          ...projectPlan,
+          status: "claim_unavailable",
+          output: truncateOutput(`Promotion claim rejected authoritative state drift: ${error.message}`),
+          tasks: allTaskResults(projectPlan.tasks, "claim_unavailable", error.message),
+          validation: [],
+          validationEvidence: null,
+        });
+        continue;
+      }
+      if (!claimed.acquired) {
+        results.push({
+          ...projectPlan,
+          status: "claim_busy",
+          output: "Another fenced promotion attempt already owns this immutable candidate.",
+          tasks: allTaskResults(projectPlan.tasks, "claim_busy", "Another fenced promotion attempt is active."),
+          validation: [],
+          validationEvidence: null,
+        });
+        continue;
+      }
+      projectPlan = {
+        ...projectPlan,
+        promotionClaim: claimed.claim,
+        promotionRecoveryReceipt: claimed.receipt || null,
+      };
+    }
     let authContext = null;
     let result = null;
     try {
@@ -1462,6 +1846,36 @@ export async function runPromotion(input = {}) {
         ...input,
         env: githubAppAuthEnv(authContext, input.env || {}),
         secrets,
+        beforeValidationCommand: projectPlan.promotionClaim
+          ? async () => {
+              const renewed = await renewProjectPromotionAttempt(projectPlan, projectPlan.promotionClaim, input);
+              projectPlan.promotionClaim = renewed;
+              return renewed;
+            }
+          : null,
+        renewPromotionClaim: projectPlan.promotionClaim
+          ? async () => {
+              const renewed = await renewProjectPromotionAttempt(projectPlan, projectPlan.promotionClaim, input);
+              projectPlan.promotionClaim = renewed;
+              return renewed;
+            }
+          : null,
+        assertPromotionClaim: projectPlan.promotionClaim
+          ? async () => assertProjectPromotionAttempt(projectPlan, projectPlan.promotionClaim, input)
+          : null,
+        recordRecoveryReceipt: projectPlan.promotionClaim
+          ? async (validationResults) => {
+              const recorded = await recordProjectPromotionRecoveryReceipt(
+                projectPlan,
+                projectPlan.promotionClaim,
+                validationResults,
+                input,
+              );
+              projectPlan.promotionClaim = recorded.claim;
+              projectPlan.promotionRecoveryReceipt = recorded.receipt;
+              return recorded;
+            }
+          : null,
       };
       result = projectPlan.mode === "reconcile"
         ? await reconcilePromotionProject(projectPlan, options)
@@ -1471,7 +1885,14 @@ export async function runPromotion(input = {}) {
     } finally {
       await cleanupGitHubAppAuth(authContext);
     }
-    await recordProjectResult(result);
+    try {
+      await recordProjectResult(result);
+    } catch (error) {
+      if (error.code !== "PROMOTION_ATTEMPT_STALE") throw error;
+      result.status = "stale_result_discarded";
+      result.output = truncateOutput(`Promotion result was discarded without overwriting newer state: ${error.message}`);
+      result.tasks = allTaskResults(projectPlan.tasks, "stale_result_discarded", result.output);
+    }
     results.push(result);
   }
 

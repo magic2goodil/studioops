@@ -884,6 +884,44 @@ test("SQLite rejects mutation of a frozen candidate manifest and rolls back atom
       /qaDecision record is append-only/,
     );
 
+    const promotionValidationRecoveryReceipt = {
+      schemaVersion: "studioops.promotion-validation-recovery.v1",
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      integrationBranch: candidate.manifest.integration.branch,
+      integrationSha,
+      policyDigest: `sha256:${"1".repeat(64)}`,
+      validationResultDigest: `sha256:${"2".repeat(64)}`,
+      validatedAt: "2026-07-25T12:45:00.000Z",
+    };
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.candidates[0].promotionValidationRecoveryReceipt = ${JSON.stringify(promotionValidationRecoveryReceipt)};
+      });
+    `);
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState((state) => {
+          state.candidates[0].promotionValidationRecoveryReceipt = {
+            ...state.candidates[0].promotionValidationRecoveryReceipt,
+            validationResultDigest: "sha256:${"3".repeat(64)}"
+          };
+        });
+      `),
+      /promotionValidationRecoveryReceipt record is append-only/,
+    );
+    await assert.rejects(
+      () => runStoreScript(root, `
+        import { readState, writeState } from ${JSON.stringify(storeModuleUrl)};
+        const state = await readState();
+        delete state.candidates[0].promotionValidationRecoveryReceipt;
+        await writeState(state);
+      `),
+      /promotionValidationRecoveryReceipt record is append-only/,
+    );
+
     const promotion = {
       branch: "qa/promotion-demo",
       prUrl: "https://github.com/example/demo/pull/1",

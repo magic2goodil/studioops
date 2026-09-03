@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
-import { planPromotions } from "../src/promotion.js";
+import { planPromotions, truncateOutput } from "../src/promotion.js";
+import { promotionValidationPolicyDigest } from "../src/promotion-validation-evidence.js";
 import { readPersistedState } from "./state-database-helper.js";
 
 const execFileAsync = promisify(execFile);
@@ -245,6 +246,73 @@ test("promotion planning requires a complete candidate-level QA pass, not a stat
   assert.equal(redirected.enabled, false);
   assert.equal(redirected.targetBranch, "main");
   assert.match(redirected.skipReason, /does not match candidate base/);
+});
+
+test("promotion planning permits one exact-candidate validation retry without discarding QA evidence", () => {
+  const fixture = {
+    baseSha: "a".repeat(40),
+    sourceSha: "b".repeat(40),
+    integrationSha: "b".repeat(40),
+  };
+  const candidate = candidateFixture({ ...fixture, status: "qa_passed" });
+  const policyDigest = promotionValidationPolicyDigest({ commands: [], timeoutMs: 600_000 });
+  const task = {
+    id: "task_1",
+    projectId: "project_1",
+    status: "approved_for_main",
+    promotionStatus: "validation_failed",
+    candidateId: candidate.id,
+    qaBundleId: candidate.qaBundleId,
+    reviewSubjectSha: fixture.sourceSha,
+    reviewSubjectCycle: 1,
+    stateVersion: 1,
+    promotionValidationCandidateId: candidate.id,
+    promotionValidationAttempts: 1,
+    promotionRetryAuthorization: {
+      schemaVersion: "studioops.promotion-retry-authorization.v1",
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      integrationSha: candidate.manifest.integration.sha,
+      policyDigest,
+      firstEvidenceDigest: `sha256:${"d".repeat(64)}`,
+      independentResult: "validation_failed",
+      authorizedBy: "studioops-promotion-worker",
+      authorizedAt: "2026-07-25T12:31:00.000Z",
+    },
+  };
+  const state = baseState({
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath: "/tmp/demo",
+      defaultBranch: "main",
+    }],
+    tasks: [task],
+    candidates: [candidate],
+  });
+
+  const retry = planPromotions(state);
+  assert.equal(retry.projects.length, 1);
+  assert.equal(retry.projects[0].mode, "retry");
+  assert.equal(retry.projects[0].tasks[0].promotionValidationAttempts, 1);
+  assert.equal(candidate.status, "qa_passed");
+  assert.equal(candidate.invalidation, null);
+
+  task.promotionValidationAttempts = 2;
+  assert.equal(planPromotions(state).projects.length, 0);
+
+  task.promotionValidationAttempts = 1;
+  task.reviewSubjectSha = "c".repeat(40);
+  assert.equal(planPromotions(state).projects.length, 0);
+});
+
+test("promotion output keeps the failure tail when bounded", () => {
+  const output = truncateOutput(`START\n${"x".repeat(500)}\nFAILURE SUMMARY`, 160);
+  assert.match(output, /^START/);
+  assert.match(output, /\.\.\.\[truncated\]\.\.\./);
+  assert.match(output, /FAILURE SUMMARY$/);
+  assert.equal(output.length, 160);
 });
 
 test("promotion planning retains persisted release candidates for reconciliation", () => {
@@ -660,7 +728,7 @@ test("owner QA cannot pass only part of a multi-task candidate", async () => {
   }
 });
 
-test("promotion creates a validated release-candidate PR without updating main", async () => {
+test("promotion retries one exact QA candidate with scrubbed validation credentials without updating main", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-promotion-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
@@ -696,6 +764,32 @@ test("promotion creates a validated release-candidate PR without updating main",
       integrationSha: sourceSha,
       status: "qa_passed",
     });
+    const blockedValidationKeys = [
+      "GH_TOKEN",
+      "GH_ENTERPRISE_TOKEN",
+      "GITHUB_TOKEN",
+      "GIT_ASKPASS",
+      "GIT_CONFIG_PARAMETERS",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_VALUE_0",
+      "GIT_SSH_COMMAND",
+      "GIT_TERMINAL_PROMPT",
+      "SSH_AUTH_SOCK",
+      "MISSION_CONTROL_GITHUB_APP_AUTH",
+      "MISSION_CONTROL_GITHUB_TOKEN",
+      "MISSION_CONTROL_GIT_USERNAME",
+      "STUDIOOPS_GITHUB_PRIVATE_KEY",
+      "GITHUB_APP_ID",
+      "GITHUB_INSTALLATION_ID",
+      "GITHUB_PRIVATE_KEY",
+    ];
+    const validationProbe = `const blocked = ${JSON.stringify(blockedValidationKeys)}; if (blocked.some((key) => process.env[key]) || process.env.SAFE_VALIDATION_MARKER !== "preserved") process.exit(23)`;
+    const validationCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(validationProbe)} && test -f feature.txt`;
+    const validationPolicyDigest = promotionValidationPolicyDigest({
+      commands: [validationCommand],
+      timeoutMs: 600_000,
+    });
     await writeState(root, baseState({
       projects: [
         {
@@ -705,7 +799,7 @@ test("promotion creates a validated release-candidate PR without updating main",
           repoPath,
           repoUrl: "",
           defaultBranch: "main",
-          validationCommands: ["test -f feature.txt"],
+          validationCommands: [validationCommand],
           promotion: {
             enabled: true,
             targetBranch: "main",
@@ -718,11 +812,27 @@ test("promotion creates a validated release-candidate PR without updating main",
           projectId: "project_1",
           title: "Feature task",
           status: "approved_for_main",
+          stateVersion: 1,
           branchName: "feature/task",
           prUrl: "",
-          promotionStatus: "queued",
+          promotionStatus: "validation_failed",
+          reviewSubjectSha: sourceSha,
+          reviewSubjectCycle: 1,
           qaBundleId: "qa_bundle_1",
           candidateId: candidate.id,
+          promotionValidationCandidateId: candidate.id,
+          promotionValidationAttempts: 1,
+          promotionRetryAuthorization: {
+            schemaVersion: "studioops.promotion-retry-authorization.v1",
+            candidateId: candidate.id,
+            manifestDigest: candidate.manifestDigest,
+            integrationSha: candidate.manifest.integration.sha,
+            policyDigest: validationPolicyDigest,
+            firstEvidenceDigest: `sha256:${"e".repeat(64)}`,
+            independentResult: "validation_failed",
+            authorizedBy: "studioops-promotion-worker",
+            authorizedAt: "2026-07-25T12:31:00.000Z",
+          },
         },
       ],
       qaBundles: [
@@ -744,7 +854,28 @@ test("promotion creates a validated release-candidate PR without updating main",
       const report = await runPromotion({
         githubAppAuth: false,
         promotionWorkspaceRoot: ${JSON.stringify(path.join(root, "promotion-workspaces"))},
-        env: { PATH: ${JSON.stringify(`${fakeBin}:/usr/local/bin:/usr/bin:/bin`)} }
+        env: {
+          PATH: ${JSON.stringify(`${fakeBin}:/usr/local/bin:/usr/bin:/bin`)},
+          GH_TOKEN: "secret-gh-token",
+          GH_ENTERPRISE_TOKEN: "secret-gh-enterprise-token",
+          GITHUB_TOKEN: "secret-github-token",
+          GIT_ASKPASS: "/tmp/secret-askpass",
+          GIT_CONFIG_PARAMETERS: "'http.extraheader=secret'",
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "credential.helper",
+          GIT_CONFIG_VALUE_0: "secret-helper",
+          GIT_SSH_COMMAND: "ssh -i /tmp/secret-key",
+          GIT_TERMINAL_PROMPT: "0",
+          MISSION_CONTROL_GITHUB_TOKEN: "secret-mission-token",
+          MISSION_CONTROL_GITHUB_APP_AUTH: "1",
+          MISSION_CONTROL_GIT_USERNAME: "x-access-token",
+          STUDIOOPS_GITHUB_PRIVATE_KEY: "secret-private-key",
+          GITHUB_APP_ID: "123",
+          GITHUB_INSTALLATION_ID: "456",
+          GITHUB_PRIVATE_KEY: "secret-github-private-key",
+          SSH_AUTH_SOCK: "/tmp/secret-ssh-agent",
+          SAFE_VALIDATION_MARKER: "preserved"
+        }
       });
       console.log(JSON.stringify(report));
     `;
@@ -752,20 +883,244 @@ test("promotion creates a validated release-candidate PR without updating main",
     const report = JSON.parse(runResult.stdout.trim());
     const state = readPersistedState(root);
 
+    assert.equal(report.projects[0].mode, "retry");
     assert.equal(report.projects[0].status, "pr_ready", report.projects[0].output);
     assert.equal(report.projects[0].tasks[0].status, "pr_ready");
     assert.equal(report.projects[0].prUrl, "https://github.com/example/demo/pull/42");
     assert.equal(state.tasks[0].status, "user_review");
     assert.equal(state.tasks[0].promotionStatus, "pr_ready");
+    assert.equal(state.tasks[0].promotionValidationCandidateId, candidate.id);
+    assert.equal(state.tasks[0].promotionValidationAttempts, 2);
     assert.equal(state.tasks[0].promotionPrUrl, "https://github.com/example/demo/pull/42");
     assert.equal(state.qaBundles[0].status, "release_candidate_ready");
     assert.equal(state.qaBundles[0].promotionPrUrl, "https://github.com/example/demo/pull/42");
     assert.equal(state.candidates[0].status, "release_candidate_ready");
+    assert.equal(state.candidates[0].promotionValidationRecoveryReceipt.policyDigest, validationPolicyDigest);
     assert.equal(state.candidates[0].promotion.commitSha, sourceSha);
     assert.ok(report.projects[0].promotionBranch);
     assert.ok(await git(root, ["--git-dir", remotePath, "rev-parse", `refs/heads/${report.projects[0].promotionBranch}`]));
     await assert.rejects(() => git(root, ["--git-dir", remotePath, "show", "refs/heads/main:feature.txt"]));
     assert.equal(state.events.some((event) => event.type === "release_candidate_ready"), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion records complete private failure evidence and exhausts one bounded exact-candidate retry", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-promotion-bounded-retry-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+
+  try {
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await configureRepo(repoPath);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "main"]);
+
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "feature.txt"), "feature\n", "utf8");
+    await git(repoPath, ["add", "feature.txt"]);
+    await git(repoPath, ["commit", "-m", "feature"]);
+    const sourceSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "feature/task"]);
+    await git(repoPath, ["branch", "qa/candidate-demo"]);
+    await git(repoPath, ["push", "origin", "qa/candidate-demo"]);
+
+    const candidate = candidateFixture({
+      baseSha,
+      sourceSha,
+      integrationSha: sourceSha,
+      status: "qa_passed",
+    });
+    const secret = "promotion-output-secret-value";
+    const validationProgram = [
+      'console.log("HEAD-SENTINEL")',
+      `console.log("${"x".repeat(5_000)}")`,
+      'console.log("MIDDLE-SENTINEL")',
+      'console.log("password=" + process.env.SAFE_TEST_SECRET)',
+      'console.error("TAIL-SENTINEL")',
+      "process.exit(7)",
+    ].join(";");
+    const validationCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(validationProgram)}`;
+    await writeState(root, baseState({
+      projects: [{
+        id: "project_1",
+        key: "demo",
+        name: "Demo",
+        repoPath,
+        defaultBranch: "main",
+        validationCommands: [validationCommand],
+        promotion: { enabled: true, targetBranch: "main" },
+      }],
+      tasks: [{
+        id: "task_1",
+        projectId: "project_1",
+        title: "Feature task",
+        status: "approved_for_main",
+        stateVersion: 1,
+        branchName: "feature/task",
+        promotionStatus: "queued",
+        reviewSubjectSha: sourceSha,
+        reviewSubjectCycle: 1,
+        qaBundleId: "qa_bundle_1",
+        candidateId: candidate.id,
+      }],
+      qaBundles: [{
+        id: "qa_bundle_1",
+        projectId: "project_1",
+        status: "passed",
+        candidateId: candidate.id,
+        manifestDigest: candidate.manifestDigest,
+        tasks: [{ id: "task_1", title: "Feature task" }],
+      }],
+      candidates: [candidate],
+    }));
+
+    const runScript = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        promotionWorkspaceRoot: ${JSON.stringify(path.join(root, "promotion-workspaces"))},
+        env: { SAFE_TEST_SECRET: ${JSON.stringify(secret)} }
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const firstRun = await run(process.execPath, ["--input-type=module", "-e", runScript], { cwd: root });
+    const firstReport = JSON.parse(firstRun.stdout.trim());
+    const firstState = readPersistedState(root);
+    const evidence = firstState.tasks[0].promotionValidation.evidence;
+    const evidenceText = await readFile(evidence.path, "utf8");
+    const evidenceInfo = await stat(evidence.path);
+
+    assert.equal(firstReport.projects[0].status, "validation_failed");
+    assert.equal(firstState.tasks[0].status, "approved_for_main");
+    assert.equal(firstState.tasks[0].assignedAgentRole, "promotion-worker");
+    assert.equal(firstState.tasks[0].promotionValidationAttempts, 1);
+    assert.equal(firstState.tasks[0].promotionRetryAuthorization.firstEvidenceDigest, evidence.digest);
+    assert.equal(firstState.candidates[0].status, "qa_passed");
+    assert.equal(evidenceInfo.mode & 0o777, 0o600);
+    assert.match(evidenceText, /HEAD-SENTINEL/);
+    assert.match(evidenceText, /MIDDLE-SENTINEL/);
+    assert.match(evidenceText, /TAIL-SENTINEL/);
+    assert.equal(evidenceText.includes(secret), false);
+    assert.equal(JSON.stringify(firstReport).includes(secret), false);
+    assert.equal(JSON.stringify(firstState.tasks[0].promotionValidation).includes(secret), false);
+    assert.equal(planPromotions(firstState).projects[0].mode, "retry");
+
+    const secondRun = await run(process.execPath, ["--input-type=module", "-e", runScript], { cwd: root });
+    const secondReport = JSON.parse(secondRun.stdout.trim());
+    const secondState = readPersistedState(root);
+    assert.equal(secondReport.projects[0].mode, "retry");
+    assert.equal(secondReport.projects[0].status, "validation_failed");
+    assert.equal(secondState.tasks[0].promotionValidationAttempts, 2);
+    assert.equal(secondState.tasks[0].status, "needs_changes");
+    assert.equal(secondState.tasks[0].assignedAgentRole, "builder");
+    assert.equal(planPromotions(secondState).projects.length, 0);
+    assert.equal(await git(remotePath, ["for-each-ref", "--format=%(refname)", "refs/heads/qa/promotion-"]), "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion discards a stale claimed result before push when task state changes during validation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-promotion-claim-drift-"));
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+
+  try {
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await configureRepo(repoPath);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "main"]);
+
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "feature.txt"), "feature\n", "utf8");
+    await git(repoPath, ["add", "feature.txt"]);
+    await git(repoPath, ["commit", "-m", "feature"]);
+    const sourceSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "feature/task"]);
+    await git(repoPath, ["branch", "qa/candidate-demo"]);
+    await git(repoPath, ["push", "origin", "qa/candidate-demo"]);
+
+    const candidate = candidateFixture({
+      baseSha,
+      sourceSha,
+      integrationSha: sourceSha,
+      status: "qa_passed",
+    });
+    const mutationProgram = `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.tasks[0].status = "needs_changes";
+        state.tasks[0].assignedAgentRole = "builder";
+      });
+    `;
+    const mutationPath = path.join(root, "mutate-promotion-state.mjs");
+    await writeFile(mutationPath, mutationProgram, "utf8");
+    const validationCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(mutationPath)}`;
+    await writeState(root, baseState({
+      projects: [{
+        id: "project_1",
+        key: "demo",
+        name: "Demo",
+        repoPath,
+        defaultBranch: "main",
+        validationCommands: [validationCommand],
+        promotion: { enabled: true, targetBranch: "main" },
+      }],
+      tasks: [{
+        id: "task_1",
+        projectId: "project_1",
+        title: "Feature task",
+        status: "approved_for_main",
+        stateVersion: 1,
+        branchName: "feature/task",
+        promotionStatus: "queued",
+        reviewSubjectSha: sourceSha,
+        reviewSubjectCycle: 1,
+        qaBundleId: "qa_bundle_1",
+        candidateId: candidate.id,
+      }],
+      qaBundles: [{
+        id: "qa_bundle_1",
+        projectId: "project_1",
+        status: "passed",
+        candidateId: candidate.id,
+        manifestDigest: candidate.manifestDigest,
+        tasks: [{ id: "task_1", title: "Feature task" }],
+      }],
+      candidates: [candidate],
+    }));
+
+    const script = `
+      import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
+      const report = await runPromotion({
+        githubAppAuth: false,
+        promotionWorkspaceRoot: ${JSON.stringify(path.join(root, "promotion-workspaces"))}
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const report = JSON.parse(runResult.stdout.trim());
+    const state = readPersistedState(root);
+
+    assert.equal(report.projects[0].status, "stale_result_discarded", JSON.stringify(report.projects[0]));
+    assert.match(report.projects[0].output, /without overwriting newer state/);
+    assert.equal(state.tasks[0].status, "needs_changes");
+    assert.equal(state.tasks[0].assignedAgentRole, "builder");
+    assert.equal(state.tasks[0].promotionStatus, "queued");
+    assert.equal(state.candidates[0].status, "qa_passed");
+    assert.equal(await git(remotePath, ["for-each-ref", "--format=%(refname)", "refs/heads/qa/promotion-"]), "");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1009,10 +1364,13 @@ test("promotion rechecks and invalidates a source ref that drifts during validat
         projectId: "project_1",
         title: "Feature task",
         status: "approved_for_main",
+        stateVersion: 1,
         branchName: "feature/task",
         promotionStatus: "queued",
         qaBundleId: "qa_bundle_1",
         candidateId: candidate.id,
+        reviewSubjectSha: reviewedSourceSha,
+        reviewSubjectCycle: 1,
       }],
       qaBundles: [{
         id: "qa_bundle_1",
@@ -1102,10 +1460,13 @@ test("promotion invalidates the candidate when its staged integration branch dri
         projectId: "project_1",
         title: "Feature task",
         status: "approved_for_main",
+        stateVersion: 1,
         branchName: "feature/task",
         promotionStatus: "queued",
         qaBundleId: "qa_bundle_1",
         candidateId: candidate.id,
+        reviewSubjectSha: sourceSha,
+        reviewSubjectCycle: 1,
       }],
       qaBundles: [{
         id: "qa_bundle_1",
