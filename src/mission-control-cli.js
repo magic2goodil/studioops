@@ -462,6 +462,9 @@ Task fields:
   --story                       User story, such as "As a customer..."
   --expected                    Expected outcome or feature behavior
   --criteria                    Acceptance criteria, comma or newline separated
+  --affected-surfaces           User-facing or operational surfaces affected, comma or newline separated
+  --validation-plan             Required validation evidence, comma or newline separated
+  --risk-classification         Delivery risk classification
   --attachment                  Image, screenshot, mockup, URL, or reference path
   --delivery-mode               functional, prototype, or visual-only
   --architecture-required       Route this task through systems architecture before builders
@@ -800,6 +803,9 @@ Automation:
       dependsOnTaskIds: args["depends-on"] || args.dependencies,
       userStory: args.story || args["user-story"],
       expectedOutcome: args.expected || args["expected-outcome"],
+      affectedSurfaces: args["affected-surfaces"] || args.surfaces,
+      validationPlan: args["validation-plan"] || args.validation,
+      riskClassification: args["risk-classification"] || args.risk,
       attachments: args.attachment || args.attachments,
       acceptanceCriteria: args.criteria,
       deliveryMode: args["delivery-mode"],
@@ -858,6 +864,12 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "dependencies")) patch.dependsOnTaskIds = args.dependencies;
     if (Object.prototype.hasOwnProperty.call(args, "story")) patch.userStory = args.story;
     if (Object.prototype.hasOwnProperty.call(args, "expected")) patch.expectedOutcome = args.expected;
+    if (Object.prototype.hasOwnProperty.call(args, "affected-surfaces")) patch.affectedSurfaces = args["affected-surfaces"];
+    if (Object.prototype.hasOwnProperty.call(args, "surfaces")) patch.affectedSurfaces = args.surfaces;
+    if (Object.prototype.hasOwnProperty.call(args, "validation-plan")) patch.validationPlan = args["validation-plan"];
+    if (Object.prototype.hasOwnProperty.call(args, "validation")) patch.validationPlan = args.validation;
+    if (Object.prototype.hasOwnProperty.call(args, "risk-classification")) patch.riskClassification = args["risk-classification"];
+    if (Object.prototype.hasOwnProperty.call(args, "risk")) patch.riskClassification = args.risk;
     if (Object.prototype.hasOwnProperty.call(args, "criteria")) patch.acceptanceCriteria = args.criteria;
     if (Object.prototype.hasOwnProperty.call(args, "attachment")) patch.attachments = args.attachment;
     if (Object.prototype.hasOwnProperty.call(args, "delivery-mode")) patch.deliveryMode = args["delivery-mode"];
