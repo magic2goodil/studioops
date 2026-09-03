@@ -27,7 +27,7 @@ import {
   runQueuedRuns,
 } from "../src/runner.js";
 import { materializeLocalCandidate } from "../src/workspace.js";
-import { eligibleRunWorkspaceSnapshotsInState } from "../src/store.js";
+import { eligibleRunWorkspaceSnapshotsInState, resumeBudgetPauseInState } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -192,6 +192,37 @@ test("runner does not launch queued work for a task paused after preserving an o
   const report = planRunnableRuns(state, { limit: 1 });
   assert.deepEqual(report.runnable, []);
   assert.equal(report.skipped[0].reason, "budget_pause");
+});
+
+test("owner can resume a preserved budget handoff with compare-and-set evidence", () => {
+  const state = {
+    projects: [{ id: "project_budget_pause" }],
+    tasks: [{
+      id: "task_budget_pause",
+      projectId: "project_budget_pause",
+      title: "Preserved task",
+      status: "queued",
+      stateVersion: 1,
+      budgetPause: { runId: "run_old", resumeStatus: "queued" },
+    }],
+    runs: [{ id: "run_next", taskId: "task_budget_pause", projectId: "project_budget_pause", group: "builder", status: "queued" }],
+    comments: [], reviews: [], events: [], candidates: [], qaBundles: [],
+  };
+  assert.throws(
+    () => resumeBudgetPauseInState(state, { task: "task_budget_pause", expectedRunId: "run_wrong" }),
+    /preserved run changed/,
+  );
+  const task = resumeBudgetPauseInState(state, {
+    task: "task_budget_pause",
+    expectedRunId: "run_old",
+    reason: "Owner verified the preserved handoff.",
+    now: "2026-09-03T13:00:00.000Z",
+  });
+  assert.equal(task.budgetPause, undefined);
+  assert.equal(task.automationAttemptEpoch, 1);
+  assert.equal(task.stateVersion, 2);
+  assert.equal(state.events.at(-1).type, "budget_pause_resumed");
+  assert.equal(planRunnableRuns(state, { limit: 1 }).runnable[0].id, "run_next");
 });
 
 async function git(repoPath, args) {

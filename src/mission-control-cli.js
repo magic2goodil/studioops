@@ -16,6 +16,7 @@ import {
   readState,
   readStateReadOnly,
   resetAutomationCircuit,
+  resumeBudgetPause,
   resumeOperatorAutomation,
   setOperatorPause,
   updateProject,
@@ -440,6 +441,7 @@ Commands:
   automation-pause              Pause new builder and reviewer work
   automation-resume             Resume builder and reviewer work after verification
   circuit-reset                 Reset one verified task or project circuit using its expected generation
+  budget-resume TASK_ID         Resume a preserved over-budget handoff after owner review
   supervisor                    Show next builder, reviewer, dependency, and owner actions
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
@@ -499,6 +501,7 @@ Automation:
   studioops automation-pause --reason "Incident investigation"
   studioops automation-resume --reason "Database and workers verified"
   studioops circuit-reset --task task_101 --expected-opened-at 2026-01-01T00:00:00.000Z --reason "Credentials verified"
+  studioops budget-resume task_101 --expected-run-id run_55 --reason "Preserved handoff verified"
   studioops status task_1 --status builder_review --subject-sha SHA --tree-sha TREE --base-sha BASE --branch feature/x --impact-files src/x.js
   studioops supervisor --json
   studioops dispatcher --plan
@@ -922,6 +925,21 @@ Automation:
     }
     const task = await updateTask(taskId, patch);
     console.log(`${task.id} -> ${task.status}`);
+    return;
+  }
+
+  if (command === "budget-resume") {
+    const taskId = args._[1];
+    if (!taskId || !String(args["expected-run-id"] || "").trim()) {
+      throw new Error("Usage: budget-resume TASK_ID --expected-run-id RUN_ID --reason VERIFIED_REASON");
+    }
+    const task = await resumeBudgetPause({
+      task: taskId,
+      expectedRunId: args["expected-run-id"],
+      reason: args.reason,
+      author: args.author,
+    });
+    console.log(`Budget continuation resumed for ${task.id}: ${task.status}`);
     return;
   }
 
