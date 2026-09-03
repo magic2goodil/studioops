@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +17,9 @@ import {
   boundedHeadTail,
   persistPromotionValidationEvidence,
   promotionValidationPolicyDigest,
+  redactPromotionValidationText,
   scrubProjectRepositoryCredentials,
+  verifyPromotionValidationEvidence,
 } from "../src/promotion-validation-evidence.js";
 
 const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -70,6 +81,20 @@ test("private promotion evidence preserves complete redacted output with verifie
     assert.equal(JSON.stringify(evidence).includes(head), false);
     assert.equal(JSON.stringify(evidence).includes(middle), false);
     assert.equal(JSON.stringify(evidence).includes(tail), false);
+    assert.deepEqual(
+      await verifyPromotionValidationEvidence(evidence, { root }),
+      {
+        verified: true,
+        path: evidence.path,
+        digest: evidence.digest,
+        bytes: evidence.bytes,
+        candidateId: evidence.candidateId,
+        manifestDigest: evidence.manifestDigest,
+        integrationSha: evidence.integrationSha,
+        attempt: evidence.attempt,
+        policyDigest: evidence.policyDigest,
+      },
+    );
 
     await assert.rejects(
       persistPromotionValidationEvidence({
@@ -86,6 +111,136 @@ test("private promotion evidence preserves complete redacted output with verifie
       /destination already exists/,
     );
     assert.deepEqual(await readFile(evidence.path), stored);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("promotion validation redaction removes complete credential-bearing HTTP header values", () => {
+  const probes = [
+    ["Authorization: Basic dXNlcjpzZWNyZXQ=", "dXNlcjpzZWNyZXQ="],
+    ["authorization: Digest username=\"admin\", response=\"raw-digest\"", "raw-digest"],
+    ["Proxy-Authorization: Negotiate raw-proxy-value", "raw-proxy-value"],
+    ["Cookie: sessionid=raw-cookie; csrftoken=raw-csrf", "raw-cookie"],
+    ["Set-Cookie: auth=raw-set-cookie; HttpOnly; Secure", "raw-set-cookie"],
+    ["prefix\n\tAuthorization : Bearer raw-multiline-token\nsuffix", "raw-multiline-token"],
+  ];
+
+  for (const [probe, rawValue] of probes) {
+    const redacted = redactPromotionValidationText(probe);
+    assert.equal(redacted.includes(rawValue), false, probe);
+    assert.match(redacted, /\[REDACTED\]/);
+  }
+  assert.equal(
+    redactPromotionValidationText("Authorization: Basic dXNlcjpzZWNyZXQ="),
+    "Authorization: [REDACTED]",
+  );
+  assert.equal(
+    redactPromotionValidationText("Cookie: sessionid=raw-cookie; theme=light"),
+    "Cookie: [REDACTED]",
+  );
+  assert.equal(
+    redactPromotionValidationText("token=raw-assignment"),
+    "token=[REDACTED]",
+  );
+});
+
+test("same-destination promotion evidence persistence has exactly one concurrent winner", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "studioops-promotion-evidence-exclusive-"));
+  const root = path.join(temporary, "private-evidence", "promotion-validation");
+  const input = {
+    root,
+    candidateId: "candidate_concurrent",
+    manifestDigest: MANIFEST_DIGEST,
+    integrationSha: INTEGRATION_SHA,
+    attempt: 1,
+    policyDigest: promotionValidationPolicyDigest({ commands: ["npm test"], timeoutMs: 600_000 }),
+    createdAt: "2026-09-03T16:00:00.000Z",
+    idFactory: () => "same-id",
+    commands: [{ command: "npm test", ok: true, output: "passed" }],
+  };
+
+  try {
+    const outcomes = await Promise.allSettled([
+      persistPromotionValidationEvidence(input),
+      persistPromotionValidationEvidence(input),
+    ]);
+    const fulfilled = outcomes.filter((outcome) => outcome.status === "fulfilled");
+    const rejected = outcomes.filter((outcome) => outcome.status === "rejected");
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.match(String(rejected[0].reason?.message || rejected[0].reason), /EEXIST|exist/i);
+    await verifyPromotionValidationEvidence(fulfilled[0].value, { root });
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("promotion evidence verification fails closed for tamper, missing, symlink, path, mode, and identity drift", async () => {
+  const temporary = await mkdtemp(path.join(os.tmpdir(), "studioops-promotion-evidence-verify-"));
+  const root = path.join(temporary, "private-evidence", "promotion-validation");
+  const policyDigest = promotionValidationPolicyDigest({ commands: ["npm test"], timeoutMs: 600_000 });
+
+  try {
+    const evidence = await persistPromotionValidationEvidence({
+      root,
+      candidateId: "candidate_verify",
+      manifestDigest: MANIFEST_DIGEST,
+      integrationSha: INTEGRATION_SHA,
+      attempt: 1,
+      policyDigest,
+      createdAt: "2026-09-03T16:00:00.000Z",
+      idFactory: () => "verify-id",
+      commands: [{ command: "npm test", ok: true, output: "passed" }],
+    });
+    const original = await readFile(evidence.path);
+
+    await assert.rejects(
+      verifyPromotionValidationEvidence({ ...evidence, candidateId: "candidate_drift" }, { root }),
+      /identity does not match/,
+    );
+    await assert.rejects(
+      verifyPromotionValidationEvidence({ ...evidence, bytes: 512 * 1024 * 1024 + 1 }, { root }),
+      /verification limit/,
+    );
+    await assert.rejects(
+      verifyPromotionValidationEvidence({ ...evidence, path: path.join(temporary, "outside.json") }, { root }),
+      /direct child/,
+    );
+    await assert.rejects(
+      verifyPromotionValidationEvidence({ ...evidence, path: "x".repeat(4_097) }, { root }),
+      /exceeds 4096/,
+    );
+
+    const symlinkPath = path.join(root, "candidate_verify-attempt-1-symlink.json");
+    await symlink(evidence.path, symlinkPath);
+    await assert.rejects(
+      verifyPromotionValidationEvidence({ ...evidence, path: symlinkPath }, { root }),
+      /not a regular file/,
+    );
+    await unlink(symlinkPath);
+
+    await chmod(evidence.path, 0o644);
+    await assert.rejects(
+      verifyPromotionValidationEvidence(evidence, { root }),
+      /not mode 0600/,
+    );
+    await chmod(evidence.path, 0o600);
+
+    const tampered = Buffer.from(original);
+    tampered[tampered.length - 2] = tampered[tampered.length - 2] === 0x20 ? 0x21 : 0x20;
+    await writeFile(evidence.path, tampered, { mode: 0o600 });
+    await assert.rejects(
+      verifyPromotionValidationEvidence(evidence, { root }),
+      /digest verification failed/,
+    );
+    await writeFile(evidence.path, original, { mode: 0o600 });
+
+    await unlink(evidence.path);
+    await assert.rejects(
+      verifyPromotionValidationEvidence(evidence, { root }),
+      /ENOENT/,
+    );
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

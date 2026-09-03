@@ -9,6 +9,19 @@ const MIN_TTL_MS = 1_000;
 const MAX_TTL_MS = 24 * 60 * 60 * 1_000;
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const MODES = new Set(["create", "retry"]);
+const AUTO_RECOVERABLE_PROMOTION_STATUSES = new Set([
+  "auth_failed",
+  "evidence_failed",
+  "pr_failed",
+  "push_failed",
+  "validation_missing",
+]);
+const REPLAYABLE_TERMINAL_OUTCOMES = new Set([
+  "auth_failed",
+  "evidence_failed",
+  "pr_failed",
+  "push_failed",
+]);
 
 function sha256(value) {
   return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
@@ -78,19 +91,46 @@ function retryAuthorization(task) {
   };
 }
 
+function persistedFirstFailureEvidence(task, candidate, policyDigest) {
+  const validation = task?.promotionValidation;
+  const evidence = validation?.evidence;
+  if (
+    !validation
+    || typeof validation !== "object"
+    || Array.isArray(validation)
+    || validation.status !== "validation_failed"
+    || !evidence
+    || typeof evidence !== "object"
+    || Array.isArray(evidence)
+    || task.promotionValidationCandidateId !== candidate.id
+    || evidence.candidateId !== candidate.id
+    || evidence.manifestDigest !== candidate.manifestDigest
+    || evidence.integrationSha !== candidate.manifest.integration.sha
+    || evidence.policyDigest !== policyDigest
+    || evidence.attempt !== 1
+    || !DIGEST_PATTERN.test(String(evidence.digest || ""))
+  ) {
+    return null;
+  }
+  return evidence;
+}
+
 export function validPromotionRetryAuthorization(task, candidate, source, policyDigest) {
   try {
     assertCandidateEnvelope(candidate);
     const authorization = retryAuthorization(task);
+    const expectedPolicyDigest = digest(policyDigest, "promotion validation policy digest");
+    const evidence = persistedFirstFailureEvidence(task, candidate, expectedPolicyDigest);
     return Boolean(
       authorization
+      && evidence
       && task?.status === "approved_for_main"
       && Number(task?.promotionValidationAttempts) === 1
       && authorization.candidateId === candidate.id
       && authorization.manifestDigest === candidate.manifestDigest
       && authorization.integrationSha === candidate.manifest.integration.sha
-      && authorization.policyDigest === digest(policyDigest, "promotion validation policy digest")
-      && DIGEST_PATTERN.test(authorization.firstEvidenceDigest)
+      && authorization.policyDigest === expectedPolicyDigest
+      && authorization.firstEvidenceDigest === evidence.digest
       && source?.taskId === task.id
       && task.candidateId === candidate.id
       && task.qaBundleId === candidate.qaBundleId
@@ -100,6 +140,45 @@ export function validPromotionRetryAuthorization(task, candidate, source, policy
   } catch {
     return false;
   }
+}
+
+function normalizedReceiptEvidence(value, candidate, policyDigest) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Candidate ${candidate.id} has a recovery receipt without private validation evidence.`);
+  }
+  const bytes = Number(value.bytes);
+  const attempt = Number(value.attempt);
+  const commandCount = Number(value.commandCount);
+  const createdAtMs = Date.parse(value.createdAt || "");
+  if (
+    !String(value.path || "").trim()
+    || !DIGEST_PATTERN.test(String(value.digest || ""))
+    || !Number.isSafeInteger(bytes)
+    || bytes < 1
+    || !Number.isSafeInteger(attempt)
+    || attempt < 1
+    || !Number.isSafeInteger(commandCount)
+    || commandCount < 1
+    || !Number.isFinite(createdAtMs)
+    || value.candidateId !== candidate.id
+    || value.manifestDigest !== candidate.manifestDigest
+    || value.integrationSha !== candidate.manifest.integration.sha
+    || value.policyDigest !== policyDigest
+  ) {
+    throw new Error(`Candidate ${candidate.id} has mismatched private validation evidence in its recovery receipt.`);
+  }
+  return {
+    path: String(value.path).trim(),
+    digest: String(value.digest).toLowerCase(),
+    bytes,
+    createdAt: new Date(createdAtMs).toISOString(),
+    candidateId: value.candidateId,
+    manifestDigest: value.manifestDigest,
+    integrationSha: value.integrationSha,
+    attempt,
+    policyDigest: value.policyDigest,
+    commandCount,
+  };
 }
 
 function receiptBinding(candidate, policyDigest) {
@@ -117,7 +196,25 @@ function receiptBinding(candidate, policyDigest) {
   ) {
     throw new Error(`Candidate ${candidate.id} has a mismatched promotion recovery receipt.`);
   }
-  return { receipt, receiptDigest: sha256(receipt) };
+  const validationEvidence = normalizedReceiptEvidence(receipt.validationEvidence, candidate, policyDigest);
+  const normalized = { ...receipt, validationEvidence };
+  return { receipt: normalized, receiptDigest: sha256(normalized) };
+}
+
+export function validPromotionRecoveryReceipt(candidate, policyDigest) {
+  try {
+    assertCandidateEnvelope(candidate);
+    return Boolean(receiptBinding(candidate, digest(policyDigest, "promotion validation policy digest")).receipt);
+  } catch {
+    return false;
+  }
+}
+
+function taskStatusAllowsPromotionClaim(task, attemptMode) {
+  if (task.status === "approved_for_main") return true;
+  return attemptMode === "create"
+    && task.status === "promotion_blocked"
+    && AUTO_RECOVERABLE_PROMOTION_STATUSES.has(String(task.promotionStatus || ""));
 }
 
 function candidateContext(state, input, versionOverride = null) {
@@ -142,7 +239,7 @@ function candidateContext(state, input, versionOverride = null) {
     if (!task) throw new Error(`Candidate source task ${source.taskId} is missing.`);
     if (
       task.projectId !== projectId
-      || task.status !== "approved_for_main"
+      || !taskStatusAllowsPromotionClaim(task, attemptMode)
       || task.candidateId !== candidate.id
       || task.qaBundleId !== candidate.qaBundleId
       || String(task.reviewSubjectSha || "").toLowerCase() !== source.headSha
@@ -223,7 +320,12 @@ export function claimPromotionAttemptInState(state, input = {}) {
   const claims = claimStore(state);
   const existing = claims[context.candidateId];
   if (active(existing, nowMs)) return { acquired: false, claim: structuredClone(existing) };
-  if (existing?.status === "terminal" && existing.mode === context.mode && existing.bindingDigest === context.bindingDigest) {
+  if (
+    existing?.status === "terminal"
+    && existing.mode === context.mode
+    && existing.bindingDigest === context.bindingDigest
+    && !REPLAYABLE_TERMINAL_OUTCOMES.has(existing.outcome)
+  ) {
     return { acquired: false, claim: structuredClone(existing) };
   }
   const factory = input.claimIdFactory || randomUUID;
@@ -314,13 +416,18 @@ function sameReceipt(existing, expected) {
     "integrationSha",
     "policyDigest",
     "validationResultDigest",
-  ].every((field) => existing?.[field] === expected[field]);
+  ].every((field) => existing?.[field] === expected[field])
+    && canonicalJson(existing?.validationEvidence || null) === canonicalJson(expected.validationEvidence);
 }
 
 export function recordPromotionRecoveryReceiptInState(state, claim, input = {}) {
   const checked = assertPromotionAttemptClaimInState(state, claim, input);
-  if (checked.context.mode !== "retry") throw new Error("Promotion recovery receipts are only valid for retry attempts.");
   const results = validationResults(input);
+  const validationEvidence = normalizedReceiptEvidence(
+    input.validationEvidence,
+    checked.context.candidate,
+    checked.context.policyDigest,
+  );
   const expected = {
     schemaVersion: RECEIPT_SCHEMA_VERSION,
     candidateId: checked.context.candidate.id,
@@ -329,6 +436,7 @@ export function recordPromotionRecoveryReceiptInState(state, claim, input = {}) 
     integrationSha: checked.context.candidate.manifest.integration.sha,
     policyDigest: checked.context.policyDigest,
     validationResultDigest: sha256(results),
+    validationEvidence,
   };
   const existing = checked.context.candidate.promotionValidationRecoveryReceipt;
   if (existing) {

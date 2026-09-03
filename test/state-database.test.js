@@ -892,6 +892,18 @@ test("SQLite rejects mutation of a frozen candidate manifest and rolls back atom
       integrationSha,
       policyDigest: `sha256:${"1".repeat(64)}`,
       validationResultDigest: `sha256:${"2".repeat(64)}`,
+      validationEvidence: {
+        path: "/private-evidence/candidate_1-attempt-1.json",
+        digest: `sha256:${"4".repeat(64)}`,
+        bytes: 512,
+        createdAt: "2026-07-25T12:44:00.000Z",
+        candidateId: candidate.id,
+        manifestDigest: candidate.manifestDigest,
+        integrationSha,
+        attempt: 1,
+        policyDigest: `sha256:${"1".repeat(64)}`,
+        commandCount: 1,
+      },
       validatedAt: "2026-07-25T12:45:00.000Z",
     };
     await runStoreScript(root, `

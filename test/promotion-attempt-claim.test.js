@@ -95,7 +95,25 @@ function fixture({ retry = true, multiTask = true } = {}) {
     qaBundleId: candidate.qaBundleId,
     reviewSubjectSha: source.headSha,
     reviewSubjectCycle: source.candidateCycle,
+    promotionValidationCandidateId: candidate.id,
     promotionValidationAttempts: retry ? 1 : 0,
+    promotionValidation: retry ? {
+      status: "validation_failed",
+      commands: [{ command: "npm run check", ok: false, outputDigest: FIRST_EVIDENCE }],
+      evidence: {
+        path: `/private-evidence/${source.taskId}.json`,
+        digest: FIRST_EVIDENCE,
+        bytes: 512,
+        createdAt: "2026-09-03T15:54:00.000Z",
+        candidateId: candidate.id,
+        manifestDigest: candidate.manifestDigest,
+        integrationSha: candidate.manifest.integration.sha,
+        attempt: 1,
+        policyDigest: POLICY,
+        commandCount: 1,
+      },
+      omittedSummaryCount: 0,
+    } : null,
     promotionRetryAuthorization: retry ? {
       schemaVersion: "studioops.promotion-retry-authorization.v1",
       candidateId: candidate.id,
@@ -133,6 +151,22 @@ function validation() {
     { command: "npm run check", ok: true, outputDigest: OUTPUT_A },
     { command: "git diff --check", status: "passed", outputDigest: OUTPUT_B },
   ];
+}
+
+function recoveryEvidence(candidate, overrides = {}) {
+  return {
+    path: "/private-evidence/recovery.json",
+    digest: `sha256:${"a".repeat(64)}`,
+    bytes: 1_024,
+    createdAt: "2026-09-03T16:00:00.000Z",
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationSha: candidate.manifest.integration.sha,
+    attempt: 2,
+    policyDigest: POLICY,
+    commandCount: 2,
+    ...overrides,
+  };
 }
 
 test("candidate-wide atomic claim admits one winner", () => {
@@ -200,12 +234,73 @@ test("retry authorization is exact and durable", () => {
   assert.equal(validPromotionRetryAuthorization(tasks[0], candidate, source, POLICY), false);
 });
 
+test("retry authorization fails closed without persisted first-failure evidence", () => {
+  const missingValidation = fixture({ multiTask: false });
+  const source = missingValidation.candidate.manifest.sources[0];
+  delete missingValidation.tasks[0].promotionValidation;
+  assert.equal(validPromotionRetryAuthorization(
+    missingValidation.tasks[0],
+    missingValidation.candidate,
+    source,
+    POLICY,
+  ), false);
+
+  const missingEvidence = fixture({ multiTask: false });
+  missingEvidence.tasks[0].promotionValidation.evidence = null;
+  assert.equal(validPromotionRetryAuthorization(
+    missingEvidence.tasks[0],
+    missingEvidence.candidate,
+    source,
+    POLICY,
+  ), false);
+});
+
+test("retry authorization rejects fabricated and structurally mismatched first-failure evidence", () => {
+  const cases = [
+    ["authorization digest", ({ task }) => { task.promotionRetryAuthorization.firstEvidenceDigest = `sha256:${"a".repeat(64)}`; }],
+    ["validation status", ({ task }) => { task.promotionValidation.status = "passed"; }],
+    ["validation candidate", ({ task }) => { task.promotionValidationCandidateId = "candidate_other"; }],
+    ["evidence candidate", ({ evidence }) => { evidence.candidateId = "candidate_other"; }],
+    ["manifest", ({ evidence }) => { evidence.manifestDigest = `sha256:${"a".repeat(64)}`; }],
+    ["integration SHA", ({ evidence }) => { evidence.integrationSha = "a".repeat(40); }],
+    ["policy", ({ evidence }) => { evidence.policyDigest = `sha256:${"a".repeat(64)}`; }],
+    ["attempt", ({ evidence }) => { evidence.attempt = 2; }],
+    ["evidence digest", ({ evidence }) => { evidence.digest = `sha256:${"a".repeat(64)}`; }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const current = fixture({ multiTask: false });
+    const task = current.tasks[0];
+    mutate({ task, evidence: task.promotionValidation.evidence });
+    assert.equal(
+      validPromotionRetryAuthorization(
+        task,
+        current.candidate,
+        current.candidate.manifest.sources[0],
+        POLICY,
+      ),
+      false,
+      label,
+    );
+  }
+});
+
+test("retry claim rejects a fabricated evidence authorization", () => {
+  const { state, tasks } = fixture({ multiTask: false });
+  tasks[0].promotionRetryAuthorization.firstEvidenceDigest = `sha256:${"a".repeat(64)}`;
+  assert.throws(
+    () => claimPromotionAttemptInState(state, input()),
+    /lacks an exact promotion retry authorization/i,
+  );
+});
+
 test("recovery receipt advances every task version and rebinds the claim", () => {
   const { state, candidate, tasks } = fixture();
   const claim = claimPromotionAttemptInState(state, input()).claim;
   const recorded = recordPromotionRecoveryReceiptInState(state, claim, {
     ...input(),
     validationResults: validation(),
+    validationEvidence: recoveryEvidence(candidate),
   });
   assert.equal(recorded.reused, false);
   assert.equal(recorded.receipt.candidateId, candidate.id);
@@ -226,6 +321,7 @@ test("exact receipt is reused after takeover and mismatches are rejected", () =>
   const recorded = recordPromotionRecoveryReceiptInState(exact.state, first, {
     ...input(),
     validationResults: validation(),
+    validationEvidence: recoveryEvidence(exact.candidate),
   });
   const takeover = claimPromotionAttemptInState(exact.state, input({
     nowMs: NOW + 10_001,
@@ -234,6 +330,7 @@ test("exact receipt is reused after takeover and mismatches are rejected", () =>
   const reused = recordPromotionRecoveryReceiptInState(exact.state, takeover, {
     ...input({ nowMs: NOW + 10_002 }),
     validationResults: validation(),
+    validationEvidence: recoveryEvidence(exact.candidate),
   });
   assert.equal(reused.reused, true);
   assert.deepEqual(reused.receipt, recorded.receipt);
@@ -243,6 +340,7 @@ test("exact receipt is reused after takeover and mismatches are rejected", () =>
   recordPromotionRecoveryReceiptInState(mismatch.state, mismatchClaim, {
     ...input(),
     validationResults: validation(),
+    validationEvidence: recoveryEvidence(mismatch.candidate),
   });
   const mismatchTakeover = claimPromotionAttemptInState(mismatch.state, input({
     nowMs: NOW + 10_001,
@@ -251,23 +349,33 @@ test("exact receipt is reused after takeover and mismatches are rejected", () =>
   assert.throws(() => recordPromotionRecoveryReceiptInState(mismatch.state, mismatchTakeover, {
     ...input({ nowMs: NOW + 10_002 }),
     validationResults: [{ command: "npm run check", ok: true, outputDigest: OUTPUT_B }],
+    validationEvidence: recoveryEvidence(mismatch.candidate),
   }), /append-only|does not match/i);
 });
 
-test("receipt requires retry mode and all validations to pass", () => {
+test("recovery receipt supports an initial validation and requires exact passing evidence", () => {
   const create = fixture({ retry: false, multiTask: false });
   const createClaim = claimPromotionAttemptInState(create.state, input({ mode: "create" })).claim;
-  assert.throws(() => recordPromotionRecoveryReceiptInState(create.state, createClaim, {
+  const created = recordPromotionRecoveryReceiptInState(create.state, createClaim, {
     ...input({ mode: "create" }),
     validationResults: validation(),
-  }), /only valid for retry/i);
+    validationEvidence: recoveryEvidence(create.candidate, { attempt: 1 }),
+  });
+  assert.equal(created.reused, false);
+  assert.equal(created.receipt.validationEvidence.attempt, 1);
 
   const retry = fixture({ multiTask: false });
   const retryClaim = claimPromotionAttemptInState(retry.state, input()).claim;
   assert.throws(() => recordPromotionRecoveryReceiptInState(retry.state, retryClaim, {
     ...input(),
     validationResults: [{ command: "npm run check", ok: false, outputDigest: OUTPUT_A }],
+    validationEvidence: recoveryEvidence(retry.candidate),
   }), /did not pass/i);
+  assert.throws(() => recordPromotionRecoveryReceiptInState(retry.state, retryClaim, {
+    ...input(),
+    validationResults: validation(),
+    validationEvidence: recoveryEvidence(retry.candidate, { policyDigest: `sha256:${"b".repeat(64)}` }),
+  }), /mismatched private validation evidence/i);
 });
 
 test("only the current claim can become terminal", () => {
@@ -277,4 +385,29 @@ test("only the current claim can become terminal", () => {
   assert.equal(terminal.status, "terminal");
   assert.equal(terminal.outcome, "pr_ready");
   assert.equal(claimPromotionAttemptInState(state, input({ claimIdFactory: () => "claim_2" })).acquired, false);
+});
+
+test("operational promotion failures can reacquire a fenced create claim but human-closed gates cannot", () => {
+  const retryable = fixture({ retry: false, multiTask: false });
+  retryable.tasks[0].status = "promotion_blocked";
+  retryable.tasks[0].promotionStatus = "pr_failed";
+  const first = claimPromotionAttemptInState(retryable.state, input({ mode: "create" })).claim;
+  terminalPromotionAttemptClaimInState(retryable.state, first, {
+    ...input({ mode: "create" }),
+    outcome: "pr_failed",
+  });
+  const replay = claimPromotionAttemptInState(retryable.state, input({
+    mode: "create",
+    claimIdFactory: () => "claim_2",
+  }));
+  assert.equal(replay.acquired, true);
+  assert.equal(replay.claim.fence, first.fence + 1);
+
+  const closed = fixture({ retry: false, multiTask: false });
+  closed.tasks[0].status = "promotion_blocked";
+  closed.tasks[0].promotionStatus = "pr_closed";
+  assert.throws(
+    () => claimPromotionAttemptInState(closed.state, input({ mode: "create" })),
+    /no longer matches the promotion candidate/i,
+  );
 });

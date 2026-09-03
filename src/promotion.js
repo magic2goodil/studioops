@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -24,6 +24,7 @@ import {
   recordPromotionRecoveryReceiptInState,
   renewPromotionAttemptClaimInState,
   terminalPromotionAttemptClaimInState,
+  validPromotionRecoveryReceipt,
   validPromotionRetryAuthorization,
 } from "./promotion-attempt-claim.js";
 import {
@@ -31,7 +32,7 @@ import {
   persistPromotionValidationEvidence,
   promotionValidationPolicyDigest,
   redactPromotionValidationText,
-  scrubProjectRepositoryCredentials,
+  verifyPromotionValidationEvidence,
 } from "./promotion-validation-evidence.js";
 
 const execFileAsync = promisify(execFile);
@@ -50,6 +51,7 @@ const PROMOTION_ATTEMPT_TTL_MS = 30 * 60_000;
 const MAX_VALIDATION_SUMMARIES = 20;
 const MAX_VALIDATION_COMMAND_CHARS = 500;
 const MAX_VALIDATION_OUTPUT_CHARS = 2_000;
+const PROMOTION_VALIDATION_ENVIRONMENT_POLICY_VERSION = "promotion-project-environment-v2-isolated-home";
 const PROMOTION_DEPENDENCY_COMPLETE_STATUSES = new Set([
   "approved",
   "merged",
@@ -67,7 +69,34 @@ function childEnv(options = {}) {
 }
 
 function projectCommandEnv(options = {}) {
-  return scrubProjectRepositoryCredentials(childEnv(options));
+  const validationHome = path.resolve(String(options.validationHome || ""));
+  if (!options.validationHome || validationHome === path.parse(validationHome).root) {
+    throw new Error("Promotion validation requires an isolated non-root HOME.");
+  }
+  const validationPath = String(
+    options.validationPath
+      || options.env?.PATH
+      || options.path
+      || process.env.MISSION_CONTROL_PROMOTION_PATH
+      || DEFAULT_PROMOTION_PATH,
+  );
+  return {
+    PATH: validationPath,
+    HOME: validationHome,
+    TMPDIR: path.join(validationHome, "tmp"),
+    XDG_CONFIG_HOME: path.join(validationHome, ".config"),
+    XDG_CACHE_HOME: path.join(validationHome, ".cache"),
+    GH_CONFIG_DIR: path.join(validationHome, ".config", "gh"),
+    npm_config_cache: path.join(validationHome, ".npm-cache"),
+    CI: "1",
+    NO_COLOR: "1",
+    TERM: "dumb",
+    LANG: "C",
+    LC_ALL: "C",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+  };
 }
 
 function nextId(items, prefix) {
@@ -239,11 +268,37 @@ async function existingExactPromotionPullRequest(repoPath, projectPlan, branch, 
     return matches.find((item) => (
       item?.headRefName === branch
       && item?.headRefOid === commit
+      && ["OPEN", "CLOSED", "MERGED"].includes(String(item?.state || "").toUpperCase())
       && /^https:\/\/github\.com\/.+\/pull\/\d+$/i.test(String(item?.url || ""))
     )) || null;
   } catch {
     return null;
   }
+}
+
+async function closeStalePromotionPullRequest(projectResult, options = {}) {
+  const prUrl = String(projectResult?.prUrl || "").trim();
+  if (!projectResult?.promotionPrExact || !/^https:\/\/github\.com\/.+\/pull\/\d+$/i.test(prUrl)) {
+    return { attempted: false, closed: false, output: "No exact promotion PR required cleanup." };
+  }
+  const closed = await runCommand("gh", [
+    "pr",
+    "close",
+    prUrl,
+    "--comment",
+    "StudioOps closed this release-candidate PR because its fenced immutable-candidate claim became stale before the release artifact could be recorded.",
+  ], {
+    cwd: projectResult.sourceRepoPath || projectResult.repoPath,
+    env: options.env,
+    secrets: options.secrets,
+    timeoutMs: 60_000,
+    allowFailure: true,
+  });
+  return {
+    attempted: true,
+    closed: closed.ok,
+    output: truncateOutput(closed.output || (closed.ok ? "Closed stale release-candidate PR." : "Failed to close stale release-candidate PR.")),
+  };
 }
 
 function sourceLabel(task) {
@@ -292,6 +347,19 @@ async function safeRemoveWorkspace(workspacePath, workspaceRoot) {
     throw new Error(`Refusing to remove unsafe promotion workspace path: ${workspacePath}`);
   }
   await rm(workspacePath, { recursive: true, force: true });
+}
+
+async function preparePromotionValidationHome(workspaceRoot) {
+  await mkdir(workspaceRoot, { recursive: true });
+  const validationHome = await mkdtemp(path.join(workspaceRoot, "validation-home-"));
+  await chmod(validationHome, 0o700);
+  await Promise.all([
+    mkdir(path.join(validationHome, "tmp"), { recursive: true, mode: 0o700 }),
+    mkdir(path.join(validationHome, ".config", "gh"), { recursive: true, mode: 0o700 }),
+    mkdir(path.join(validationHome, ".cache"), { recursive: true, mode: 0o700 }),
+    mkdir(path.join(validationHome, ".npm-cache"), { recursive: true, mode: 0o700 }),
+  ]);
+  return validationHome;
 }
 
 async function copyGitConfigValue(sourceRepoPath, workspacePath, key) {
@@ -460,6 +528,8 @@ async function runValidationCommands(repoPath, commands, options, context) {
     const result = await runCommand("sh", ["-lc", command], {
       cwd: repoPath,
       env: options.env,
+      validationHome: options.validationHome,
+      validationPath: options.validationPath,
       projectCommand: true,
       secrets: options.secrets,
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
@@ -605,6 +675,13 @@ const PROMOTABLE_TASK_STATUSES = new Set([
   "deployed",
   "done",
 ]);
+const AUTO_RECOVERABLE_PROMOTION_STATUSES = new Set([
+  "auth_failed",
+  "evidence_failed",
+  "pr_failed",
+  "push_failed",
+  "validation_missing",
+]);
 
 function promotionValidationAttemptsForCandidate(task, candidate) {
   if (task?.promotionValidationCandidateId === candidate.id) {
@@ -624,13 +701,20 @@ function taskCanRetryPromotionValidation(task, candidate, source, policyDigest) 
 }
 
 function candidateTasksRemainPromotable(candidate, tasksById, policyDigest) {
+  const reusableValidation = validPromotionRecoveryReceipt(candidate, policyDigest);
   return candidate.manifest.sources.every((source) => {
     const task = tasksById.get(source.taskId);
     if (!task) return false;
     const attempts = promotionValidationAttemptsForCandidate(task, candidate);
     if (candidate.status === "qa_passed" && attempts > 0) {
-      return taskCanRetryPromotionValidation(task, candidate, source, policyDigest);
+      if (taskCanRetryPromotionValidation(task, candidate, source, policyDigest)) return true;
+      if (!reusableValidation) return false;
     }
+    if (
+      candidate.status === "qa_passed"
+      && task.status === "promotion_blocked"
+      && !AUTO_RECOVERABLE_PROMOTION_STATUSES.has(String(task.promotionStatus || ""))
+    ) return false;
     return PROMOTABLE_TASK_STATUSES.has(task.status);
   });
 }
@@ -705,6 +789,7 @@ export function planPromotions(state, input = {}) {
       const validationPolicyDigest = promotionValidationPolicyDigest({
         commands: validationCommands,
         timeoutMs: validationTimeoutMs,
+        environmentPolicyVersion: PROMOTION_VALIDATION_ENVIRONMENT_POLICY_VERSION,
       });
       const projectTasks = new Map(
         (state.tasks || [])
@@ -795,6 +880,7 @@ function authoritativePromotionPolicyDigest(state, projectPlan) {
   return promotionValidationPolicyDigest({
     commands: promotionValidationCommands(project),
     timeoutMs: Number(projectPlan.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
+    environmentPolicyVersion: PROMOTION_VALIDATION_ENVIRONMENT_POLICY_VERSION,
   });
 }
 
@@ -845,13 +931,14 @@ async function assertProjectPromotionAttempt(projectPlan, claim, input = {}) {
   }
 }
 
-async function recordProjectPromotionRecoveryReceipt(projectPlan, claim, validationResults, input = {}) {
+async function recordProjectPromotionRecoveryReceipt(projectPlan, claim, validationResults, validationEvidence, input = {}) {
   return mutateState((state) => recordPromotionRecoveryReceiptInState(
     state,
     claim,
     {
       ...promotionClaimInput(projectPlan, input, {}, state),
       validationResults,
+      validationEvidence,
     },
   ), { operationName: "promotion.record_recovery_receipt" });
 }
@@ -1198,8 +1285,10 @@ async function promoteProject(projectPlan, options = {}) {
   }
 
   let workspace = null;
+  let validationHome = "";
   try {
     workspace = await preparePromotionWorkspace(repoPath, projectPlan, options);
+    validationHome = await preparePromotionValidationHome(workspace.workspaceRoot);
     result.workspacePath = workspace.workspacePath;
     result.workspaceStrategy = workspace.strategy;
     const executionRepoPath = workspace.executionRepoPath;
@@ -1215,10 +1304,19 @@ async function promoteProject(projectPlan, options = {}) {
     result.tasks.push(...candidateTasks);
 
     let validationReceiptResults = [];
-    const reusableRecoveryReceipt = projectPlan.mode === "retry"
-      ? projectPlan.promotionRecoveryReceipt
-      : null;
+    const reusableRecoveryReceipt = projectPlan.promotionRecoveryReceipt || null;
     if (reusableRecoveryReceipt) {
+      const verifiedEvidence = await verifyPromotionValidationEvidence(
+        reusableRecoveryReceipt.validationEvidence,
+        { root: options.validationEvidenceRoot },
+      );
+      result.validationEvidence = {
+        ...reusableRecoveryReceipt.validationEvidence,
+        path: verifiedEvidence.path,
+        digest: verifiedEvidence.digest,
+        bytes: verifiedEvidence.bytes,
+      };
+      result.validationAttempt = Number(reusableRecoveryReceipt.validationEvidence.attempt);
       result.validation = [{
         command: "[exact promotion recovery receipt]",
         ok: true,
@@ -1229,7 +1327,7 @@ async function promoteProject(projectPlan, options = {}) {
       const validationRun = await runValidationCommands(
         executionRepoPath,
         validationCommands,
-        options,
+        { ...options, validationHome },
         {
           candidate: projectPlan.candidate,
           attempt: result.validationAttempt,
@@ -1272,14 +1370,15 @@ async function promoteProject(projectPlan, options = {}) {
       return result;
     }
 
-    if (projectPlan.mode === "retry" && !reusableRecoveryReceipt) {
-      const recorded = await options.recordRecoveryReceipt(validationReceiptResults);
+    if (!reusableRecoveryReceipt) {
+      const recorded = await options.recordRecoveryReceipt(validationReceiptResults, result.validationEvidence);
       projectPlan.promotionClaim = recorded.claim;
       projectPlan.promotionRecoveryReceipt = recorded.receipt;
       projectPlan.candidate.promotionValidationRecoveryReceipt = recorded.receipt;
       result.promotionClaim = recorded.claim;
       result.promotionRecoveryReceipt = recorded.receipt;
     }
+    if (options.beforePromotionPush) await options.beforePromotionPush();
     if (options.assertPromotionClaim) await options.assertPromotionClaim();
 
     result.promotionBranch = promotionBranchName(projectPlan);
@@ -1313,7 +1412,17 @@ async function promoteProject(projectPlan, options = {}) {
       commit,
       options,
     );
+    const existingPrState = String(existingPr?.state || "").toUpperCase();
+    if (existingPr && existingPrState === "CLOSED") {
+      result.prUrl = existingPr.url;
+      result.promotionPrExact = true;
+      result.status = "pr_closed";
+      result.output = "The exact deterministic release-candidate PR was closed without merging. StudioOps will not reopen or replace a human-closed release gate automatically.";
+      for (const task of candidateTasks) task.status = "pr_closed";
+      return result;
+    }
     let prOutput = existingPr?.url || "";
+    let promotionPrCreated = false;
     if (!existingPr) {
       if (options.assertPromotionClaim) await options.assertPromotionClaim();
       const taskList = projectPlan.tasks
@@ -1344,12 +1453,16 @@ async function promoteProject(projectPlan, options = {}) {
         return result;
       }
       prOutput = pr.output || "";
+      promotionPrCreated = true;
     }
 
     result.prUrl = String(prOutput).trim().split(/\s+/).find((value) => /^https:\/\/github\.com\/.+\/pull\/\d+/.test(value)) || "";
-    result.status = "pr_ready";
+    result.promotionPrExact = Boolean(result.prUrl);
+    result.promotionPrCreated = promotionPrCreated;
+    if (options.assertPromotionClaim) await options.assertPromotionClaim();
+    result.status = existingPrState === "MERGED" ? "pr_merged_detected" : "pr_ready";
     result.output = truncateOutput(prOutput || `Created release-candidate PR from ${result.promotionBranch}.`);
-    for (const task of candidateTasks) task.status = "pr_ready";
+    for (const task of candidateTasks) task.status = result.status;
     return result;
   } catch (error) {
     const failureStatus = error.code === "PROMOTION_VALIDATION_EVIDENCE_FAILED"
@@ -1374,6 +1487,13 @@ async function promoteProject(projectPlan, options = {}) {
     }
     return result;
   } finally {
+    if (validationHome && workspace?.workspaceRoot) {
+      try {
+        await safeRemoveWorkspace(validationHome, workspace.workspaceRoot);
+      } catch (error) {
+        result.output = [result.output, `Validation-home cleanup warning: ${error.message}`].filter(Boolean).join("\n");
+      }
+    }
     if (workspace?.workspacePath) {
       try {
         await safeRemoveWorkspace(workspace.workspacePath, workspace.workspaceRoot);
@@ -1387,10 +1507,11 @@ async function promoteProject(projectPlan, options = {}) {
 function authFailureProjectResult(projectPlan, error) {
   const output = `GitHub App auth failed for promotion: ${error.message}`;
   const reconciliation = projectPlan.mode === "reconcile";
+  const status = reconciliation ? "reconciliation_unavailable" : "auth_failed";
   return {
     ...projectPlan,
-    tasks: allTaskResults(projectPlan.tasks, reconciliation ? "reconciliation_unavailable" : "blocked", output),
-    status: reconciliation ? "reconciliation_unavailable" : "blocked",
+    tasks: allTaskResults(projectPlan.tasks, status, output),
+    status,
     output: truncateOutput(output),
     commit: "",
     validation: [],
@@ -1434,7 +1555,10 @@ function commentForTask(projectResult, taskResult) {
     : `\n\nTarget branch: ${projectResult.targetBranch}`;
   const workspaceLine = workspaceSummary(projectResult);
 
-  if (taskResult.status === "pr_ready") {
+  if (["pr_ready", "pr_merged_detected"].includes(taskResult.status)) {
+    if (taskResult.status === "pr_merged_detected") {
+      return `Detected that the exact QA-approved release-candidate PR is already merged. StudioOps persisted the immutable handoff and will reconcile protected-main reachability next.\n\nPR: ${projectResult.prUrl}${targetLine}${workspaceLine}\n\nValidation evidence was reverified:\n${validationSummary(projectResult)}${validationEvidenceSummary(projectResult)}`;
+    }
     return `QA-approved release-candidate PR is ready for ${projectResult.targetBranch} at ${projectResult.commit}.${projectResult.prUrl ? `\n\nPR: ${projectResult.prUrl}` : ""}${targetLine}${workspaceLine}\n\nValidation passed:\n${validationSummary(projectResult)}${validationEvidenceSummary(projectResult)}`;
   }
 
@@ -1451,12 +1575,20 @@ function commentForTask(projectResult, taskResult) {
     return `Promotion stopped before push because its private validation evidence could not be persisted and verified.${workspaceLine}\n\n${projectResult.output}`;
   }
 
+  if (taskResult.status === "auth_failed") {
+    return `Promotion authentication is unavailable. The exact QA candidate and its release authority were preserved for automatic recovery after credentials are repaired.${workspaceLine}\n\n${projectResult.output}`;
+  }
+
   if (taskResult.status === "push_failed") {
     return `Promotion could not update ${projectResult.targetBranch} with ${taskResult.source}. No force push was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (taskResult.status === "pr_failed") {
     return `Release-candidate branch ${projectResult.promotionBranch || ""} was pushed, but its pull request could not be created.${workspaceLine}\n\n${projectResult.output}`;
+  }
+
+  if (taskResult.status === "pr_closed") {
+    return `The exact release-candidate PR was closed without merging. StudioOps preserved the QA candidate and stopped automatic promotion until the owner decides whether to reopen that gate.\n\nPR: ${projectResult.prUrl || "unavailable"}${workspaceLine}`;
   }
 
   if (taskResult.status === "dependency_blocked") {
@@ -1514,7 +1646,7 @@ function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) 
     promotionConflictFiles: taskResult.conflicts || [],
   };
 
-  if (taskResult.status === "pr_ready") {
+  if (["pr_ready", "pr_merged_detected"].includes(taskResult.status)) {
     return {
       ...patch,
       status: "user_review",
@@ -1544,13 +1676,33 @@ function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) 
     };
   }
 
+  if (taskResult.status === "auth_failed") {
+    return {
+      ...patch,
+      status: "promotion_blocked",
+      assignedAgentRole: "promotion-worker",
+      reviewerThreadId: "",
+    };
+  }
+
   if (["push_failed", "pr_failed"].includes(taskResult.status)) {
+    return {
+      ...patch,
+      status: "promotion_blocked",
+      assignedAgentRole: "promotion-worker",
+      reviewerThreadId: "",
+      promotionBranch: projectResult.promotionBranch || "",
+    };
+  }
+
+  if (taskResult.status === "pr_closed") {
     return {
       ...patch,
       status: "promotion_blocked",
       assignedAgentRole: "owner",
       reviewerThreadId: "",
       promotionBranch: projectResult.promotionBranch || "",
+      promotionPrUrl: projectResult.prUrl || "",
     };
   }
 
@@ -1698,7 +1850,7 @@ async function recordProjectResult(projectResult) {
         Object.assign(task, patch);
         task.updatedAt = now;
       }
-      if (taskResult.status === "pr_ready") {
+      if (["pr_ready", "pr_merged_detected"].includes(taskResult.status)) {
         promotedCount += 1;
         promotedTaskIds.add(task.id);
       }
@@ -1839,10 +1991,11 @@ export async function runPromotion(input = {}) {
     }
     let authContext = null;
     let result = null;
+    let promotionOptions = input;
     try {
       authContext = await preparePromotionAuth(projectPlan, input);
       const secrets = normalizeSecrets(input.secrets, githubAppAuthSecrets(authContext));
-      const options = {
+      promotionOptions = {
         ...input,
         env: githubAppAuthEnv(authContext, input.env || {}),
         secrets,
@@ -1864,11 +2017,12 @@ export async function runPromotion(input = {}) {
           ? async () => assertProjectPromotionAttempt(projectPlan, projectPlan.promotionClaim, input)
           : null,
         recordRecoveryReceipt: projectPlan.promotionClaim
-          ? async (validationResults) => {
+          ? async (validationResults, validationEvidence) => {
               const recorded = await recordProjectPromotionRecoveryReceipt(
                 projectPlan,
                 projectPlan.promotionClaim,
                 validationResults,
+                validationEvidence,
                 input,
               );
               projectPlan.promotionClaim = recorded.claim;
@@ -1878,20 +2032,31 @@ export async function runPromotion(input = {}) {
           : null,
       };
       result = projectPlan.mode === "reconcile"
-        ? await reconcilePromotionProject(projectPlan, options)
-        : await promoteProject(projectPlan, options);
+        ? await reconcilePromotionProject(projectPlan, promotionOptions)
+        : await promoteProject(projectPlan, promotionOptions);
     } catch (error) {
       result = authFailureProjectResult(projectPlan, error);
-    } finally {
-      await cleanupGitHubAppAuth(authContext);
     }
     try {
-      await recordProjectResult(result);
-    } catch (error) {
-      if (error.code !== "PROMOTION_ATTEMPT_STALE") throw error;
-      result.status = "stale_result_discarded";
-      result.output = truncateOutput(`Promotion result was discarded without overwriting newer state: ${error.message}`);
-      result.tasks = allTaskResults(projectPlan.tasks, "stale_result_discarded", result.output);
+      try {
+        await recordProjectResult(result);
+      } catch (error) {
+        if (error.code !== "PROMOTION_ATTEMPT_STALE") throw error;
+        const cleanup = await closeStalePromotionPullRequest(result, promotionOptions);
+        result.status = "stale_result_discarded";
+        result.stalePromotionPrCleanup = cleanup;
+        result.output = truncateOutput([
+          `Promotion result was discarded without overwriting newer state: ${error.message}`,
+          cleanup.attempted
+            ? cleanup.closed
+              ? "The exact stale release-candidate PR was closed."
+              : `StudioOps could not close the exact stale release-candidate PR: ${cleanup.output}`
+            : "No external release-candidate PR required cleanup.",
+        ].join("\n"));
+        result.tasks = allTaskResults(projectPlan.tasks, "stale_result_discarded", result.output);
+      }
+    } finally {
+      await cleanupGitHubAppAuth(authContext);
     }
     results.push(result);
   }
