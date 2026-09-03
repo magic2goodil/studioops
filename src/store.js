@@ -3451,11 +3451,6 @@ export function resumeBudgetPauseInState(state, input = {}) {
   task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
   task.retryNotBefore = "";
   task.updatedAt = now;
-  applyStoreLifecycleTransition(state, task, task.status, {
-    action: "mutate_assignment",
-    force: true,
-    now,
-  });
   state.comments = state.comments || [];
   addAutomationComment(
     state,

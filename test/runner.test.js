@@ -220,7 +220,7 @@ test("owner can resume a preserved budget handoff with compare-and-set evidence"
   });
   assert.equal(task.budgetPause, undefined);
   assert.equal(task.automationAttemptEpoch, 1);
-  assert.equal(task.stateVersion, 2);
+  assert.equal(task.stateVersion, 1);
   assert.equal(state.events.at(-1).type, "budget_pause_resumed");
   assert.equal(planRunnableRuns(state, { limit: 1 }).runnable[0].id, "run_next");
 });
