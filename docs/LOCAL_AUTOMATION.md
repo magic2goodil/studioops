@@ -423,7 +423,10 @@ LaunchAgents are bootstrapped from the configured plist (or the standard
 The health endpoint must attest the commit actually served by the running
 preview. Return the full Git SHA in the configured `identityHeader` (default
 `X-StudioOps-Commit`) or JSON `identityJsonField` (default `commitSha`). A plain
-HTTP 200 is insufficient and blocks candidate freeze.
+HTTP 200 is insufficient and blocks candidate freeze. After restarting a
+configured preview LaunchAgent, StudioOps polls that exact identity for up to
+90 bounded attempts (capped at 120) so a large local state migration or cold
+Node startup does not create a false identity failure.
 
 ## Local TechOps recovery
 
