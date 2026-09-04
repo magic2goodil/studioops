@@ -203,7 +203,7 @@ if [ "$command_bytes" -gt 26214400 ]; then
   command_truncated=true
 fi
 chmod 600 "$command_log"
-command_log_digest="$(shasum -a 256 "$command_log" | awk '{print $1}')"
+command_log_digest="$(${shellQuote(process.execPath)} -e ${shellQuote("const crypto=require('node:crypto');const fs=require('node:fs');process.stdout.write(crypto.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex'));")} "$command_log")"
 {
   printf '%s\n' ${shellQuote(`command_${index + 1}_label=${label}`)}
   printf '%s\n' ${shellQuote(`command_${index + 1}_digest=${commandDigest}`)}
