@@ -186,7 +186,7 @@ The app reads the first fenced `json studioops-config` block in this file.
     },
     "globalRunAdmission": {
       "maxActiveMeteredRuns": 2,
-      "maxMeteredRunsPerWindow": 12,
+      "maxMeteredRunsPerWindow": 0,
       "runWindowMinutes": 60
     },
     "qaIntegration": {

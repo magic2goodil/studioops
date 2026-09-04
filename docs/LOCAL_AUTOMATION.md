@@ -677,36 +677,49 @@ Projects that use GitHub Actions can opt into a project-level worker budget in
 {
   "wipPolicy": {
     "maxActiveRuns": 1,
-    "maxRunsPerWindow": 8,
+    "maxRunsPerWindow": 0,
     "runWindowMinutes": 60
   }
 }
 ```
 
-These limits apply to queued, running, and completed builder/reviewer/QA-worker
-runs; owner handoffs are intentionally exempt. `maxActiveRuns` prevents a
-single project from fanning out several Actions-triggering branches at once,
-while `maxRunsPerWindow` prevents a retry or review loop from creating an
-unbounded burst after the active slot clears. The dispatcher records explicit
-`project_active_run_limit` or `project_run_window_limit` skips and leaves the
-task state intact for the next sweep.
+`maxActiveRuns` applies to queued and running builder/reviewer/QA-worker runs;
+owner handoffs are intentionally exempt. It prevents a single project from
+fanning out several Actions-triggering branches at once. Completed healthy
+runs do not consume a rolling launch quota, so distinct productive work can
+continue as soon as the active slot clears. Lane and exact file-scope conflicts,
+credit admission, duplicate exact candidate-stage suppression, and durable
+failure incidents continue to contain unsafe or redundant work.
 
 Configure them with `studioops update-project PROJECT --max-active-runs 1
---max-runs-per-window 8 --run-window-minutes 60`. This is a StudioOps safety
-valve; it does not replace repository workflow design. Target repositories
-should still keep expensive validation on pull requests and their canonical QA
-branch rather than on every feature-branch push.
+--max-runs-per-window 0 --run-window-minutes 60`. For one compatibility release,
+legacy positive `maxRunsPerWindow` values remain readable but normalize to zero
+and emit one bounded `total_run_window_deprecated` diagnostic. The preserved
+`runWindowMinutes` value is used only for duplicate exact-stage detection and
+deprecation evidence. Target repositories should still keep expensive
+validation on pull requests and their canonical QA branch rather than on every
+feature-branch push.
 
-StudioOps also applies an installation-wide metered-work brake. The conservative
-default admits two workers across the installation at a time and at most twelve
-worker runs per rolling hour; per-project limits still keep one configured project
-from running overlapping work, and owner handoffs remain visible and unmetered. Configure it
-under `defaults.globalRunAdmission` with `maxActiveMeteredRuns`,
-`maxMeteredRunsPerWindow`, and `runWindowMinutes`. Deferred work remains queued
-with `global_active_run_limit` or `global_run_window_limit` evidence.
+StudioOps also applies an installation-wide active-work brake. The default
+admits two metered workers across the installation at a time; per-project limits
+still prevent overlapping project work, and owner handoffs remain visible and
+unmetered. Configure it under `defaults.globalRunAdmission` with
+`maxActiveMeteredRuns`. `maxMeteredRunsPerWindow` is now the same inert
+compatibility field and defaults to zero. Deferred active work remains queued
+with `global_active_run_limit` evidence; completed healthy work never causes a
+`global_run_window_limit` skip.
 
-Exact candidate-stage duplicates and unchanged failed retries are suppressed as
-`duplicate_candidate_stage` and `unchanged_retry`. Before a GitHub push, the
+Before selecting paid work, the dispatcher reads indexed durable failure
+incidents and suppresses only an exact task, action, provider, and immutable
+candidate match whose circuit is open or whose backoff has not elapsed. An
+unrelated task or changed candidate remains eligible. The dispatcher is a
+read-only admission boundary; it records that the atomic paid-attempt claim
+belongs immediately before provider launch in the runner, so a queued run that
+never launches cannot spend a failure-generation attempt.
+
+Exact candidate-stage duplicates and unchanged failed retries inside their
+retry window are suppressed as `duplicate_candidate_stage` and `retry_backoff`.
+Before a GitHub push, the
 runner installs a local pre-push hook that executes the project's deterministic
 `validationCommands`, keeps full output in a local log, emits only a bounded
 failure excerpt, and caches success by exact Git tree and validation-policy

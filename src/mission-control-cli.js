@@ -25,7 +25,7 @@ import {
   updateRun,
 } from "./store.js";
 import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
-import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
+import { dispatchSupervisorActions, formatDispatchReport } from "./dispatcher.js";
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
@@ -250,7 +250,7 @@ async function setup() {
         },
         globalRunAdmission: {
           maxActiveMeteredRuns: 2,
-          maxMeteredRunsPerWindow: 12,
+          maxMeteredRunsPerWindow: 0,
           runWindowMinutes: 60,
         },
         qaIntegration: {
@@ -484,8 +484,8 @@ Task fields:
   --no-trust-leads              Disable Trust Leads for a project
   --integration-branch          Non-production branch used for QA integration bundles
   --max-active-runs             Project WIP guard for concurrent builder/reviewer runs
-  --max-runs-per-window         Project WIP guard for worker runs in a rolling window
-  --run-window-minutes          Rolling-window length for --max-runs-per-window (default 60)
+  --max-runs-per-window         Deprecated inert compatibility input; completed-run windows no longer throttle work
+  --run-window-minutes          Compatibility window used for duplicate-stage detection and deprecation evidence
   --subject-sha                 Exact full source SHA submitted for the current review cycle
   --tree-sha                    Exact candidate tree SHA for fast-lane review intake
   --base-sha                    Exact protected-base SHA for fast-lane review intake
@@ -1103,6 +1103,10 @@ Automation:
       project: args.project || args.projects,
       dryRun: args["dry-run"] || args.dryRun,
       provider: args.provider || dispatcherDefaults.provider || "prompt-outbox",
+      failureProvider: args["failure-provider"]
+        || config?.runner?.provider
+        || config?.defaults?.runner?.provider
+        || "codex-cli",
       maxDispatchesPerSweep: args.limit || args["max-dispatches"] || dispatcherDefaults.maxDispatchesPerSweep,
       builderConcurrency: args["builder-concurrency"] || effectiveCapacity.builderConcurrency,
       architectConcurrency: args["architect-concurrency"] || dispatcherDefaults.architectConcurrency,
@@ -1123,15 +1127,12 @@ Automation:
     };
     options.creditSnapshot = await getCodexCreditSnapshot(options.creditPolicy);
     if (args.plan) {
-      const plan = planDispatches(state, supervisor.actions, options);
-      const report = {
-        generatedAt: supervisor.generatedAt,
+      const report = await dispatchSupervisorActions(supervisor.actions, {
+        ...options,
+        state,
         dryRun: true,
-        runs: [],
-        effectiveCapacity: plan.effectiveCapacity,
-        selected: plan.selected,
-        skipped: plan.skipped,
-      };
+        loadFailureIncidents: true,
+      });
       if (args.json) console.log(JSON.stringify(report, null, 2));
       else console.log(formatDispatchReport(report));
       return;

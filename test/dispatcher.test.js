@@ -8,11 +8,16 @@ import {
   formatDispatchReport,
   planDispatches,
 } from "../src/dispatcher.js";
-import { buildOwnerInbox } from "../src/owner-inbox.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { fileScopesMayOverlap } from "../src/work-lanes.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 import { claimRuns, planRunnableRuns } from "../src/runner.js";
+import {
+  createFailureIncident,
+  failureFingerprint,
+  openFailureCircuit,
+  scheduleFailureBackoff,
+} from "../src/failure-containment.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -330,7 +335,7 @@ test("project run budget limits concurrent worker dispatches", async () => {
   assert.equal(state.runs.filter((run) => run.group !== "owner").length, 1);
 });
 
-test("project run budget limits recent worker runs while allowing the window to expire", () => {
+test("legacy project completed-run windows are inert and emit bounded diagnostics", () => {
   const state = fixtureState();
   state.projects[0].wipPolicy = { maxRunsPerWindow: 2, runWindowMinutes: 60 };
   state.runs.push(
@@ -349,16 +354,66 @@ test("project run budget limits recent worker runs while allowing the window to 
     taskStatus: "qa_review",
   };
 
-  const blocked = planDispatches(state, [action], {
+  const admitted = planDispatches(state, [action], {
     nowMs: Date.parse("2026-01-01T00:45:00.000Z"),
   });
-  assert.equal(blocked.selected.length, 0);
-  assert.equal(blocked.skipped[0].reason, "project_run_window_limit");
+  assert.equal(admitted.selected.length, 1);
+  assert.deepEqual(admitted.effectiveCapacity.deprecationDiagnostics, [{
+    scope: "project",
+    projectId: "project_1",
+    projectKey: "demo",
+    code: "total_run_window_deprecated",
+    status: "inert",
+    schemaVersion: 1,
+    configuredMaxRunsPerWindow: 2,
+    configuredRunWindowMinutes: 60,
+  }]);
+});
 
-  const afterWindow = planDispatches(state, [action], {
-    nowMs: Date.parse("2026-01-01T02:00:00.000Z"),
+test("six distinct healthy builds remain dispatchable after six completions in one hour", () => {
+  const state = fixtureState();
+  state.projects[0].wipPolicy = { maxRunsPerWindow: 4, runWindowMinutes: 60 };
+  state.tasks = [];
+  state.runs = [];
+  const actions = [];
+  for (let index = 1; index <= 6; index += 1) {
+    state.runs.push({
+      id: `run_completed_${index}`,
+      taskId: `task_completed_${index}`,
+      projectId: "project_1",
+      group: "builder",
+      status: "completed",
+      createdAt: `2026-01-01T00:${String(index).padStart(2, "0")}:00.000Z`,
+    });
+    const taskId = `task_healthy_${index}`;
+    state.tasks.push({
+      id: taskId,
+      projectId: "project_1",
+      title: `Healthy build ${index}`,
+      status: "ready",
+      architectureRequired: false,
+      architectureStatus: "not_required",
+      lane: "backend",
+      workAreas: [`src/component-${index}/**`],
+    });
+    actions.push({
+      id: `${taskId}:start_builder`,
+      type: "start_builder",
+      role: "builder",
+      projectId: "project_1",
+      projectKey: "demo",
+      taskId,
+      taskStatus: "ready",
+    });
+  }
+
+  const report = planDispatches(state, actions, {
+    nowMs: Date.parse("2026-01-01T00:45:00.000Z"),
+    builderConcurrency: 6,
+    maxDispatchesPerSweep: 6,
   });
-  assert.equal(afterWindow.selected.length, 1);
+  assert.equal(report.selected.length, 6);
+  assert.equal(report.skipped.length, 0);
 });
 
 test("project run budgets do not block owner handoffs", () => {
@@ -524,7 +579,7 @@ test("three budget-paused queued runs free admission for unrelated eligible work
   assert.equal(state.runs.filter((run) => run.taskId.startsWith("task_paused_")).every((run) => run.status === "queued"), true);
 });
 
-test("global rolling window and exact recent candidate-stage suppress redundant work", () => {
+test("global completed-run windows are inert while exact recent candidate stages remain suppressed", () => {
   const state = fixtureState();
   state.tasks[0] = {
     ...state.tasks[0],
@@ -550,11 +605,13 @@ test("global rolling window and exact recent candidate-stage suppress redundant 
     status: "completed",
     createdAt: "2026-01-01T00:30:00.000Z",
   });
-  const windowBlocked = planDispatches(state, [action], {
+  const admitted = planDispatches(state, [action], {
     nowMs: Date.parse("2026-01-01T00:45:00.000Z"),
     globalRunAdmission: { maxActiveMeteredRuns: 2, maxMeteredRunsPerWindow: 1, runWindowMinutes: 60 },
   });
-  assert.equal(windowBlocked.skipped[0].reason, "global_run_window_limit");
+  assert.equal(admitted.selected.length, 1);
+  assert.equal(admitted.effectiveCapacity.deprecationDiagnostics[0].scope, "installation");
+  assert.equal(admitted.effectiveCapacity.deprecationDiagnostics[0].configuredMaxRunsPerWindow, 1);
 
   state.runs = [{
     id: "run_same_stage",
@@ -571,6 +628,86 @@ test("global rolling window and exact recent candidate-stage suppress redundant 
     globalRunAdmission: { maxActiveMeteredRuns: 2, maxMeteredRunsPerWindow: 12, runWindowMinutes: 60 },
   });
   assert.equal(duplicate.skipped[0].reason, "duplicate_candidate_stage");
+});
+
+test("durable failure incidents suppress only the exact task action provider and candidate", () => {
+  const state = fixtureState();
+  state.tasks = [
+    {
+      id: "task_1",
+      projectId: "project_1",
+      title: "Blocked exact candidate",
+      status: "ready",
+      architectureRequired: false,
+      architectureStatus: "not_required",
+      lane: "backend",
+      workAreas: ["src/one/**"],
+    },
+    {
+      id: "task_2",
+      projectId: "project_1",
+      title: "Independent candidate",
+      status: "ready",
+      architectureRequired: false,
+      architectureStatus: "not_required",
+      lane: "backend",
+      workAreas: ["src/two/**"],
+    },
+  ];
+  const actions = state.tasks.map((task) => ({
+    id: `${task.id}:start_builder`,
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: task.id,
+    taskStatus: "ready",
+  }));
+  const incident = openFailureCircuit(createFailureIncident({
+    fingerprint: failureFingerprint({
+      taskId: "task_1",
+      action: "start_builder",
+      provider: "codex-cli",
+      reasonCode: "execution_failed",
+    }),
+    now: "2026-01-01T00:00:00.000Z",
+  }), { now: "2026-01-01T00:01:00.000Z" });
+
+  const report = planDispatches(state, actions, {
+    nowMs: Date.parse("2026-01-01T00:05:00.000Z"),
+    failureProvider: "codex-cli",
+    failureIncidents: [incident],
+    builderConcurrency: 2,
+  });
+  assert.deepEqual(report.selected.map((item) => item.taskId), ["task_2"]);
+  assert.equal(report.skipped[0].taskId, "task_1");
+  assert.equal(report.skipped[0].reason, "failure_circuit_open");
+  assert.equal(report.skipped[0].incidentId, incident.incidentId);
+
+  state.tasks[0].candidateIdentity = { commitSha: "a".repeat(40) };
+  const changedCandidate = planDispatches(state, [actions[0]], {
+    nowMs: Date.parse("2026-01-01T00:05:00.000Z"),
+    failureProvider: "codex-cli",
+    failureIncidents: [incident],
+  });
+  assert.equal(changedCandidate.selected.length, 1);
+
+  const backoff = scheduleFailureBackoff(createFailureIncident({
+    fingerprint: failureFingerprint({
+      taskId: "task_2",
+      action: "start_builder",
+      provider: "codex-cli",
+      reasonCode: "provider_rate_limited",
+    }),
+    now: "2026-01-01T00:00:00.000Z",
+  }), { now: "2026-01-01T00:01:00.000Z", delayMs: 10 * 60 * 1000 });
+  const duringBackoff = planDispatches(state, [actions[1]], {
+    nowMs: Date.parse("2026-01-01T00:05:00.000Z"),
+    failureProvider: "codex-cli",
+    failureIncidents: [backoff],
+  });
+  assert.equal(duringBackoff.skipped[0].reason, "failure_backoff");
+  assert.equal(duringBackoff.skipped[0].backoffUntil, "2026-01-01T00:11:00.000Z");
 });
 
 test("an unchanged failed stage retries after its bounded backoff instead of disappearing for the full run window", () => {
@@ -692,7 +829,7 @@ test("retry backoff follows the newest same-stage failure when failure codes dif
   assert.equal(afterNewestBackoff.selected.length, 1);
 });
 
-test("active final-attempt review runs suppress duplicate dispatch before exhaustion opens a circuit", async () => {
+test("active review runs suppress duplicate dispatch before durable failure admission", async () => {
   for (const status of ["queued", "running"]) {
     const { state, action } = finalAttemptReviewFixture(status);
 
@@ -750,29 +887,21 @@ test("a successful active final attempt leaves the next review stage dispatchabl
   assert.equal(state.tasks[1].automationCircuit, undefined);
 });
 
-test("a failed final attempt opens the bounded circuit after no matching run remains active", async () => {
-  const { state, action, finalAttempt, attemptKey } = finalAttemptReviewFixture();
+test("historical run counts no longer act as failure-containment authority", async () => {
+  const { state, action, finalAttempt } = finalAttemptReviewFixture();
   const activeReport = await dispatchSupervisorActions([action], { state });
   assert.equal(activeReport.skipped[0].reason, "already_dispatched");
 
   finalAttempt.status = "failed";
-  const exhaustedReport = await dispatchSupervisorActions([action], { state });
+  const report = await dispatchSupervisorActions([action], { state, failureIncidents: [] });
 
-  assert.equal(exhaustedReport.runs.length, 0);
-  assert.equal(exhaustedReport.skipped[0].reason, "attempt_budget_exhausted");
-  assert.equal(state.tasks[1].status, "blocked");
-  assert.equal(state.tasks[1].automationCircuit.state, "open");
-  assert.equal(state.tasks[1].automationCircuit.attemptsConsumed, 2);
-  assert.equal(state.tasks[1].automationCircuit.maxAttempts, 2);
-  assert.equal(state.tasks[1].automationBlocker.attemptKey, attemptKey);
-  assert.match(state.comments.at(-1).body, /2\/2 dispatch-attempt budget is exhausted/);
-  assert.ok(state.events.some((event) => (
-    event.type === "automation_circuit_opened"
-    && event.taskId === "task_2"
-  )));
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.runs[0].failureContainmentAdmission.authority, "dispatcher_read_only");
+  assert.equal(report.runs[0].failureContainmentAdmission.claimBoundary, "runner_pre_provider_launch");
+  assert.equal(state.tasks[1].automationCircuit, undefined);
 });
 
-test("exhausted attempt budgets stop redispatch", () => {
+test("completed or failed run totals never replace the durable failure ledger", () => {
   const state = fixtureState();
   state.runs.push(
     {
@@ -805,11 +934,11 @@ test("exhausted attempt budgets stop redispatch", () => {
     reason: "QA integration is blocked with status conflict.",
   }]);
 
-  assert.equal(report.selected.length, 0);
-  assert.equal(report.skipped[0].reason, "attempt_budget_exhausted");
+  assert.equal(report.selected.length, 1);
+  assert.equal(report.skipped.length, 0);
 });
 
-test("an actual dispatcher sweep turns exhausted historical attempts into a visible resettable circuit", async () => {
+test("an actual dispatcher sweep records a read-only failure-ledger admission decision", async () => {
   const state = fixtureState();
   state.tasks[1].acceptanceCriteria = ["QA integration succeeds without conflicts."];
   state.runs.push(
@@ -844,19 +973,14 @@ test("an actual dispatcher sweep turns exhausted historical attempts into a visi
 
   const report = await dispatchSupervisorActions([action], { state });
 
-  assert.equal(report.runs.length, 0);
-  assert.equal(report.skipped[0].reason, "attempt_budget_exhausted");
-  assert.equal(state.tasks[1].status, "blocked");
-  assert.equal(state.tasks[1].automationCircuit.state, "open");
-  assert.equal(state.tasks[1].automationBlocker.resumeStatus, "qa_review");
-  assert.equal(state.tasks[1].automationCircuit.attemptsConsumed, 2);
-  assert.ok(state.events.some((event) => event.type === "automation_circuit_opened"));
-  const inbox = buildOwnerInbox(state);
-  assert.equal(inbox.items[0].taskId, "task_2");
-  assert.match(inbox.items[0].nextAction, /circuit-reset/);
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.runs[0].failureContainmentAdmission.decision, "admitted");
+  assert.equal(report.runs[0].failureContainmentAdmission.actionIdentity, "qa_integration_blocked");
+  assert.equal(state.tasks[1].status, "qa_review");
+  assert.equal(state.tasks[1].automationCircuit, undefined);
 });
 
-test("opening an exhausted circuit does not suppress an owner handoff in the same sweep", async () => {
+test("legacy failed runs do not suppress a concurrent owner handoff", async () => {
   const state = fixtureState();
   state.runs.push(
     {
@@ -898,9 +1022,9 @@ test("opening an exhausted circuit does not suppress an owner handoff in the sam
     },
   ], { state });
 
-  assert.equal(state.tasks[1].automationCircuit.state, "open");
-  assert.equal(report.runs.length, 1);
-  assert.equal(report.runs[0].actionType, "notify_owner");
+  assert.equal(state.tasks[1].automationCircuit, undefined);
+  assert.equal(report.runs.length, 2);
+  assert.deepEqual(report.runs.map((run) => run.actionType), ["qa_integration_blocked", "notify_owner"]);
 });
 
 test("credit admission blocks a critical run once and opens an owner-visible circuit", async () => {

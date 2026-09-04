@@ -315,6 +315,26 @@ test("automation reconciliation supersedes a circuit after objective workflow ad
   assert.ok(state.events.some((event) => event.type === "automation_circuit_superseded"));
 });
 
+test("automation reconciliation retires legacy project run windows exactly once", () => {
+  const state = stateWith({ status: "merged" });
+  state.projects[0].wipPolicy = {
+    maxActiveRuns: 1,
+    maxRunsPerWindow: 4,
+    runWindowMinutes: 60,
+  };
+
+  const first = reconcileAutomationStateInState(state, { now: "2026-07-21T12:00:00.000Z" });
+  assert.equal(state.projects[0].wipPolicy.maxActiveRuns, 1);
+  assert.equal(state.projects[0].wipPolicy.maxRunsPerWindow, 0);
+  assert.equal(state.projects[0].wipPolicy.deprecatedTotalWindowAdmission.configuredMaxRunsPerWindow, 4);
+  assert.ok(first.some((action) => /retired completed-run window admission/.test(action)));
+  assert.equal(state.events.filter((event) => event.type === "run_window_policy_deprecated").length, 1);
+
+  const second = reconcileAutomationStateInState(state, { now: "2026-07-21T12:01:00.000Z" });
+  assert.equal(second.some((action) => /retired completed-run window admission/.test(action)), false);
+  assert.equal(state.events.filter((event) => event.type === "run_window_policy_deprecated").length, 1);
+});
+
 test("automation reconciliation preserves a matching blocked circuit", () => {
   const state = stateWith({
     status: "blocked",
