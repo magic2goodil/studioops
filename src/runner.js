@@ -163,16 +163,30 @@ function prePushValidationDescriptor(run = {}, root = missionControlRoot()) {
   const projectKey = slugify(run.project?.key || run.projectId || "project");
   const policyDigest = createHash("sha256").update(effectiveCommands.join("\n")).digest("hex").slice(0, 16);
   const cacheRoot = path.join(root, "validation-cache", projectKey, policyDigest);
-  return { effectiveCommands, projectKey, policyDigest, cacheRoot };
+  const context = {
+    baseSha: String(run.candidateIdentity?.baseSha || run.preflightBaseCommit || ""),
+    manifestDigest: String(run.impactPlan?.manifest?.digest || ""),
+    selectedComponentsDigest: sha256Digest((run.impactPlan?.selectedComponents || []).map((item) => item.id).sort()),
+    commandsDigest: sha256Digest(effectiveCommands),
+    environmentContractDigest: sha256Digest({
+      projectKey,
+      workflowMode: run.workflowMode || run.project?.workflowMode || "auto",
+      aggregateCommand: run.impactPlan?.aggregateCommand || "",
+    }),
+    attempt: String(run.attempt || 1),
+    skips: "none",
+  };
+  const contextDigest = sha256Digest(context).slice("sha256:".length);
+  return { effectiveCommands, projectKey, policyDigest, cacheRoot, context, contextDigest };
 }
 
 export function prePushValidationScript(run = {}, root = missionControlRoot()) {
-  const { effectiveCommands, projectKey, cacheRoot } = prePushValidationDescriptor(run, root);
+  const { effectiveCommands, projectKey, cacheRoot, context, contextDigest } = prePushValidationDescriptor(run, root);
   const commandLines = effectiveCommands.map((command, index) => {
     const label = `validation-${index + 1}`;
     const commandDigest = sha256Digest(command);
     return `echo "StudioOps pre-push: ${label}"
-command_log="$cache_root/$tree.${label}.log"
+command_log="$cache_root/$evidence_key.${label}.log"
 command_started="$(date +%s)"
 set +e
 /bin/sh -lc ${shellQuote(command)} > "$command_log" 2>&1
@@ -208,26 +222,18 @@ if [ "$command_status" -ne 0 ]; then
   exit 1
 fi`;
   }).join("\n");
-  const manifestDigest = String(run.impactPlan?.manifest?.digest || "");
-  const selectedComponentsDigest = sha256Digest((run.impactPlan?.selectedComponents || []).map((item) => item.id).sort());
-  const commandsDigest = sha256Digest(effectiveCommands);
-  const environmentDigest = sha256Digest({
-    projectKey,
-    workflowMode: run.workflowMode || run.project?.workflowMode || "auto",
-    aggregateCommand: run.impactPlan?.aggregateCommand || "",
-  });
-  const baseSha = String(run.candidateIdentity?.baseSha || run.preflightBaseCommit || "");
   return `#!/bin/sh
 set -eu
 umask 077
 head="$(git rev-parse HEAD)"
 tree="$(git rev-parse 'HEAD^{tree}')"
 cache_root=${shellQuote(cacheRoot)}
-marker="$cache_root/$tree.ok"
-evidence="$cache_root/$tree.evidence"
+evidence_key="$head.$tree.${contextDigest}"
+marker="$cache_root/$evidence_key.ok"
+evidence="$cache_root/$evidence_key.evidence"
 evidence_tmp="$evidence.tmp.$$"
 if [ -f "$marker" ] && [ -f "$evidence" ]; then
-  echo "StudioOps pre-push: cached local validation passed for $tree"
+  echo "StudioOps pre-push: cached exact-context validation passed for $head"
   exit 0
 fi
 mkdir -p "$cache_root"
@@ -237,13 +243,13 @@ chmod 700 "$cache_root"
   printf 'project_key=%s\n' ${shellQuote(projectKey)}
   printf 'source_sha=%s\n' "$head"
   printf 'tree_sha=%s\n' "$tree"
-  printf 'base_sha=%s\n' ${shellQuote(baseSha)}
-  printf 'manifest_digest=%s\n' ${shellQuote(manifestDigest)}
-  printf 'selected_components_digest=%s\n' ${shellQuote(selectedComponentsDigest)}
-  printf 'commands_digest=%s\n' ${shellQuote(commandsDigest)}
-  printf 'environment_contract_digest=%s\n' ${shellQuote(environmentDigest)}
-  printf 'attempt=%s\n' ${shellQuote(String(run.attempt || 1))}
-  printf '%s\n' 'skips=none'
+  printf 'base_sha=%s\n' ${shellQuote(context.baseSha)}
+  printf 'manifest_digest=%s\n' ${shellQuote(context.manifestDigest)}
+  printf 'selected_components_digest=%s\n' ${shellQuote(context.selectedComponentsDigest)}
+  printf 'commands_digest=%s\n' ${shellQuote(context.commandsDigest)}
+  printf 'environment_contract_digest=%s\n' ${shellQuote(context.environmentContractDigest)}
+  printf 'attempt=%s\n' ${shellQuote(context.attempt)}
+  printf 'skips=%s\n' ${shellQuote(context.skips)}
 } > "$evidence_tmp"
 ${commandLines}
 printf '%s\n' 'outcome=passed' >> "$evidence_tmp"
@@ -263,10 +269,10 @@ function parseLineEvidence(value) {
 }
 
 export async function readPrePushValidationAttestation(run = {}, repoPath, root = missionControlRoot()) {
-  const { effectiveCommands, projectKey, cacheRoot } = prePushValidationDescriptor(run, root);
+  const { effectiveCommands, projectKey, cacheRoot, context, contextDigest } = prePushValidationDescriptor(run, root);
   const head = (await gitOutput(["rev-parse", "HEAD"], { cwd: repoPath })).trim().toLowerCase();
   const tree = (await gitOutput(["rev-parse", "HEAD^{tree}"], { cwd: repoPath })).trim().toLowerCase();
-  const evidencePath = path.join(cacheRoot, `${tree}.evidence`);
+  const evidencePath = path.join(cacheRoot, `${head}.${tree}.${contextDigest}.evidence`);
   if (!existsSync(evidencePath)) return null;
   const info = await lstat(evidencePath);
   if (!info.isFile() || (info.mode & 0o077) !== 0 || info.size > 128 * 1024) {
@@ -279,14 +285,13 @@ export async function readPrePushValidationAttestation(run = {}, repoPath, root 
     project_key: projectKey,
     source_sha: head,
     tree_sha: tree,
-    manifest_digest: String(run.impactPlan?.manifest?.digest || ""),
-    selected_components_digest: sha256Digest((run.impactPlan?.selectedComponents || []).map((item) => item.id).sort()),
-    commands_digest: sha256Digest(effectiveCommands),
-    environment_contract_digest: sha256Digest({
-      projectKey,
-      workflowMode: run.workflowMode || run.project?.workflowMode || "auto",
-      aggregateCommand: run.impactPlan?.aggregateCommand || "",
-    }),
+    base_sha: context.baseSha,
+    manifest_digest: context.manifestDigest,
+    selected_components_digest: context.selectedComponentsDigest,
+    commands_digest: context.commandsDigest,
+    environment_contract_digest: context.environmentContractDigest,
+    attempt: context.attempt,
+    skips: context.skips,
     outcome: "passed",
   };
   for (const [key, expectedValue] of Object.entries(expected)) {
@@ -294,11 +299,24 @@ export async function readPrePushValidationAttestation(run = {}, repoPath, root 
       throw new Error(`Pre-push validation attestation ${key} does not match the exact run context.`);
     }
   }
+  for (let index = 0; index < effectiveCommands.length; index += 1) {
+    const prefix = `command_${index + 1}`;
+    if (evidence[`${prefix}_digest`] !== sha256Digest(effectiveCommands[index])) {
+      throw new Error(`Pre-push validation attestation ${prefix}_digest does not match the validation command.`);
+    }
+    if (evidence[`${prefix}_outcome`] !== "passed") {
+      throw new Error(`Pre-push validation attestation ${prefix}_outcome is not passed.`);
+    }
+    if (!/^sha256:[0-9a-f]{64}$/.test(evidence[`${prefix}_artifact_digest`] || "")) {
+      throw new Error(`Pre-push validation attestation ${prefix}_artifact_digest is invalid.`);
+    }
+  }
   return {
     path: evidencePath,
     digest: sha256Digest(content),
     sourceSha: head,
     treeSha: tree,
+    baseSha: evidence.base_sha,
     manifestDigest: evidence.manifest_digest,
     selectedComponentsDigest: evidence.selected_components_digest,
     commandsDigest: evidence.commands_digest,
