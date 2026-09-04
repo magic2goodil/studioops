@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 
@@ -7,7 +11,19 @@ const serverTestEnvironment = await createHermeticTestEnvironment();
 Object.assign(process.env, serverTestEnvironment.env);
 test.after(async () => serverTestEnvironment.cleanup());
 
-const { createStudioOpsServer, startStudioOpsServer } = await import(`../src/server.js?request-security=${Date.now()}`);
+const { createStudioOpsServer, isStudioOpsServerEntryPoint, startStudioOpsServer } = await import(`../src/server.js?request-security=${Date.now()}`);
+
+test("server entrypoint recognizes the immutable runtime through its current symlink", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-server-entrypoint-"));
+  try {
+    const serverUrl = new URL("../src/server.js", import.meta.url);
+    const linkPath = path.join(root, "server.js");
+    await symlink(fileURLToPath(serverUrl), linkPath);
+    assert.equal(isStudioOpsServerEntryPoint(linkPath, serverUrl), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function listen(server) {
   await new Promise((resolve, reject) => {
