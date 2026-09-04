@@ -11,6 +11,7 @@ import {
   readState,
   recordQaTechOpsHealth,
 } from "./store.js";
+import { recordFailureContainmentActivity } from "./state-database.js";
 
 const execFileAsync = promisify(execFile);
 const ACTIVE_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed"]);
@@ -75,6 +76,40 @@ function candidateForBundle(state, bundle) {
     && candidate.status === "frozen"
     && !candidate.invalidation
   ));
+}
+
+function techOpsFailureAuthority(action, health) {
+  const manifestDigest = String(action.manifestDigest || "");
+  return {
+    taskId: action.taskId || action.bundleId,
+    action: "techops_check_qa_preview",
+    provider: "local",
+    reasonCode: "service_unhealthy",
+    candidate: {
+      candidateId: String(action.candidateId || "").toLowerCase(),
+      commitSha: action.integrationSha,
+      manifestDigest: /^sha256:[a-f0-9]{64}$/.test(manifestDigest) ? manifestDigest : "",
+    },
+    evidence: {
+      repository: { branch: "", prUrl: "", commitSha: action.integrationSha },
+      dependencies: [],
+      credentialClass: "unknown",
+      configurationDigest: `sha256:${action.policyDigest}`,
+      policyDigest: `sha256:${action.policyDigest}`,
+      componentMapDigest: "",
+      serviceHealth: { qa_preview: health?.status === "healthy" ? "healthy" : "degraded" },
+    },
+  };
+}
+
+async function recordTechOpsFailureActivity(action, health, type, outcome, input) {
+  if (input.state && !input.recordFailureActivity) return null;
+  return (input.recordFailureActivity || recordFailureContainmentActivity)({
+    ...techOpsFailureAuthority(action, health),
+    type,
+    verifier: { id: "service_health_probe" },
+    outcome,
+  });
 }
 
 function healthUrlFor(project, candidate) {
@@ -377,6 +412,7 @@ async function runAction(action, state, input = {}) {
     });
     return summarizeTechOpsAction(action, { outcome: "healthy", health });
   }
+  await recordTechOpsFailureActivity(action, health, "cheap_probe", "failed", input);
   const claim = await (input.claimRecovery || claimQaTechOpsRecovery)({
     ...action,
     health,
@@ -387,6 +423,13 @@ async function runAction(action, state, input = {}) {
   });
   if (!claim) return summarizeTechOpsAction(action, { type: "techops_recover_qa_preview", outcome: "deferred", health });
   const result = await executeRecovery(action, project, input);
+  await recordTechOpsFailureActivity(
+    action,
+    health,
+    "repair",
+    result.ok ? "passed" : "failed",
+    input,
+  );
   const incident = await (input.finalizeRecovery || finalizeQaTechOpsRecovery)(claim, result, {
     nowMs: Number(input.nowMsAfterRecovery || Date.now()),
     nextCheckAt,

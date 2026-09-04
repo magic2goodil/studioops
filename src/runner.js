@@ -68,6 +68,20 @@ import {
   writeBoundedDiscoveryArtifact,
 } from "./impact-planner.js";
 import { sha256Digest } from "./component-impact-map.js";
+import { MAX_VALIDATION_ARTIFACT_BYTES } from "./run-output-evidence.js";
+import { createRemediationHandoff } from "./remediation-handoff.js";
+import {
+  claimFailureContainmentPaidAttempt,
+  openFailureContainmentCircuit,
+  readFailureIncidents,
+  recordFailureContainmentActivity,
+  scheduleFailureContainmentBackoff,
+} from "./state-database.js";
+import {
+  failureFingerprint,
+  failureIncidentCompatibilityCircuit,
+  normalizeFailureProvider,
+} from "./failure-containment.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -84,7 +98,7 @@ const SUPPORTED_PROVIDERS = new Set(["codex-cli", "codex-sdk"]);
 const BLOCKED_QA_INTEGRATION_STATUSES = new Set(["conflict", "validation_failed", "push_failed", "preview_blocked", "blocked"]);
 const BRANCH_WRITER_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
 const ARCHITECTURE_GATED_ACTIONS = new Set(["start_builder", "start_builder_fix", "return_to_builder", "unblock_task"]);
-const DEFAULT_RUN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const DEFAULT_RUN_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_PREFLIGHT_RETRY_DELAY_MS = 250;
 const DEFAULT_RUNNER_PATH = [
   "/opt/homebrew/bin",
@@ -185,40 +199,32 @@ export function prePushValidationScript(run = {}, root = missionControlRoot()) {
   const commandLines = effectiveCommands.map((command, index) => {
     const label = `validation-${index + 1}`;
     const commandDigest = sha256Digest(command);
+    const descriptor = Buffer.from(JSON.stringify({
+      command,
+      commandIndex: index + 1,
+      label,
+      commandDigest,
+      artifactRoot: cacheRoot,
+      artifactPath: path.join(cacheRoot, `__EVIDENCE_KEY__.${label}.log`),
+      evidencePath: "__EVIDENCE_TMP__",
+      environmentContractDigest: context.environmentContractDigest,
+      baseSha: context.baseSha,
+      manifestDigest: context.manifestDigest,
+      selectedComponentsDigest: context.selectedComponentsDigest,
+      candidateCycle: Number(run.candidateCycle || run.candidateIdentity?.candidateCycle || 0),
+    })).toString("base64url");
     return `echo "StudioOps pre-push: ${label}"
-command_log="$cache_root/$evidence_key.${label}.log"
-command_started="$(date +%s)"
+descriptor=${shellQuote(descriptor)}
+descriptor="$(${shellQuote(process.execPath)} -e ${shellQuote("const value=JSON.parse(Buffer.from(process.argv[1],'base64url'));value.artifactPath=value.artifactPath.replace('__EVIDENCE_KEY__',process.argv[2]);value.evidencePath=process.argv[3];value.sourceSha=process.argv[4];value.treeSha=process.argv[5];process.stdout.write(Buffer.from(JSON.stringify(value)).toString('base64url'));")} "$descriptor" "$evidence_key" "$evidence_tmp" "$head" "$tree")"
 set +e
-/bin/sh -lc ${shellQuote(command)} > "$command_log" 2>&1
+${shellQuote(process.execPath)} ${shellQuote(path.join(MODULE_DIR, "run-output-evidence.js"))} "$descriptor"
 command_status="$?"
 set -e
-command_finished="$(date +%s)"
-command_duration="$((command_finished - command_started))"
-command_bytes="$(wc -c < "$command_log" | tr -d ' ')"
-command_truncated=false
-if [ "$command_bytes" -gt 26214400 ]; then
-  tail -c 26214400 "$command_log" > "$command_log.tmp"
-  mv "$command_log.tmp" "$command_log"
-  command_bytes=26214400
-  command_truncated=true
-fi
-chmod 600 "$command_log"
-command_log_digest="$(${shellQuote(process.execPath)} -e ${shellQuote("const crypto=require('node:crypto');const fs=require('node:fs');process.stdout.write(crypto.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex'));")} "$command_log")"
-{
-  printf '%s\n' ${shellQuote(`command_${index + 1}_label=${label}`)}
-  printf '%s\n' ${shellQuote(`command_${index + 1}_digest=${commandDigest}`)}
-  printf 'command_${index + 1}_outcome=%s\n' "$(if [ "$command_status" -eq 0 ]; then printf passed; else printf failed; fi)"
-  printf 'command_${index + 1}_duration_seconds=%s\n' "$command_duration"
-  printf 'command_${index + 1}_artifact_digest=sha256:%s\n' "$command_log_digest"
-  printf 'command_${index + 1}_artifact_bytes=%s\n' "$command_bytes"
-  printf 'command_${index + 1}_artifact_truncated=%s\n' "$command_truncated"
-} >> "$evidence_tmp"
 if [ "$command_status" -ne 0 ]; then
   printf '%s\n' 'outcome=failed' >> "$evidence_tmp"
   mv "$evidence_tmp" "$evidence"
   chmod 600 "$evidence"
   echo "StudioOps blocked this push because ${label} failed." >&2
-  tail -n 80 "$command_log" >&2
   exit 1
 fi`;
   }).join("\n");
@@ -310,7 +316,46 @@ export async function readPrePushValidationAttestation(run = {}, repoPath, root 
     if (!/^sha256:[0-9a-f]{64}$/.test(evidence[`${prefix}_artifact_digest`] || "")) {
       throw new Error(`Pre-push validation attestation ${prefix}_artifact_digest is invalid.`);
     }
+    const artifactPath = path.resolve(evidence[`${prefix}_artifact_path`] || "");
+    const resolvedCacheRoot = path.resolve(cacheRoot);
+    if (artifactPath !== resolvedCacheRoot && !artifactPath.startsWith(`${resolvedCacheRoot}${path.sep}`)) {
+      throw new Error(`Pre-push validation attestation ${prefix}_artifact_path escaped the evidence root.`);
+    }
+    const artifact = await lstat(artifactPath);
+    if (!artifact.isFile() || (artifact.mode & 0o077) !== 0 || artifact.size > MAX_VALIDATION_ARTIFACT_BYTES) {
+      throw new Error(`Pre-push validation attestation ${prefix} artifact has unsafe permissions, type, or size.`);
+    }
+    const artifactContent = await readFile(artifactPath);
+    if (sha256Digest(artifactContent) !== evidence[`${prefix}_artifact_digest`]) {
+      throw new Error(`Pre-push validation attestation ${prefix} artifact digest does not match.`);
+    }
+    const exactBindings = {
+      environment_contract_digest: context.environmentContractDigest,
+      source_sha: head,
+      tree_sha: tree,
+      base_sha: context.baseSha,
+      manifest_digest: context.manifestDigest,
+      selected_components_digest: context.selectedComponentsDigest,
+      candidate_cycle: String(Number(run.candidateCycle || run.candidateIdentity?.candidateCycle || 0)),
+    };
+    for (const [key, expectedValue] of Object.entries(exactBindings)) {
+      if (evidence[`${prefix}_${key}`] !== expectedValue) {
+        throw new Error(`Pre-push validation attestation ${prefix}_${key} does not match the exact run context.`);
+      }
+    }
   }
+  const commandArtifacts = effectiveCommands.map((_, index) => {
+    const prefix = `command_${index + 1}`;
+    return {
+      label: evidence[`${prefix}_label`],
+      digest: evidence[`${prefix}_artifact_digest`],
+      path: evidence[`${prefix}_artifact_path`],
+      bytes: Number(evidence[`${prefix}_artifact_bytes`] || 0),
+      durationMs: Number(evidence[`${prefix}_duration_ms`] || 0),
+      truncated: evidence[`${prefix}_artifact_truncated`] === "true",
+      outcome: evidence[`${prefix}_outcome`],
+    };
+  });
   return {
     path: evidencePath,
     digest: sha256Digest(content),
@@ -324,6 +369,7 @@ export async function readPrePushValidationAttestation(run = {}, repoPath, root 
     attempt: Number(evidence.attempt || 0),
     skips: evidence.skips || "",
     outcome: evidence.outcome,
+    commandArtifacts,
   };
 }
 
@@ -916,6 +962,22 @@ async function gitOutput(args, options = {}) {
 
 async function readLinkedPrState(run, env) {
   if (!run.prUrl || !isBranchWriterRun(run)) return null;
+  const branch = branchNameForRun(run);
+  const defaultBranch = run.project.defaultBranch || "main";
+  const branchSha = (await gitOutput(["rev-parse", "--verify", `refs/remotes/origin/${branch}^{commit}`], {
+    cwd: run.project.repoPath,
+  })).trim().toLowerCase();
+  const baseSha = (await gitOutput(["rev-parse", "--verify", `refs/remotes/origin/${defaultBranch}^{commit}`], {
+    cwd: run.project.repoPath,
+  })).trim().toLowerCase();
+  if (
+    branchSha
+    && baseSha
+    && branchSha !== baseSha
+    && await gitOk(["merge-base", "--is-ancestor", branchSha, baseSha], { cwd: run.project.repoPath })
+  ) {
+    return { state: "MERGED", mergedAt: "local-git-ancestry", headRefName: branch, url: run.prUrl, source: "local_git" };
+  }
   try {
     const result = await execFileAsync("gh", ["pr", "view", run.prUrl, "--json", "state,mergedAt,headRefName,url"], {
       cwd: run.project.repoPath,
@@ -923,20 +985,172 @@ async function readLinkedPrState(run, env) {
       timeout: 30_000,
       maxBuffer: 1024 * 1024,
     });
-    return JSON.parse(result.stdout || "{}");
+    return { ...JSON.parse(result.stdout || "{}"), source: "github_metadata" };
   } catch {
     return null;
   }
 }
 
-async function assertBranchReuseIsSafe(run, env, log) {
+async function collisionSafeRemediationBranch(repoPath, branch, startGeneration = 1) {
+  const stem = String(branch || "codex/remediation").replace(/-r[1-9][0-9]*$/, "");
+  for (let generation = Math.max(1, Number(startGeneration || 1)); generation <= 100; generation += 1) {
+    const candidate = `${stem}-r${generation}`;
+    const exists = await gitOk(["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], { cwd: repoPath })
+      || await gitOk(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidate}`], { cwd: repoPath });
+    if (!exists) return { branch: candidate, generation };
+  }
+  throw new Error("No collision-safe remediation branch was available within the bounded 100-generation search.");
+}
+
+export function remediateStaleLinkedPrInState(state, run, input = {}) {
+  const task = findTask(state, run.taskId);
+  if (!task) throw new Error(`Stale-PR remediation task is missing: ${run.taskId}`);
+  if (task.prUrl !== input.expectedPrUrl || task.branchName !== input.expectedBranch) {
+    throw new Error("Stale-PR remediation lost its compare-and-set binding; the task changed concurrently.");
+  }
+  const now = input.now || new Date().toISOString();
+  const oldSubjectSha = String(task.reviewSubjectSha || task.candidateIdentity?.commitSha || "").trim().toLowerCase();
+  const oldCandidateId = String(task.candidateId || "");
+  for (const review of state.reviews || []) {
+    if (
+      review.taskId === task.id
+      && !review.invalidatedAt
+      && (!oldSubjectSha || String(review.subjectSha || "").toLowerCase() === oldSubjectSha)
+    ) {
+      review.invalidatedAt = now;
+      review.invalidationReason = "stale_pull_request";
+    }
+  }
+  if (oldCandidateId) {
+    const candidate = (state.candidates || []).find((item) => item.id === oldCandidateId);
+    if (candidate && candidate.status !== "merged") {
+      candidate.status = "invalidated";
+      candidate.invalidationReason = "stale_pull_request";
+      candidate.updatedAt = now;
+    }
+  }
+  const nextCycle = Math.max(Number(task.reviewSubjectCycle || 0), Number(task.reviewCycle || 0)) + 1;
+  Object.assign(task, {
+    branchName: input.newBranch,
+    prUrl: "",
+    candidateId: "",
+    qaBundleId: "",
+    qaDecision: null,
+    integrationStatus: "",
+    integrationCommit: "",
+    promotionStatus: "",
+    promotionEvidence: null,
+    reviewSubjectSha: "",
+    reviewSubjectCycle: nextCycle,
+    reviewerThreadId: "",
+    reviewerThreadIds: {},
+    assignedThreadId: "",
+    status: "in_progress",
+    assignedAgentRole: "builder",
+    retryNotBefore: "",
+    lastAutomationFailure: "",
+    candidateIdentity: {
+      branch: input.newBranch,
+      baseSha: input.baseSha,
+      candidateCycle: nextCycle,
+    },
+    updatedAt: now,
+  });
+  delete task.automationBlocker;
+  task.remediationHandoff = createRemediationHandoff(task, [{
+    id: `stale_pr_${run.id}`,
+    outcome: "changes_requested",
+    severity: "high",
+    role: "techops-reliability",
+    stageKey: "repository-recovery",
+    author: "StudioOps deterministic remediation",
+    createdAt: now,
+    body: `Linked pull request ${input.expectedPrUrl} is ${String(input.prState || "closed").toLowerCase()}. Continue from protected base ${input.baseSha} on collision-safe branch ${input.newBranch}. Patch boundary: preserve this task's existing repository and component-map scope; do not reuse the stale PR or cross repository boundaries.`,
+  }], now);
+  const liveRun = (state.runs || []).find((item) => item.id === run.id);
+  if (!liveRun || liveRun.prUrl !== input.expectedPrUrl || liveRun.branchName !== input.expectedBranch) {
+    throw new Error("Stale-PR remediation run binding changed concurrently.");
+  }
+  Object.assign(liveRun, {
+    branchName: input.newBranch,
+    prUrl: "",
+    candidateId: "",
+    qaBundleId: "",
+    reviewSubjectSha: "",
+    candidateCycle: nextCycle,
+    candidateIdentity: structuredClone(task.candidateIdentity),
+    preflightBaseRef: `origin/${input.defaultBranch}`,
+    preflightBaseCommit: input.baseSha,
+    stalePrRemediation: {
+      reasonCode: "stale_pull_request",
+      priorPrUrl: input.expectedPrUrl,
+      priorBranch: input.expectedBranch,
+      branchGeneration: input.branchGeneration,
+      baseSha: input.baseSha,
+      observationSource: input.observationSource,
+      remediatedAt: now,
+    },
+    updatedAt: now,
+  });
+  Object.assign(run, structuredClone(liveRun), { task: structuredClone(task) });
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "stale_pull_request_remediated",
+    projectId: run.projectId,
+    taskId: run.taskId,
+    message: `${run.id} cleared stale PR binding and allocated ${input.newBranch} from protected base ${input.baseSha}`,
+    createdAt: now,
+  });
+  return { task, run: liveRun };
+}
+
+async function ensureBranchReuseIsSafe(run, env, log) {
   const pr = await readLinkedPrState(run, env);
   if (!pr) return;
   const reason = branchReuseSafetyReason(run, pr);
   if (!reason) return;
   log.write(`${reason}\n`);
-  await recordUnsafeBranchReuse(run, reason);
-  throw new Error(reason);
+  const expectedBranch = branchNameForRun(run);
+  const defaultBranch = run.project.defaultBranch || "main";
+  const baseSha = (await git(["rev-parse", "--verify", `origin/${defaultBranch}^{commit}`], {
+    cwd: run.project.repoPath,
+  })).trim().toLowerCase();
+  const allocation = await collisionSafeRemediationBranch(
+    run.project.repoPath,
+    expectedBranch,
+    Math.max(1, Number(run.stalePrRemediation?.branchGeneration || 0) + 1),
+  );
+  await mutateState(async (state) => remediateStaleLinkedPrInState(state, run, {
+    expectedPrUrl: run.prUrl,
+    expectedBranch,
+    newBranch: allocation.branch,
+    branchGeneration: allocation.generation,
+    defaultBranch,
+    baseSha,
+    prState: pr.mergedAt ? "merged" : pr.state,
+    observationSource: pr.source || "github_metadata",
+  }), { operationName: "runner.remediate_stale_pull_request" });
+  await recordFailureContainmentActivity({
+    taskId: run.taskId,
+    action: run.actionType,
+    provider: "github",
+    reasonCode: "stale_pull_request",
+    candidate: { baseSha, candidateCycle: Number(run.candidateCycle || 0) },
+    evidence: {
+      repository: { branch: allocation.branch, prUrl: "", commitSha: baseSha },
+      dependencies: [],
+      credentialClass: "available",
+      configurationDigest: "",
+      policyDigest: "",
+      componentMapDigest: run.impactPlan?.manifest?.digest || "",
+      serviceHealth: { github: "healthy" },
+    },
+    type: "repair",
+    verifier: { id: "deterministic_repair" },
+    outcome: "passed",
+  });
+  log.write(`StudioOps cleared the exact stale PR/candidate/reviewer binding and allocated ${allocation.branch} from ${baseSha}; no model attempt was charged.\n`);
 }
 
 async function remoteBranchExists(repoPath, branch) {
@@ -1253,6 +1467,10 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
     true,
   );
   if (!enabled && workflowMode !== "local") {
+    await withGitRepositoryLock(run.project.repoPath, async () => {
+      await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000, env: gitEnv });
+      await ensureBranchReuseIsSafe(run, gitEnv, log);
+    }, input.gitLock || {});
     return {
       executionRepoPath: run.project.repoPath,
       workspacePath: "",
@@ -1266,25 +1484,27 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
       || process.env.MISSION_CONTROL_WORKSPACE_ROOT
       || DEFAULT_WORKSPACE_ROOT,
   );
-  const branch = branchNameForRun(run);
   const defaultBranch = run.project.defaultBranch || "main";
   const projectKey = slugify(run.project.key || run.projectId || "project");
-  const workspacePath = path.join(workspaceRoot, projectKey, `${slugify(run.id)}-${slugify(branch)}`);
   const persistPreparedWorkspace = async (workspace) => {
     workspace.gitHooksPath = await installPrePushValidationHook(run, log);
     await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
     return workspace;
   };
 
-  await mkdir(path.dirname(workspacePath), { recursive: true });
-  await safeRemoveWorkspace(workspacePath, workspaceRoot);
+  await mkdir(path.join(workspaceRoot, projectKey), { recursive: true });
   return withGitRepositoryLock(run.project.repoPath, async () => {
     log.write(`Acquired source repository Git lock: ${run.project.repoPath}\n`);
     let startRef;
     let startCommit = "";
     if (workflowMode === "github") {
       await git(["fetch", "origin", "--prune"], { cwd: run.project.repoPath, timeout: 300_000, env: gitEnv });
-      await assertBranchReuseIsSafe(run, gitEnv, log);
+      await ensureBranchReuseIsSafe(run, gitEnv, log);
+    }
+    const branch = branchNameForRun(run);
+    const workspacePath = path.join(workspaceRoot, projectKey, `${slugify(run.id)}-${slugify(branch)}`);
+    await safeRemoveWorkspace(workspacePath, workspaceRoot);
+    if (workflowMode === "github") {
       startRef = await remoteBranchExists(run.project.repoPath, branch)
         ? `origin/${branch}`
         : `origin/${defaultBranch}`;
@@ -1713,6 +1933,302 @@ export function applyFailedRunToTask(task, run, reason, now) {
   return { blocked: false, retryAt: task.retryNotBefore };
 }
 
+export function classifyRunFailureReason(run = {}, code = "", notes = "") {
+  const value = `${code} ${notes}`.toLowerCase();
+  if (/output.*budget|command_output|raw_context/.test(value)) return "output_guard_exceeded";
+  if (/validation|test_failed|check_failed/.test(value)) return "validation_failed";
+  if (/rate.?limit|quota|too many requests|\b429\b/.test(value)) return "provider_rate_limited";
+  if (/unauthorized|forbidden|bad credentials|auth_failed|\b401\b|\b403\b/.test(value)) return "provider_auth_failed";
+  if (/credential|private-key|github_app_not_installed|missing_github/.test(value)) return "credential_unavailable";
+  if (/repository|remote|workspace|git ref|branch.*missing|not a git/.test(value)) return "repository_unavailable";
+  if (/service.*unhealthy|health check/.test(value)) return "service_unhealthy";
+  if (/dependency|module not found|command not found/.test(value)) return "dependency_unavailable";
+  if (/spawn|timeout|aborted|provider|sdk_error|network|econn|temporar/.test(value)) return "provider_unavailable";
+  return "execution_failed";
+}
+
+function fullGitSha(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(normalized) ? normalized : "";
+}
+
+function canonicalPrUrl(value) {
+  const normalized = String(value || "").trim();
+  return /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9][0-9]*$/.test(normalized)
+    ? normalized
+    : "";
+}
+
+function canonicalCandidateId(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9_.:-]{0,179}$/.test(normalized) ? normalized : "";
+}
+
+function failureCandidateForRun(run = {}) {
+  const identity = run.candidateIdentity || {};
+  return {
+    candidateId: canonicalCandidateId(run.candidateId),
+    commitSha: fullGitSha(identity.commitSha || run.reviewSubjectSha),
+    treeSha: fullGitSha(identity.treeSha),
+    baseSha: fullGitSha(identity.baseSha || run.preflightBaseCommit),
+    manifestDigest: /^sha256:[a-f0-9]{64}$/.test(String(run.candidateManifestDigest || ""))
+      ? run.candidateManifestDigest
+      : "",
+    candidateCycle: Math.max(0, Number(identity.candidateCycle || run.candidateCycle || 0)),
+  };
+}
+
+function failureEvidenceForRun(run = {}, state = {}) {
+  const task = findTask(state, run.taskId) || run.task || {};
+  const dependencies = (task.dependencies || task.dependsOn || [])
+    .map((entry) => typeof entry === "string" ? entry : entry?.taskId)
+    .filter(Boolean)
+    .map((taskId) => {
+      const dependency = findTask(state, taskId);
+      return {
+        taskId,
+        stateVersion: Math.max(0, Number(dependency?.stateVersion || 0)),
+        status: String(dependency?.status || "unknown").toLowerCase().replace(/[^a-z0-9_.:-]/g, "_") || "unknown",
+      };
+    });
+  const identity = failureCandidateForRun(run);
+  const componentMapDigest = String(run.impactPlan?.manifest?.digest || task.impactEvidence?.componentMapDigest || "");
+  return {
+    repository: {
+      branch: branchNameForRun(run),
+      prUrl: canonicalPrUrl(run.prUrl || task.prUrl),
+      commitSha: identity.commitSha || identity.baseSha,
+    },
+    dependencies,
+    credentialClass: /missing|credential|auth/.test(String(run.exitCode || "").toLowerCase()) ? "missing" : "unknown",
+    configurationDigest: sha256Digest({
+      workflowMode: run.workflowMode || run.project?.workflowMode || "auto",
+      timeoutMs: Number(run.timeoutMs || DEFAULT_RUN_TIMEOUT_MS),
+    }),
+    policyDigest: sha256Digest({
+      action: run.actionType,
+      group: run.group,
+      lane: run.lane || "",
+      fileScope: run.fileScope || [],
+    }),
+    componentMapDigest: /^sha256:[a-f0-9]{64}$/.test(componentMapDigest) ? componentMapDigest : "",
+    serviceHealth: { runner: "healthy" },
+  };
+}
+
+function failureAuthorityForRun(run, reasonCode, state, evidenceOverride = null) {
+  return {
+    taskId: run.taskId,
+    action: run.actionType,
+    provider: normalizeFailureProvider(run.provider || "codex"),
+    reasonCode,
+    candidate: failureCandidateForRun(run),
+    evidence: evidenceOverride || failureEvidenceForRun(run, state),
+  };
+}
+
+async function persistFailureClaim(run, claim) {
+  run.failureContainmentClaim = {
+    incidentId: claim.incident.incidentId,
+    generation: claim.incident.generation,
+    fingerprintDigest: claim.incident.fingerprintDigest,
+    evidenceDigest: claim.incident.evidenceDigest,
+    reasonCode: claim.incident.reasonCode,
+    paidAttempt: claim.incident.paidAttempts,
+    claimedAt: claim.incident.updatedAt,
+  };
+  await mutateState(async (state) => {
+    const liveRun = (state.runs || []).find((item) => item.id === run.id);
+    if (liveRun?.status !== "running") throw new Error("Failure-attempt claim lost the exact running-run binding.");
+    liveRun.failureContainmentClaim = structuredClone(run.failureContainmentClaim);
+    liveRun.updatedAt = claim.incident.updatedAt;
+  }, { operationName: "runner.persist_failure_attempt_claim" });
+}
+
+async function denyPaidFailureAttempt(run, claim) {
+  const now = new Date().toISOString();
+  await mutateState(async (state) => {
+    const liveRun = (state.runs || []).find((item) => item.id === run.id);
+    const task = findTask(state, run.taskId);
+    if (liveRun?.status === "running") {
+      liveRun.status = "cancelled";
+      liveRun.exitCode = claim.reason === "backoff" ? "failure_backoff" : "failure_circuit_open";
+      liveRun.attemptConsumed = false;
+      liveRun.completedAt = now;
+      liveRun.updatedAt = now;
+    }
+    if (task) {
+      const open = claim.incident.state === "open";
+      task.status = open ? "blocked" : restoreTaskStatusForRun(run, task);
+      task.assignedAgentRole = open ? "techops-reliability" : run.group === "reviewer" ? run.role : "builder";
+      task.retryNotBefore = claim.incident.backoffUntil || "";
+      task.automationCircuit = failureIncidentCompatibilityCircuit(claim.incident, { runId: run.id });
+      if (open) {
+        task.automationBlocker = {
+          type: "failure_containment",
+          reason: claim.reason,
+          incidentId: claim.incident.incidentId,
+          resource: `${run.projectId}:${run.taskId}`,
+          retryAt: "",
+          blockedAt: now,
+        };
+      } else {
+        delete task.automationBlocker;
+      }
+      task.updatedAt = now;
+    }
+  }, { operationName: "runner.deny_paid_failure_attempt" });
+}
+
+export async function claimCurrentFailureAttempt(run, input = {}) {
+  const state = input.state || await (input.readState || readState)();
+  const incidents = input.failureIncidents || await (input.readFailureIncidents || readFailureIncidents)({ taskId: run.taskId });
+  const match = incidents.find((incident) => {
+    if (incident.action !== run.actionType || incident.provider !== normalizeFailureProvider(run.provider || "codex")) return false;
+    const authority = failureAuthorityForRun(run, incident.reasonCode, state, incident.evidence);
+    return failureFingerprint(authority).digest === incident.fingerprintDigest;
+  });
+  if (!match) return { admitted: true, reason: "no_active_failure_generation", incident: null };
+  const authority = failureAuthorityForRun(run, match.reasonCode, state, match.evidence);
+  const claim = await (input.claimFailureAttempt || claimFailureContainmentPaidAttempt)({
+    ...authority,
+    initiator: "runner",
+    transport: String(run.provider || "codex").replaceAll("-", "_"),
+  });
+  if (claim.admitted) await (input.persistFailureClaim || persistFailureClaim)(run, claim);
+  else await (input.denyPaidFailureAttempt || denyPaidFailureAttempt)(run, claim);
+  return claim;
+}
+
+const INFRASTRUCTURE_FAILURE_REASONS = new Set([
+  "credential_unavailable",
+  "dependency_unavailable",
+  "provider_auth_failed",
+  "provider_rate_limited",
+  "provider_unavailable",
+  "repository_unavailable",
+  "service_unhealthy",
+]);
+
+export async function runBoundedFailureProbe(run, reasonCode, input = {}) {
+  if (!INFRASTRUCTURE_FAILURE_REASONS.has(reasonCode)) return { applicable: false, ok: true, code: "not_infrastructure" };
+  if (typeof input.probe === "function") return { applicable: true, ...await input.probe(run, reasonCode) };
+  if (reasonCode === "provider_rate_limited") {
+    return { applicable: true, ok: false, code: "quota_probe_unavailable" };
+  }
+  try {
+    if (reasonCode === "repository_unavailable") {
+      await execFileAsync("git", ["rev-parse", "--git-dir"], {
+        cwd: run.project?.repoPath,
+        timeout: 15_000,
+        maxBuffer: 64 * 1024,
+      });
+    } else if (["credential_unavailable", "provider_auth_failed"].includes(reasonCode)) {
+      const inherited = String(process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "");
+      if (!inherited && run.gitAuthStrategy !== "inherited-ssh") throw new Error("credential_probe_failed");
+    } else {
+      await execFileAsync(resolveCodexBin(input), ["--version"], {
+        timeout: 15_000,
+        maxBuffer: 64 * 1024,
+        env: { ...process.env, PATH: input.path || DEFAULT_RUNNER_PATH },
+      });
+    }
+    return { applicable: true, ok: true, code: "bounded_probe_passed" };
+  } catch {
+    return { applicable: true, ok: false, code: "bounded_probe_failed" };
+  }
+}
+
+async function recordFailureContainmentOutcome(run, reasonCode, input = {}) {
+  const state = await (input.readState || readState)();
+  const authorityRun = {
+    ...run,
+    project: run.project || findProject(state, run.projectId),
+    task: run.task || findTask(state, run.taskId),
+  };
+  const authority = failureAuthorityForRun(authorityRun, reasonCode, state);
+  let incident;
+  if (run.failureContainmentClaim?.reasonCode === reasonCode) {
+    const incidents = await (input.readFailureIncidents || readFailureIncidents)({
+      taskId: run.taskId,
+      fingerprintDigest: run.failureContainmentClaim.fingerprintDigest,
+    });
+    incident = incidents.find((item) => item.incidentId === run.failureContainmentClaim.incidentId) || null;
+  }
+  if (!incident) {
+    const claim = await (input.claimFailureAttempt || claimFailureContainmentPaidAttempt)({
+      ...authority,
+      initiator: "runner",
+      transport: String(run.provider || "codex").replaceAll("-", "_"),
+    });
+    incident = claim.incident;
+    run.failureContainmentClaim = {
+      incidentId: incident.incidentId,
+      generation: incident.generation,
+      fingerprintDigest: incident.fingerprintDigest,
+      evidenceDigest: incident.evidenceDigest,
+      reasonCode,
+      paidAttempt: incident.paidAttempts,
+      claimedAt: incident.updatedAt,
+    };
+  }
+  const probe = await runBoundedFailureProbe(authorityRun, reasonCode, input);
+  if (probe.applicable) {
+    incident = await (input.recordFailureActivity || recordFailureContainmentActivity)({
+      ...authority,
+      evidence: incident.evidence,
+      type: "cheap_probe",
+      verifier: { id: reasonCode === "repository_unavailable" ? "repository_probe" : "service_health_probe" },
+      outcome: probe.ok ? "passed" : "failed",
+    });
+  }
+  const backoffMs = probe.applicable && !probe.ok
+    ? Math.min(15 * 60 * 1000, Math.max(60_000, Number(run.retryBackoffMs || 60_000) * incident.paidAttempts))
+    : Math.max(15_000, Number(run.retryBackoffMs || 15_000) * incident.paidAttempts);
+  incident = incident.paidAttempts >= 2
+    ? await (input.openFailureCircuit || openFailureContainmentCircuit)({ ...authority, evidence: incident.evidence })
+    : await (input.scheduleFailureBackoff || scheduleFailureContainmentBackoff)({
+      ...authority,
+      evidence: incident.evidence,
+      delayMs: backoffMs,
+    });
+  return { incident, probe, backoffMs };
+}
+
+function applyFailureContainmentToTask(task, run, result, now) {
+  if (!task) return { blocked: true, retryAt: "" };
+  const { incident, probe } = result;
+  const open = incident.state === "open";
+  task.lastAutomationFailure = incident.reasonCode;
+  task.lastAutomationFailureRunId = run.id;
+  task.automationCircuit = failureIncidentCompatibilityCircuit(incident, { runId: run.id, probe: probe.code });
+  task.status = open ? "blocked" : restoreTaskStatusForRun(run, task);
+  task.assignedAgentRole = open ? "techops-reliability" : run.group === "reviewer" ? run.role : "builder";
+  task.retryNotBefore = incident.backoffUntil || "";
+  task.automationBlocker = open ? {
+    type: "failure_containment",
+    reason: incident.reasonCode,
+    incidentId: incident.incidentId,
+    resource: `${run.projectId}:${run.taskId}`,
+    retryAt: incident.backoffUntil || "",
+    blockedAt: now,
+  } : undefined;
+  if (!task.automationBlocker) delete task.automationBlocker;
+  if (run.provider === "codex-sdk" && incident.paidAttempts === 1 && incident.reasonCode === "provider_unavailable") {
+    task.preferredRunnerProvider = "codex-cli";
+    task.automationFailover = {
+      from: "codex-sdk",
+      to: "codex-cli",
+      reason: incident.reasonCode,
+      runId: run.id,
+      failedOverAt: now,
+      sharedIncidentId: incident.incidentId,
+    };
+  }
+  task.updatedAt = now;
+  return { blocked: task.status === "blocked", retryAt: task.retryNotBefore, incidentId: incident.incidentId };
+}
+
 function runFailureComment(run, reason, disposition) {
   if (disposition.failedOver) {
     return `${run.id} failed in the Codex SDK path: ${reason}. StudioOps switched this task to the approved codex-cli provider and will retry after ${disposition.retryAt}.`;
@@ -2023,12 +2539,16 @@ export async function completeRun(runId, input = {}) {
   const mutate = input.state
     ? async (mutator) => mutator(input.state)
     : mutateState;
-  return mutate(async (state) => {
+  const durableContainment = !input.state && input.failureContainment !== false;
+  const completed = await mutate(async (state) => {
     state.runs = state.runs || [];
     state.events = state.events || [];
     state.comments = state.comments || [];
     const run = state.runs.find((item) => item.id === runId);
     if (!run) throw new Error(`Unknown run: ${runId}`);
+    if (input.expectedStatus && run.status !== input.expectedStatus) {
+      throw new Error(`Run ${runId} changed from expected ${input.expectedStatus} to ${run.status}; completion was not applied.`);
+    }
     const now = new Date().toISOString();
     run.status = input.status || "completed";
     run.exitCode = String(input.exitCode ?? "");
@@ -2088,7 +2608,25 @@ export async function completeRun(runId, input = {}) {
     } else if (run.status === "failed" && ["token_budget_exceeded", "effective_token_budget_exceeded", "raw_context_budget_exceeded", "cost_budget_exceeded"].includes(run.exitCode)) {
       applyBudgetExceededToTask(task, run, now);
     } else if (run.status === "failed") {
-      failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
+      if (durableContainment) {
+        run.rawFailureCode = run.exitCode || "runner_failed";
+        run.exitCode = classifyRunFailureReason(run, run.rawFailureCode, run.notes);
+        if (task) {
+          task.status = "blocked";
+          task.assignedAgentRole = "techops-reliability";
+          task.retryNotBefore = "";
+          task.automationBlocker = {
+            type: "failure_containment_pending",
+            reason: run.exitCode,
+            runId: run.id,
+            resource: `${run.projectId}:${run.taskId}`,
+            blockedAt: now,
+          };
+          task.updatedAt = now;
+        }
+      } else {
+        failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
+      }
     }
 
     const neutralCompletion = run.status === "completed" && run.completionDisposition === "superseded";
@@ -2118,6 +2656,71 @@ export async function completeRun(runId, input = {}) {
 
     return run;
   });
+  const budgetFailure = ["token_budget_exceeded", "effective_token_budget_exceeded", "raw_context_budget_exceeded", "cost_budget_exceeded"].includes(completed.exitCode);
+  if (!durableContainment || completed.status !== "failed" || budgetFailure) return completed;
+  try {
+    const containment = await recordFailureContainmentOutcome(completed, completed.exitCode, input);
+    return mutateState(async (state) => {
+      const liveRun = (state.runs || []).find((item) => item.id === completed.id);
+      const task = findTask(state, completed.taskId);
+      if (!liveRun || liveRun.status !== "failed" || liveRun.exitCode !== completed.exitCode) {
+        throw new Error("Failure containment lost the exact terminal-run binding.");
+      }
+      const now = new Date().toISOString();
+      liveRun.failureContainmentClaim = structuredClone(completed.failureContainmentClaim || {
+        incidentId: containment.incident.incidentId,
+        generation: containment.incident.generation,
+        fingerprintDigest: containment.incident.fingerprintDigest,
+        evidenceDigest: containment.incident.evidenceDigest,
+        reasonCode: containment.incident.reasonCode,
+        paidAttempt: containment.incident.paidAttempts,
+        claimedAt: containment.incident.updatedAt,
+      });
+      liveRun.failureContainmentProbe = structuredClone(containment.probe);
+      liveRun.updatedAt = now;
+      const disposition = applyFailureContainmentToTask(task, liveRun, containment, now);
+      await appendTaskComment(
+        state,
+        liveRun,
+        `${liveRun.id} entered durable failure containment incident ${containment.incident.incidentId} (${containment.incident.paidAttempts}/2 paid attempts; probe ${containment.probe.code}; ${disposition.blocked ? "blocked" : `retry no earlier than ${disposition.retryAt}`}).`,
+        now,
+      );
+      state.events = state.events || [];
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: containment.incident.state === "open" ? "failure_circuit_opened" : "failure_backoff_scheduled",
+        projectId: liveRun.projectId,
+        taskId: liveRun.taskId,
+        message: `${containment.incident.incidentId}: ${liveRun.exitCode}`,
+        createdAt: now,
+      });
+      return structuredClone(liveRun);
+    }, { operationName: "runner.apply_failure_containment" });
+  } catch (error) {
+    await mutateState(async (state) => {
+      const liveRun = (state.runs || []).find((item) => item.id === completed.id);
+      const task = findTask(state, completed.taskId);
+      const now = new Date().toISOString();
+      if (liveRun) {
+        liveRun.failureContainmentError = safeCleanupError(error);
+        liveRun.updatedAt = now;
+      }
+      if (task) {
+        task.status = "blocked";
+        task.assignedAgentRole = "techops-reliability";
+        task.retryNotBefore = "";
+        task.automationBlocker = {
+          type: "failure_containment_write_failed",
+          reason: completed.exitCode,
+          runId: completed.id,
+          resource: `${completed.projectId}:${completed.taskId}`,
+          blockedAt: now,
+        };
+        task.updatedAt = now;
+      }
+    }, { operationName: "runner.fail_closed_failure_containment" });
+    return { ...completed, failureContainmentError: safeCleanupError(error) };
+  }
 }
 
 export async function completeRunAfterExecution(run, input, executionRun = run) {
@@ -2175,35 +2778,33 @@ export async function completeRunAfterExecution(run, input, executionRun = run) 
 }
 
 export async function reconcileStaleRuns(input = {}) {
-  return mutateState(async (state) => {
-    state.events = state.events || [];
-    state.comments = state.comments || [];
-    const now = new Date(Number(input.nowMs || Date.now())).toISOString();
-    const recovered = [];
-    for (const run of state.runs || []) {
-      if (run.status !== "running") continue;
-      const reason = activeRunStaleReason(run, input);
-      if (!reason) continue;
-      run.status = "failed";
-      run.exitCode = `orphaned_run:${reason}`;
-      run.completedAt = now;
-      run.updatedAt = now;
-      const task = findTask(state, run.taskId);
-      const disposition = applyFailedRunToTask(task, run, run.exitCode, now);
-      const message = `${run.id} recovered from stale running state: ${reason}.`;
-      await appendTaskComment(state, run, `${message}\n\n${runFailureComment(run, run.exitCode, disposition)}`, now);
-      state.events.push({
-        id: nextId(state.events, "event"),
-        type: "stale_run_recovered",
-        projectId: run.projectId,
-        taskId: run.taskId,
-        message,
-        createdAt: now,
+  const state = input.state || await readState();
+  const stale = (state.runs || []).filter((run) => run.status === "running")
+    .map((run) => ({ run, reason: activeRunStaleReason(run, input) }))
+    .filter((item) => item.reason);
+  const recovered = [];
+  for (const item of stale) {
+    try {
+      const completed = await completeRun(item.run.id, {
+        ...(input.state ? { state: input.state } : {}),
+        status: "failed",
+        exitCode: `orphaned_run:${item.reason}`,
+        notes: `Watchdog observed stale running state: ${item.reason}.`,
+        expectedStatus: "running",
       });
-      recovered.push({ runId: run.id, taskId: run.taskId, reason, blocked: disposition.blocked });
+      recovered.push({
+        runId: completed.id,
+        taskId: completed.taskId,
+        reason: item.reason,
+        blocked: input.state
+          ? findTask(input.state, completed.taskId)?.status === "blocked"
+          : completed.exitCode === "failure_circuit_open",
+      });
+    } catch {
+      // A concurrent completion won the compare-and-set race; do not overwrite it.
     }
-    return recovered;
-  }, { operationName: "runner.reconcile_stale" });
+  }
+  return recovered;
 }
 
 async function persistRunThread(run, threadId) {
@@ -2310,6 +2911,18 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
+    const failureClaim = await claimCurrentFailureAttempt(run, input);
+    if (!failureClaim.admitted) {
+      status = "cancelled";
+      exitCode = failureClaim.reason === "backoff" ? "failure_backoff" : "failure_circuit_open";
+      log.write(`StudioOps skipped provider launch because ${failureClaim.reason} is active for ${failureClaim.incident.incidentId}.\n`);
+      return {
+        ...run,
+        status,
+        exitCode,
+        attemptConsumed: false,
+      };
+    }
     const prompt = runnerPrompt(executionRun, executionRun.project, authContext);
     log.write(`Repo: ${executionRun.project.repoPath}\n`);
     log.write(`Existing thread: ${run.threadId || "(new thread)"}\n`);
@@ -2439,6 +3052,18 @@ async function runClaimedRunWithCli(run, input = {}) {
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
+    const failureClaim = await claimCurrentFailureAttempt(run, input);
+    if (!failureClaim.admitted) {
+      log.write(`StudioOps skipped provider launch because ${failureClaim.reason} is active for ${failureClaim.incident.incidentId}.\n`);
+      log.end();
+      await cleanupGitHubAppAuth(authContext);
+      return {
+        ...run,
+        status: "cancelled",
+        exitCode: failureClaim.reason === "backoff" ? "failure_backoff" : "failure_circuit_open",
+        attemptConsumed: false,
+      };
+    }
     prompt = runnerPrompt(executionRun, executionRun.project, authContext);
   } catch (error) {
     const notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
