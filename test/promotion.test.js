@@ -1033,6 +1033,33 @@ test("promotion reconciliation binds declared validation policy without resolvin
     assert.equal(reconciliation.validationToolchain.declaredCommandsDigest, sha256(JSON.stringify([validationCommand])));
     assert.deepEqual(reconciliation.validationToolchain.commandExecutables, []);
 
+    const receiptPolicyDigest = `sha256:${"e".repeat(64)}`;
+    releaseCandidate.promotionValidationRecoveryReceipt = {
+      schemaVersion: "studioops.promotion-validation-recovery.v1",
+      candidateId: releaseCandidate.id,
+      manifestDigest: releaseCandidate.manifestDigest,
+      integrationBranch: releaseCandidate.manifest.integration.branch,
+      integrationSha: releaseCandidate.manifest.integration.sha,
+      policyDigest: receiptPolicyDigest,
+      validationResultDigest: `sha256:${"c".repeat(64)}`,
+      validationEvidence: {
+        path: "/private-evidence/passed.json",
+        digest: `sha256:${"d".repeat(64)}`,
+        bytes: 512,
+        createdAt: "2026-07-25T12:31:00.000Z",
+        candidateId: releaseCandidate.id,
+        manifestDigest: releaseCandidate.manifestDigest,
+        integrationSha: releaseCandidate.manifest.integration.sha,
+        attempt: 1,
+        policyDigest: receiptPolicyDigest,
+        commandCount: 1,
+      },
+      validatedAt: "2026-07-25T12:31:00.000Z",
+    };
+    const receiptBoundReconciliation = planPromotions(reconciliationState).projects[0];
+    assert.equal(receiptBoundReconciliation.mode, "reconcile");
+    assert.equal(receiptBoundReconciliation.validationPolicyDigest, receiptPolicyDigest);
+
     const alternateReconciliationPlan = (projectOverrides) => {
       const alternateCandidate = releaseCandidateFixture({
         baseSha: "a".repeat(40),
