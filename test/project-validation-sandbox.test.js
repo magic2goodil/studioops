@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { promisify } from "node:util";
 import {
@@ -313,19 +314,43 @@ test("npm dependencies are acquired without lifecycle scripts and installed offl
   timeout: 60_000,
 }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-npm-validation-"));
-  const { repoPath, head } = await repositoryFixture(root);
+  const { repoPath } = await repositoryFixture(root);
+  const dependencyPath = path.join(root, "dependency");
+  await mkdir(dependencyPath, { recursive: true });
+  await writeFile(path.join(dependencyPath, "package.json"), JSON.stringify({
+    name: "studioops-cache-fixture",
+    version: "1.0.0",
+    main: "index.js",
+  }) + "\n");
+  await writeFile(path.join(dependencyPath, "index.js"), "module.exports = 'cached';\n");
+  const packed = await execFileAsync("npm", ["pack", "--ignore-scripts", "--pack-destination", root], {
+    cwd: dependencyPath,
+  });
+  const tarball = await readFile(path.join(root, packed.stdout.trim()));
+  let registryRequests = 0;
+  const registry = createHttpServer((request, response) => {
+    registryRequests += 1;
+    if (request.url !== "/dependency.tgz") {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/octet-stream", "content-length": tarball.byteLength });
+    response.end(tarball);
+  });
+  await new Promise((resolve, reject) => {
+    registry.once("error", reject);
+    registry.listen(0, "127.0.0.1", resolve);
+  });
+  const port = registry.address().port;
   await writeFile(path.join(repoPath, "package.json"), JSON.stringify({
     name: "studioops-npm-fixture",
     version: "1.0.0",
+    dependencies: { "studioops-cache-fixture": `http://127.0.0.1:${port}/dependency.tgz` },
     scripts: { postinstall: "node -e \"require('node:fs').writeFileSync('lifecycle-ran', 'yes')\"" },
   }) + "\n");
-  await writeFile(path.join(repoPath, "package-lock.json"), JSON.stringify({
-    name: "studioops-npm-fixture",
-    version: "1.0.0",
-    lockfileVersion: 3,
-    requires: true,
-    packages: { "": { name: "studioops-npm-fixture", version: "1.0.0", hasInstallScript: true } },
-  }) + "\n");
+  await execFileAsync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
+    cwd: repoPath,
+  });
   await git(repoPath, ["add", "package.json", "package-lock.json"]);
   await git(repoPath, ["commit", "-m", "npm fixture"]);
   const npmHead = await git(repoPath, ["rev-parse", "HEAD"]);
@@ -340,12 +365,24 @@ test("npm dependencies are acquired without lifecycle scripts and installed offl
       dependencyAcquisitionTimeoutMs: 15_000,
     });
     assert.equal(prepared.status, "prepared");
+    assert.ok(registryRequests > 0, "cold acquisition should populate the cache from the fixture registry");
     assert.equal(await readFile(path.join(sandbox.repoPath, "lifecycle-ran"), "utf8").catch(() => ""), "");
+    await new Promise((resolve, reject) => registry.close((error) => error ? reject(error) : resolve()));
+    const warm = await prepareProjectValidationDependencies(sandbox, {
+      dependencyAcquisitionTimeoutMs: 15_000,
+    });
+    assert.equal(warm.status, "prepared");
     const installed = await installPreparedProjectValidationDependencies(sandbox, { validationTimeoutMs: 15_000 });
     assert.equal(installed.ok, true, installed.output);
     assert.equal(await readFile(path.join(sandbox.repoPath, "lifecycle-ran"), "utf8"), "yes");
     assert.equal(sandbox.environment.npm_config_cache, prepared.cachePath);
+    await rm(path.join(sandbox.repoPath, "node_modules"), { recursive: true, force: true });
+    await rm(path.join(prepared.cachePath, "_cacache"), { recursive: true, force: true });
+    const missing = await installPreparedProjectValidationDependencies(sandbox, { validationTimeoutMs: 15_000 });
+    assert.equal(missing.ok, false);
+    assert.match(missing.output, /offline|cache|ENOTCACHED/i);
   } finally {
+    if (registry.listening) await new Promise((resolve) => registry.close(resolve));
     await cleanupProjectValidationSandbox(sandbox);
     await rm(root, { recursive: true, force: true });
   }
