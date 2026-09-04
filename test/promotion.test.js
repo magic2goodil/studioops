@@ -75,6 +75,23 @@ function testPathWithin(parentPath, childPath) {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+function trustedValidationNodePath() {
+  const approvedRoots = [...new Set(VALIDATION_SYSTEM_TOOL_ROOTS.flatMap((entry) => {
+    try { return [realpathSync(entry)]; } catch { return []; }
+  }))];
+  for (const entry of DEFAULT_PROJECT_VALIDATION_PATH.split(path.delimiter)) {
+    const provenance = expectedPathProvenance(path.join(entry, "node"), "file");
+    if (
+      provenance.available
+      && (lstatSync(provenance.path).mode & 0o111) !== 0
+      && approvedRoots.some((root) => testPathWithin(root, provenance.path))
+    ) return provenance.path;
+  }
+  throw new Error("The test host has no trusted Node executable on the project validation PATH.");
+}
+
+const TRUSTED_VALIDATION_NODE = trustedValidationNodePath();
+
 function expectedValidationCommandExecutables(commands, pathEntries) {
   const approvedRoots = [...new Set(VALIDATION_SYSTEM_TOOL_ROOTS.flatMap((entry) => {
     try { return [realpathSync(entry)]; } catch { return []; }
@@ -2274,7 +2291,7 @@ test("promotion retries one exact QA candidate with scrubbed validation credenti
       "NPM_TOKEN",
     ];
     const validationProbe = `const fs = require("node:fs"); const path = require("node:path"); const blocked = ${JSON.stringify(blockedValidationKeys)}; const home = process.env.HOME || ""; if (blocked.some((key) => Object.hasOwn(process.env, key)) || Object.hasOwn(process.env, "STUDIOOPS_TEST_MARKER") || !home.includes("validation-sandbox-") || path.basename(home) !== "home" || process.env.TMPDIR !== path.join(home, "tmp") || process.env.XDG_CONFIG_HOME !== path.join(home, ".config") || process.env.XDG_CACHE_HOME !== path.join(home, ".cache") || process.env.GH_CONFIG_DIR !== path.join(home, ".config", "gh") || process.env.npm_config_cache !== path.join(home, ".npm-cache") || process.env.CI !== "1" || process.env.GIT_CONFIG_NOSYSTEM !== "1" || process.env.GIT_CONFIG_GLOBAL !== "/dev/null" || process.env.GIT_TERMINAL_PROMPT !== "0") process.exit(23); try { fs.writeFileSync(${JSON.stringify(forbiddenHostWrite)}, "forbidden") } catch (error) { if (!["EACCES", "EPERM"].includes(error.code)) process.exit(24); process.exit(0) } process.exit(25)`;
-    const validationCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(validationProbe)} && test -f feature.txt`;
+    const validationCommand = `${JSON.stringify(TRUSTED_VALIDATION_NODE)} -e ${JSON.stringify(validationProbe)} && test -f feature.txt`;
     const project = {
       id: "project_1",
       key: "demo",
@@ -2722,7 +2739,7 @@ test("promotion records complete private failure evidence and exhausts one bound
       'console.error("TAIL-SENTINEL")',
       "process.exit(7)",
     ].join(";");
-    const validationCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(validationProgram)}`;
+    const validationCommand = `${JSON.stringify(TRUSTED_VALIDATION_NODE)} -e ${JSON.stringify(validationProgram)}`;
     await writeState(root, baseState({
       projects: [{
         id: "project_1",
