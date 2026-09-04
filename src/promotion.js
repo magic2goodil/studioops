@@ -2676,6 +2676,12 @@ function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) 
 }
 
 async function recordProjectResult(projectResult) {
+  if (projectResult.status === "merged") {
+    // GitHub may omit fractional seconds. Canonicalize once before binding the
+    // terminal claim and writing each durable merge mirror so they cannot
+    // disagree solely because equivalent ISO timestamps use different forms.
+    projectResult.mergedAt = new Date(projectResult.mergedAt).toISOString();
+  }
   return mutateCandidatePromotionState(projectResult.candidate?.id, projectResult.promotionClaim, async (state) => {
     const now = new Date().toISOString();
     state.comments = state.comments || [];
