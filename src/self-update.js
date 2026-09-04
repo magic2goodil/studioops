@@ -79,7 +79,10 @@ async function git(args, options = {}) {
     timeout: options.timeout || 120_000,
     maxBuffer: options.maxBuffer || 20 * 1024 * 1024,
   });
-  return `${result.stdout || ""}${result.stderr || ""}`.trim();
+  // Successful Git commands may emit non-fatal sandbox or platform warnings
+  // on stderr. Callers that parse refs, counts, or porcelain output must only
+  // consume stdout; failures still retain stderr through gitMaybe's catch path.
+  return String(result.stdout || "").trim();
 }
 
 async function gitMaybe(args, options = {}) {

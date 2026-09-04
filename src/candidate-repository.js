@@ -173,17 +173,21 @@ function pathContains(parentPath, childPath) {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function trustedGitEnvironment(input = {}) {
-  const auth = input.gitAuthEnv || {};
-  const isolatedTestRoot = process.env.NODE_ENV === "test"
+function isolatedTestRoot() {
+  return process.env.NODE_ENV === "test"
     && process.env.STUDIOOPS_TEST_ISOLATION === "1"
     && path.isAbsolute(String(process.env.STUDIOOPS_TEST_ROOT || ""))
     ? String(process.env.STUDIOOPS_TEST_ROOT)
     : "";
+}
+
+function trustedGitEnvironment(input = {}) {
+  const auth = input.gitAuthEnv || {};
+  const testRoot = isolatedTestRoot();
   const env = {
     PATH: TRUSTED_GIT_PATH,
-    HOME: "/",
-    TMPDIR: isolatedTestRoot || "/tmp",
+    HOME: testRoot || "/",
+    TMPDIR: testRoot || "/tmp",
     LANG: "C",
     LC_ALL: "C",
     GIT_ATTR_NOSYSTEM: "1",
@@ -305,7 +309,7 @@ async function trustedGit(repoPath, args, input = {}) {
     TRUSTED_GIT_EXECUTABLE,
     effectiveArgs,
     {
-      cwd: "/",
+      cwd: isolatedTestRoot() || "/",
       env: trustedGitEnvironment(input),
       timeout: Number(input.timeoutMs || 60_000),
       maxBuffer: 2 * 1024 * 1024,

@@ -279,7 +279,7 @@ function candidateRepositoryTestRunnerPrelude(remotePath, repositoryUrl = GITHUB
 }
 
 const nestedValidationSandboxTest = process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX
-  ? { skip: "macOS sandbox-exec does not support nesting the project validation sandbox" }
+  ? { skip: "The outer release sandbox cannot run nested validation or local Git remote transport fixtures; these suites run in builder validation." }
   : {};
 
 async function run(command, args, options = {}) {
@@ -1664,7 +1664,7 @@ async function reconciliationFixture(prState = "OPEN", overrides = {}) {
   return { root, remotePath, repoPath, fakeBin, githubApiStatePath, candidate, sourceSha, mergeCommit };
 }
 
-test("promotion GitHub API test adapter is rejected outside isolated test mode", async () => {
+test("promotion GitHub API test adapter is rejected outside isolated test mode", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("OPEN");
   const adapterMarker = path.join(fixture.root, "github-api-adapter-ran");
   try {
@@ -2013,7 +2013,7 @@ test("owner QA cannot pass only part of a multi-task candidate", async () => {
   }
 });
 
-test("promotion Git ignores caller PATH and URL rewrite injection before remote access", async () => {
+test("promotion Git ignores caller PATH and URL rewrite injection before remote access", nestedValidationSandboxTest, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-promotion-git-isolation-"));
   const remoteA = path.join(root, "remote-a.git");
   const remoteB = path.join(root, "remote-b.git");
@@ -2978,7 +2978,7 @@ test("promotion closes an exact external PR when the fenced claim becomes stale 
   }
 });
 
-test("promotion reconciliation records an exact merged candidate once", async () => {
+test("promotion reconciliation records an exact merged candidate once", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("MERGED");
   try {
     const script = `
@@ -3016,7 +3016,7 @@ test("promotion reconciliation records an exact merged candidate once", async ()
   }
 });
 
-test("promotion self-recovers a legacy merged PR overwritten by a stale validation result", async () => {
+test("promotion self-recovers a legacy merged PR overwritten by a stale validation result", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("MERGED", {
     legacyBody: true,
     stalePostMerge: true,
@@ -3064,7 +3064,7 @@ test("promotion self-recovers a legacy merged PR overwritten by a stale validati
   }
 });
 
-test("merged admission recovery accepts a production v1 owner QA packet and legacy decision", async () => {
+test("merged admission recovery accepts a production v1 owner QA packet and legacy decision", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("MERGED", {
     legacyBody: true,
     legacyOwnerQaPacket: true,
@@ -3137,7 +3137,7 @@ test("merged admission recovery accepts a production v1 owner QA packet and lega
   }
 });
 
-test("promotion reconciliation preserves a deployed task while backfilling exact merge evidence once", async () => {
+test("promotion reconciliation preserves a deployed task while backfilling exact merge evidence once", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("MERGED");
   try {
     const state = JSON.parse(await readFile(path.join(fixture.root, "data", "mission-control.json"), "utf8"));
@@ -3181,7 +3181,7 @@ test("promotion reconciliation preserves a deployed task while backfilling exact
   }
 });
 
-test("promotion reconciliation closes a superseded candidate when a trusted merged candidate contains it", async () => {
+test("promotion reconciliation closes a superseded candidate when a trusted merged candidate contains it", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("CLOSED");
   try {
     await git(fixture.repoPath, ["checkout", "-b", "feature/replacement", fixture.sourceSha]);
@@ -3296,7 +3296,7 @@ test("promotion reconciliation closes a superseded candidate when a trusted merg
   }
 });
 
-test("superseded reconciliation discards replacement metadata drift before merge recording", async () => {
+test("superseded reconciliation discards replacement metadata drift before merge recording", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("CLOSED");
   try {
     await git(fixture.repoPath, ["checkout", "-b", "feature/replacement", fixture.sourceSha]);
@@ -3407,7 +3407,7 @@ test("superseded reconciliation discards replacement metadata drift before merge
   }
 });
 
-test("promotion reconciliation leaves open PRs stable without duplicate evidence", async () => {
+test("promotion reconciliation leaves open PRs stable without duplicate evidence", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("OPEN");
   try {
     const script = `
@@ -3434,7 +3434,7 @@ test("promotion reconciliation leaves open PRs stable without duplicate evidence
   }
 });
 
-test("promotion reconciliation records a later exact merge after first observing the PR closed", async () => {
+test("promotion reconciliation records a later exact merge after first observing the PR closed", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("CLOSED");
   try {
     const script = `
@@ -3500,7 +3500,7 @@ test("promotion reconciliation records a later exact merge after first observing
   }
 });
 
-test("promotion reconciliation bounds closed and drifted PRs without restarting review", async (t) => {
+test("promotion reconciliation bounds closed and drifted PRs without restarting review", nestedValidationSandboxTest, async (t) => {
   for (const scenario of [
     { name: "closed", state: "CLOSED", overrides: {}, expected: "promotion_closed" },
     { name: "target mismatch", state: "OPEN", overrides: { baseRefName: "release" }, expected: "promotion_invalid" },
@@ -3532,7 +3532,7 @@ test("promotion reconciliation bounds closed and drifted PRs without restarting 
   }
 });
 
-test("closed reconciliation preserves terminal task states while auditing the observation", async (t) => {
+test("closed reconciliation preserves terminal task states while auditing the observation", nestedValidationSandboxTest, async (t) => {
   for (const terminalStatus of ["merged", "deployed", "done"]) {
     await t.test(terminalStatus, async () => {
       const fixture = await reconciliationFixture("CLOSED");
@@ -3687,7 +3687,7 @@ test("promotion validation cannot mutate a host source ref", nestedValidationSan
   }
 });
 
-test("promotion invalidates the candidate when its staged integration branch drifts", async () => {
+test("promotion invalidates the candidate when its staged integration branch drifts", nestedValidationSandboxTest, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-candidate-branch-drift-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
