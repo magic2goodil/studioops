@@ -65,7 +65,9 @@ import {
 import {
   assertChangedFileEvidenceMatches,
   assertChangedFilesWithinImpactPlan,
+  assertImpactPlanProjectBinding,
   exactCandidateChangedFiles,
+  resolveProjectImpactPlan,
 } from "./impact-planner.js";
 import {
   createQaRevocationTestObservation,
@@ -2765,7 +2767,25 @@ export async function updateTask(taskId, patch) {
         cwd: process.cwd(),
       });
       assertChangedFileEvidenceMatches(actualChangedFiles, impactEvidence.changedFiles);
-      assertChangedFilesWithinImpactPlan(task.impactPlan, actualChangedFiles);
+      const candidateImpactPlan = resolveProjectImpactPlan({
+        project,
+        task: {
+          ...task,
+          candidateIdentity: {
+            ...candidateIdentityAfterPatch,
+            impactEvidence,
+          },
+          impactEvidence,
+        },
+        repoRoot: project.sourceRepoPath || project.repoPath,
+        sourceCommit: candidateIdentityAfterPatch.commitSha,
+        changedFiles: actualChangedFiles,
+      });
+      assertImpactPlanProjectBinding(candidateImpactPlan, project);
+      if (candidateImpactPlan.status === "mapped") {
+        assertChangedFilesWithinImpactPlan(candidateImpactPlan, actualChangedFiles);
+      }
+      task.impactPlan = candidateImpactPlan;
     }
     const unchangedCandidateTree = Object.prototype.hasOwnProperty.call(patch, "candidateIdentity")
       && Object.prototype.hasOwnProperty.call(patch, "subjectSha")

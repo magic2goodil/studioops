@@ -2,7 +2,13 @@ import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { sha256Digest, loadProjectComponentImpactMap, normalizeRepositoryIdentity, projectRepositoryIdentity } from "./component-impact-map.js";
+import {
+  sha256Digest,
+  loadProjectComponentImpactMap,
+  loadProjectComponentImpactMapAtCommit,
+  normalizeRepositoryIdentity,
+  projectRepositoryIdentity,
+} from "./component-impact-map.js";
 
 const FULL_REGRESSION_WORDS = [
   "authorization", "identity", "consent", "privacy", "entitlement", "safety",
@@ -219,8 +225,11 @@ function fallbackPlan(project, task, loaded, sourceCommit) {
 export function resolveProjectImpactPlan(input = {}) {
   const project = input.project || {};
   const task = input.task || {};
-  const loaded = input.loadedMap || loadProjectComponentImpactMap(project, { repoRoot: input.repoRoot });
   const candidate = task.candidateIdentity || {};
+  const candidateCommit = exactSha(candidate.commitSha);
+  const loaded = input.loadedMap || (candidateCommit
+    ? loadProjectComponentImpactMapAtCommit(project, candidateCommit, { repoRoot: input.repoRoot })
+    : loadProjectComponentImpactMap(project, { repoRoot: input.repoRoot }));
   const sourceCommit = input.sourceCommit || candidate.commitSha || task.reviewSubjectSha || candidate.baseSha || "";
   if (!loaded.manifest) return fallbackPlan(project, task, loaded, sourceCommit);
   const text = taskSearchText(task);

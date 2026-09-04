@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   readFileSync,
@@ -311,5 +312,82 @@ export function loadProjectComponentImpactMap(project = {}, options = {}) {
     manifest,
     digest: sha256Digest(manifest),
     path: source === "primary" ? relativeManifestPath : "docs/architecture/*.components.json",
+  };
+}
+
+function trustedGit(repoRoot, args) {
+  return execFileSync("/usr/bin/git", ["-C", repoRoot, ...args], {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      LANG: "C",
+      LC_ALL: "C",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_PAGER: "cat",
+    },
+  });
+}
+
+/**
+ * Load the primary component map from an immutable candidate commit without
+ * changing the repository checkout. The Git root and its origin must still
+ * match the task's project authority, so an object from another repository
+ * cannot supply a remap.
+ */
+export function loadProjectComponentImpactMapAtCommit(project = {}, commitSha, options = {}) {
+  const sha = String(commitSha || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(sha)) {
+    throw new Error("Candidate component-map lookup requires a full Git SHA.");
+  }
+  const repoRootInput = options.repoRoot || project.sourceRepoPath || project.repoPath;
+  if (!repoRootInput || !existsSync(repoRootInput)) {
+    return { status: "missing", reason: "repository_root_missing", manifest: null, digest: "", path: "", sourceCommit: sha };
+  }
+  const repoRoot = realpathSync(repoRootInput);
+  const expectedRepository = projectRepositoryIdentity(project);
+  if (expectedRepository && !expectedRepository.startsWith("local:")) {
+    let observedRepository = "";
+    try {
+      observedRepository = normalizeRepositoryIdentity(trustedGit(repoRoot, ["remote", "get-url", "origin"]).trim());
+    } catch {
+      throw new ComponentMapIsolationError("Candidate component-map repository origin is unavailable.");
+    }
+    if (observedRepository !== expectedRepository) {
+      throw new ComponentMapIsolationError(`Candidate component-map repository ${observedRepository || "(missing)"} does not match ${expectedRepository}.`);
+    }
+  }
+  trustedGit(repoRoot, ["cat-file", "-e", `${sha}^{commit}`]);
+  const relativeManifestPath = safeRelativePath(
+    project.componentImpactMapPath || options.manifestPath || DEFAULT_COMPONENT_MAP_PATH,
+    "Component map path",
+  );
+  let serialized;
+  try {
+    serialized = trustedGit(repoRoot, ["show", `${sha}:${relativeManifestPath}`]);
+  } catch {
+    return {
+      status: "missing",
+      reason: "component_map_missing_at_candidate",
+      manifest: null,
+      digest: "",
+      path: relativeManifestPath,
+      sourceCommit: sha,
+    };
+  }
+  const manifest = validateComponentImpactMap(JSON.parse(serialized), {
+    projectKey: String(project.key || project.id || "").trim(),
+    repository: expectedRepository,
+  });
+  return {
+    status: "mapped",
+    reason: "candidate_component_map_loaded",
+    manifest,
+    digest: sha256Digest(manifest),
+    path: relativeManifestPath,
+    sourceCommit: sha,
   };
 }

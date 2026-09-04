@@ -32,6 +32,7 @@
     "src/component-impact-map.js",
     "src/impact-planner.js",
     "docs/architecture/components.json",
+    "package.json",
     "src/store.js",
     "src/state-database.js",
     "src/lifecycle-policy.js",
@@ -53,6 +54,23 @@
     { "from": "scheduling-dispatch", "to": "owner-console" }
   ],
   "components": {
+    "repository-composition": {
+      "owner": "devops-runtime",
+      "aliases": ["package scripts", "aggregate validation", "repository composition"],
+      "capabilities": ["stable repository validation entry point"],
+      "paths": ["package.json"],
+      "workflows": ["validation composition"],
+      "publicContracts": ["npm run check aggregate contract"],
+      "tests": [
+        { "command": "npm run check", "layer": "composition" }
+      ],
+      "reviewOwners": ["backend-reviewer", "lead-reviewer"],
+      "fullRegressionPaths": ["package.json"],
+      "policyAuthorities": ["aggregate validation composition"],
+      "dependsOn": ["component-impact-planning"],
+      "shared": true,
+      "rollback": "Restore the previous package script while retaining repository-local component ownership."
+    },
     "component-impact-planning": {
       "owner": "backend-architecture",
       "aliases": ["component map", "impact map", "context packet", "scoped worker planning"],
