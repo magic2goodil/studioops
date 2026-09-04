@@ -346,6 +346,7 @@ export function formatImpactPlanForPrompt(plan = {}) {
 - Project binding: ${plan.project?.id || "(missing)"}/${plan.project?.key || "(missing)"} @ ${plan.project?.repository || "(local identity missing)"}
 - Source commit binding: ${plan.sourceCommit || "assigned during workspace preflight"}
 - Component manifest: ${plan.manifest?.path || "(missing)"} (${plan.manifest?.digest || "no digest"})
+- Manifest digest contract: SHA-256 of canonical JSON after schema validation and normalization; this is intentionally not the raw file-byte hash.
 - Selected components: ${components.join(", ") || "(unclassified)"}
 - Allowed file scope: ${scope.join(", ") || "(none; remap before editing)"}
 - Targeted implementation tests: ${tests.join(" && ") || "(none; use final aggregate only)"}

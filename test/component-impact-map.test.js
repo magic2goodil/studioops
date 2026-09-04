@@ -111,6 +111,7 @@ test("planner emits a narrow context packet and targeted tests for mapped work",
   assert.deepEqual(plan.targetedTests, ["node --test test/catalog.test.js"]);
   assertImpactPlanProjectBinding(plan, project);
   assert.match(formatImpactPlanForPrompt(plan), /SCOPED CONTEXT PACKET/);
+  assert.match(formatImpactPlanForPrompt(plan), /not the raw file-byte hash/);
   assert.match(formatImpactPlanForPrompt(plan), /Do not list or broadly search/);
 });
 
