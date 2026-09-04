@@ -158,6 +158,35 @@ test("task CLI preserves and updates required readiness evidence", async () => {
   }
 });
 
+test("terminal task assignment cleanup does not rerun completion gates", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-terminal-assignment-cleanup-"));
+  try {
+    const state = invalidStatusState();
+    Object.assign(state.tasks[0], {
+      status: "done",
+      assignedAgentRole: "builder",
+      stateVersion: 1,
+    });
+    await writeLegacyState(root, state);
+    const env = await environmentForTestControlRoot(root);
+    await execFileAsync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `import { updateTask } from ${JSON.stringify(path.resolve("src/store.js"))}; await updateTask("task_1", { assignedAgentRole: "" });`,
+    ], { cwd: root, env });
+
+    const persisted = await readPersistedState(root, env);
+    assert.equal(persisted.tasks[0].status, "done");
+    assert.equal(persisted.tasks[0].assignedAgentRole, "");
+    assert.equal(
+      persisted.events.some((event) => event.type === "lifecycle_transition" && event.action === "mutate_assignment"),
+      true,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("status without a value and show-task leave the task unchanged", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-status-cli-"));
   try {

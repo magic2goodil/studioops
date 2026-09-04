@@ -2151,7 +2151,7 @@ function applyStoreLifecycleTransition(state, task, targetStatus, input = {}) {
   if (targetStatus === task.status && input.force !== true) return null;
   const action = input.action || defaultLifecycleAction(task, targetStatus);
   const evidence = lifecycleEvidenceForTask(state, task, targetStatus, input.evidence);
-  if (action === "finish_task" || targetStatus === "done") {
+  if (action === "finish_task" || (targetStatus === "done" && task.status !== "done")) {
     const completion = completionEvidenceForTask(state, task);
     if (!completion.complete && input.allowIncompleteDone !== true) {
       throw new Error(`Task is not done from objective evidence. Missing: ${[...completion.missing, ...completion.missingReviews].join(", ")}.`);
