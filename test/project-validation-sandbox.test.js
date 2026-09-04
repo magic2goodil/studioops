@@ -9,7 +9,9 @@ import { createServer } from "node:net";
 import { promisify } from "node:util";
 import {
   cleanupProjectValidationSandbox,
+  installPreparedProjectValidationDependencies,
   prepareProjectValidationSandbox,
+  prepareProjectValidationDependencies,
   PROJECT_VALIDATION_SANDBOX_ISOLATION,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
   runProjectValidationCommand,
@@ -302,6 +304,49 @@ test("project validation uses a disposable no-network sandbox and cannot reach s
       }
     }
     if (sandbox) await cleanupProjectValidationSandbox(sandbox);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("npm dependencies are acquired without lifecycle scripts and installed offline inside the sandbox", {
+  skip: process.platform !== "darwin" || NESTED_PROJECT_SANDBOX,
+  timeout: 60_000,
+}, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-npm-validation-"));
+  const { repoPath, head } = await repositoryFixture(root);
+  await writeFile(path.join(repoPath, "package.json"), JSON.stringify({
+    name: "studioops-npm-fixture",
+    version: "1.0.0",
+    scripts: { postinstall: "node -e \"require('node:fs').writeFileSync('lifecycle-ran', 'yes')\"" },
+  }) + "\n");
+  await writeFile(path.join(repoPath, "package-lock.json"), JSON.stringify({
+    name: "studioops-npm-fixture",
+    version: "1.0.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: { "": { name: "studioops-npm-fixture", version: "1.0.0", hasInstallScript: true } },
+  }) + "\n");
+  await git(repoPath, ["add", "package.json", "package-lock.json"]);
+  await git(repoPath, ["commit", "-m", "npm fixture"]);
+  const npmHead = await git(repoPath, ["rev-parse", "HEAD"]);
+  let sandbox;
+  try {
+    sandbox = await prepareProjectValidationSandbox({
+      sourceRepoPath: repoPath,
+      workspaceRoot: path.join(root, "workspaces"),
+      expectedHeadSha: npmHead,
+    });
+    const prepared = await prepareProjectValidationDependencies(sandbox, {
+      dependencyAcquisitionTimeoutMs: 15_000,
+    });
+    assert.equal(prepared.status, "prepared");
+    assert.equal(await readFile(path.join(sandbox.repoPath, "lifecycle-ran"), "utf8").catch(() => ""), "");
+    const installed = await installPreparedProjectValidationDependencies(sandbox, { validationTimeoutMs: 15_000 });
+    assert.equal(installed.ok, true, installed.output);
+    assert.equal(await readFile(path.join(sandbox.repoPath, "lifecycle-ran"), "utf8"), "yes");
+    assert.equal(sandbox.environment.npm_config_cache, prepared.cachePath);
+  } finally {
+    await cleanupProjectValidationSandbox(sandbox);
     await rm(root, { recursive: true, force: true });
   }
 });
