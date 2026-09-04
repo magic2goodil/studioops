@@ -282,6 +282,22 @@ test("SQLite migration backfills legacy circuits and indexed incident queries av
     assert.equal(incidents[0].paidAttempts, 2);
     assert.equal(incidents[0].provider, "codex");
 
+    const pageOutput = await runDatabaseScript(root, `
+      import { readFailureIncidentPage, readFailureIncidentTotals } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      console.log(JSON.stringify({
+        page: await readFailureIncidentPage({ projectId: "project_1", limit: 1 }),
+        totals: await readFailureIncidentTotals({ projectId: "project_1", updatedAfter: "2026-09-04T00:00:00.000Z" })
+      }));
+    `);
+    const { page, totals } = JSON.parse(pageOutput.stdout.trim());
+    assert.equal(page.limit, 1);
+    assert.equal(page.incidents.length, 1);
+    assert.equal(page.incidents[0].incidentId, incidents[0].incidentId);
+    assert.equal(page.nextCursor, "");
+    assert.equal(totals.containedFingerprintGenerations, 1);
+    assert.equal(totals.paidModelAttempts, 2);
+    assert.equal(totals.cheapProbesAndRepairs, 1);
+
     const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
     try {
       const meta = JSON.parse(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get().payload);

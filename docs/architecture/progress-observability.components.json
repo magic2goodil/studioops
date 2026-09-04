@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "workflowImpact": "full-regression",
+  "reason": "durable project-scoped owner metrics, waiting diagnostics, and failure-generation notification identity",
+  "components": {
+    "progress-read-model": {
+      "paths": ["src/progress-report.js", "test/progress-report.test.js"],
+      "owner": "backend-owner-experience",
+      "publicContracts": ["allowlisted progress windows", "repository-bound project filter", "bounded sanitized response"],
+      "ownedData": ["derived progress summary", "stable waiting reason projection"],
+      "dependsOn": ["failure-incident-index"],
+      "rollback": "Hide the progress view and retain the durable incident ledger unchanged.",
+      "testLayers": ["unit", "privacy", "repository-isolation"]
+    },
+    "failure-incident-index": {
+      "paths": ["src/state-database.js", "test/failure-containment.test.js"],
+      "owner": "backend-workflow-state",
+      "publicContracts": ["100-row cursor-paginated incident query"],
+      "ownedData": ["failure_incidents"],
+      "dependsOn": [],
+      "rollback": "Stop progress reads while preserving every incident row for recovery.",
+      "testLayers": ["SQLite", "restart", "pagination"]
+    },
+    "progress-api": {
+      "paths": ["src/server.js", "test/server-request-security.test.js"],
+      "owner": "backend-owner-experience",
+      "publicContracts": ["loopback-only GET /api/automation/progress"],
+      "dependsOn": ["progress-read-model", "failure-incident-index"],
+      "rollback": "Remove the route and keep the board on the prior state endpoint.",
+      "testLayers": ["API", "loopback-security", "payload-bound"]
+    },
+    "progress-owner-ui": {
+      "paths": ["public/app.js", "public/index.html", "public/styles.css", "test/progress-observability-ui.test.js"],
+      "owner": "frontend-owner-experience",
+      "publicContracts": ["project progress cards", "task containment panel", "accessible loading empty error retry and degraded states"],
+      "dependsOn": ["progress-api"],
+      "rollback": "Hide both panels while leaving the local progress API available for diagnosis.",
+      "testLayers": ["browser-contract", "responsive", "accessibility"]
+    },
+    "circuit-notification": {
+      "paths": ["src/notifier.js", "test/notifier.test.js"],
+      "owner": "owner-notifications",
+      "publicContracts": ["one actionable local notification per failure generation"],
+      "ownedData": ["failure_circuit notification outbox item"],
+      "dependsOn": ["failure-incident-index"],
+      "rollback": "Stop enqueueing failure-circuit notifications and retain prior outbox audit records.",
+      "testLayers": ["unit", "idempotency", "lifecycle"]
+    },
+    "operator-documentation": {
+      "paths": ["docs/LOCAL_AUTOMATION.md", "docs/architecture/components.json", "docs/architecture/progress-observability.components.json"],
+      "owner": "developer-experience",
+      "publicContracts": ["migration observability recovery rollback and repository-bound safeguards"],
+      "dependsOn": ["progress-read-model", "circuit-notification"],
+      "testLayers": ["documentation"]
+    }
+  },
+  "dependencyEdges": [
+    { "from": "progress-read-model", "to": "failure-incident-index" },
+    { "from": "progress-api", "to": "progress-read-model" },
+    { "from": "progress-api", "to": "failure-incident-index" },
+    { "from": "progress-owner-ui", "to": "progress-api" },
+    { "from": "circuit-notification", "to": "failure-incident-index" },
+    { "from": "operator-documentation", "to": "progress-read-model" }
+  ],
+  "prohibited": ["cross-project aggregation after project selection", "cross-repository mutation", "raw log or provider payload in browser", "private path or credential in browser", "time-only circuit reset", "notification key derived from backoff time", "more than 100 incident rows", "response at or above 128 KiB"],
+  "impactClassifier": {
+    "input": "base/head diff plus this repository-owned manifest",
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "pathRules": [
+      { "pattern": "src/progress-report.js", "component": "progress-read-model", "selection": "full_regression" },
+      { "pattern": "test/progress-report.test.js", "component": "progress-read-model", "selection": "full_regression" },
+      { "pattern": "src/state-database.js", "component": "failure-incident-index", "selection": "full_regression" },
+      { "pattern": "src/server.js", "component": "progress-api", "selection": "full_regression" },
+      { "pattern": "public/app.js", "component": "progress-owner-ui", "selection": "full_regression" },
+      { "pattern": "public/index.html", "component": "progress-owner-ui", "selection": "full_regression" },
+      { "pattern": "public/styles.css", "component": "progress-owner-ui", "selection": "full_regression" },
+      { "pattern": "test/progress-observability-ui.test.js", "component": "progress-owner-ui", "selection": "full_regression" },
+      { "pattern": "src/notifier.js", "component": "circuit-notification", "selection": "full_regression" },
+      { "pattern": "test/notifier.test.js", "component": "circuit-notification", "selection": "full_regression" },
+      { "pattern": "docs/LOCAL_AUTOMATION.md", "component": "operator-documentation", "selection": "full_regression" }
+    ],
+    "aggregateCommand": "npm run check"
+  }
+}

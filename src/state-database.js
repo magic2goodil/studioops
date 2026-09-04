@@ -3140,6 +3140,85 @@ export async function readFailureIncidents(input = {}) {
   return rows.map(failureIncidentFromRow);
 }
 
+/** Cursor-paginated failure rows for the bounded owner progress read model. */
+export async function readFailureIncidentPage(input = {}) {
+  const db = await ensureStateDatabase();
+  const where = [];
+  const parameters = [];
+  const taskIds = [...new Set((input.taskIds || []).map(String).filter(Boolean))].slice(0, 500);
+  if (input.projectId) {
+    where.push("EXISTS (SELECT 1 FROM tasks AS scoped_task WHERE scoped_task.id = failure_incidents.task_id AND scoped_task.project_id = ?)");
+    parameters.push(String(input.projectId));
+  } else if (taskIds.length) {
+    where.push(`task_id IN (${taskIds.map(() => "?").join(", ")})`);
+    parameters.push(...taskIds);
+  } else if (input.requireTaskScope !== false) {
+    return { incidents: [], limit: Math.min(100, Math.max(1, Number(input.limit || 100))), nextCursor: "" };
+  }
+  if (input.updatedAfter) {
+    where.push("updated_at >= ?");
+    parameters.push(String(input.updatedAfter));
+  }
+  if (input.cursor?.updatedAt && input.cursor?.incidentId) {
+    where.push("(updated_at < ? OR (updated_at = ? AND incident_id < ?))");
+    parameters.push(String(input.cursor.updatedAt), String(input.cursor.updatedAt), String(input.cursor.incidentId));
+  }
+  const limit = Math.floor(Math.min(100, Math.max(1, Number(input.limit || 100))));
+  parameters.push(limit + 1);
+  const rows = db.prepare(`
+    SELECT * FROM failure_incidents
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+    ORDER BY updated_at DESC, incident_id DESC
+    LIMIT ?
+  `).all(...parameters);
+  const hasMore = rows.length > limit;
+  const incidents = rows.slice(0, limit).map(failureIncidentFromRow);
+  const last = incidents.at(-1);
+  return {
+    incidents,
+    limit,
+    nextCursor: hasMore && last
+      ? Buffer.from(JSON.stringify({ updatedAt: last.updatedAt, incidentId: last.incidentId }), "utf8").toString("base64url")
+      : "",
+  };
+}
+
+/** Aggregate counters are independent of the incident detail page size. */
+export async function readFailureIncidentTotals(input = {}) {
+  const db = await ensureStateDatabase();
+  const where = [];
+  const parameters = [];
+  const taskIds = [...new Set((input.taskIds || []).map(String).filter(Boolean))].slice(0, 500);
+  if (input.projectId) {
+    where.push("EXISTS (SELECT 1 FROM tasks AS scoped_task WHERE scoped_task.id = failure_incidents.task_id AND scoped_task.project_id = ?)");
+    parameters.push(String(input.projectId));
+  } else if (taskIds.length) {
+    where.push(`task_id IN (${taskIds.map(() => "?").join(", ")})`);
+    parameters.push(...taskIds);
+  } else if (input.requireTaskScope !== false) {
+    return { containedFingerprintGenerations: 0, cheapProbesAndRepairs: 0, paidModelAttempts: 0, avoidedModelRetries: 0 };
+  }
+  if (input.updatedAfter) {
+    where.push("updated_at >= ?");
+    parameters.push(String(input.updatedAfter));
+  }
+  const row = db.prepare(`
+    SELECT
+      coalesce(sum(CASE WHEN state IN ('open', 'backoff') THEN 1 ELSE 0 END), 0) AS contained_fingerprint_generations,
+      coalesce(sum(cheap_probe_attempts + repair_attempts), 0) AS cheap_probes_and_repairs,
+      coalesce(sum(paid_attempts), 0) AS paid_model_attempts,
+      coalesce(sum(avoided_retries), 0) AS avoided_model_retries
+    FROM failure_incidents
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+  `).get(...parameters);
+  return {
+    containedFingerprintGenerations: Number(row.contained_fingerprint_generations || 0),
+    cheapProbesAndRepairs: Number(row.cheap_probes_and_repairs || 0),
+    paidModelAttempts: Number(row.paid_model_attempts || 0),
+    avoidedModelRetries: Number(row.avoided_model_retries || 0),
+  };
+}
+
 export async function databaseContentionHealth(input = {}) {
   const db = await ensureStateDatabase();
   const windowMinutes = Math.min(1_440, Math.max(1, Number(input.windowMinutes) || 15));
