@@ -29,6 +29,7 @@ import { defaultStudioOpsCredentialsRoot, missionControlDataDir } from "./runtim
 import {
   loadConfig,
   normalizeProjectWorkflowMode,
+  normalizeTechOpsPolicy,
   normalizeWorkspaceRetention,
   withDefaultProjectStandards,
 } from "./config.js";
@@ -787,6 +788,278 @@ export async function mutateState(mutator, options = {}) {
   // This public state-transform API is retry-safe by contract. Callers that
   // perform any non-repeatable work must opt out or use a fenced operation.
   return mutateDatabaseState(mutator, { idempotent: true, ...options });
+}
+
+const ACTIVE_TECHOPS_QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed"]);
+
+function boundedTechOpsEvidence(value, maxOutputChars = 4_000) {
+  const item = value && typeof value === "object" ? value : {};
+  return {
+    status: String(item.status || "unknown").slice(0, 80),
+    reason: boundedRecoveryDiagnostic(item.reason || item.output || "").slice(0, maxOutputChars),
+    observedSha: String(item.observedSha || "").slice(0, 64),
+    durationMs: Math.max(0, Math.round(Number(item.durationMs) || 0)),
+  };
+}
+
+function techOpsBinding(candidate, bundle, input = {}) {
+  const integrationSha = normalizeGitSha(
+    input.integrationSha || candidate?.manifest?.integration?.sha,
+    "TechOps integration SHA",
+  );
+  const candidateId = String(input.candidateId || candidate?.id || "").trim();
+  const manifestDigest = String(input.manifestDigest || candidate?.manifestDigest || "").trim();
+  const policyDigest = String(input.policyDigest || "").trim();
+  if (!candidateId || !manifestDigest || !policyDigest) {
+    throw new Error("TechOps recovery requires candidate, manifest, and policy identity.");
+  }
+  if (
+    bundle?.candidateId !== candidateId
+    || candidate?.qaBundleId !== bundle?.id
+    || candidate?.manifestDigest !== manifestDigest
+    || candidate?.manifest?.integration?.sha !== integrationSha
+  ) {
+    throw new Error("TechOps recovery identity does not match the current immutable QA candidate.");
+  }
+  return { candidateId, manifestDigest, integrationSha, policyDigest };
+}
+
+function sameTechOpsBinding(incident, binding) {
+  return Boolean(incident && ["candidateId", "manifestDigest", "integrationSha", "policyDigest"]
+    .every((key) => incident[key] === binding[key]));
+}
+
+function requireTechOpsBundle(state, input = {}) {
+  const bundle = (state.qaBundles || []).find((item) => item.id === String(input.bundleId || ""));
+  if (!bundle) throw new Error(`Unknown QA bundle: ${input.bundleId}`);
+  if (!ACTIVE_TECHOPS_QA_BUNDLE_STATUSES.has(bundle.status)) {
+    throw new Error(`QA bundle ${bundle.id} is not active and ready for TechOps health checks.`);
+  }
+  const candidate = (state.candidates || []).find((item) => item.id === bundle.candidateId);
+  if (!candidate || candidate.invalidation || candidate.status !== "frozen") {
+    throw new Error(`QA bundle ${bundle.id} does not have a current frozen candidate.`);
+  }
+  return { bundle, candidate };
+}
+
+/** Persist a healthy exact-SHA observation and close any recovery incident. */
+export function recordQaTechOpsHealthInState(state, input = {}) {
+  const { bundle, candidate } = requireTechOpsBundle(state, input);
+  const binding = techOpsBinding(candidate, bundle, input);
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  const previous = bundle.techOps;
+  const health = boundedTechOpsEvidence(input.health, Number(input.maxOutputChars) || 4_000);
+  if (health.status !== "healthy" || health.observedSha !== binding.integrationSha) {
+    throw new Error("TechOps healthy observations must attest the exact immutable candidate SHA.");
+  }
+  bundle.techOps = {
+    ...binding,
+    state: "healthy",
+    generation: Math.max(0, Number(previous?.generation) || 0) + 1,
+    lastCheckedAt: now,
+    nextCheckAt: input.nextCheckAt || now,
+    health,
+    attemptCount: 0,
+    attempts: Array.isArray(previous?.attempts) ? previous.attempts.slice(-9) : [],
+    ...(previous?.openedAt ? { openedAt: previous.openedAt } : {}),
+    ...(previous && previous.state !== "healthy" ? { recoveredAt: now } : {}),
+  };
+  bundle.updatedAt = now;
+  if (previous && ["recovering", "backoff", "circuit_open"].includes(previous.state)) {
+    state.events = state.events || [];
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "techops_recovery_succeeded",
+      projectId: bundle.projectId,
+      message: `${bundle.id}: TechOps restored and verified candidate ${binding.integrationSha}.`,
+      createdAt: now,
+    });
+  }
+  return structuredClone(bundle.techOps);
+}
+
+export async function recordQaTechOpsHealth(input = {}) {
+  return mutateState(async (state) => recordQaTechOpsHealthInState(state, input), {
+    operationName: "techops.record_health",
+  });
+}
+
+/** Claim one fenced recovery attempt. Backoff, deduplication, and circuits are durable. */
+export function claimQaTechOpsRecoveryInState(state, input = {}) {
+  const { bundle, candidate } = requireTechOpsBundle(state, input);
+  const binding = techOpsBinding(candidate, bundle, input);
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const previous = sameTechOpsBinding(bundle.techOps, binding) ? bundle.techOps : null;
+  const leaseExpiresMs = Date.parse(previous?.leaseExpiresAt || "");
+  if (previous?.state === "circuit_open") return null;
+  if (previous?.state === "recovering" && Number.isFinite(leaseExpiresMs) && leaseExpiresMs > nowMs) return null;
+  const retryAtMs = Date.parse(previous?.retryNotBefore || "");
+  if (Number.isFinite(retryAtMs) && retryAtMs > nowMs) return null;
+  const maxAttempts = Math.max(1, Math.min(10, Number(input.maxAttempts) || 3));
+  const attempt = Math.max(0, Number(previous?.attemptCount) || 0) + 1;
+  if (attempt > maxAttempts) {
+    const blocker = "The final TechOps recovery lease expired without verified exact-candidate health.";
+    bundle.techOps = {
+      ...previous,
+      state: "circuit_open",
+      generation: Math.max(0, Number(previous?.generation) || 0) + 1,
+      maxAttempts,
+      circuitOpenedAt: now,
+      lastCheckedAt: now,
+      blocker,
+    };
+    delete bundle.techOps.leaseId;
+    delete bundle.techOps.leaseExpiresAt;
+    delete bundle.techOps.retryNotBefore;
+    bundle.updatedAt = now;
+    state.events = state.events || [];
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "techops_recovery_circuit_opened",
+      projectId: bundle.projectId,
+      message: `${bundle.id}: TechOps opened a circuit after ${maxAttempts} attempts. ${blocker}`,
+      createdAt: now,
+    });
+    return null;
+  }
+  const leaseId = `techops_${randomUUID()}`;
+  const leaseSeconds = Math.max(30, Math.min(30 * 60, Number(input.leaseSeconds) || 5 * 60));
+  bundle.techOps = {
+    ...binding,
+    state: "recovering",
+    generation: Math.max(0, Number(previous?.generation) || 0) + 1,
+    openedAt: previous?.openedAt || now,
+    lastCheckedAt: now,
+    attemptCount: attempt,
+    maxAttempts,
+    leaseId,
+    leaseExpiresAt: new Date(nowMs + leaseSeconds * 1_000).toISOString(),
+    health: boundedTechOpsEvidence(input.health, Number(input.maxOutputChars) || 4_000),
+    attempts: Array.isArray(previous?.attempts) ? previous.attempts.slice(-9) : [],
+  };
+  bundle.updatedAt = now;
+  state.events = state.events || [];
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: "techops_recovery_started",
+    projectId: bundle.projectId,
+    message: `${bundle.id}: TechOps started bounded recovery attempt ${attempt}/${maxAttempts} for candidate ${binding.integrationSha}.`,
+    createdAt: now,
+  });
+  return {
+    bundleId: bundle.id,
+    projectId: bundle.projectId,
+    leaseId,
+    attempt,
+    maxAttempts,
+    ...binding,
+  };
+}
+
+export async function claimQaTechOpsRecovery(input = {}) {
+  return mutateState(async (state) => claimQaTechOpsRecoveryInState(state, input), {
+    operationName: "techops.claim_recovery",
+  });
+}
+
+/** Complete the exact leased attempt and either back off or open one circuit. */
+export function finalizeQaTechOpsRecoveryInState(state, claim, result = {}, input = {}) {
+  const { bundle, candidate } = requireTechOpsBundle(state, { bundleId: claim?.bundleId });
+  const binding = techOpsBinding(candidate, bundle, claim);
+  const incident = bundle.techOps;
+  if (!sameTechOpsBinding(incident, binding) || incident?.leaseId !== claim?.leaseId || incident?.state !== "recovering") {
+    return null;
+  }
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const maxOutputChars = Math.max(256, Number(input.maxOutputChars) || 4_000);
+  const health = boundedTechOpsEvidence(result.health, maxOutputChars);
+  const success = result.ok === true && health.status === "healthy" && health.observedSha === binding.integrationSha;
+  const commands = (Array.isArray(result.commands) ? result.commands : []).slice(0, 16).map((command) => ({
+    id: String(command.id || "unknown").slice(0, 64),
+    type: String(command.type || "recovery").slice(0, 20),
+    ok: command.ok === true,
+    timedOut: command.timedOut === true,
+    durationMs: Math.max(0, Math.round(Number(command.durationMs) || 0)),
+    output: boundedRecoveryDiagnostic(command.output || "").slice(0, maxOutputChars),
+  }));
+  const restartResults = (Array.isArray(result.restartResults) ? result.restartResults : []).slice(0, 16).map((item) => ({
+    label: String(item.label || "").slice(0, 128),
+    ok: item.ok === true,
+    output: boundedRecoveryDiagnostic(item.output || "").slice(0, maxOutputChars),
+  }));
+  const attemptRecord = {
+    attempt: incident.attemptCount,
+    startedAt: incident.lastCheckedAt,
+    completedAt: now,
+    outcome: success ? "recovered" : "failed",
+    commands,
+    restartResults,
+    health,
+  };
+  const attempts = [...(incident.attempts || []), attemptRecord].slice(-10);
+  state.events = state.events || [];
+  if (success) {
+    bundle.techOps = {
+      ...binding,
+      state: "healthy",
+      generation: Number(incident.generation) + 1,
+      openedAt: incident.openedAt,
+      recoveredAt: now,
+      lastCheckedAt: now,
+      nextCheckAt: input.nextCheckAt || now,
+      attemptCount: 0,
+      maxAttempts: incident.maxAttempts,
+      health,
+      attempts,
+    };
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "techops_recovery_succeeded",
+      projectId: bundle.projectId,
+      message: `${bundle.id}: TechOps restored and verified candidate ${binding.integrationSha} on attempt ${claim.attempt}.`,
+      createdAt: now,
+    });
+  } else {
+    const exhausted = incident.attemptCount >= incident.maxAttempts;
+    const baseMs = Math.max(1_000, Number(input.initialBackoffMs) || 60_000);
+    const maxMs = Math.max(baseMs, Number(input.maxBackoffMs) || 15 * 60_000);
+    const delayMs = Math.min(maxMs, baseMs * (2 ** Math.max(0, incident.attemptCount - 1)));
+    const blocker = boundedRecoveryDiagnostic(
+      result.blocker || health.reason || commands.find((item) => !item.ok)?.output || "Recovery did not restore the exact candidate preview.",
+    ).slice(0, maxOutputChars);
+    bundle.techOps = {
+      ...incident,
+      state: exhausted ? "circuit_open" : "backoff",
+      generation: Number(incident.generation) + 1,
+      lastCheckedAt: now,
+      ...(exhausted ? { circuitOpenedAt: now } : { retryNotBefore: new Date(nowMs + delayMs).toISOString() }),
+      blocker,
+      health,
+      attempts,
+    };
+    delete bundle.techOps.leaseId;
+    delete bundle.techOps.leaseExpiresAt;
+    if (exhausted) delete bundle.techOps.retryNotBefore;
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: exhausted ? "techops_recovery_circuit_opened" : "techops_recovery_failed",
+      projectId: bundle.projectId,
+      message: exhausted
+        ? `${bundle.id}: TechOps opened a circuit after ${incident.maxAttempts} failed attempts. ${blocker}`
+        : `${bundle.id}: TechOps recovery attempt ${claim.attempt} failed; next attempt is delayed by ${delayMs}ms.`,
+      createdAt: now,
+    });
+  }
+  bundle.updatedAt = now;
+  return structuredClone(bundle.techOps);
+}
+
+export async function finalizeQaTechOpsRecovery(claim, result = {}, input = {}) {
+  return mutateState(async (state) => finalizeQaTechOpsRecoveryInState(state, claim, result, input), {
+    operationName: "techops.finalize_recovery",
+  });
 }
 
 function boundedRecoveryDiagnostic(value) {
@@ -1598,6 +1871,7 @@ export async function addProject(input) {
       reviewPipeline: normalizeReviewPipeline(input.reviewPipeline),
       qaIntegration: input.qaIntegration || {},
       localQaPreview: input.localQaPreview || input.qaIntegration?.localPreview || null,
+      techOps: normalizeTechOpsPolicy(input.techOps || {}),
       promotion: input.promotion || {},
       reviewPolicy,
       wipPolicy: {
@@ -1711,6 +1985,12 @@ export async function updateProject(projectId, patch = {}) {
         ...(project.qaIntegration || {}),
         localPreview: project.localQaPreview,
       };
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "techOps")) {
+      project.techOps = normalizeTechOpsPolicy({
+        ...(project.techOps || {}),
+        ...(patch.techOps || {}),
+      });
     }
     if (Object.prototype.hasOwnProperty.call(patch, "promotion")) {
       project.promotion = {
@@ -3186,6 +3466,7 @@ function qaDecisionAuthorityBinding(state, candidate, selector) {
       reviewPolicy: project.reviewPolicy || {},
       qaIntegration: project.qaIntegration || {},
       localQaPreview: project.localQaPreview || null,
+      techOps: project.techOps || null,
     },
     candidate: {
       id: candidate.id,

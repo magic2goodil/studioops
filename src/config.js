@@ -25,6 +25,175 @@ export const DEFAULT_GLOBAL_RUN_ADMISSION = Object.freeze({
   maxMeteredRunsPerWindow: 12,
   runWindowMinutes: 60,
 });
+export const DEFAULT_TECHOPS_POLICY = Object.freeze({
+  enabled: false,
+  healthCheckIntervalSeconds: 60,
+  healthTimeoutMs: 5_000,
+  commandTimeoutMs: 60_000,
+  maxAttempts: 3,
+  initialBackoffSeconds: 60,
+  maxBackoffSeconds: 15 * 60,
+  leaseSeconds: 5 * 60,
+  maxConcurrentRecoveries: 1,
+  maxCommandsPerAttempt: 8,
+  maxOutputChars: 4_000,
+  verificationAttempts: 5,
+  verificationDelayMs: 1_000,
+});
+export const TECHOPS_COMMAND_OPERATIONS = Object.freeze({
+  docker_compose_ps: Object.freeze({ type: "diagnostic", args: Object.freeze(["ps", "--all"]) }),
+  docker_compose_up: Object.freeze({ type: "recovery", args: Object.freeze(["up", "--detach", "--no-deps", "--no-recreate"]) }),
+  docker_compose_start: Object.freeze({ type: "recovery", args: Object.freeze(["start"]) }),
+  docker_compose_restart: Object.freeze({ type: "recovery", args: Object.freeze(["restart"]) }),
+});
+const TECHOPS_CONFIGURATION_ERROR_CODES = new Set([
+  "duplicate_command_id",
+  "invalid_command_id",
+  "invalid_command_shape",
+  "invalid_service",
+  "operation_type_mismatch",
+  "unsupported_operation",
+]);
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum
+    ? parsed
+    : fallback;
+}
+
+function techOpsConfigurationError(item, type, index, code) {
+  const candidateId = item && typeof item === "object" && !Array.isArray(item)
+    ? String(item.id || "").trim()
+    : "";
+  return {
+    id: /^[a-z][a-z0-9_.-]{0,63}$/i.test(candidateId) ? candidateId : `${type}-${index + 1}`,
+    type,
+    code,
+  };
+}
+
+function normalizeTechOpsCommand(item, type, index) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return { error: techOpsConfigurationError(item, type, index, "invalid_command_shape") };
+  }
+  const id = String(item.id || "").trim();
+  if (!/^[a-z][a-z0-9_.-]{0,63}$/i.test(id)) {
+    return { error: techOpsConfigurationError(item, type, index, "invalid_command_id") };
+  }
+  const operation = String(item.operation || "").trim().toLowerCase();
+  const definition = TECHOPS_COMMAND_OPERATIONS[operation];
+  if (!definition) {
+    return { error: techOpsConfigurationError(item, type, index, "unsupported_operation") };
+  }
+  if (definition.type !== type) {
+    return { error: techOpsConfigurationError(item, type, index, "operation_type_mismatch") };
+  }
+  const services = Array.isArray(item.services)
+    ? [...new Set(item.services.map((service) => String(service).trim()))]
+    : [];
+  if (!services.length || services.some((service) => !/^[a-z0-9][a-z0-9_.-]{0,127}$/i.test(service))) {
+    return { error: techOpsConfigurationError(item, type, index, "invalid_service") };
+  }
+  return { command: {
+    id,
+    type,
+    operation,
+    services,
+    ...(item.cwd ? { cwd: expandHome(String(item.cwd)) } : {}),
+    timeoutMs: boundedInteger(item.timeoutMs, DEFAULT_TECHOPS_POLICY.commandTimeoutMs, 1_000, 5 * 60_000),
+  } };
+}
+
+function normalizedTechOpsConfigurationErrors(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const id = String(item?.id || "").trim();
+    const type = String(item?.type || "").trim();
+    const code = String(item?.code || "").trim();
+    if (
+      !/^[a-z][a-z0-9_.-]{0,63}$/i.test(id)
+      || !["diagnostic", "recovery"].includes(type)
+      || !TECHOPS_CONFIGURATION_ERROR_CODES.has(code)
+    ) return [];
+    return [{ id, type, code }];
+  });
+}
+
+export function techOpsCommandInvocation(command) {
+  const definition = TECHOPS_COMMAND_OPERATIONS[command?.operation];
+  if (
+    !definition
+    || definition.type !== command?.type
+    || !Array.isArray(command?.services)
+    || !command.services.length
+    || command.services.some((service) => !/^[a-z0-9][a-z0-9_.-]{0,127}$/i.test(String(service)))
+  ) {
+    throw new Error(`TechOps command ${String(command?.id || "unknown")} is not a supported typed operation.`);
+  }
+  return { executable: "docker", args: [...definition.args, ...command.services] };
+}
+
+/** Canonical local-only policy consumed by the TechOps worker. */
+export function normalizeTechOpsPolicy(value = {}) {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const diagnostics = Array.isArray(raw.diagnosticCommands) ? raw.diagnosticCommands : [];
+  const recoveries = Array.isArray(raw.recoveryCommands) ? raw.recoveryCommands : [];
+  const canonicalCommands = Array.isArray(raw.commands) ? raw.commands : [];
+  const normalizedCommands = [
+    ...canonicalCommands.map((item, index) => normalizeTechOpsCommand(
+      item,
+      item?.type === "diagnostic" ? "diagnostic" : "recovery",
+      index,
+    )),
+    ...diagnostics.map((item, index) => normalizeTechOpsCommand(item, "diagnostic", index)),
+    ...recoveries.map((item, index) => normalizeTechOpsCommand(item, "recovery", index)),
+  ];
+  const commands = [];
+  const configurationErrors = normalizedTechOpsConfigurationErrors(raw.configurationErrors);
+  for (const normalized of normalizedCommands) {
+    if (normalized.error) {
+      configurationErrors.push(normalized.error);
+      continue;
+    }
+    if (commands.some((candidate) => candidate.id === normalized.command.id)) {
+      configurationErrors.push(techOpsConfigurationError(
+        normalized.command,
+        normalized.command.type,
+        commands.length,
+        "duplicate_command_id",
+      ));
+      continue;
+    }
+    commands.push(normalized.command);
+  }
+  const initialBackoffSeconds = boundedInteger(
+    raw.initialBackoffSeconds,
+    DEFAULT_TECHOPS_POLICY.initialBackoffSeconds,
+    1,
+    24 * 60 * 60,
+  );
+  return {
+    enabled: raw.enabled === true,
+    healthCheckIntervalSeconds: boundedInteger(raw.healthCheckIntervalSeconds, DEFAULT_TECHOPS_POLICY.healthCheckIntervalSeconds, 5, 24 * 60 * 60),
+    healthTimeoutMs: boundedInteger(raw.healthTimeoutMs, DEFAULT_TECHOPS_POLICY.healthTimeoutMs, 250, 60_000),
+    commandTimeoutMs: boundedInteger(raw.commandTimeoutMs, DEFAULT_TECHOPS_POLICY.commandTimeoutMs, 1_000, 5 * 60_000),
+    maxAttempts: boundedInteger(raw.maxAttempts, DEFAULT_TECHOPS_POLICY.maxAttempts, 1, 10),
+    initialBackoffSeconds,
+    maxBackoffSeconds: boundedInteger(raw.maxBackoffSeconds, DEFAULT_TECHOPS_POLICY.maxBackoffSeconds, initialBackoffSeconds, 24 * 60 * 60),
+    leaseSeconds: boundedInteger(raw.leaseSeconds, DEFAULT_TECHOPS_POLICY.leaseSeconds, 30, 30 * 60),
+    maxConcurrentRecoveries: boundedInteger(raw.maxConcurrentRecoveries, DEFAULT_TECHOPS_POLICY.maxConcurrentRecoveries, 1, 4),
+    maxCommandsPerAttempt: boundedInteger(raw.maxCommandsPerAttempt, DEFAULT_TECHOPS_POLICY.maxCommandsPerAttempt, 1, 16),
+    maxOutputChars: boundedInteger(raw.maxOutputChars, DEFAULT_TECHOPS_POLICY.maxOutputChars, 256, 24_000),
+    verificationAttempts: boundedInteger(raw.verificationAttempts, DEFAULT_TECHOPS_POLICY.verificationAttempts, 1, 10),
+    verificationDelayMs: boundedInteger(raw.verificationDelayMs, DEFAULT_TECHOPS_POLICY.verificationDelayMs, 0, 30_000),
+    commands,
+    configurationErrors,
+    restartLaunchAgents: [...new Set((Array.isArray(raw.restartLaunchAgents) ? raw.restartLaunchAgents : [])
+      .map((item) => String(item).trim())
+      .filter((item) => /^[a-z0-9][a-z0-9_.-]{0,127}$/i.test(item)))],
+  };
+}
 
 export function normalizeRunOutputGuard(value = {}) {
   const raw = value && typeof value === "object" ? value : {};
@@ -363,6 +532,10 @@ export function projectFromConfig(rawProject, defaults = {}) {
     },
     deliveryPolicy: rawProject.deliveryPolicy || defaults.deliveryPolicy || {},
     localQaPreview: rawProject.localQaPreview || rawProject.qaIntegration?.localPreview || null,
+    techOps: normalizeTechOpsPolicy({
+      ...(defaults.techOps || {}),
+      ...(rawProject.techOps || {}),
+    }),
     trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
     integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),
   };
