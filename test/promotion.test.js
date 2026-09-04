@@ -3080,6 +3080,19 @@ test("merged admission recovery accepts a production v1 owner QA packet and lega
     assert.equal(Object.hasOwn(historicalCandidate.qaDecision, "ownerQaPacketDigest"), false);
     assert.equal(Object.hasOwn(historicalBundle.qaDecision, "ownerQaPacketDigest"), false);
 
+    // Production was still on integrity v5 when this stale post-merge record
+    // had to cross the v6 migration before its attested recovery could run.
+    const database = new DatabaseSync(path.join(fixture.root, "data", "mission-control.sqlite3"));
+    try {
+      const row = database.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
+      const meta = JSON.parse(row.payload);
+      meta.stateIntegrityVersion = 5;
+      database.prepare("UPDATE state_meta SET payload = ? WHERE singleton_id = 1")
+        .run(JSON.stringify(meta));
+    } finally {
+      database.close();
+    }
+
     const script = `
       import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
       const report = await runPromotion({
