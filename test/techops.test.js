@@ -124,6 +124,7 @@ test("stopped dependency is recovered and exact candidate health clears the inci
   let healthCalls = 0;
   const executed = [];
   const executionOptions = [];
+  const containmentActivities = [];
   const report = await runTechOps({
     state,
     nowMs: Date.parse("2026-01-01T00:01:00Z"),
@@ -142,6 +143,10 @@ test("stopped dependency is recovered and exact candidate health clears the inci
     claimRecovery: async (input) => claimQaTechOpsRecoveryInState(state, input),
     finalizeRecovery: async (claim, result, input) => finalizeQaTechOpsRecoveryInState(state, claim, result, input),
     recordHealth: async () => assert.fail("initial health should be unavailable"),
+    recordFailureActivity: async (activity) => {
+      containmentActivities.push(activity);
+      return { ...activity, state: "active" };
+    },
   });
   assert.equal(report.results[0].outcome, "recovered");
   assert.equal(executed.length, 2);
@@ -159,6 +164,8 @@ test("stopped dependency is recovered and exact candidate health clears the inci
     ["postgres-status", "postgres-start"],
   );
   assert.equal(state.qaBundles[0].techOps.attempts[0].commands[0].output.length, 1_000);
+  assert.deepEqual(containmentActivities.map((item) => item.type), ["cheap_probe", "repair"]);
+  assert.equal(containmentActivities.every((item) => item.provider === "local"), true);
 });
 
 test("recovery claims deduplicate, back off exponentially, and open a durable circuit", () => {

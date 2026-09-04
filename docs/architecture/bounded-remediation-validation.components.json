@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "workflowImpact": "full-regression",
+  "reason": "shared runner failure-attempt authority, deterministic stale-PR remediation, TechOps incident integration, and validation evidence contract",
+  "components": {
+    "runner-bounded-remediation": {
+      "paths": ["src/runner.js", "test/runner.test.js"],
+      "owner": "devops-runtime",
+      "publicContracts": ["claimCurrentFailureAttempt", "classifyRunFailureReason", "remediateStaleLinkedPrInState", "30-minute worker timeout"],
+      "ownedData": ["run.failureContainmentClaim", "run.failureContainmentProbe", "run.stalePrRemediation", "task remediation handoff and exact retry backoff"],
+      "ownedEvents": ["stale_pull_request_remediated", "failure_backoff_scheduled", "failure_circuit_opened"],
+      "dependsOn": ["failure-incident-authority", "validation-evidence-artifacts"],
+      "rollback": "Pause worker launch and restore the prior runner while retaining durable incident and artifact evidence.",
+      "testLayers": ["unit", "adapter", "failure-state", "repository-isolation"]
+    },
+    "validation-evidence-artifacts": {
+      "paths": ["src/run-output-evidence.js", "test/run-output-evidence.test.js"],
+      "owner": "devops-runtime",
+      "publicContracts": ["executeValidationCommand", "boundedValidationTranscript", "25 MiB private artifact cap"],
+      "ownedData": ["redacted command artifact", "exact validation command evidence lines"],
+      "dependsOn": [],
+      "rollback": "Disable pushes and retain existing private evidence artifacts until the helper is restored.",
+      "testLayers": ["unit", "redaction", "filesystem-permissions"]
+    },
+    "failure-incident-authority": {
+      "paths": ["src/failure-containment.js", "src/state-database.js", "test/failure-containment.test.js"],
+      "owner": "backend-workflow-state",
+      "publicContracts": ["two paid attempts per unchanged generation", "model-free incident activity creation", "bounded reason codes"],
+      "ownedData": ["failure_incidents"],
+      "dependsOn": [],
+      "rollback": "Preserve incident rows and stop new paid launches if the atomic authority is unavailable.",
+      "testLayers": ["state-machine", "SQLite-concurrency", "migration"]
+    },
+    "techops-recovery-adapter": {
+      "paths": ["src/techops.js", "test/techops.test.js"],
+      "owner": "techops-reliability",
+      "publicContracts": ["typed allowlisted recovery commands", "canonical incident probe and repair activity"],
+      "ownedData": ["QA preview recovery evidence"],
+      "dependsOn": ["failure-incident-authority"],
+      "rollback": "Disable automated recovery commands and retain health-check evidence for explicit repair.",
+      "testLayers": ["unit", "allowlist", "candidate-health"]
+    },
+    "operator-documentation": {
+      "paths": ["docs/LOCAL_AUTOMATION.md"],
+      "owner": "developer-experience",
+      "publicContracts": ["bounded recovery and validation operator contract"],
+      "dependsOn": ["runner-bounded-remediation", "techops-recovery-adapter"],
+      "testLayers": ["documentation"]
+    },
+    "architecture-validation": {
+      "paths": ["docs/architecture/components.json", "docs/architecture/bounded-remediation-validation.components.json"],
+      "owner": "shared-validation",
+      "publicContracts": ["repository-bound component ownership"],
+      "dependsOn": [],
+      "testLayers": ["composition"]
+    },
+    "repository-composition": {
+      "paths": ["package.json"],
+      "owner": "devops-runtime",
+      "publicContracts": ["aggregate syntax-check composition"],
+      "dependsOn": ["validation-evidence-artifacts"],
+      "testLayers": ["composition"]
+    }
+  },
+  "dependencyEdges": [
+    { "from": "runner-bounded-remediation", "to": "failure-incident-authority" },
+    { "from": "runner-bounded-remediation", "to": "validation-evidence-artifacts" },
+    { "from": "techops-recovery-adapter", "to": "failure-incident-authority" },
+    { "from": "operator-documentation", "to": "runner-bounded-remediation" },
+    { "from": "operator-documentation", "to": "techops-recovery-adapter" },
+    { "from": "repository-composition", "to": "validation-evidence-artifacts" }
+  ],
+  "prohibited": ["cross-repository mutation", "cross-project retry suppression", "dispatcher-side paid-attempt claim", "provider-specific attempt budget", "generic sdk_error authority", "unbounded validation transcript", "unredacted command artifact", "time-only circuit reset", "dependency cycle"],
+  "impactClassifier": {
+    "input": "base/head diff plus this repository-owned manifest",
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "pathRules": [
+      { "pattern": "src/runner.js", "component": "runner-bounded-remediation", "selection": "full_regression" },
+      { "pattern": "test/runner.test.js", "component": "runner-bounded-remediation", "selection": "full_regression" },
+      { "pattern": "src/run-output-evidence.js", "component": "validation-evidence-artifacts", "selection": "full_regression" },
+      { "pattern": "test/run-output-evidence.test.js", "component": "validation-evidence-artifacts", "selection": "full_regression" },
+      { "pattern": "src/failure-containment.js", "component": "failure-incident-authority", "selection": "full_regression" },
+      { "pattern": "src/state-database.js", "component": "failure-incident-authority", "selection": "full_regression" },
+      { "pattern": "test/failure-containment.test.js", "component": "failure-incident-authority", "selection": "full_regression" },
+      { "pattern": "src/techops.js", "component": "techops-recovery-adapter", "selection": "full_regression" },
+      { "pattern": "test/techops.test.js", "component": "techops-recovery-adapter", "selection": "full_regression" },
+      { "pattern": "docs/LOCAL_AUTOMATION.md", "component": "operator-documentation", "selection": "full_regression" },
+      { "pattern": "docs/architecture/components.json", "component": "architecture-validation", "selection": "full_regression" },
+      { "pattern": "docs/architecture/bounded-remediation-validation.components.json", "component": "architecture-validation", "selection": "full_regression" },
+      { "pattern": "package.json", "component": "repository-composition", "selection": "full_regression" }
+    ],
+    "fullRegressionTriggers": ["shared runner authority", "state persistence", "manifest change", "release-sensitive path", "ambiguous or unclassified path"],
+    "aggregateCommand": "npm run check"
+  },
+  "retention": { "failureIncidents": "durable", "validationArtifacts": "local private bounded", "legacyTaskCircuit": "one release" }
+}

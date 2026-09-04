@@ -717,13 +717,39 @@ read-only admission boundary; it records that the atomic paid-attempt claim
 belongs immediately before provider launch in the runner, so a queued run that
 never launches cannot spend a failure-generation attempt.
 
+After credential-free local Git observation and, when available, a bounded
+GitHub metadata probe, a builder never reuses a linked pull request that is
+closed or merged. StudioOps atomically clears only that exact task's stale
+PR, branch, candidate, QA, and reviewer-thread bindings; invalidates their
+historical evidence; allocates a collision-safe branch generation from the
+protected base; and writes a remediation handoff. This deterministic repair
+finishes before the runner's paid-attempt claim and therefore costs no model
+attempt. Repository and component-map bindings remain unchanged, so a repair
+cannot move work into another project.
+
+The runner then atomically claims from the canonical failure incident directly
+before SDK or CLI launch. Both transports normalize to the same `codex`
+provider identity and share a maximum of two paid launches for an unchanged
+task, action, candidate, reason, and evidence generation. Watchdog stale-run
+reconciliation uses the same completion path. Infrastructure failures receive
+one bounded, model-free probe; configured TechOps recovery remains restricted
+to typed allowlisted commands and records probe and repair activity on the
+same incident. Failed probes back off only the bound task/resource. Time alone
+cannot reset a circuit, and raw transport values such as `sdk_error` are never
+used as reason-code authority.
+
 Exact candidate-stage duplicates and unchanged failed retries inside their
 retry window are suppressed as `duplicate_candidate_stage` and `retry_backoff`.
 Before a GitHub push, the
 runner installs a local pre-push hook that executes the project's deterministic
-`validationCommands`, keeps full output in a local log, emits only a bounded
+`validationCommands`, keeps up to 25 MiB of the complete redacted stream in a
+private `0600` local artifact, emits at most a 4 KiB passing summary or 8 KiB
 failure excerpt, and caches success by exact Git tree and validation-policy
-digest. Review comments and other state-only work never push.
+digest. Each attestation records the command outcome, duration, SHA-256, byte
+count, environment contract, and exact source/tree/base/manifest/component and
+candidate-cycle bindings. These command artifacts do not relax the independent
+per-command or cumulative model-output guards. Review comments and other
+state-only work never push. Worker turns retain the 30-minute default timeout.
 
 Finally, `defaults.runner.outputGuard` records guidance and bounds the stored event
 when one command exceeds 24,000 characters. The first broad read does not discard

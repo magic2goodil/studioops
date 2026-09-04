@@ -20,6 +20,7 @@ const REASON_CODES = new Set([
   "provider_unavailable",
   "repository_unavailable",
   "service_unhealthy",
+  "stale_pull_request",
   "validation_failed",
   "unknown_failure",
 ]);
@@ -39,6 +40,7 @@ const VERIFIERS_BY_REASON = Object.freeze({
   provider_unavailable: new Set(["service_health_probe"]),
   repository_unavailable: new Set(["credential_probe", "repository_probe"]),
   service_unhealthy: new Set(["service_health_probe"]),
+  stale_pull_request: new Set(["deterministic_repair", "repository_probe"]),
   validation_failed: new Set(["candidate_change", "deterministic_repair"]),
   unknown_failure: new Set(["candidate_change", "deterministic_repair", "policy_probe"]),
 });
