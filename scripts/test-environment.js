@@ -40,6 +40,22 @@ const SENSITIVE_ENV_KEYS = [
   "CODEX_API_KEY",
 ];
 
+const HOST_GIT_ENV_KEYS = new Set([
+  "GH_CONFIG_DIR",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_ASKPASS",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_WORK_TREE",
+  "SSH_ASKPASS",
+  "SSH_AUTH_SOCK",
+]);
+
 export const STUDIOOPS_TEST_ENV_KEYS = [
   ...ROOT_ENV_KEYS,
   ...OPERATIONAL_ENV_KEYS,
@@ -68,6 +84,9 @@ function environmentForPaths(baseEnv, paths, token) {
   const env = { ...baseEnv };
   for (const key of STUDIOOPS_TEST_ENV_KEYS) delete env[key];
   for (const key of SENSITIVE_ENV_KEYS) delete env[key];
+  for (const key of Object.keys(env)) {
+    if (HOST_GIT_ENV_KEYS.has(key) || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
+  }
   return {
     ...env,
     NODE_ENV: "test",
