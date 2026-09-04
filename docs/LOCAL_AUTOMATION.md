@@ -477,9 +477,11 @@ diagnostic operations are `docker_compose_ps`; supported recovery operations
 are `docker_compose_up`, `docker_compose_start`, and
 `docker_compose_restart`. Every operation requires one or more validated Compose
 service names. StudioOps generates the Docker argv internally, pins the local
-`default` Docker context, assigns a deterministic project-specific Compose
-project name, supplies the project directory, and never exposes delete, remove,
-down, prune, or volume flags. The `docker_compose_up` operation always includes
+`default` Docker context, supplies the already verified project-local Compose
+project directory without accepting file or project-name overrides, and never
+exposes delete, remove, down, prune, or volume flags. Compose therefore resolves
+only the configuration and existing project identity rooted at that directory.
+The `docker_compose_up` operation always includes
 `--no-recreate`, so it can start or create a missing service but cannot replace
 an existing database container. A malformed command makes the entire recovery
 policy fail closed; it cannot be skipped while other commands or LaunchAgent

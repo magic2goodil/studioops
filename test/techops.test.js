@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 import { normalizeTechOpsPolicy } from "../src/config.js";
 import {
@@ -146,7 +147,7 @@ test("stopped dependency is recovered and exact candidate health clears the inci
   assert.equal(executed.length, 2);
   assert.equal(executed.every(([file]) => file === "docker"), true);
   assert.deepEqual(executed[0].slice(1, 4), ["--context", "default", "compose"]);
-  assert.match(executed[0][5], /^studioops-sample-[a-f0-9]{10}$/);
+  assert.deepEqual(executed[0].slice(4, 6), ["--project-directory", path.resolve(".")]);
   assert.deepEqual(executed[0].slice(-3), ["ps", "--all", "postgres"]);
   assert.deepEqual(executed[1].slice(-5), ["up", "--detach", "--no-deps", "--no-recreate", "postgres"]);
   assert.equal(executionOptions.every((options) => options.timeout === 1_000), true);

@@ -228,16 +228,6 @@ async function safeCommandCwd(command, project) {
   return actual;
 }
 
-function dockerComposeProjectName(project) {
-  const slug = String(project.key || project.id || "project")
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^[^a-z0-9]+/, "")
-    .slice(0, 32) || "project";
-  const suffix = createHash("sha256").update(`${project.id}:${project.key || ""}`).digest("hex").slice(0, 10);
-  return `studioops-${slug}-${suffix}`;
-}
-
 async function executeConfiguredCommand(command, project, policy, input = {}) {
   const startedAt = Date.now();
   try {
@@ -247,8 +237,6 @@ async function executeConfiguredCommand(command, project, policy, input = {}) {
       "--context",
       "default",
       "compose",
-      "--project-name",
-      dockerComposeProjectName(project),
       "--project-directory",
       cwd,
       ...invocation.args,
