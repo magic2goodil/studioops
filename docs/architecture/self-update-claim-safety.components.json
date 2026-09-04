@@ -11,6 +11,7 @@
       "paths": [
         "src/self-update.js",
         "test/self-update.test.js",
+        "test/qa-integration.test.js",
         "docs/LOCAL_AUTOMATION.md",
         "docs/architecture/components.json",
         "docs/architecture/self-update-claim-safety.components.json"
@@ -48,6 +49,7 @@
     "pathRules": [
       { "pattern": "src/self-update.js", "component": "self-update-claim-safety", "selection": "full_regression" },
       { "pattern": "test/self-update.test.js", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "test/qa-integration.test.js", "component": "self-update-claim-safety", "selection": "full_regression" },
       { "pattern": "docs/LOCAL_AUTOMATION.md", "component": "self-update-claim-safety", "selection": "full_regression" },
       { "pattern": "docs/architecture/components.json", "component": "self-update-claim-safety", "selection": "full_regression" },
       { "pattern": "docs/architecture/self-update-claim-safety.components.json", "component": "self-update-claim-safety", "selection": "full_regression" }

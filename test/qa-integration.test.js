@@ -190,6 +190,14 @@ async function git(repoPath, args) {
   return `${result.stdout || ""}${result.stderr || ""}`.trim();
 }
 
+function normalizedPorcelain(value) {
+  return String(value || "")
+    .split("\n")
+    .filter((line) => line !== "warning: unable to access '/etc/gitattributes': Operation not permitted")
+    .join("\n")
+    .trim();
+}
+
 async function stateWithReviewEvidence(state) {
   state.reviews = state.reviews || [];
   for (const task of state.tasks || []) {
@@ -1408,7 +1416,10 @@ test("failed validation leaves the owner checkout untouched and does not push", 
 
     assert.equal(await git(remotePath, ["rev-parse", "refs/heads/qa/integration"]), await git(remotePath, ["rev-parse", "refs/heads/main"]));
     assert.equal(await git(repoPath, ["symbolic-ref", "--short", "HEAD"]), "owner/work");
-    assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
+    assert.equal(
+      normalizedPorcelain(await git(repoPath, ["status", "--porcelain"])),
+      normalizedPorcelain(ownerStatusBefore),
+    );
 
     const state = readPersistedState(root);
     assert.equal(state.tasks[0].integrationStatus, "validation_failed");
