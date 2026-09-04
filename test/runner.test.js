@@ -19,6 +19,7 @@ import {
   performGitHubRemoteRecoveryProbe,
   planRunnableRuns,
   prePushValidationScript,
+  readPrePushValidationAttestation,
   preflightRun,
   prepareRunWorkspace,
   resolveProjectWorkflowMode,
@@ -69,18 +70,23 @@ test("pre-push validation is local, bounded on failure, and cached by exact tree
   await writeFile(path.join(repo, "file.txt"), "ok\n");
   await execFileAsync("git", ["add", "file.txt"], { cwd: repo });
   await execFileAsync("git", ["commit", "-m", "fixture"], { cwd: repo });
-  await writeFile(hook, prePushValidationScript({
+  const passingRun = {
     id: "run_hook",
     projectId: "project_hook",
     project: {
       key: "hook",
       validationCommands: [`printf run >> ${JSON.stringify(counter)}`],
     },
-  }, root));
+  };
+  await writeFile(hook, prePushValidationScript(passingRun, root));
   await chmod(hook, 0o700);
   await execFileAsync(hook, [], { cwd: repo });
   await execFileAsync(hook, [], { cwd: repo });
   assert.equal(await readFile(counter, "utf8"), "run");
+  const attestation = await readPrePushValidationAttestation(passingRun, repo, root);
+  assert.equal(attestation.outcome, "passed");
+  assert.match(attestation.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal((await lstat(attestation.path)).mode & 0o777, 0o600);
 
   await writeFile(hook, prePushValidationScript({
     id: "run_hook_fail",

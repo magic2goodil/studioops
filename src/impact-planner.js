@@ -1,8 +1,13 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { sha256Digest, loadProjectComponentImpactMap, normalizeRepositoryIdentity, projectRepositoryIdentity } from "./component-impact-map.js";
 
 const FULL_REGRESSION_WORDS = [
-  "authorization", "identity", "safety", "schema", "migration", "workflow",
-  "deployment", "composition root", "shared kernel", "multi-component", "ambiguous",
+  "authorization", "identity", "consent", "privacy", "entitlement", "safety",
+  "schema", "migration", "event version", "workflow", "deployment", "public contract",
+  "dependency", "composition root", "shared kernel", "multi-component", "ambiguous",
 ];
 
 function list(value) {
@@ -63,6 +68,131 @@ function componentMatchesTask(component, task, text) {
   return componentTerms(component).some((term) => text.includes(term));
 }
 
+function exactSha(value) {
+  const sha = String(value || "").trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : "";
+}
+
+function trustedGit(repoRoot, args) {
+  return execFileSync("/usr/bin/git", ["-C", repoRoot, ...args], {
+    encoding: "utf8",
+    maxBuffer: 2 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      HOME: "/",
+      LANG: "C",
+      LC_ALL: "C",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_PAGER: "cat",
+    },
+  });
+}
+
+function candidateRepositoryRoots(project = {}, cwd = process.cwd()) {
+  return [...new Set([
+    cwd,
+    project.repoPath,
+    project.sourceRepoPath,
+  ].map((item) => String(item || "").trim()).filter((item) => path.isAbsolute(item) && existsSync(item)))]
+    .map((item) => realpathSync(item));
+}
+
+export function exactCandidateChangedFiles(project = {}, candidate = {}, options = {}) {
+  const baseSha = exactSha(candidate.baseSha);
+  const commitSha = exactSha(candidate.commitSha);
+  if (!baseSha || !commitSha) {
+    const error = new Error("Exact candidate diff requires full base and commit SHAs.");
+    error.code = "candidate_diff_identity_incomplete";
+    throw error;
+  }
+  const expectedRepository = projectRepositoryIdentity(project);
+  let lastError;
+  for (const repoRoot of candidateRepositoryRoots(project, options.cwd)) {
+    try {
+      const remote = (() => {
+        try {
+          return normalizeRepositoryIdentity(trustedGit(repoRoot, ["remote", "get-url", "origin"]).trim());
+        } catch {
+          return "";
+        }
+      })();
+      if (!expectedRepository.startsWith("local:") && remote !== expectedRepository) continue;
+      trustedGit(repoRoot, ["cat-file", "-e", `${baseSha}^{commit}`]);
+      trustedGit(repoRoot, ["cat-file", "-e", `${commitSha}^{commit}`]);
+      const output = trustedGit(repoRoot, [
+        "--no-pager", "diff", "--no-ext-diff", "--no-renames", "--name-only", "--diff-filter=ACMR", "-z",
+        `${baseSha}...${commitSha}`, "--",
+      ]);
+      return [...new Set(output.split("\0").map((item) => item.trim()).filter(Boolean))].sort();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  const error = new Error(`Exact candidate diff is unavailable in the bound project repository${lastError?.message ? `: ${lastError.message}` : "."}`);
+  error.code = "candidate_diff_unavailable";
+  throw error;
+}
+
+export function assertChangedFileEvidenceMatches(actualFiles = [], reportedFiles = []) {
+  const actual = list(actualFiles).sort();
+  const reported = list(reportedFiles).sort();
+  if (JSON.stringify(actual) !== JSON.stringify(reported)) {
+    const omitted = actual.filter((file) => !reported.includes(file));
+    const invented = reported.filter((file) => !actual.includes(file));
+    const error = new Error(`Builder changed-file evidence does not match the immutable Git diff. Omitted: ${omitted.join(", ") || "none"}; unverified: ${invented.join(", ") || "none"}.`);
+    error.code = "candidate_diff_evidence_mismatch";
+    error.omittedFiles = omitted;
+    error.unverifiedFiles = invented;
+    throw error;
+  }
+  return true;
+}
+
+function artifactSlug(value, fallback) {
+  return String(value || fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || fallback;
+}
+
+function redactDiscoveryOutput(value) {
+  return String(value || "")
+    .replace(/\b(authorization|password|passwd|secret|token|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/\b(?:ghp|github_pat|sk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_TOKEN]");
+}
+
+export async function writeBoundedDiscoveryArtifact(input = {}) {
+  const artifactRoot = String(input.artifactRoot || "").trim();
+  if (!path.isAbsolute(artifactRoot)) throw new Error("Discovery artifact root must be absolute.");
+  const reasonCode = artifactSlug(input.reasonCode, "bounded_discovery");
+  const projectKey = artifactSlug(input.projectKey, "project");
+  const runId = artifactSlug(input.runId || input.taskId, "run");
+  const maxBytes = Math.max(1, Math.min(25 * 1024 * 1024, Number(input.maxBytes || 1024 * 1024)));
+  const redacted = redactDiscoveryOutput(input.output);
+  const encoded = Buffer.from(redacted, "utf8");
+  const bounded = encoded.subarray(0, maxBytes);
+  const digest = sha256Digest(bounded);
+  const directory = path.join(artifactRoot, projectKey, runId);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const artifactPath = path.join(directory, `${reasonCode}-${digest.slice("sha256:".length, "sha256:".length + 16)}.log`);
+  await writeFile(artifactPath, bounded, { mode: 0o600 });
+  await chmod(artifactPath, 0o600);
+  return {
+    reasonCode,
+    path: artifactPath,
+    digest,
+    bytes: bounded.length,
+    originalBytes: encoded.length,
+    truncated: encoded.length > bounded.length,
+    summary: `Discovery output stored locally (${bounded.length} bytes, ${digest}${encoded.length > bounded.length ? ", truncated" : ""}).`,
+  };
+}
+
 function fallbackPlan(project, task, loaded, sourceCommit) {
   const allowedFileScope = list(task.workAreas);
   return {
@@ -90,24 +220,45 @@ export function resolveProjectImpactPlan(input = {}) {
   const project = input.project || {};
   const task = input.task || {};
   const loaded = input.loadedMap || loadProjectComponentImpactMap(project, { repoRoot: input.repoRoot });
-  const sourceCommit = input.sourceCommit || task.candidateIdentity?.baseSha || task.reviewSubjectSha || "";
+  const candidate = task.candidateIdentity || {};
+  const sourceCommit = input.sourceCommit || candidate.commitSha || task.reviewSubjectSha || candidate.baseSha || "";
   if (!loaded.manifest) return fallbackPlan(project, task, loaded, sourceCommit);
   const text = taskSearchText(task);
+  const declaredPaths = list(task.workAreas);
+  const immutableChangedFiles = list(input.changedFiles || candidate.impactEvidence?.changedFiles || task.impactEvidence?.changedFiles);
+  const immutableCandidate = Boolean(exactSha(candidate.baseSha) && exactSha(candidate.commitSha));
+  const classificationPaths = immutableCandidate ? immutableChangedFiles : declaredPaths;
   const matches = Object.values(loaded.manifest.components)
-    .filter((component) => componentMatchesTask(component, task, text));
+    .filter((component) => (
+      classificationPaths.some((changedPath) => component.paths.some((scope) => pathMatchesImpactScope(changedPath, scope)))
+      || (!classificationPaths.length && componentMatchesTask(component, task, text))
+    ));
   const selected = matches.length ? matches : [];
   const selectedPaths = [...new Set(selected.flatMap((component) => component.paths))].sort();
-  const declaredPaths = list(task.workAreas);
   const unmappedDeclaredPaths = declaredPaths.filter((area) => (
     !selectedPaths.some((scope) => pathMatchesImpactScope(area, scope) || pathMatchesImpactScope(scope, area))
   ));
-  const sensitive = FULL_REGRESSION_WORDS.filter((word) => text.includes(word));
+  const unmappedImpactPaths = classificationPaths.filter((changedPath) => (
+    !Object.values(loaded.manifest.components).some((component) => (
+      component.paths.some((scope) => pathMatchesImpactScope(changedPath, scope))
+    ))
+  ));
+  const sensitiveKeywords = [...new Set([
+    ...FULL_REGRESSION_WORDS,
+    ...list(loaded.manifest.fullRegressionKeywords).map((item) => item.toLowerCase()),
+  ])].filter((word) => text.includes(word));
+  const sensitivePaths = classificationPaths.filter((changedPath) => (
+    loaded.manifest.releaseSensitivePaths.some((scope) => pathMatchesImpactScope(changedPath, scope))
+    || selected.some((component) => component.fullRegressionPaths.some((scope) => pathMatchesImpactScope(changedPath, scope)))
+  ));
   const reasonCodes = [];
   if (!selected.length) reasonCodes.push("unclassified_impact");
   if (selected.length > 1) reasonCodes.push("multi_component_impact");
   if (selected.some((component) => component.shared)) reasonCodes.push("shared_component_impact");
   if (unmappedDeclaredPaths.length) reasonCodes.push("declared_path_unmapped");
-  if (sensitive.length) reasonCodes.push("release_sensitive_impact");
+  if (unmappedImpactPaths.length) reasonCodes.push("immutable_diff_path_unmapped");
+  if (immutableCandidate && !immutableChangedFiles.length) reasonCodes.push("immutable_diff_evidence_missing");
+  if (sensitiveKeywords.length || sensitivePaths.length) reasonCodes.push("release_sensitive_impact");
   if (loaded.status === "legacy") reasonCodes.push("legacy_manifest_compatibility");
   const fullRegression = reasonCodes.length > 0;
   const allowedFileScope = [...new Set([
@@ -125,6 +276,12 @@ export function resolveProjectImpactPlan(input = {}) {
       repository: projectRepositoryIdentity(project),
     },
     sourceCommit: String(sourceCommit || ""),
+    candidateBinding: {
+      baseSha: exactSha(candidate.baseSha),
+      commitSha: exactSha(candidate.commitSha) || exactSha(sourceCommit),
+      changedFilesDigest: immutableChangedFiles.length ? sha256Digest(immutableChangedFiles.sort()) : "",
+      classificationSource: immutableCandidate ? "immutable_git_diff" : "declared_task_scope",
+    },
     manifest: {
       path: loaded.path,
       digest: loaded.digest,
@@ -142,8 +299,12 @@ export function resolveProjectImpactPlan(input = {}) {
     aggregateCommand: loaded.manifest.aggregateCommand,
     reasonCodes: fullRegression ? reasonCodes : ["single_component_mapped"],
     discovery: {
-      required: !selected.length || unmappedDeclaredPaths.length > 0,
-      reasonCode: !selected.length ? "unclassified_impact" : unmappedDeclaredPaths.length ? "declared_path_unmapped" : "",
+      required: !selected.length || unmappedDeclaredPaths.length > 0 || unmappedImpactPaths.length > 0,
+      reasonCode: !selected.length
+        ? "unclassified_impact"
+        : unmappedImpactPaths.length
+          ? "immutable_diff_path_unmapped"
+          : unmappedDeclaredPaths.length ? "declared_path_unmapped" : "",
     },
   };
 }

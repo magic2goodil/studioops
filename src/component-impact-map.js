@@ -29,7 +29,10 @@ export function canonicalJson(value) {
 }
 
 export function sha256Digest(value) {
-  return `sha256:${createHash("sha256").update(typeof value === "string" ? value : canonicalJson(value)).digest("hex")}`;
+  const material = typeof value === "string" || Buffer.isBuffer(value) || value instanceof Uint8Array
+    ? value
+    : canonicalJson(value);
+  return `sha256:${createHash("sha256").update(material).digest("hex")}`;
 }
 
 export function normalizeRepositoryIdentity(value) {
@@ -86,12 +89,12 @@ function normalizeTest(test, componentId) {
   };
 }
 
-function normalizeComponent(id, input = {}) {
+function normalizeComponent(id, input = {}, options = {}) {
   const owner = String(input.owner || "").trim();
   if (!owner) throw new Error(`Component ${id} must declare an owner.`);
   const paths = list(input.paths).map((item) => safeRelativePath(item, `Component ${id} path`));
   if (!paths.length) throw new Error(`Component ${id} must declare at least one repository-relative path.`);
-  return {
+  const component = {
     id,
     owner,
     aliases: list(input.aliases),
@@ -106,12 +109,24 @@ function normalizeComponent(id, input = {}) {
     workflows: list(input.workflows),
     deploySurfaces: list(input.deploySurfaces),
     publicContracts: list(input.publicContracts),
+    policyAuthorities: list(input.policyAuthorities),
     dependsOn: list(input.dependsOn),
     reviewOwners: list(input.reviewOwners || input.reviewers),
     tests: (Array.isArray(input.tests) ? input.tests : []).map((test) => normalizeTest(test, id)),
+    fullRegressionPaths: list(input.fullRegressionPaths).map((item) => safeRelativePath(item, `Component ${id} full-regression path`)),
     shared: input.shared === true,
     rollback: String(input.rollback || "").trim(),
   };
+  if (!options.compatibility) {
+    if (!component.publicContracts.length) throw new Error(`Component ${id} must classify its public contracts.`);
+    if (!component.reviewOwners.length) throw new Error(`Component ${id} must declare review owners.`);
+    if (!component.tests.length) throw new Error(`Component ${id} must declare owned tests.`);
+    if (!component.rollback) throw new Error(`Component ${id} must declare a rollback boundary.`);
+    if (![component.routes, component.ui, component.services, component.data, component.jobs, component.events, component.workflows, component.deploySurfaces].some((items) => items.length)) {
+      throw new Error(`Component ${id} must classify at least one runtime, data, workflow, or deploy surface.`);
+    }
+  }
+  return component;
 }
 
 function assertAcyclic(components) {
@@ -157,14 +172,56 @@ export function validateComponentImpactMap(input, expected = {}) {
   const components = Object.fromEntries(entries.map(([rawId, value]) => {
     const id = String(rawId || "").trim();
     if (!id) throw new Error("Component IDs cannot be empty.");
-    return [id, normalizeComponent(id, value)];
+    return [id, normalizeComponent(id, value, { compatibility: expected.compatibility === true })];
   }));
   assertAcyclic(components);
+  if (!expected.compatibility) {
+    const pathOwners = new Map();
+    const policyOwners = new Map();
+    for (const component of Object.values(components)) {
+      for (const ownedPath of component.paths) {
+        const owners = pathOwners.get(ownedPath) || [];
+        owners.push(component.id);
+        pathOwners.set(ownedPath, owners);
+      }
+      for (const authority of component.policyAuthorities) {
+        const owners = policyOwners.get(authority) || [];
+        owners.push(component.id);
+        policyOwners.set(authority, owners);
+      }
+    }
+    const duplicatePath = [...pathOwners].find(([, owners]) => owners.length > 1);
+    if (duplicatePath) throw new Error(`Repository path ${duplicatePath[0]} has duplicate component authorities: ${duplicatePath[1].join(", ")}.`);
+    const duplicatePolicy = [...policyOwners].find(([, owners]) => owners.length > 1);
+    if (duplicatePolicy) throw new Error(`Business policy ${duplicatePolicy[0]} has duplicate component authorities: ${duplicatePolicy[1].join(", ")}.`);
+  }
+  const prohibitedDependencies = (Array.isArray(input.prohibitedDependencies) ? input.prohibitedDependencies : []).map((edge) => ({
+    from: String(edge?.from || "").trim(),
+    to: String(edge?.to || "").trim(),
+  }));
+  for (const edge of prohibitedDependencies) {
+    if (!edge.from || !edge.to) throw new Error("Prohibited dependency entries require from and to component IDs.");
+    if (components[edge.from]?.dependsOn.includes(edge.to)) {
+      throw new Error(`Component dependency ${edge.from} -> ${edge.to} is prohibited.`);
+    }
+  }
+  const releaseSensitivePaths = list(input.releaseSensitivePaths)
+    .map((item) => safeRelativePath(item, "Release-sensitive path"));
+  for (const sensitivePath of releaseSensitivePaths) {
+    const owner = Object.values(components).find((component) => component.paths.includes(sensitivePath));
+    if (!owner) throw new Error(`Release-sensitive path ${sensitivePath} has no component owner.`);
+    if (!owner.fullRegressionPaths.includes(sensitivePath)) {
+      throw new Error(`Release-sensitive path ${sensitivePath} must be classified for full regression by ${owner.id}.`);
+    }
+  }
   return {
     schemaVersion: COMPONENT_IMPACT_SCHEMA_VERSION,
     project: { key: projectKey, repository },
     aggregateCommand: String(input.aggregateCommand || "npm run check").trim(),
     fullRegressionTriggers: list(input.fullRegressionTriggers),
+    fullRegressionKeywords: list(input.fullRegressionKeywords),
+    releaseSensitivePaths,
+    prohibitedDependencies,
     components,
   };
 }
@@ -193,7 +250,11 @@ function loadLegacyMaps(repoRoot, project) {
         ...component,
         paths,
         dependsOn: list(component.dependsOn).filter((dependency) => Object.hasOwn(legacy.components || {}, dependency)),
-        tests: list(component.tests),
+        publicContracts: list(component.publicContracts).length ? component.publicContracts : ["legacy component contract"],
+        reviewers: list(component.reviewers).length ? component.reviewers : [component.owner || "legacy-owner"],
+        tests: Array.isArray(component.tests) && component.tests.length ? component.tests : ["npm run check"],
+        workflows: list(component.workflows).length ? component.workflows : ["legacy compatibility workflow"],
+        rollback: component.rollback || "Disable legacy-map planning and use full regression.",
       };
     }
   }
@@ -242,6 +303,7 @@ export function loadProjectComponentImpactMap(project = {}, options = {}) {
   const manifest = validateComponentImpactMap(raw, {
     projectKey: String(project.key || project.id || "").trim(),
     repository: projectRepositoryIdentity(project),
+    compatibility: source === "legacy",
   });
   return {
     status: source === "primary" ? "mapped" : "legacy",
