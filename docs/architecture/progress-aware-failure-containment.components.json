@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "workflowImpact": "full-regression",
+  "reason": "shared worker-attempt authority and additive SQLite migration",
+  "components": {
+    "failure-containment-authority": {
+      "paths": ["src/failure-containment.js", "test/failure-containment.test.js"],
+      "owner": "techops-reliability",
+      "publicContracts": ["failureFingerprint", "failureEvidence", "claimPaidFailureAttempt", "recordFailureRecoveryActivity", "scheduleFailureBackoff", "openFailureCircuit", "failureIncidentCompatibilityCircuit"],
+      "ownedData": ["canonical failure fingerprint and evidence DTOs", "incident generation and two-paid-attempt policy", "cheap-probe repair avoided-retry circuit-event and notification counters"],
+      "ownedEvents": ["paid_attempt_claimed", "evidence_verified", "cheap_probe", "repair", "retry_avoided"],
+      "dependsOn": [],
+      "rollback": "Stop new incident writers; retain additive incident rows and continue reading task.automationCircuit as the one-release compatibility projection.",
+      "testLayers": ["unit", "contract", "redaction", "state-machine"]
+    },
+    "workflow-state-persistence": {
+      "paths": ["src/state-database.js", "src/store.js", "test/state-database.test.js"],
+      "owner": "backend-workflow-state",
+      "publicContracts": ["claimFailureContainmentPaidAttempt", "recordFailureContainmentActivity", "scheduleFailureContainmentBackoff", "openFailureContainmentCircuit", "readFailureIncidents"],
+      "ownedData": ["failure_incidents", "meta.failureContainmentMigration", "task.automationCircuit compatibility read model"],
+      "ownedMigrations": ["failure containment schema v1 with verified pre-migration backup and deterministic legacy circuit and run backfill"],
+      "dependsOn": ["failure-containment-authority"],
+      "rollback": "Preserve failure_incidents as operational evidence; older runtimes ignore the additive table and retain task circuit compatibility fields.",
+      "testLayers": ["persistence", "concurrency", "migration", "indexed-query"]
+    },
+    "execution-policy-adapter": {
+      "paths": ["src/execution-policy.js", "test/execution-policy.test.js"],
+      "owner": "backend-automation",
+      "publicContracts": ["bounded reason and provider classification inputs"],
+      "ownedData": [],
+      "dependsOn": ["failure-containment-authority"],
+      "rollback": "Disable the adapter while the durable authority remains fail closed.",
+      "testLayers": ["contract"]
+    },
+    "architecture-validation": {
+      "paths": ["docs/architecture/components.json", "docs/architecture/progress-aware-failure-containment.components.json"],
+      "owner": "shared-validation",
+      "publicContracts": ["deterministic ownership and dependency manifest"],
+      "ownedData": [],
+      "testLayers": ["composition"]
+    }
+  },
+  "dependencyEdges": [
+    { "from": "workflow-state-persistence", "to": "failure-containment-authority" },
+    { "from": "execution-policy-adapter", "to": "failure-containment-authority" }
+  ],
+  "prohibited": ["second database", "raw failure messages in fingerprints or evidence", "timestamp-bound evidence digests", "provider-specific paid-attempt budgets", "time-only circuit reset", "credential or secret persistence", "dependency cycles"],
+  "impactClassifier": {
+    "input": "base/head diff plus this repository-owned manifest",
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "pathRules": [
+      { "pattern": "src/failure-containment.js", "component": "failure-containment-authority", "selection": "full_regression" },
+      { "pattern": "src/state-database.js", "component": "workflow-state-persistence", "selection": "full_regression" },
+      { "pattern": "src/store.js", "component": "workflow-state-persistence", "selection": "full_regression" },
+      { "pattern": "src/execution-policy.js", "component": "execution-policy-adapter", "selection": "full_regression" },
+      { "pattern": "test/failure-containment.test.js", "component": "failure-containment-authority", "selection": "full_regression" },
+      { "pattern": "test/state-database.test.js", "component": "workflow-state-persistence", "selection": "full_regression" },
+      { "pattern": "test/execution-policy.test.js", "component": "execution-policy-adapter", "selection": "full_regression" },
+      { "pattern": "docs/architecture/progress-aware-failure-containment.components.json", "component": "architecture-validation", "selection": "full_regression" }
+    ],
+    "fullRegressionTriggers": ["schema or migration change", "shared public contract", "manifest change", "ambiguous or unclassified path"],
+    "aggregateCommand": "npm run check"
+  },
+  "retention": { "incidentGenerations": "durable", "taskCircuitCompatibility": "one release" }
+}

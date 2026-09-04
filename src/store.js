@@ -82,6 +82,10 @@ import {
   isolatedTestAdapterRun,
   registerIsolatedTestAdapter,
 } from "./test-authority-realm.js";
+import {
+  assertFailureIncident,
+  failureIncidentCompatibilityCircuit,
+} from "./failure-containment.js";
 
 const DATA_DIR = missionControlDataDir();
 const DATA_FILE = LEGACY_DATA_FILE;
@@ -4513,6 +4517,52 @@ export function taskAutomationCircuitIsCurrent(task = {}) {
     Object.keys(circuit.snapshot).map((key) => [key, liveSnapshot[key]]),
   );
   return isDeepStrictEqual(circuit.snapshot, comparableLiveSnapshot);
+}
+
+/**
+ * Publish the durable failure incident as the legacy task circuit projection.
+ * Policy decisions remain in failure-containment; this copy exists only for
+ * one compatibility release and owner-facing readers.
+ */
+export function applyFailureIncidentCompatibilityReadModelInState(state, task, incidentInput, input = {}) {
+  const incident = assertFailureIncident(incidentInput);
+  if (!task || task.id !== incident.taskId) {
+    throw new Error("Failure incident compatibility projection task binding changed.");
+  }
+  const snapshot = input.snapshot || workflowSnapshotForTask(task);
+  const circuit = failureIncidentCompatibilityCircuit(incident, snapshot);
+  task.automationCircuit = circuit;
+  if (incident.state === "open") {
+    task.automationBlocker = {
+      type: "circuit",
+      reason: incident.reasonCode,
+      resumeStatus: snapshot.status || "queued",
+      attempts: incident.paidAttempts,
+      retryAt: "",
+      incidentId: incident.incidentId,
+      incidentGeneration: incident.generation,
+      evidenceDigest: incident.evidenceDigest,
+    };
+  } else if (task.automationBlocker?.incidentId === incident.incidentId) {
+    delete task.automationBlocker;
+  }
+  task.updatedAt = incident.updatedAt;
+  state.events = state.events || [];
+  if (
+    incident.state === "open"
+    && !state.events.some((event) => event.failureCircuitEventKey === circuit.notificationKey)
+  ) {
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "automation_circuit_opened",
+      projectId: task.projectId,
+      taskId: task.id,
+      failureCircuitEventKey: circuit.notificationKey,
+      message: `${task.id} opened durable failure incident ${incident.incidentId}; further paid retries are suppressed.`,
+      createdAt: incident.openedAt || incident.updatedAt,
+    });
+  }
+  return circuit;
 }
 
 export function supersedeStaleTaskCircuitInState(state, task, input = {}) {

@@ -481,9 +481,12 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
     assert.equal(state.tasks[0].title, "Persist me");
     assert.equal(state.meta.storageBackend, "sqlite");
     assert.match(state.meta.migratedFrom, /mission-control\.json$/);
-    assert.equal(state.meta.stateIntegrityVersion, 6);
+    assert.equal(state.meta.stateIntegrityVersion, 7);
     assert.equal(state.meta.lifecycleMigration.schemaVersion, 1);
     assert.equal(state.meta.lifecycleMigration.backupVerified, true);
+    assert.equal(state.meta.failureContainmentMigration.schemaVersion, 1);
+    assert.equal(state.meta.failureContainmentMigration.contract, "studioops.failure-containment.v1");
+    assert.equal(state.meta.failureContainmentMigration.backupVerified, true);
     assert.equal(state.tasks[0].stateVersion, 1);
 
     const dataMode = (await stat(path.join(root, "data"))).mode & 0o777;
@@ -497,6 +500,8 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
     const migratedDb = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
     try {
       assert.equal(migratedDb.prepare("SELECT state_version FROM tasks WHERE id = 'task_1'").get().state_version, 1);
+      assert.ok(migratedDb.prepare("PRAGMA index_list(failure_incidents)").all()
+        .some((entry) => entry.name === "idx_failure_incidents_task_fingerprint_state"));
       assert.equal(migratedDb.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
     } finally {
       migratedDb.close();
@@ -513,7 +518,7 @@ test("SQLite migrates legacy state once and protects persisted PII at rest", asy
   }
 });
 
-test("integrity v6 quarantines active legacy candidates that reference invalidated reviews", async () => {
+test("integrity v7 quarantines active legacy candidates that reference invalidated reviews", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-invalidated-review-migration-"));
   try {
     const invalidatedAt = "2026-08-24T21:38:03.807Z";
@@ -615,7 +620,7 @@ test("integrity v6 quarantines active legacy candidates that reference invalidat
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
     let persisted = readPersistedState(root);
     const quarantined = persisted.candidates[0];
-    assert.equal(persisted.meta.stateIntegrityVersion, 6);
+    assert.equal(persisted.meta.stateIntegrityVersion, 7);
     assert.equal(quarantined.status, "invalidated");
     assert.deepEqual(quarantined.invalidation, {
       reason: `Integrity migration quarantined candidate ${candidate.id} because source review review_legacy_invalidated was already invalidated.`,
@@ -723,7 +728,7 @@ test("lifecycle integrity migration upgrades an existing v4 database once from a
 
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
     let persisted = readPersistedState(root);
-    assert.equal(persisted.meta.stateIntegrityVersion, 6);
+    assert.equal(persisted.meta.stateIntegrityVersion, 7);
     assert.equal(persisted.meta.lifecycleMigration.schemaVersion, 1);
     assert.equal(persisted.tasks[0].stateVersion, 1);
     const backupPath = persisted.meta.lifecycleMigration.backupPath;
@@ -782,7 +787,7 @@ test("lifecycle schema migration repairs a version-5 database that lacks the lif
 
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
     const persisted = readPersistedState(root);
-    assert.equal(persisted.meta.stateIntegrityVersion, 6);
+    assert.equal(persisted.meta.stateIntegrityVersion, 7);
     assert.equal(persisted.meta.lifecycleMigration.schemaVersion, 1);
     assert.equal(persisted.meta.lifecycleMigration.backupVerified, true);
     assert.equal(persisted.tasks[0].stateVersion, 1);

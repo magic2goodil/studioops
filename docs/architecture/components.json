@@ -121,7 +121,7 @@
     "failure-recovery": {
       "owner": "techops-reliability",
       "aliases": ["failure containment", "watchdog", "TechOps", "circuit"],
-      "paths": ["src/watchdog.js", "src/techops.js", "src/remediation-handoff.js", "test/watchdog.test.js", "test/techops.test.js"],
+      "paths": ["src/failure-containment.js", "src/watchdog.js", "src/techops.js", "src/remediation-handoff.js", "test/failure-containment.test.js", "test/watchdog.test.js", "test/techops.test.js"],
       "services": ["watchdog", "bounded TechOps repair", "remediation handoff"],
       "publicContracts": ["bounded failure recovery", "durable remediation handoff"],
       "workflows": ["failure recovery", "stale branch remediation"],
