@@ -170,10 +170,10 @@
     "runtime-self-update": {
       "owner": "devops-runtime",
       "aliases": ["self update", "runtime install", "immutable runtime", "LaunchAgent restart"],
-      "capabilities": ["verified runtime publication", "bounded worker restart"],
+      "capabilities": ["verified runtime publication", "bounded worker restart", "durable workflow claim-aware restart deferral"],
       "paths": ["src/self-update.js", "src/self-update-lease.js", "src/runtime-install.js", "test/self-update.test.js", "test/runtime-install.test.js", "test/identity-verification.test.js"],
       "services": ["self-update planner", "runtime installer", "maintenance lease"],
-      "publicContracts": ["clean fast-forward source update", "verified immutable runtime provenance"],
+      "publicContracts": ["clean fast-forward source update", "verified immutable runtime provenance", "bounded active QA and promotion claim diagnostics"],
       "workflows": ["StudioOps self-update", "runtime-only repair"],
       "deploySurfaces": ["local immutable runtime", "managed LaunchAgents"],
       "tests": [{ "command": "node --test test/self-update.test.js test/runtime-install.test.js", "layer": "runtime-release" }],
