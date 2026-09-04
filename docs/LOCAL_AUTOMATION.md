@@ -316,6 +316,7 @@ node src/mission-control-cli.js runs
 npm run runner -- --plan
 npm run dispatcher -- --plan
 npm run qa-integrate -- --plan
+node src/mission-control-techops.js --plan
 npm run promotion -- --plan
 npm run self-update -- --plan
 ```
@@ -423,6 +424,93 @@ The health endpoint must attest the commit actually served by the running
 preview. Return the full Git SHA in the configured `identityHeader` (default
 `X-StudioOps-Commit`) or JSON `identityJsonField` (default `commitSha`). A plain
 HTTP 200 is insufficient and blocks candidate freeze.
+
+## Local TechOps recovery
+
+The optional TechOps worker rechecks the loopback health endpoint for active
+`ready` and `partially_reviewed` QA bundles after they have been frozen. It
+checks both availability and the full immutable candidate SHA, so a previously
+healthy preview that stops or begins serving a stale checkout becomes a
+dedicated `techops_check_qa_preview` action rather than another feature build.
+
+Configure the policy per project (or under `defaults.techOps`):
+
+```json
+{
+  "techOps": {
+    "enabled": true,
+    "healthCheckIntervalSeconds": 60,
+    "healthTimeoutMs": 5000,
+    "commandTimeoutMs": 60000,
+    "maxAttempts": 3,
+    "initialBackoffSeconds": 60,
+    "maxBackoffSeconds": 900,
+    "leaseSeconds": 300,
+    "maxConcurrentRecoveries": 1,
+    "maxCommandsPerAttempt": 8,
+    "maxOutputChars": 4000,
+    "verificationAttempts": 5,
+    "verificationDelayMs": 1000,
+    "diagnosticCommands": [
+      {
+        "id": "postgres-status",
+        "operation": "docker_compose_ps",
+        "services": ["postgres"]
+      }
+    ],
+    "recoveryCommands": [
+      {
+        "id": "postgres-start",
+        "operation": "docker_compose_up",
+        "services": ["postgres"]
+      }
+    ],
+    "restartLaunchAgents": ["com.example.myapp.local"]
+  }
+}
+```
+
+Commands must use the typed operation records above; arbitrary executables,
+argument arrays, shell strings, SQL, interpreter/eval commands, filesystem
+utilities, and raw Docker subcommands are rejected before execution. Supported
+diagnostic operations are `docker_compose_ps`; supported recovery operations
+are `docker_compose_up`, `docker_compose_start`, and
+`docker_compose_restart`. Every operation requires one or more validated Compose
+service names. StudioOps generates the Docker argv internally, pins the local
+`default` Docker context, supplies the already verified project-local Compose
+project directory without accepting file or project-name overrides, and never
+exposes delete, remove, down, prune, or volume flags. Compose therefore resolves
+only the configuration and existing project identity rooted at that directory.
+The `docker_compose_up` operation always includes
+`--no-recreate`, so it can start or create a missing service but cannot replace
+an existing database container. A malformed command makes the entire recovery
+policy fail closed; it cannot be skipped while other commands or LaunchAgent
+restarts continue.
+
+Command working directories must resolve inside the registered project or its
+local QA preview checkout. LaunchAgents are restarted by the worker only when
+their labels also appear in
+`localPreview.restartLaunchAgents`. Keep secrets out of command arguments and
+output; stored output is bounded and common credential forms are redacted, and
+the durable audit records command identifiers and typed result codes rather
+than generated argv values.
+
+Run a read-only plan or one sweep manually:
+
+```bash
+node src/mission-control-techops.js --plan
+node src/mission-control-techops.js --json
+```
+
+The installed `com.codex.mission-control.techops` LaunchAgent runs one sweep per
+minute. A fenced lease deduplicates overlapping sweeps. Failures use durable
+exponential backoff; after `maxAttempts`, the QA bundle records one
+`circuit_open` incident with the final actionable blocker and no further
+recovery is claimed. A successful recovery must again attest the exact
+candidate SHA before the incident is cleared. Changing candidate or recovery
+policy identity starts a new bounded series. TechOps never merges, pushes,
+deploys, deletes databases, resets volumes, or runs a command rooted in another
+project.
 
 ## Main Promotion
 

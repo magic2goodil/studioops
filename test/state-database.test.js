@@ -10,6 +10,7 @@ import test from "node:test";
 import { compactOperationalHistory, maintenanceWriteBlocker } from "../src/state-database.js";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
+import { buildOwnerQaPacket } from "../src/owner-qa-packet.js";
 import { readPersistedState } from "./state-database-helper.js";
 import {
   claimRunWorkspaceCandidatesInState,
@@ -598,6 +599,17 @@ test("integrity v6 quarantines active legacy candidates that reference invalidat
       tasks: [{ id: "task_1", title: state.tasks[0].title }],
     }];
     state.candidates = [candidate];
+    const historicalPacket = buildOwnerQaPacket(state, candidate, {
+      bundle: state.qaBundles[0],
+      generatedAt: "2026-08-20T12:00:01.000Z",
+    });
+    candidate.qaPacket = historicalPacket;
+    state.qaBundles[0].qaPacket = historicalPacket;
+    state.qaBundles[0].packetDigest = historicalPacket.packetDigest;
+    // Version-5 history compaction removed summaries after authority had been
+    // revoked. Integrity v6 must quarantine the active envelope without
+    // attempting to reactivate or rewrite that historical packet.
+    state.qaBundles[0].tasks = [];
     await writeLegacyState(root, state);
 
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
@@ -613,6 +625,9 @@ test("integrity v6 quarantines active legacy candidates that reference invalidat
     });
     assert.equal(quarantined.updatedAt, invalidatedAt);
     assert.equal(persisted.qaBundles[0].status, "invalidated");
+    assert.deepEqual(persisted.qaBundles[0].tasks.map((task) => task.id), ["task_1"]);
+    assert.deepEqual(persisted.candidates[0].qaPacket, historicalPacket);
+    assert.deepEqual(persisted.qaBundles[0].qaPacket, historicalPacket);
     assert.equal(persisted.qaBundles[0].updatedAt, invalidatedAt);
     assert.equal(persisted.tasks[0].status, "done");
     assert.deepEqual(persisted.tasks[0].terminalEvidence, taskEvidence);
@@ -621,10 +636,33 @@ test("integrity v6 quarantines active legacy candidates that reference invalidat
 
     const firstCandidate = structuredClone(quarantined);
     const firstTask = structuredClone(persisted.tasks[0]);
+
+    // Reproduce the version-5 production shape: authority was already
+    // invalidated, then history compaction removed the bundle summaries.
+    const databasePath = path.join(root, "data", "mission-control.sqlite3");
+    const legacyDb = new DatabaseSync(databasePath);
+    try {
+      const bundleRow = legacyDb.prepare("SELECT payload FROM qa_bundles WHERE id = ?")
+        .get(candidate.qaBundleId);
+      const compactedBundle = JSON.parse(bundleRow.payload);
+      compactedBundle.tasks = [];
+      legacyDb.prepare("UPDATE qa_bundles SET payload = ? WHERE id = ?")
+        .run(JSON.stringify(compactedBundle), candidate.qaBundleId);
+      const metaRow = legacyDb.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
+      const legacyMeta = JSON.parse(metaRow.payload);
+      legacyMeta.stateIntegrityVersion = 5;
+      legacyDb.prepare("UPDATE state_meta SET payload = ? WHERE singleton_id = 1")
+        .run(JSON.stringify(legacyMeta));
+    } finally {
+      legacyDb.close();
+    }
+
     await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
     persisted = readPersistedState(root);
     assert.deepEqual(persisted.candidates[0], firstCandidate);
     assert.deepEqual(persisted.tasks[0], firstTask);
+    assert.deepEqual(persisted.qaBundles[0].tasks, []);
+    assert.deepEqual(persisted.qaBundles[0].qaPacket, historicalPacket);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

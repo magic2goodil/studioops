@@ -1,4 +1,5 @@
 import http from "node:http";
+import { realpathSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -467,6 +468,17 @@ export function startStudioOpsServer(options = {}) {
   return server;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+export function isStudioOpsServerEntryPoint(entryPath, moduleUrl = import.meta.url) {
+  if (!entryPath) return false;
+  const resolvedEntry = path.resolve(entryPath);
+  const resolvedModule = fileURLToPath(moduleUrl);
+  try {
+    return realpathSync(resolvedEntry) === realpathSync(resolvedModule);
+  } catch {
+    return resolvedEntry === resolvedModule;
+  }
+}
+
+if (isStudioOpsServerEntryPoint(process.argv[1])) {
   startStudioOpsServer();
 }

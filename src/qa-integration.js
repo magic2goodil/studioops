@@ -41,6 +41,8 @@ import {
   cleanupProjectValidationSandbox,
   DEFAULT_PROJECT_VALIDATION_PATH,
   prepareProjectValidationSandbox,
+  prepareProjectValidationDependencies,
+  installPreparedProjectValidationDependencies,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
   runProjectValidationCommand,
   verifyProjectValidationSandbox,
@@ -877,6 +879,8 @@ function validationSandboxAdapter(options = {}) {
       prepare: prepareProjectValidationSandbox,
       run: runProjectValidationCommand,
       verify: verifyProjectValidationSandbox,
+      prepareDependencies: prepareProjectValidationDependencies,
+      installDependencies: installPreparedProjectValidationDependencies,
       cleanup: cleanupProjectValidationSandbox,
     };
   }
@@ -1838,6 +1842,19 @@ async function mergeTaskSource(repoPath, task, options = {}) {
 async function runValidationCommands(sandbox, commands, options) {
   const sandboxOperations = validationSandboxAdapter(options);
   const results = [];
+  if (sandboxOperations.prepareDependencies) {
+    const dependencyCache = await sandboxOperations.prepareDependencies(sandbox, {
+      dependencyAcquisitionTimeoutMs: options.validationDependencyAcquisitionTimeoutMs,
+      dependencyAcquisitionMaxCaptureBytes: options.validationDependencyAcquisitionMaxCaptureBytes,
+    });
+    if (dependencyCache?.applicable && sandboxOperations.installDependencies) {
+      const install = await sandboxOperations.installDependencies(sandbox, {
+        validationTimeoutMs: options.validationTimeoutMs,
+      });
+      results.push({ command: "[offline dependency installation]", ok: install.ok, output: truncateOutput(install.output) });
+      if (!install.ok) return results;
+    }
+  }
   for (const command of commands) {
     if (options.renewQaClaim) await options.renewQaClaim();
     const result = await sandboxOperations.run(sandbox, command, {
@@ -3036,10 +3053,15 @@ async function integrateProject(projectPlan, options = {}) {
     return result;
   } catch (error) {
     const validationSandboxFailure = String(error?.code || "").startsWith("PROJECT_VALIDATION_");
-    result.status = validationSandboxFailure ? "validation_sandbox_unavailable" : "blocked";
+    const dependencyAcquisitionFailure = error?.code === "PROJECT_VALIDATION_DEPENDENCY_ACQUISITION_FAILED";
+    result.status = dependencyAcquisitionFailure
+      ? "dependency_acquisition_failed"
+      : validationSandboxFailure ? "validation_sandbox_unavailable" : "blocked";
     result.output = truncateOutput(redactPromotionValidationText(
-      validationSandboxFailure
-        ? `Project validation sandbox unavailable; the QA candidate was not pushed: ${error.message}`
+      dependencyAcquisitionFailure
+        ? `Dependency acquisition failed before isolated validation; the QA candidate was not pushed: ${error.message}`
+        : validationSandboxFailure
+          ? `Project validation sandbox unavailable; the QA candidate was not pushed: ${error.message}`
         : error.message,
     ));
     if (result.tasks.length) {
@@ -3198,6 +3220,10 @@ function commentForTask(projectResult, taskResult) {
 
   if (["candidate_drift", "candidate_publish_failed", "candidate_supersession_failed"].includes(taskResult.status)) {
     return `Protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
+  }
+
+  if (taskResult.status === "dependency_acquisition_failed") {
+    return `QA integration could not prepare the lockfile-bound dependency cache, so no validation or push was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (taskResult.status === "validation_sandbox_unavailable") {

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readlink, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -26,6 +26,8 @@ export const DEFAULT_PROJECT_VALIDATION_PATH = [
 
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
+const DEFAULT_DEPENDENCY_ACQUISITION_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_DEPENDENCY_ACQUISITION_MAX_CAPTURE_BYTES = 256 * 1024;
 const PROCESS_DRAIN_DEADLINE_MS = 500;
 const TRUSTED_GIT_EXECUTABLE = "/usr/bin/git";
 const SANDBOX_CAPABILITIES = new WeakMap();
@@ -51,6 +53,7 @@ const SYSTEM_RUNTIME_READ_ROOTS = [
   "/opt/homebrew/Cellar",
   "/opt/homebrew/opt",
   "/Applications/Xcode.app/Contents",
+  "/Library/Frameworks/Python.framework",
   "/Library/Developer/CommandLineTools",
   "/Library/Apple/usr/libexec/oah",
   "/Library/Java/JavaVirtualMachines",
@@ -656,6 +659,7 @@ export async function prepareProjectValidationSandbox(input = {}) {
       verifierExecutable,
       expectedHeadSha,
       expectedWorkspaceManifest: structuredClone(expectedWorkspaceManifest),
+      dependencyCachePrepared: false,
       device: Number(rootIdentity.dev),
       inode: Number(rootIdentity.ino),
       cleaned: false,
@@ -695,6 +699,119 @@ export async function runProjectValidationCommand(sandbox, command, options = {}
     timeoutMs: Number(options.timeoutMs || DEFAULT_TIMEOUT_MS),
     maxCaptureBytes: options.maxCaptureBytes,
   });
+}
+
+function dependencyAcquisitionError(message, output = "") {
+  const error = sandboxError(message, "PROJECT_VALIDATION_DEPENDENCY_ACQUISITION_FAILED");
+  error.output = output;
+  return error;
+}
+
+/**
+ * Populate a lockfile-bound npm cache before entering the deny-all sandbox.
+ * npm ci is deliberately run with lifecycle scripts disabled; the disposable
+ * sandbox performs the actual install and product validation later.
+ */
+export async function prepareProjectValidationDependencies(sandbox, options = {}) {
+  const capability = sandboxCapability(sandbox);
+  const lockName = await (async () => {
+    for (const candidate of ["package-lock.json", "npm-shrinkwrap.json"]) {
+      try {
+        const info = await lstat(path.join(capability.repoPath, candidate));
+        if (info.isFile()) return candidate;
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    return "";
+  })();
+  if (!lockName) return { applicable: false, status: "not_applicable" };
+
+  const lockPath = path.join(capability.repoPath, lockName);
+  const lockBytes = await readFile(lockPath);
+  const lockDigest = createHash("sha256").update(lockBytes).digest("hex");
+  const cachePath = path.join(capability.rootPath, `npm-cache-${lockDigest}`);
+  const identityPath = path.join(cachePath, ".studioops-cache-identity.json");
+  await mkdir(cachePath, { recursive: true, mode: 0o700 });
+  let cachePrepared = false;
+  try {
+    const identity = JSON.parse(await readFile(identityPath, "utf8"));
+    if (identity.lockfile !== lockName || identity.lockDigest !== lockDigest) {
+      throw dependencyAcquisitionError(
+        `Prepared npm cache identity does not match ${lockName}; refusing incompatible dependency reuse.`,
+      );
+    }
+    cachePrepared = true;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      if (error?.code === "PROJECT_VALIDATION_DEPENDENCY_ACQUISITION_FAILED") throw error;
+      throw dependencyAcquisitionError(`Prepared npm cache identity is unreadable: ${error.message}`);
+    }
+  }
+
+  const acquisitionEnvironment = {
+    ...capability.environment,
+    npm_config_cache: cachePath,
+    npm_config_ignore_scripts: "true",
+    npm_config_audit: "false",
+    npm_config_fund: "false",
+    npm_config_userconfig: path.join(capability.homePath, ".npmrc"),
+  };
+  let acquisition;
+  try {
+    acquisition = cachePrepared ? { ok: true, output: "reused lockfile-bound cache" } : await runCaptured("npm", [
+      "ci",
+      "--ignore-scripts",
+      "--cache",
+      cachePath,
+      "--prefer-online",
+      "--no-audit",
+      "--no-fund",
+    ], {
+      cwd: capability.repoPath,
+      env: acquisitionEnvironment,
+      timeoutMs: Number(options.dependencyAcquisitionTimeoutMs || DEFAULT_DEPENDENCY_ACQUISITION_TIMEOUT_MS),
+      maxCaptureBytes: Number(options.dependencyAcquisitionMaxCaptureBytes || DEFAULT_DEPENDENCY_ACQUISITION_MAX_CAPTURE_BYTES),
+    });
+  } catch (error) {
+    await rm(path.join(capability.repoPath, "node_modules"), { recursive: true, force: true });
+    throw dependencyAcquisitionError(`Dependency acquisition could not start for ${lockName}: ${error.message}`);
+  }
+  await rm(path.join(capability.repoPath, "node_modules"), { recursive: true, force: true });
+  if (!acquisition.ok) {
+    throw dependencyAcquisitionError(
+      `Dependency acquisition failed for ${lockName}: ${acquisition.output || `exit=${acquisition.code ?? "none"}`}`,
+      acquisition.output,
+    );
+  }
+  await writeFile(identityPath, JSON.stringify({
+    schemaVersion: "studioops.project-validation-npm-cache.v1",
+    lockfile: lockName,
+    lockDigest,
+  }) + "\n", { mode: 0o600 });
+  capability.environment.npm_config_cache = cachePath;
+  capability.dependencyCachePrepared = true;
+  return {
+    applicable: true,
+    status: "prepared",
+    lockfile: lockName,
+    lockDigest,
+    cachePath,
+    acquisition: {
+      ok: true,
+      timeoutMs: Number(options.dependencyAcquisitionTimeoutMs || DEFAULT_DEPENDENCY_ACQUISITION_TIMEOUT_MS),
+    },
+  };
+}
+
+export async function installPreparedProjectValidationDependencies(sandbox, options = {}) {
+  const capability = sandboxCapability(sandbox);
+  if (!capability.dependencyCachePrepared) return { applicable: false, status: "not_applicable" };
+  const result = await runProjectValidationCommand(sandbox, "npm ci --offline --no-audit --no-fund", {
+    timeoutMs: Number(options.validationTimeoutMs || DEFAULT_TIMEOUT_MS),
+    maxCaptureBytes: Number(options.maxCaptureBytes || DEFAULT_DEPENDENCY_ACQUISITION_MAX_CAPTURE_BYTES),
+  });
+  return { applicable: true, status: result.ok ? "installed" : "failed", ...result };
 }
 
 export async function verifyProjectValidationSandbox(sandbox) {

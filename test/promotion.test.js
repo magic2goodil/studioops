@@ -1493,7 +1493,7 @@ async function reconciliationFixture(prState = "OPEN", overrides = {}) {
     await git(repoPath, ["checkout", "main"]);
     await git(repoPath, ["merge", "--no-ff", sourceSha, "-m", "merge release candidate"]);
     mergeCommit = await git(repoPath, ["rev-parse", "HEAD"]);
-    mergedAt = "2026-07-25T13:00:00.000Z";
+    mergedAt = overrides.mergedAt || "2026-07-25T13:00:00.000Z";
     await git(repoPath, ["push", "origin", "main"]);
   }
 
@@ -3069,6 +3069,7 @@ test("merged admission recovery accepts a production v1 owner QA packet and lega
     legacyBody: true,
     legacyOwnerQaPacket: true,
     stalePostMerge: true,
+    mergedAt: "2026-07-25T13:00:00Z",
   });
   try {
     const before = readPersistedState(fixture.root);
@@ -3079,6 +3080,19 @@ test("merged admission recovery accepts a production v1 owner QA packet and lega
     assert.equal(historicalBundle.packetDigest, historicalCandidate.qaPacket.packetDigest);
     assert.equal(Object.hasOwn(historicalCandidate.qaDecision, "ownerQaPacketDigest"), false);
     assert.equal(Object.hasOwn(historicalBundle.qaDecision, "ownerQaPacketDigest"), false);
+
+    // Production was still on integrity v5 when this stale post-merge record
+    // had to cross the v6 migration before its attested recovery could run.
+    const database = new DatabaseSync(path.join(fixture.root, "data", "mission-control.sqlite3"));
+    try {
+      const row = database.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
+      const meta = JSON.parse(row.payload);
+      meta.stateIntegrityVersion = 5;
+      database.prepare("UPDATE state_meta SET payload = ? WHERE singleton_id = 1")
+        .run(JSON.stringify(meta));
+    } finally {
+      database.close();
+    }
 
     const script = `
       import { runPromotion } from ${JSON.stringify(promotionModuleUrl)};
@@ -3106,6 +3120,7 @@ test("merged admission recovery accepts a production v1 owner QA packet and lega
     assert.equal(task.promotionStatus, "merged_with_validation_warning");
     assert.equal(task.promotionEvidence.validationWarning.preserved, true);
     assert.equal(candidate.status, "merged");
+    assert.equal(candidate.promotionMerge.mergedAt, "2026-07-25T13:00:00.000Z");
     assert.equal(candidate.promotionMerge.mergeCommit, fixture.mergeCommit);
     assert.equal(candidate.qaPacket.schemaVersion, "studioops.owner-qa-packet.v1");
     assert.equal(Object.hasOwn(candidate.qaDecision, "ownerQaPacketDigest"), false);

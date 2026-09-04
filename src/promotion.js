@@ -59,6 +59,8 @@ import {
   cleanupProjectValidationSandbox,
   DEFAULT_PROJECT_VALIDATION_PATH,
   prepareProjectValidationSandbox,
+  prepareProjectValidationDependencies,
+  installPreparedProjectValidationDependencies,
   PROJECT_VALIDATION_SANDBOX_ISOLATION,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
   runProjectValidationCommand,
@@ -825,6 +827,19 @@ async function mergeTaskSource(repoPath, task, options = {}) {
 
 async function runValidationCommands(sandbox, commands, options, context) {
   const completeResults = [];
+  const dependencyInstall = await installPreparedProjectValidationDependencies(sandbox, options);
+  if (dependencyInstall.applicable) {
+    completeResults.push({
+      command: "[offline dependency installation]",
+      ok: dependencyInstall.ok,
+      output: redactPromotionValidationText(redactCommandOutput(dependencyInstall.output, options)),
+    });
+    if (!dependencyInstall.ok) {
+      // Preserve the failed install as validation evidence and do not run
+      // product commands against a partial node_modules tree.
+      commands = [];
+    }
+  }
   for (const command of commands) {
     if (options.beforeValidationCommand) await options.beforeValidationCommand();
     const result = await runProjectValidationCommand(sandbox, command, {
@@ -1162,6 +1177,7 @@ const AUTO_RECOVERABLE_PROMOTION_STATUSES = new Set([
   "remote_policy_invalid",
   "validation_missing",
   "validation_sandbox_unavailable",
+  "dependency_acquisition_failed",
   "claim_circuit_open",
 ]);
 
@@ -2129,6 +2145,10 @@ async function promoteProject(projectPlan, options = {}) {
         sandboxExecutable: options.validationSandboxExecutable,
         cloneTimeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
       });
+      result.validationDependencyCache = await prepareProjectValidationDependencies(validationSandbox, {
+        dependencyAcquisitionTimeoutMs: options.validationDependencyAcquisitionTimeoutMs,
+        dependencyAcquisitionMaxCaptureBytes: options.validationDependencyAcquisitionMaxCaptureBytes,
+      });
       result.validationSandboxPolicy = validationSandbox.policyId;
       result.validationWorkspaceStrategy = validationSandbox.strategy;
       result.validationNetworkPolicy = validationSandbox.networkPolicy;
@@ -2317,6 +2337,8 @@ async function promoteProject(projectPlan, options = {}) {
       ? "evidence_failed"
       : error.code === "PROMOTION_REMOTE_POLICY"
         ? "remote_policy_invalid"
+      : error.code === "PROJECT_VALIDATION_DEPENDENCY_ACQUISITION_FAILED"
+        ? "dependency_acquisition_failed"
       : String(error.code || "").startsWith("PROJECT_VALIDATION_")
         ? "validation_sandbox_unavailable"
       : error.code === "CANDIDATE_INTEGRITY"
@@ -2431,6 +2453,10 @@ function commentForTask(projectResult, taskResult) {
 
   if (taskResult.status === "auth_failed") {
     return `Promotion authentication is unavailable. The exact QA candidate and its release authority were preserved for automatic recovery after credentials are repaired.${workspaceLine}\n\n${projectResult.output}`;
+  }
+
+  if (taskResult.status === "dependency_acquisition_failed") {
+    return `Promotion stopped because lockfile-bound dependency acquisition failed before isolated validation. No validation command, push, or PR action was attempted.${workspaceLine}\n\n${projectResult.output}`;
   }
 
   if (taskResult.status === "validation_sandbox_unavailable") {
@@ -2598,7 +2624,7 @@ function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) 
     };
   }
 
-  if (["evidence_failed", "auth_failed", "candidate_verification_unavailable", "validation_sandbox_unavailable", "push_failed", "pr_failed"].includes(taskResult.status)) {
+  if (["evidence_failed", "auth_failed", "candidate_verification_unavailable", "validation_sandbox_unavailable", "dependency_acquisition_failed", "push_failed", "pr_failed"].includes(taskResult.status)) {
     if (projectResult.promotionClaim?.circuit?.shouldOpen) {
       return {
         ...patch,
@@ -2676,6 +2702,12 @@ function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) 
 }
 
 async function recordProjectResult(projectResult) {
+  if (projectResult.status === "merged") {
+    // GitHub may omit fractional seconds. Canonicalize once before binding the
+    // terminal claim and writing each durable merge mirror so they cannot
+    // disagree solely because equivalent ISO timestamps use different forms.
+    projectResult.mergedAt = new Date(projectResult.mergedAt).toISOString();
+  }
   return mutateCandidatePromotionState(projectResult.candidate?.id, projectResult.promotionClaim, async (state) => {
     const now = new Date().toISOString();
     state.comments = state.comments || [];
