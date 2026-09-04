@@ -373,22 +373,47 @@ export async function readPrePushValidationAttestation(run = {}, repoPath, root 
   };
 }
 
-async function installPrePushValidationHook(run, log) {
+async function resolveGitExecutable(searchPath = DEFAULT_RUNNER_PATH) {
+  const { stdout } = await execFileAsync("/bin/sh", ["-c", "command -v git"], {
+    env: { ...process.env, PATH: searchPath },
+  });
+  const executable = String(stdout || "").trim();
+  if (!path.isAbsolute(executable)) {
+    throw new Error("StudioOps could not resolve an absolute git executable for validation-hook enforcement.");
+  }
+  return executable;
+}
+
+async function installPrePushValidationHook(run, log, input = {}) {
   if ((run.workflowMode || resolveProjectWorkflowMode(run.project)) === "local") return "";
-  const hooksPath = path.join(missionControlRoot(), "validation-hooks", slugify(run.id));
+  const root = input.root || missionControlRoot();
+  const hooksPath = path.join(root, "validation-hooks", slugify(run.id));
   await mkdir(hooksPath, { recursive: true });
   const hookPath = path.join(hooksPath, "pre-push");
-  await writeFile(hookPath, prePushValidationScript(run), "utf8");
+  await writeFile(hookPath, prePushValidationScript(run, root), "utf8");
   await chmod(hookPath, 0o700);
+  const wrapperDirectory = path.join(hooksPath, "bin");
+  const wrapperPath = path.join(wrapperDirectory, "git");
+  const gitExecutable = await resolveGitExecutable(input.path || DEFAULT_RUNNER_PATH);
+  await mkdir(wrapperDirectory, { recursive: true });
+  await writeFile(
+    wrapperPath,
+    `#!/bin/sh\nexec ${shellQuote(gitExecutable)} -c core.hooksPath=${shellQuote(hooksPath)} "$@"\n`,
+    "utf8",
+  );
+  await chmod(wrapperPath, 0o700);
   log.write(`Pre-push validation hook: ${hookPath}\n`);
+  log.write(`Validation-enforcing git wrapper: ${wrapperPath}\n`);
   return hooksPath;
 }
 
-function withGitHooksEnv(env, hooksPath) {
+export function withGitHooksEnv(env, hooksPath) {
   if (!hooksPath) return env;
   const count = Math.max(0, Number(env.GIT_CONFIG_COUNT || 0));
+  const wrapperDirectory = path.join(hooksPath, "bin");
   return {
     ...env,
+    PATH: [wrapperDirectory, env.PATH || ""].filter(Boolean).join(path.delimiter),
     GIT_CONFIG_COUNT: String(count + 1),
     [`GIT_CONFIG_KEY_${count}`]: "core.hooksPath",
     [`GIT_CONFIG_VALUE_${count}`]: hooksPath,
@@ -1487,7 +1512,10 @@ export async function prepareRunWorkspace(run, input = {}, log, authContext = nu
   const defaultBranch = run.project.defaultBranch || "main";
   const projectKey = slugify(run.project.key || run.projectId || "project");
   const persistPreparedWorkspace = async (workspace) => {
-    workspace.gitHooksPath = await installPrePushValidationHook(run, log);
+    workspace.gitHooksPath = await installPrePushValidationHook(run, log, {
+      root: input.validationHookRoot,
+      path: input.path,
+    });
     await (input.persistRunWorkspace || persistRunWorkspace)(run, workspace);
     return workspace;
   };

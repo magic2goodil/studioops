@@ -29,6 +29,7 @@ import {
   runGitHubRemoteRecoveryProbes,
   runWorkspaceCleanup,
   runQueuedRuns,
+  sdkClientOptions,
 } from "../src/runner.js";
 import {
   claimPaidFailureAttempt,
@@ -859,6 +860,69 @@ test("local preflight never prepares GitHub auth and creates an isolated no-orig
     assert.equal(await git(workspace.workspacePath, ["symbolic-ref", "--short", "HEAD"]), "codex/demo-local");
     assert.equal(await git(workspace.workspacePath, ["remote"]), "");
     assert.equal(await readFile(path.join(workspace.workspacePath, "README.md"), "utf8"), "test\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("prepared GitHub workspaces enforce exact-SHA validation through the git executable", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-git-hook-workspace-"));
+  try {
+    const repoPath = await createRepository(root);
+    const remotePath = path.join(root, "remote.git");
+    await mkdir(remotePath);
+    await git(remotePath, ["init", "--bare"]);
+    await git(repoPath, ["remote", "add", "origin", remotePath]);
+    await git(repoPath, ["push", "--set-upstream", "origin", "main"]);
+
+    const marker = path.join(root, "validation-ran.txt");
+    const run = {
+      ...builderRun({
+        id: "run_git_hook_workspace",
+        branchName: "codex/demo-hook-workspace",
+        prUrl: "",
+      }),
+      workflowMode: "github",
+      project: {
+        id: "project_1",
+        key: "demo",
+        repoPath,
+        repoUrl: remotePath,
+        workflowMode: "github",
+        defaultBranch: "main",
+        validationCommands: [`printf validated > ${JSON.stringify(marker)}`],
+      },
+    };
+    const workspace = await prepareRunWorkspace(run, {
+      workspaceRoot: path.join(root, "workspaces"),
+      validationHookRoot: path.join(root, "runtime"),
+      persistRunWorkspace: async () => {},
+    }, { write() {} });
+    await writeFile(path.join(workspace.workspacePath, "candidate.txt"), "candidate\n", "utf8");
+    await git(workspace.workspacePath, ["add", "candidate.txt"]);
+    await git(workspace.workspacePath, ["commit", "-m", "Candidate"]);
+
+    const childEnv = sdkClientOptions({
+      workflowMode: "github",
+      gitHooksPath: workspace.gitHooksPath,
+      path: process.env.PATH,
+    }).env;
+    await execFileAsync("git", ["push", "--set-upstream", "origin", "HEAD"], {
+      cwd: workspace.workspacePath,
+      env: childEnv,
+    });
+
+    assert.equal(await readFile(marker, "utf8"), "validated");
+    assert.equal(
+      await git(repoPath, ["config", "--get", "core.hooksPath"]).catch(() => ""),
+      "",
+    );
+    const attestation = await readPrePushValidationAttestation(
+      run,
+      workspace.workspacePath,
+      path.join(root, "runtime"),
+    );
+    assert.equal(attestation.outcome, "passed");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
