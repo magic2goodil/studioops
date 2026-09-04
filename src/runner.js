@@ -61,6 +61,13 @@ import {
   sanitizeOriginUrl,
   verifyLocalCandidate,
 } from "./workspace.js";
+import {
+  assertImpactPlanProjectBinding,
+  formatImpactPlanForPrompt,
+  resolveProjectImpactPlan,
+  writeBoundedDiscoveryArtifact,
+} from "./impact-planner.js";
+import { sha256Digest } from "./component-impact-map.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -148,7 +155,7 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-export function prePushValidationScript(run = {}, root = missionControlRoot()) {
+function prePushValidationDescriptor(run = {}, root = missionControlRoot()) {
   const commands = (run.project?.validationCommands || [])
     .map((command) => String(command || "").trim())
     .filter(Boolean);
@@ -156,25 +163,168 @@ export function prePushValidationScript(run = {}, root = missionControlRoot()) {
   const projectKey = slugify(run.project?.key || run.projectId || "project");
   const policyDigest = createHash("sha256").update(effectiveCommands.join("\n")).digest("hex").slice(0, 16);
   const cacheRoot = path.join(root, "validation-cache", projectKey, policyDigest);
+  const context = {
+    baseSha: String(run.candidateIdentity?.baseSha || run.preflightBaseCommit || ""),
+    manifestDigest: String(run.impactPlan?.manifest?.digest || ""),
+    selectedComponentsDigest: sha256Digest((run.impactPlan?.selectedComponents || []).map((item) => item.id).sort()),
+    commandsDigest: sha256Digest(effectiveCommands),
+    environmentContractDigest: sha256Digest({
+      projectKey,
+      workflowMode: run.workflowMode || run.project?.workflowMode || "auto",
+      aggregateCommand: run.impactPlan?.aggregateCommand || "",
+    }),
+    attempt: String(run.attempt || 1),
+    skips: "none",
+  };
+  const contextDigest = sha256Digest(context).slice("sha256:".length);
+  return { effectiveCommands, projectKey, policyDigest, cacheRoot, context, contextDigest };
+}
+
+export function prePushValidationScript(run = {}, root = missionControlRoot()) {
+  const { effectiveCommands, projectKey, cacheRoot, context, contextDigest } = prePushValidationDescriptor(run, root);
   const commandLines = effectiveCommands.map((command, index) => {
     const label = `validation-${index + 1}`;
-    return `echo "StudioOps pre-push: ${label}"\nif ! /bin/sh -lc ${shellQuote(command)} > "$log_file" 2>&1; then\n  echo "StudioOps blocked this push because ${label} failed." >&2\n  tail -n 80 "$log_file" >&2\n  exit 1\nfi`;
+    const commandDigest = sha256Digest(command);
+    return `echo "StudioOps pre-push: ${label}"
+command_log="$cache_root/$evidence_key.${label}.log"
+command_started="$(date +%s)"
+set +e
+/bin/sh -lc ${shellQuote(command)} > "$command_log" 2>&1
+command_status="$?"
+set -e
+command_finished="$(date +%s)"
+command_duration="$((command_finished - command_started))"
+command_bytes="$(wc -c < "$command_log" | tr -d ' ')"
+command_truncated=false
+if [ "$command_bytes" -gt 26214400 ]; then
+  tail -c 26214400 "$command_log" > "$command_log.tmp"
+  mv "$command_log.tmp" "$command_log"
+  command_bytes=26214400
+  command_truncated=true
+fi
+chmod 600 "$command_log"
+command_log_digest="$(${shellQuote(process.execPath)} -e ${shellQuote("const crypto=require('node:crypto');const fs=require('node:fs');process.stdout.write(crypto.createHash('sha256').update(fs.readFileSync(process.argv[1])).digest('hex'));")} "$command_log")"
+{
+  printf '%s\n' ${shellQuote(`command_${index + 1}_label=${label}`)}
+  printf '%s\n' ${shellQuote(`command_${index + 1}_digest=${commandDigest}`)}
+  printf 'command_${index + 1}_outcome=%s\n' "$(if [ "$command_status" -eq 0 ]; then printf passed; else printf failed; fi)"
+  printf 'command_${index + 1}_duration_seconds=%s\n' "$command_duration"
+  printf 'command_${index + 1}_artifact_digest=sha256:%s\n' "$command_log_digest"
+  printf 'command_${index + 1}_artifact_bytes=%s\n' "$command_bytes"
+  printf 'command_${index + 1}_artifact_truncated=%s\n' "$command_truncated"
+} >> "$evidence_tmp"
+if [ "$command_status" -ne 0 ]; then
+  printf '%s\n' 'outcome=failed' >> "$evidence_tmp"
+  mv "$evidence_tmp" "$evidence"
+  chmod 600 "$evidence"
+  echo "StudioOps blocked this push because ${label} failed." >&2
+  tail -n 80 "$command_log" >&2
+  exit 1
+fi`;
   }).join("\n");
   return `#!/bin/sh
 set -eu
+umask 077
+head="$(git rev-parse HEAD)"
 tree="$(git rev-parse 'HEAD^{tree}')"
 cache_root=${shellQuote(cacheRoot)}
-marker="$cache_root/$tree.ok"
-log_file="$cache_root/$tree.log"
-if [ -f "$marker" ]; then
-  echo "StudioOps pre-push: cached local validation passed for $tree"
+evidence_key="$head.$tree.${contextDigest}"
+marker="$cache_root/$evidence_key.ok"
+evidence="$cache_root/$evidence_key.evidence"
+evidence_tmp="$evidence.tmp.$$"
+if [ -f "$marker" ] && [ -f "$evidence" ]; then
+  echo "StudioOps pre-push: cached exact-context validation passed for $head"
   exit 0
 fi
 mkdir -p "$cache_root"
+chmod 700 "$cache_root"
+{
+  printf '%s\n' 'schema_version=1'
+  printf 'project_key=%s\n' ${shellQuote(projectKey)}
+  printf 'source_sha=%s\n' "$head"
+  printf 'tree_sha=%s\n' "$tree"
+  printf 'base_sha=%s\n' ${shellQuote(context.baseSha)}
+  printf 'manifest_digest=%s\n' ${shellQuote(context.manifestDigest)}
+  printf 'selected_components_digest=%s\n' ${shellQuote(context.selectedComponentsDigest)}
+  printf 'commands_digest=%s\n' ${shellQuote(context.commandsDigest)}
+  printf 'environment_contract_digest=%s\n' ${shellQuote(context.environmentContractDigest)}
+  printf 'attempt=%s\n' ${shellQuote(context.attempt)}
+  printf 'skips=%s\n' ${shellQuote(context.skips)}
+} > "$evidence_tmp"
 ${commandLines}
+printf '%s\n' 'outcome=passed' >> "$evidence_tmp"
+mv "$evidence_tmp" "$evidence"
+chmod 600 "$evidence"
 : > "$marker"
+chmod 600 "$marker"
 echo "StudioOps pre-push: local validation passed for $tree"
 `;
+}
+
+function parseLineEvidence(value) {
+  return Object.fromEntries(String(value || "").split("\n").filter(Boolean).map((line) => {
+    const split = line.indexOf("=");
+    return split < 1 ? [line, ""] : [line.slice(0, split), line.slice(split + 1)];
+  }));
+}
+
+export async function readPrePushValidationAttestation(run = {}, repoPath, root = missionControlRoot()) {
+  const { effectiveCommands, projectKey, cacheRoot, context, contextDigest } = prePushValidationDescriptor(run, root);
+  const head = (await gitOutput(["rev-parse", "HEAD"], { cwd: repoPath })).trim().toLowerCase();
+  const tree = (await gitOutput(["rev-parse", "HEAD^{tree}"], { cwd: repoPath })).trim().toLowerCase();
+  const evidencePath = path.join(cacheRoot, `${head}.${tree}.${contextDigest}.evidence`);
+  if (!existsSync(evidencePath)) return null;
+  const info = await lstat(evidencePath);
+  if (!info.isFile() || (info.mode & 0o077) !== 0 || info.size > 128 * 1024) {
+    throw new Error("Pre-push validation attestation has unsafe permissions, type, or size.");
+  }
+  const content = await readFile(evidencePath, "utf8");
+  const evidence = parseLineEvidence(content);
+  const expected = {
+    schema_version: "1",
+    project_key: projectKey,
+    source_sha: head,
+    tree_sha: tree,
+    base_sha: context.baseSha,
+    manifest_digest: context.manifestDigest,
+    selected_components_digest: context.selectedComponentsDigest,
+    commands_digest: context.commandsDigest,
+    environment_contract_digest: context.environmentContractDigest,
+    attempt: context.attempt,
+    skips: context.skips,
+    outcome: "passed",
+  };
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    if (evidence[key] !== expectedValue) {
+      throw new Error(`Pre-push validation attestation ${key} does not match the exact run context.`);
+    }
+  }
+  for (let index = 0; index < effectiveCommands.length; index += 1) {
+    const prefix = `command_${index + 1}`;
+    if (evidence[`${prefix}_digest`] !== sha256Digest(effectiveCommands[index])) {
+      throw new Error(`Pre-push validation attestation ${prefix}_digest does not match the validation command.`);
+    }
+    if (evidence[`${prefix}_outcome`] !== "passed") {
+      throw new Error(`Pre-push validation attestation ${prefix}_outcome is not passed.`);
+    }
+    if (!/^sha256:[0-9a-f]{64}$/.test(evidence[`${prefix}_artifact_digest`] || "")) {
+      throw new Error(`Pre-push validation attestation ${prefix}_artifact_digest is invalid.`);
+    }
+  }
+  return {
+    path: evidencePath,
+    digest: sha256Digest(content),
+    sourceSha: head,
+    treeSha: tree,
+    baseSha: evidence.base_sha,
+    manifestDigest: evidence.manifest_digest,
+    selectedComponentsDigest: evidence.selected_components_digest,
+    commandsDigest: evidence.commands_digest,
+    environmentContractDigest: evidence.environment_contract_digest,
+    attempt: Number(evidence.attempt || 0),
+    skips: evidence.skips || "",
+    outcome: evidence.outcome,
+  };
 }
 
 async function installPrePushValidationHook(run, log) {
@@ -1200,6 +1350,22 @@ function withExecutionWorkspace(run, workspace) {
   };
 }
 
+function withExecutionImpactPlan(run) {
+  const impactPlan = resolveProjectImpactPlan({
+    project: run.project,
+    task: run.task || {},
+    repoRoot: run.project.repoPath,
+    sourceCommit: run.reviewSubjectSha || run.preflightBaseCommit || "",
+  });
+  assertImpactPlanProjectBinding(impactPlan, run.project);
+  return {
+    ...run,
+    impactPlan,
+    fileScope: impactPlan.allowedFileScope.length ? impactPlan.allowedFileScope : run.fileScope,
+    fileScopeExplicit: impactPlan.allowedFileScope.length > 0 || run.fileScopeExplicit,
+  };
+}
+
 async function prepareRunAuth(run, input = {}) {
   if (run.workflowMode === "local" || run.gitAuthStrategy === "inherited-ssh") return null;
   const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
@@ -1280,7 +1446,13 @@ function runnerPrompt(run, project, authContext = null) {
   const taskUrl = run.taskUrl || `http://127.0.0.1:4317/tasks/${run.taskId}`;
   const sourceRepoPath = project?.sourceRepoPath || project?.repoPath || "(not recorded)";
   const executionRepoPath = run.executionRepoPath || project?.repoPath || "(not recorded)";
-  return `StudioOps automation run: ${run.id}
+  if (run.impactPlan) assertImpactPlanProjectBinding(run.impactPlan, project);
+  const impactPacket = run.impactPlan
+    ? formatImpactPlanForPrompt(run.impactPlan)
+    : "SCOPED CONTEXT PACKET\n- No repository component map was available. Fail closed to the declared file scope and final aggregate validation.";
+  return `${impactPacket}
+
+StudioOps automation run: ${run.id}
 
 You are being launched automatically by StudioOps.
 
@@ -1839,6 +2011,7 @@ export async function claimRuns(input = {}) {
       claimed.push({
         ...run,
         project,
+        task: task ? structuredClone(task) : null,
       });
       plannedRuns.push(run);
     }
@@ -1864,6 +2037,8 @@ export async function completeRun(runId, input = {}) {
     run.outputPath = input.outputPath || run.outputPath || "";
     run.lastMessagePath = input.lastMessagePath || run.lastMessagePath || "";
     run.notes = String(input.notes || run.notes || "").trim();
+    if (input.impactPlan) run.impactPlan = structuredClone(input.impactPlan);
+    if (input.contextEvidence) run.contextEvidence = structuredClone(input.contextEvidence);
     const budget = recordRunUsage(run, input.usage, now);
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
@@ -2115,6 +2290,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
   let executionRun = run;
   let authContext = null;
   let usage = null;
+  const discoveryArtifacts = [];
+  let validationAttestation = null;
   const outputGuardState = { cumulativeCommandOutputChars: 0 };
   const outputGuard = normalizeRunOutputGuard(input.outputGuard);
 
@@ -2132,7 +2309,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
-    executionRun = withExecutionWorkspace(run, workspace);
+    executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
     const prompt = runnerPrompt(executionRun, executionRun.project, authContext);
     log.write(`Repo: ${executionRun.project.repoPath}\n`);
     log.write(`Existing thread: ${run.threadId || "(new thread)"}\n`);
@@ -2161,6 +2338,18 @@ async function runClaimedRunWithSdk(run, input = {}) {
       }
       if (observation.warning) {
         log.write(`\nStudioOps output guidance: ${observation.warning.message}\n`);
+        const commandOutput = String(event.item?.aggregated_output || "");
+        if (commandOutput) {
+          const artifact = await writeBoundedDiscoveryArtifact({
+            artifactRoot: path.join(RUN_OUTPUT_DIR, "context-artifacts"),
+            projectKey: executionRun.project?.key || run.projectId,
+            runId: run.id,
+            reasonCode: "oversized_command_output",
+            output: redactSecrets(commandOutput, githubAppAuthSecrets(authContext)),
+          });
+          discoveryArtifacts.push(artifact);
+          log.write(`StudioOps discovery artifact: ${artifact.path} (${artifact.digest})\n`);
+        }
       }
       const loggedEvent = observation.warning
         ? boundedRunOutputEvent(event, outputGuard.maxCommandOutputChars)
@@ -2205,6 +2394,20 @@ async function runClaimedRunWithSdk(run, input = {}) {
     await cleanupGitHubAppAuth(authContext);
   }
 
+  if (status === "completed" && run.group === "builder" && run.workflowMode !== "local") {
+    try {
+      validationAttestation = await readPrePushValidationAttestation(
+        executionRun,
+        executionRun.project.repoPath,
+      );
+      if (!validationAttestation) throw new Error("No exact-SHA pre-push validation attestation was produced.");
+    } catch (error) {
+      status = "failed";
+      exitCode = "validation_evidence_missing";
+      notes = `${notes}\n\n${error.message}`.trim();
+    }
+  }
+
   const completed = await completeRunAfterExecution(run, {
     status,
     exitCode,
@@ -2212,6 +2415,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
     lastMessagePath,
     notes,
     usage,
+    impactPlan: executionRun.impactPlan,
+    contextEvidence: { discoveryArtifacts, validationAttestation },
     workspaceRoot: input.workspaceRoot,
   }, executionRun);
   if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
@@ -2233,7 +2438,7 @@ async function runClaimedRunWithCli(run, input = {}) {
     authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
-    executionRun = withExecutionWorkspace(run, workspace);
+    executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
     prompt = runnerPrompt(executionRun, executionRun.project, authContext);
   } catch (error) {
     const notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
@@ -2365,12 +2570,30 @@ async function runClaimedRunWithCli(run, input = {}) {
       log.write(`\nStudioOps Runner finished ${run.id} at ${new Date().toISOString()} with code ${code}\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
+      let completionStatus = outputBudgetViolation ? "failed" : code === 0 ? "completed" : "failed";
+      let completionCode = outputBudgetViolation || code;
+      let validationAttestation = null;
+      if (completionStatus === "completed" && run.group === "builder" && run.workflowMode !== "local") {
+        try {
+          validationAttestation = await readPrePushValidationAttestation(
+            executionRun,
+            executionRun.project.repoPath,
+          );
+          if (!validationAttestation) throw new Error("No exact-SHA pre-push validation attestation was produced.");
+        } catch (error) {
+          completionStatus = "failed";
+          completionCode = "validation_evidence_missing";
+          notes = `${notes}\n\n${error.message}`.trim();
+        }
+      }
       const completed = await completeRunAfterExecution(run, {
-        status: outputBudgetViolation ? "failed" : code === 0 ? "completed" : "failed",
-        exitCode: outputBudgetViolation || code,
+        status: completionStatus,
+        exitCode: completionCode,
         outputPath,
         lastMessagePath,
         notes,
+        impactPlan: executionRun.impactPlan,
+        contextEvidence: { validationAttestation },
         workspaceRoot: input.workspaceRoot,
       }, executionRun);
       if (outputBudgetViolation) {

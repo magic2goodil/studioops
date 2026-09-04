@@ -22,6 +22,7 @@ import {
   INSTALLED_AUTOMATION_CAPACITY,
   normalizeGlobalRunAdmission,
 } from "./config.js";
+import { resolveProjectImpactPlan } from "./impact-planner.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_architecture",
@@ -792,6 +793,17 @@ function makeRun(state, task, action, options, now) {
     ? ""
     : requestedThreadId;
   const profile = laneProfile(task, action);
+  const project = findProject(state, task.projectId) || {};
+  const impactPlan = resolveProjectImpactPlan({
+    project,
+    task,
+    action,
+    repoRoot: project.sourceRepoPath || project.repoPath,
+    sourceCommit: task.candidateIdentity?.baseSha || task.reviewSubjectSha || "",
+  });
+  const scopedFileScope = impactPlan.allowedFileScope.length
+    ? impactPlan.allowedFileScope
+    : profile.fileScope;
   const executionPolicy = resolveExecutionPolicy(task, action, options);
   const promptPacket = compactPromptPacket(prompt, executionPolicy.maxPromptChars);
   const creditAdmission = assessCreditAdmission(
@@ -812,8 +824,9 @@ function makeRun(state, task, action, options, now) {
     role,
     lane: profile.lane,
     conflictGroup: profile.conflictGroup,
-    fileScope: profile.fileScope,
-    fileScopeExplicit: profile.fileScopeExplicit,
+    fileScope: scopedFileScope,
+    fileScopeExplicit: scopedFileScope.length > 0 || profile.fileScopeExplicit,
+    impactPlan,
     provider: task.preferredRunnerProvider || options.provider || DEFAULTS.provider,
     model: executionPolicy.model,
     modelTier: executionPolicy.modelTier,
@@ -1085,6 +1098,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       const nextStatus = taskStatusFor(item.action);
       if (nextStatus) task.status = nextStatus;
       task.assignedAgentRole = run.role;
+      task.impactPlan = structuredClone(run.impactPlan);
       task.retryNotBefore = "";
       task.updatedAt = now;
 
