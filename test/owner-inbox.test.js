@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import { buildOwnerInbox } from "../src/owner-inbox.js";
-import { createCandidateEnvelope, manifestDigest } from "../src/candidate-manifest.js";
+import {
+  assertCurrentOwnerQaPacket,
+  buildOwnerInbox,
+  buildOwnerQaPacket,
+} from "../src/owner-inbox.js";
+import {
+  canonicalJson,
+  createCandidateEnvelope,
+  manifestDigest,
+} from "../src/candidate-manifest.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const BASE_SHA = "b".repeat(40);
@@ -9,6 +18,14 @@ const INTEGRATION_SHA = "c".repeat(40);
 const PROMOTION_SHA = "d".repeat(40);
 const PREVIEW_URL = "http://127.0.0.1:5080/";
 const INTEGRATION_BRANCH = "qa/candidate-dollos";
+
+function withPacketDigest(packet) {
+  const { packetDigest: _discarded, ...base } = packet;
+  return {
+    ...base,
+    packetDigest: `sha256:${createHash("sha256").update(canonicalJson(base)).digest("hex")}`,
+  };
+}
 
 function currentReviews() {
   return [
@@ -38,6 +55,7 @@ function fixtureState() {
       id: "project_1",
       key: "dollos",
       name: "DollOS",
+      repoUrl: "https://github.com/example/dollos",
       localQaPreview: {
         previewUrl: PREVIEW_URL,
       },
@@ -185,11 +203,126 @@ function addCurrentBundle(state, status = "ready", input = {}) {
     updatedAt: "2026-07-23T15:05:00.000Z",
   }];
   state.candidates = [candidate];
+  const packet = buildOwnerQaPacket(state, candidate, {
+    bundle: state.qaBundles[0],
+    generatedAt: "2026-07-23T15:04:10.000Z",
+  });
+  candidate.qaPacket = packet;
+  state.qaBundles[0].qaPacket = packet;
+  state.qaBundles[0].packetDigest = packet.packetDigest;
+  if (releaseReady) {
+    candidate.qaDecision.ownerQaPacketDigest = packet.packetDigest;
+    state.qaBundles[0].qaDecision = candidate.qaDecision;
+  }
+}
+
+function addPendingQaRevocation(state, input = {}) {
+  const candidate = state.candidates[0];
+  candidate.qaRevocationIntent = {
+    schemaVersion: "studioops.qa-revocation-intent.v1",
+    requestId: "qa_revocation_11111111-1111-4111-8111-111111111111",
+    outcome: "failed",
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationSha: candidate.manifest.integration.sha,
+    ownerQaPacketDigest: candidate.qaPacket.packetDigest,
+    taskIds: candidate.manifest.sources.map((source) => source.taskId).sort(),
+    author: "Owner QA",
+    notes: "Revoke this approval.",
+    requestedAt: "2026-07-23T15:06:00.000Z",
+  };
+  if (input.settlement) candidate.qaRevocationSettlement = input.settlement;
 }
 
 function group(inbox, id) {
   return inbox.groups.find((item) => item.id === id);
 }
+
+test("owner QA packet v2 snapshots complete approval authority and detects definition drift", () => {
+  const state = fixtureState();
+  state.projects[0] = {
+    ...state.projects[0],
+    description: "Owner-visible product scope",
+    repoPath: "/workspace/dollos",
+    repoUrl: "https://github.com/example/dollos",
+    validationCommands: ["npm test"],
+    contextLinks: ["https://example.com/product-brief"],
+    standards: ["modular architecture"],
+    safetyRules: ["Never expose credentials"],
+    deliveryPolicy: { profile: "standard" },
+  };
+  state.tasks[0] = {
+    ...state.tasks[0],
+    description: "Change the exact ritual duration.",
+    expectedOutcome: "The owner sees the intended duration.",
+    validationPlan: ["npm test"],
+    dependsOnTaskIds: [],
+    architectureDecision: "Use the existing duration service.",
+    deliveryMode: "functional",
+    attachments: [{ id: "attachment_1", name: "reference.png" }],
+    branchName: "codex/dollos-task_7",
+    prUrl: "https://github.com/example/dollos/pull/7",
+    operationalLocalArtifactRef: "artifact://owner-preview/task_7",
+    candidateIdentity: {
+      commitSha: SUBJECT_SHA,
+      treeSha: "e".repeat(40),
+      baseSha: BASE_SHA,
+      branch: "codex/dollos-task_7",
+      candidateCycle: 1,
+    },
+  };
+  addCurrentBundle(state);
+
+  const packet = assertCurrentOwnerQaPacket(state, state.candidates[0], state.qaBundles[0]);
+  assert.equal(packet.schemaVersion, "studioops.owner-qa-packet.v2");
+  assert.equal(packet.project.definition.reviewPolicy.integrationBranch, "qa/dollos");
+  assert.deepEqual(packet.project.definition.safetyRules, ["Never expose credentials"]);
+  assert.deepEqual(packet.project.validationCommands, ["npm test"]);
+  assert.deepEqual(packet.project.definition.contextLinks, ["https://example.com/product-brief"]);
+  assert.equal(packet.tasks[0].definition.expectedOutcome, "The owner sees the intended duration.");
+  assert.deepEqual(packet.tasks[0].acceptanceCriteria, state.tasks[0].acceptanceCriteria);
+  assert.deepEqual(packet.tasks[0].validation.plan, ["npm test"]);
+  assert.deepEqual(packet.tasks[0].dependencies, []);
+  assert.equal(packet.tasks[0].architecture.decision, "Use the existing duration service.");
+  assert.equal(packet.tasks[0].delivery.mode, "functional");
+  assert.equal(packet.tasks[0].attachments[0].id, "attachment_1");
+  assert.equal(packet.tasks[0].definition.branchName, "codex/dollos-task_7");
+  assert.equal(packet.tasks[0].definition.prUrl, "https://github.com/example/dollos/pull/7");
+  assert.equal(packet.tasks[0].definition.operationalLocalArtifactRef, "artifact://owner-preview/task_7");
+  assert.equal(packet.tasks[0].candidateIdentity.commitSha, SUBJECT_SHA);
+  assert.match(packet.packetDigest, /^sha256:[a-f0-9]{64}$/);
+
+  state.tasks[0].acceptanceCriteria = ["Changed after packet generation"];
+  assert.throws(
+    () => assertCurrentOwnerQaPacket(state, state.candidates[0], state.qaBundles[0]),
+    /no longer matches current project or task definitions/,
+  );
+});
+
+test("owner QA packet validation rejects unsupported schemas and candidate/bundle packet divergence", () => {
+  const state = fixtureState();
+  addCurrentBundle(state);
+  const candidate = state.candidates[0];
+  const bundle = state.qaBundles[0];
+
+  assert.throws(
+    () => buildOwnerQaPacket(state, candidate, { generatedAt: "2026-07-23T15:04:10.000Z" }),
+    /requires an authoritative QA bundle/,
+  );
+
+  candidate.qaPacket = withPacketDigest({
+    ...candidate.qaPacket,
+    schemaVersion: "studioops.owner-qa-packet.v0",
+  });
+  assert.throws(() => assertCurrentOwnerQaPacket(state, candidate, bundle), /Unsupported owner QA packet schema/);
+
+  candidate.qaPacket = bundle.qaPacket;
+  bundle.packetDigest = `sha256:${"f".repeat(64)}`;
+  assert.throws(
+    () => assertCurrentOwnerQaPacket(state, candidate, bundle),
+    /Candidate and bundle owner QA packet records do not match/,
+  );
+});
 
 test("current owner exceptions remain decision-counted after desktop notification delivery", () => {
   const inbox = buildOwnerInbox(fixtureState());
@@ -442,6 +575,69 @@ test("release candidates count only with immutable evidence and a concrete PR ac
   assert.equal(decision.primaryAction.href, "https://github.com/example/dollos/pull/99");
 });
 
+test("release candidates with a PR in another GitHub repository route to non-actionable Operations", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "release_candidate_ready", {
+    promotionPrUrl: "https://github.com/attacker/forged-release/pull/99",
+  });
+
+  const inbox = buildOwnerInbox(state);
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.decisions, 0);
+  assert.equal(inbox.counts.operations, 1);
+  const operation = group(inbox, "operations").items[0];
+  assert.equal(operation.status, "candidate_evidence_invalid");
+  assert.equal(operation.primaryAction.type, "task");
+  assert.doesNotMatch(JSON.stringify(inbox), /attacker|forged-release|Review release candidate/);
+});
+
+test("release candidates with durable QA revocation intent route to non-actionable Operations", () => {
+  const state = fixtureState();
+  addCurrentBundle(state, "release_candidate_ready", {
+    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+  });
+  addPendingQaRevocation(state);
+
+  const inbox = buildOwnerInbox(state);
+  const operation = group(inbox, "operations").items[0];
+  assert.equal(inbox.count, 0);
+  assert.equal(inbox.counts.decisions, 0);
+  assert.equal(inbox.counts.operations, 1);
+  assert.equal(operation.classification, "revocation_pending");
+  assert.equal(operation.kind, "qa_revocation_pending");
+  assert.equal(operation.status, "revocation_pending");
+  assert.equal(operation.bundleId, "qa_bundle_1");
+  assert.equal(operation.candidateId, "candidate_1");
+  assert.equal(operation.prUrl, "");
+  assert.equal(operation.primaryAction.type, "task");
+  assert.match(operation.nextAction, /durable QA revocation request/i);
+  assert.doesNotMatch(JSON.stringify(inbox), /Review release candidate|release_approval/);
+});
+
+test("remote revocation settlement cannot restore release approval before local invalidation", () => {
+  for (const status of ["closed", "merged"]) {
+    const state = fixtureState();
+    addCurrentBundle(state, "release_candidate_ready", {
+      promotionPrUrl: "https://github.com/example/dollos/pull/99",
+    });
+    addPendingQaRevocation(state, {
+      settlement: {
+        schemaVersion: "studioops.qa-revocation-settlement.v1",
+        status,
+        prUrl: "https://github.com/example/dollos/pull/99",
+        observedAt: "2026-07-23T15:07:00.000Z",
+        mergeCommit: status === "merged" ? "e".repeat(40) : "",
+        mergedAt: status === "merged" ? "2026-07-23T15:06:30.000Z" : "",
+      },
+    });
+
+    const inbox = buildOwnerInbox(state);
+    assert.equal(inbox.count, 0, status);
+    assert.equal(inbox.counts.operations, 1, status);
+    assert.equal(group(inbox, "operations").items[0].classification, "revocation_pending", status);
+  }
+});
+
 test("release candidates without a passed immutable QA decision route to Operations", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
@@ -516,14 +712,14 @@ test("release candidates with a mismatched promotion handoff route to Operations
 
 test("current bundles with missing owner handoff evidence route to Operations", () => {
   const state = fixtureState();
-  addCurrentBundle(state, "ready", { previewUrl: "" });
+  addCurrentBundle(state);
+  state.qaBundles[0].previewUrl = "";
   state.projects[0].localQaPreview.previewUrl = "";
 
   const inbox = buildOwnerInbox(state);
   assert.equal(inbox.count, 0);
   assert.equal(inbox.counts.operations, 1);
-  assert.equal(group(inbox, "operations").items[0].kind, "qa_preview_blocked");
-  assert.match(group(inbox, "operations").items[0].nextAction, /before asking the owner/);
+  assert.equal(group(inbox, "operations").items[0].status, "candidate_evidence_invalid");
 });
 
 test("active bundles with invalid candidate evidence route to Operations", () => {

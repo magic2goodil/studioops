@@ -101,8 +101,10 @@ Usage:
 
 The worker merges owner-QA-passed task branches or PR heads into the project's
 configured target branch, defaulting to the project default branch. It uses an
-isolated clone, runs validation commands, performs a non-force push, and never
-deploys production. Production deployment should remain release/tag gated.
+isolated clone, validates the exact candidate in a disposable no-network
+sandbox, performs a non-force candidate-branch push, and authoritatively
+re-observes the exact pull request. It never deploys production. Production
+deployment should remain release/tag gated.
 `);
     return;
   }

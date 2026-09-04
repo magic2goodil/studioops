@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { assertTerminalMergedPromotionClaimForTask } from "./promotion-attempt-claim.js";
 
 const SHA_PATTERN = /^[0-9a-f]{40,64}$/i;
 const REASON_CODE_PATTERN = /^[a-z][a-z0-9_-]{2,63}$/;
@@ -42,6 +43,9 @@ function rule(from, to, options = {}) {
 const reviewRoutingSources = ["builder_review", ...REVIEW_STATUSES];
 const forwardReviewEdges = ["builder_review", ...REVIEW_STATUSES]
   .flatMap((source, sourceIndex, statuses) => statuses.slice(sourceIndex + 1).map((target) => [source, target]));
+const mutablePromotionOutcomeSources = ["approved_for_main", "promotion_blocked", "user_review"];
+const mutablePromotionOutcomeTargets = ["approved_for_main", "promotion_blocked", "user_review", "needs_changes"];
+const terminalPromotionOutcomeStatuses = ["merged", "deployed", "done"];
 
 // This is the sole transition graph. Adapters choose an action; they never
 // decide whether an edge, actor, assignment, lease, or evidence binding is valid.
@@ -65,9 +69,68 @@ export const LIFECYCLE_ACTION_MATRIX = Object.freeze({
   request_qa_review: rule(REVIEW_STATUSES.concat("user_review"), ["qa_review"], { actorTypes: ["system", "owner"], roles: ["workflow-engine", "owner"], candidateCycle: true, subjectBinding: "sha" }),
   approve_owner_review: rule(["user_review"], ["approved"], { actorTypes: ["owner"], roles: ["owner"], candidateCycle: true, subjectBinding: "sha" }),
   pass_qa: rule(["qa_review"], ["approved_for_main"], { actorTypes: ["owner"], roles: ["owner"], candidateCycle: true, subjectBinding: "candidate" }),
+  fail_qa: rule(["qa_review"], ["needs_changes"], { actorTypes: ["owner"], roles: ["owner"], candidateCycle: true, subjectBinding: "candidate" }),
+  revoke_qa: rule(["approved_for_main", "promotion_blocked", "user_review"], ["needs_changes"], {
+    actorTypes: ["owner"],
+    roles: ["owner"],
+    candidateCycle: true,
+    subjectBinding: "candidate",
+    invalidates: ["reviews", "qa", "candidate", "promotion"],
+  }),
   block_promotion: rule(["approved_for_main", "user_review"], ["promotion_blocked"], { actorTypes: ["system"], roles: ["promotion-worker"], activeRun: true, workflowLease: true, candidateCycle: true, subjectBinding: "candidate" }),
   resume_promotion: rule(["promotion_blocked"], ["approved_for_main"], { actorTypes: ["owner", "system"], roles: ["owner", "promotion-worker"], candidateCycle: true, subjectBinding: "candidate" }),
-  record_merge: rule(["approved_for_main", "approved", "user_review"], ["merged"], { actorTypes: ["owner", "worker"], roles: ["owner", "promotion-worker"], candidateCycle: true, subjectBinding: "candidate_or_sha" }),
+  record_promotion_outcome: rule(
+    [...mutablePromotionOutcomeSources, ...terminalPromotionOutcomeStatuses],
+    [...mutablePromotionOutcomeTargets, ...terminalPromotionOutcomeStatuses],
+    {
+      actorTypes: ["system"],
+      roles: ["promotion-worker"],
+      candidateCycle: true,
+      subjectBinding: "candidate_or_sha",
+      edges: [
+        ...mutablePromotionOutcomeSources.flatMap((source) => mutablePromotionOutcomeTargets.map((target) => [source, target])),
+        ...terminalPromotionOutcomeStatuses.map((status) => [status, status]),
+      ],
+    },
+  ),
+  record_promotion_validation_evidence: rule(
+    ["approved_for_main", "promotion_blocked"],
+    ["approved_for_main", "promotion_blocked"],
+    {
+      actorTypes: ["system"],
+      roles: ["promotion-worker"],
+      candidateCycle: true,
+      subjectBinding: "candidate",
+      edges: [["approved_for_main", "approved_for_main"], ["promotion_blocked", "promotion_blocked"]],
+    },
+  ),
+  open_promotion_circuit: rule(
+    ["approved_for_main", "promotion_blocked", "user_review"],
+    ["blocked"],
+    { actorTypes: ["system"], roles: ["promotion-worker"], candidateCycle: true, subjectBinding: "candidate" },
+  ),
+  // A release PR can be closed and later reopened by its owner. Reconciliation
+  // records the close as promotion_blocked, so the same exact candidate must
+  // still be able to advance when that exact PR is subsequently merged.
+  record_merge: rule(
+    ["approved_for_main", "promotion_blocked", "approved", "user_review", "merged", "deployed", "done"],
+    ["merged", "deployed", "done"],
+    {
+      actorTypes: ["owner", "worker"],
+      roles: ["owner", "promotion-worker"],
+      candidateCycle: true,
+      subjectBinding: "candidate_or_sha",
+      edges: [
+        ["approved_for_main", "merged"],
+        ["promotion_blocked", "merged"],
+        ["approved", "merged"],
+        ["user_review", "merged"],
+        ["merged", "merged"],
+        ["deployed", "deployed"],
+        ["done", "done"],
+      ],
+    },
+  ),
   record_deployment: rule(["merged"], ["deployed"], { actorTypes: ["owner", "worker"], roles: ["owner", "release-manager"], candidateCycle: true, subjectBinding: "candidate_or_sha" }),
   finish_task: rule(["merged", "deployed"], ["done"], { actorTypes: ["owner", "system"], roles: ["owner", "workflow-engine"], candidateCycle: true, subjectBinding: "candidate_or_sha" }),
   close_task: rule(CANONICAL_LIFECYCLE_STATUSES.filter((status) => !["closed", "legacy_untrusted"].includes(status)), ["closed"], { actorTypes: ["owner"], roles: ["owner"] }),
@@ -198,6 +261,65 @@ function assertCompletionEvidence(action, context = {}) {
   }
 }
 
+function assertPromotionWorkerMergeAuthority(action, actor, aggregate, evidence = {}, context = {}) {
+  if (action !== "record_merge" || actor.actorType !== "worker" || actor.role !== "promotion-worker") return;
+  const candidateId = String(evidence.candidateId || aggregate.candidateId || "").trim();
+  const candidate = (context.candidates || []).find((item) => item.id === candidateId);
+  const claim = context.promotionAttemptClaims?.[candidateId];
+  const expectedClaimId = String(evidence.promotionClaimId || "").trim();
+  const expectedFence = Number(evidence.promotionClaimFence);
+  const expectedOutcome = String(evidence.promotionClaimOutcome || "").trim();
+  let terminalAuthority;
+  try {
+    terminalAuthority = assertTerminalMergedPromotionClaimForTask(claim, aggregate, candidate, {
+      candidates: context.candidates || [],
+    });
+  } catch {
+    terminalAuthority = null;
+  }
+  if (
+    !candidate
+    || !claim
+    || !terminalAuthority
+    || claim.status !== "terminal"
+    || claim.outcome !== "merged"
+    || expectedOutcome !== "merged"
+    || !expectedClaimId
+    || claim.claimId !== expectedClaimId
+    || !Number.isSafeInteger(expectedFence)
+    || expectedFence < 1
+    || Number(claim.fence) !== expectedFence
+    || claim.candidateId !== candidate.id
+  ) {
+    throw new Error("Promotion-worker merge recording requires the exact terminal merged promotion claim and fence.");
+  }
+  const terminal = terminalAuthority.terminalResult;
+  const prUrl = String(evidence.prUrl || "").trim();
+  const mergeCommit = String(evidence.mergeCommit || "").trim().toLowerCase();
+  const mergedAtMs = Date.parse(evidence.mergedAt || "");
+  const mergedAt = Number.isFinite(mergedAtMs) ? new Date(mergedAtMs).toISOString() : "";
+  const replacement = terminalAuthority.replacement;
+  const promotion = replacement?.promotion || candidate.promotion;
+  const promotionMerge = replacement?.promotionMerge || null;
+  if (
+    !terminal
+    || terminal.candidateId !== candidate.id
+    || terminal.manifestDigest !== candidate.manifestDigest
+    || terminal.prUrl !== prUrl
+    || terminal.mergeCommit !== mergeCommit
+    || terminal.mergedAt !== mergedAt
+    || !SHA_PATTERN.test(mergeCommit)
+    || !mergedAt
+    || promotion?.prUrl !== prUrl
+    || (promotionMerge && (
+      promotionMerge.mergeCommit !== mergeCommit
+      || new Date(promotionMerge.mergedAt).toISOString() !== mergedAt
+    ))
+  ) {
+    throw new Error("Promotion-worker merge evidence does not match the terminal claim and exact candidate promotion PR.");
+  }
+}
+
 function assertBoundEvidence(action, ruleValue, aggregate, evidence = {}, context = {}) {
   const candidate = (context.candidates || []).find((item) => item.id === (evidence.candidateId || aggregate.candidateId));
   const candidateSource = candidate?.manifest?.sources?.find((source) => source.taskId === aggregate.id);
@@ -299,6 +421,7 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
     }
   }
   assertBoundEvidence(action, ruleValue, aggregate, command.evidence || {}, context);
+  assertPromotionWorkerMergeAuthority(action, actor, aggregate, command.evidence || {}, context);
   assertReviewGates(action, aggregate, command.evidence || {}, context);
   assertCompletionEvidence(action, context);
   const override = action === "owner_override" ? validateOwnerOverride(command.evidence) : null;
@@ -333,6 +456,15 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
         subjectSha: String(command.evidence?.subjectSha || "").trim().toLowerCase(),
         candidateId: String(command.evidence?.candidateId || "").trim(),
         manifestDigest: String(command.evidence?.manifestDigest || "").trim(),
+        promotionOutcome: String(command.evidence?.promotionOutcome || "").trim(),
+        promotionClaimId: String(command.evidence?.promotionClaimId || "").trim(),
+        promotionClaimFence: Number(command.evidence?.promotionClaimFence || 0),
+        promotionClaimOutcome: String(command.evidence?.promotionClaimOutcome || "").trim(),
+        prUrl: String(command.evidence?.prUrl || "").trim(),
+        mergeCommit: String(command.evidence?.mergeCommit || "").trim().toLowerCase(),
+        mergedAt: String(command.evidence?.mergedAt || "").trim(),
+        validationEvidenceDigest: String(command.evidence?.validationEvidenceDigest || "").trim(),
+        promotionCircuitReason: String(command.evidence?.promotionCircuitReason || "").trim(),
         ...(action === "finish_task" ? { completionEvidence: context.completionEvidence } : {}),
       },
       invalidates: ruleValue.invalidates,

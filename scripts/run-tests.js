@@ -10,7 +10,12 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDir, "..");
 
 function parseArguments(argv) {
-  const options = { probe: "", testFiles: [], passthrough: [] };
+  const options = {
+    probe: "",
+    testFiles: [],
+    excludedTestFiles: [],
+    passthrough: [],
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--probe") {
@@ -19,6 +24,13 @@ function parseArguments(argv) {
     } else if (value === "--test-file") {
       options.testFiles.push(argv[index + 1] || "");
       index += 1;
+    } else if (value === "--exclude-test-file") {
+      const excluded = argv[index + 1] || "";
+      if (!excluded || excluded.startsWith("--")) {
+        throw new Error("--exclude-test-file requires a repository-relative test file.");
+      }
+      options.excludedTestFiles.push(excluded);
+      index += 1;
     } else if (value === "--") {
       options.passthrough.push(...argv.slice(index + 1));
       break;
@@ -26,8 +38,8 @@ function parseArguments(argv) {
       options.passthrough.push(value);
     }
   }
-  if (options.probe && options.testFiles.length) {
-    throw new Error("--probe and --test-file cannot be combined.");
+  if (options.probe && (options.testFiles.length || options.excludedTestFiles.length)) {
+    throw new Error("--probe cannot be combined with test-file selection options.");
   }
   return options;
 }
@@ -44,7 +56,16 @@ function runNode(args, env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, {
       cwd: repositoryRoot,
-      env,
+      env: {
+        ...env,
+        // Test-created clones intentionally do not inherit a writable global
+        // Git configuration inside the release sandbox. Give fixture commits
+        // a stable non-personal identity instead of depending on the host.
+        GIT_AUTHOR_NAME: "StudioOps Test",
+        GIT_AUTHOR_EMAIL: "studioops-test@example.invalid",
+        GIT_COMMITTER_NAME: "StudioOps Test",
+        GIT_COMMITTER_EMAIL: "studioops-test@example.invalid",
+      },
       stdio: "inherit",
     });
     child.once("error", reject);
@@ -68,9 +89,17 @@ try {
       isolated.env,
     );
   } else {
-    const testFiles = options.testFiles.length
+    const selectedTestFiles = options.testFiles.length
       ? options.testFiles.map((entry) => path.relative(repositoryRoot, path.resolve(repositoryRoot, entry)))
       : await defaultTestFiles();
+    const excludedTestFiles = new Set(
+      options.excludedTestFiles
+        .map((entry) => path.relative(repositoryRoot, path.resolve(repositoryRoot, entry))),
+    );
+    const testFiles = selectedTestFiles.filter((entry) => !excludedTestFiles.has(entry));
+    if (!testFiles.length) {
+      throw new Error("Test-file selection is empty after applying exclusions.");
+    }
     console.log(`[StudioOps] Running ${testFiles.length} test files in a hermetic temporary control plane.`);
     exitCode = await runNode(["--test", ...options.passthrough, ...testFiles], isolated.env);
   }

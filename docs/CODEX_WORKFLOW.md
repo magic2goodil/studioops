@@ -132,9 +132,16 @@ node src/mission-control-cli.js review task_123 --stage backend --outcome approv
 Record owner QA outcomes with:
 
 ```bash
-node src/mission-control-cli.js qa-pass task_123 --body "Checked the local QA preview."
-node src/mission-control-cli.js qa-fail task_123 --body "Mobile nav still overlaps."
+node src/mission-control-cli.js qa-list --json
+node src/mission-control-cli.js qa-pass task_123 --candidate candidate_ID --manifest-digest sha256:MANIFEST_DIGEST --integration-sha FULL_GIT_SHA --owner-qa-packet-digest sha256:OWNER_QA_PACKET_DIGEST --body "Checked the local QA preview."
+node src/mission-control-cli.js qa-fail task_123 --candidate candidate_ID --manifest-digest sha256:MANIFEST_DIGEST --integration-sha FULL_GIT_SHA --owner-qa-packet-digest sha256:OWNER_QA_PACKET_DIGEST --body "Mobile nav still overlaps."
+node src/mission-control-cli.js qa-pass --bundle qa_bundle_ID --candidate candidate_ID --manifest-digest sha256:MANIFEST_DIGEST --integration-sha FULL_GIT_SHA --owner-qa-packet-digest sha256:OWNER_QA_PACKET_DIGEST --body "Checked the complete bundle."
 ```
+
+Use the four exact immutable coordinates from one actionable `qa-list` task or
+bundle row. Refresh the list instead of reusing coordinates after any candidate
+change. Use `--bundle BUNDLE_ID` for bundle rows; multi-task candidates require
+that selector so all included tasks receive one atomic decision.
 
 The active local automation stack calls the steward, dispatcher, runner, and notifier every 10 seconds by default, with the read-only supervisor reporting every 15 seconds. The dispatcher creates durable builder, reviewer, and owner handoff runs, the runner executes queued Codex work, and the notifier alerts the human owner when review or failures need attention. The stack should not deploy production or merge PRs.
 
