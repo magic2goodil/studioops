@@ -53,6 +53,7 @@ const SYSTEM_RUNTIME_READ_ROOTS = [
   "/opt/homebrew/Cellar",
   "/opt/homebrew/opt",
   "/Applications/Xcode.app/Contents",
+  "/Library/Frameworks/Python.framework",
   "/Library/Developer/CommandLineTools",
   "/Library/Apple/usr/libexec/oah",
   "/Library/Java/JavaVirtualMachines",

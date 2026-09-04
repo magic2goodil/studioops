@@ -112,6 +112,19 @@ test("project validation uses a disposable no-network sandbox and cannot reach s
     const npmRuntime = await runProjectValidationCommand(sandbox, "npm --version");
     assert.equal(npmRuntime.ok, true, npmRuntime.output);
 
+    const frameworkPython = "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3";
+    const frameworkPythonAvailable = await readFile(frameworkPython)
+      .then(() => true)
+      .catch(() => false);
+    if (frameworkPythonAvailable) {
+      const pythonRuntime = await runProjectValidationCommand(
+        sandbox,
+        `${JSON.stringify(frameworkPython)} --version`,
+      );
+      assert.equal(pythonRuntime.ok, true, pythonRuntime.output);
+      assert.match(pythonRuntime.stdout, /^Python 3\.11\./);
+    }
+
     const hostSentinel = `host-process-${randomUUID()}`;
     hostSentinelProcess = spawn("/bin/sleep", ["30"], {
       env: { ...process.env, STUDIOOPS_SANDBOX_HOST_SENTINEL: hostSentinel },
