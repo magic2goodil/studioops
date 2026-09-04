@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   ComponentMapIsolationError,
   loadProjectComponentImpactMap,
@@ -22,6 +23,14 @@ import {
   writeBoundedDiscoveryArtifact,
 } from "../src/impact-planner.js";
 import { dispatchSupervisorActions } from "../src/dispatcher.js";
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const studioOpsProject = {
+  id: "project_6",
+  key: "studioops",
+  repoUrl: "https://github.com/magic2goodil/studioops",
+  repoPath: repositoryRoot,
+};
 
 function manifest(key, repository, componentPath = "src/catalog.js") {
   return {
@@ -68,6 +77,105 @@ test("component maps are canonical, validated, and content addressed", () => {
   assert.equal(first.project.repository, second.project.repository);
   assert.equal(sha256Digest(first), sha256Digest(structuredClone(first)));
   assert.throws(() => validateComponentImpactMap({ ...manifest("dollos", "https://github.com/example/dollos"), schemaVersion: 2 }), /Unsupported/);
+});
+
+test("checked-in StudioOps primary map is repository-bound and has unique authorities", () => {
+  const loaded = loadProjectComponentImpactMap(studioOpsProject);
+  assert.equal(loaded.status, "mapped");
+  assert.equal(loaded.reason, "component_map_loaded");
+  assert.equal(loaded.path, "docs/architecture/components.json");
+  assert.equal(loaded.manifest.project.key, studioOpsProject.key);
+  assert.equal(loaded.manifest.project.repository, studioOpsProject.repoUrl);
+  assert.equal(loaded.digest, sha256Digest(loaded.manifest));
+
+  const ownedPaths = Object.values(loaded.manifest.components).flatMap((component) => component.paths);
+  const policyAuthorities = Object.values(loaded.manifest.components)
+    .flatMap((component) => component.policyAuthorities);
+  assert.equal(new Set(ownedPaths).size, ownedPaths.length);
+  assert.equal(new Set(policyAuthorities).size, policyAuthorities.length);
+
+  assert.throws(
+    () => loadProjectComponentImpactMap({
+      ...studioOpsProject,
+      repoUrl: "https://github.com/example/not-studioops",
+    }),
+    ComponentMapIsolationError,
+  );
+});
+
+test("checked-in StudioOps map produces a bounded single-component context packet", () => {
+  const loaded = loadProjectComponentImpactMap(studioOpsProject);
+  const plan = resolveProjectImpactPlan({
+    project: studioOpsProject,
+    task: {
+      title: "Extend component impact test coverage",
+      workAreas: ["test/component-impact-map.test.js"],
+    },
+    sourceCommit: "a".repeat(40),
+    loadedMap: loaded,
+  });
+
+  assert.equal(plan.status, "mapped");
+  assert.equal(plan.fullRegression, false);
+  assert.deepEqual(plan.reasonCodes, ["single_component_mapped"]);
+  assert.deepEqual(plan.selectedComponents.map((component) => component.id), ["component-impact-planning"]);
+  assert.deepEqual(plan.allowedFileScope, [
+    "docs/architecture/*.components.json",
+    "docs/architecture/components.json",
+    "src/component-impact-map.js",
+    "src/impact-planner.js",
+    "test/component-impact-map.test.js",
+  ]);
+  assert.deepEqual(plan.targetedTests, ["node --test test/component-impact-map.test.js"]);
+  assert.deepEqual(plan.requiredReviewLanes, ["backend-reviewer", "lead-reviewer"]);
+  assertImpactPlanProjectBinding(plan, studioOpsProject);
+
+  const packet = formatImpactPlanForPrompt(plan);
+  assert.match(packet, /Project binding: project_6\/studioops @ https:\/\/github\.com\/magic2goodil\/studioops/);
+  assert.match(packet, /Selected components: component-impact-planning/);
+  assert.match(packet, /Targeted implementation tests: node --test test\/component-impact-map\.test\.js/);
+});
+
+test("checked-in StudioOps map fails closed for uncertain and release-sensitive impact", () => {
+  const loaded = loadProjectComponentImpactMap(studioOpsProject);
+  const cases = [
+    {
+      name: "unknown",
+      task: { title: "Adjust unmapped module", workAreas: ["src/not-owned.js"] },
+      reasons: ["unclassified_impact", "declared_path_unmapped", "immutable_diff_path_unmapped"],
+    },
+    {
+      name: "shared",
+      task: { title: "Adjust repository scripts", workAreas: ["package.json"] },
+      reasons: ["shared_component_impact", "release_sensitive_impact"],
+    },
+    {
+      name: "multi-component",
+      task: {
+        title: "Adjust component planning and task state",
+        workAreas: ["test/component-impact-map.test.js", "test/state-database.test.js"],
+      },
+      reasons: ["multi_component_impact", "shared_component_impact"],
+    },
+    {
+      name: "release-sensitive",
+      task: { title: "Adjust impact planner", workAreas: ["src/impact-planner.js"] },
+      reasons: ["release_sensitive_impact"],
+    },
+  ];
+
+  for (const entry of cases) {
+    const plan = resolveProjectImpactPlan({
+      project: studioOpsProject,
+      task: entry.task,
+      sourceCommit: "a".repeat(40),
+      loadedMap: loaded,
+    });
+    assert.equal(plan.fullRegression, true, `${entry.name} impact must require full regression`);
+    for (const reason of entry.reasons) {
+      assert.ok(plan.reasonCodes.includes(reason), `${entry.name} impact must include ${reason}`);
+    }
+  }
 });
 
 test("repository identity prevents cross-project lookup even with identical component names", async () => {
