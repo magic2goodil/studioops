@@ -28,6 +28,7 @@ import {
 import { defaultStudioOpsCredentialsRoot, missionControlDataDir } from "./runtime-paths.js";
 import {
   loadConfig,
+  normalizeProjectRunAdmissionPolicy,
   normalizeProjectWorkflowMode,
   normalizeTechOpsPolicy,
   normalizeWorkspaceRetention,
@@ -1885,14 +1886,14 @@ export async function addProject(input) {
       techOps: normalizeTechOpsPolicy(input.techOps || {}),
       promotion: input.promotion || {},
       reviewPolicy,
-      wipPolicy: {
+      wipPolicy: normalizeProjectRunAdmissionPolicy({
         maxActiveTasks: Number(input.wipPolicy?.maxActiveTasks || input.maxActiveTasks || 0),
         maxActiveRuns: Number(input.wipPolicy?.maxActiveRuns || input.maxActiveRuns || 0),
         maxRunsPerWindow: Number(input.wipPolicy?.maxRunsPerWindow || input.maxRunsPerWindow || 0),
         runWindowMinutes: Number(input.wipPolicy?.runWindowMinutes || input.runWindowMinutes || 60),
         weights: input.wipPolicy?.weights || {},
         agePromotionMs: Number(input.wipPolicy?.agePromotionMs || 24 * 60 * 60 * 1000),
-      },
+      }),
       deliveryPolicy,
       trustLeadApprovals: reviewPolicy.trustLeadApprovals,
       integrationBranch: reviewPolicy.integrationBranch,
@@ -2019,7 +2020,7 @@ export async function updateProject(projectId, patch = {}) {
     }
     if (Object.prototype.hasOwnProperty.call(patch, "wipPolicy")) {
       const policyPatch = patch.wipPolicy || {};
-      project.wipPolicy = {
+      project.wipPolicy = normalizeProjectRunAdmissionPolicy({
         ...(project.wipPolicy || {}),
         ...policyPatch,
         ...(Object.prototype.hasOwnProperty.call(policyPatch, "maxActiveTasks")
@@ -2034,7 +2035,7 @@ export async function updateProject(projectId, patch = {}) {
         ...(Object.prototype.hasOwnProperty.call(policyPatch, "runWindowMinutes")
           ? { runWindowMinutes: Number(policyPatch.runWindowMinutes || 60) }
           : {}),
-      };
+      });
     }
     if (Object.prototype.hasOwnProperty.call(patch, "deliveryPolicy")) {
       project.deliveryPolicy = normalizeDeliveryPolicy(patch.deliveryPolicy);
@@ -4621,6 +4622,30 @@ export function reconcileAutomationStateInState(state, input = {}) {
   const now = input.now || new Date(nowMs).toISOString();
   const orphanGraceMs = Math.max(60_000, Number(input.orphanGraceMs || DEFAULT_ORPHANED_TASK_GRACE_MS));
   const actions = [];
+
+  for (const project of state.projects || []) {
+    if (input.project && project.id !== input.project.id) continue;
+    const priorPolicy = project.wipPolicy || {};
+    const hasLegacyWindow = Number.isSafeInteger(Number(priorPolicy.maxRunsPerWindow))
+      && Number(priorPolicy.maxRunsPerWindow) > 0;
+    if (!hasLegacyWindow && !priorPolicy.deprecatedTotalWindowAdmission) continue;
+    const normalizedPolicy = normalizeProjectRunAdmissionPolicy(priorPolicy);
+    if (isDeepStrictEqual(priorPolicy, normalizedPolicy)) continue;
+    const priorDiagnostic = priorPolicy.deprecatedTotalWindowAdmission;
+    project.wipPolicy = normalizedPolicy;
+    project.updatedAt = now;
+    actions.push(`${project.id}: retired completed-run window admission`);
+    if (!isDeepStrictEqual(priorDiagnostic, normalizedPolicy.deprecatedTotalWindowAdmission)) {
+      state.events = state.events || [];
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "run_window_policy_deprecated",
+        projectId: project.id,
+        message: `${project.name || project.key || project.id}: completed-run window admission is inert; active-run, lane, credit, and durable failure controls remain authoritative.`,
+        createdAt: now,
+      });
+    }
+  }
 
   for (const task of state.tasks || []) {
     if (input.project && task.projectId !== input.project.id) continue;

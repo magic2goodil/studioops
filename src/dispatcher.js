@@ -21,8 +21,15 @@ import { runConsumesExecutionCapacity } from "./runner.js";
 import {
   INSTALLED_AUTOMATION_CAPACITY,
   normalizeGlobalRunAdmission,
+  normalizeProjectRunAdmissionPolicy,
 } from "./config.js";
 import { resolveProjectImpactPlan } from "./impact-planner.js";
+import {
+  failureActionIdentity,
+  failureFingerprint,
+  normalizeFailureProvider,
+} from "./failure-containment.js";
+import { readFailureIncidents } from "./state-database.js";
 
 const DISPATCHABLE_ACTIONS = new Set([
   "start_architecture",
@@ -177,14 +184,14 @@ function projectWipLimit(project) {
 }
 
 function projectRunBudget(project) {
-  const policy = project?.wipPolicy || {};
+  const policy = normalizeProjectRunAdmissionPolicy(project?.wipPolicy || {});
   const maxActiveRuns = Number(policy.maxActiveRuns || 0);
-  const maxRunsPerWindow = Number(policy.maxRunsPerWindow || 0);
   const runWindowMinutes = Number(policy.runWindowMinutes || 60);
   return {
     maxActiveRuns: Number.isInteger(maxActiveRuns) && maxActiveRuns > 0 ? maxActiveRuns : 0,
-    maxRunsPerWindow: Number.isInteger(maxRunsPerWindow) && maxRunsPerWindow > 0 ? maxRunsPerWindow : 0,
+    maxRunsPerWindow: 0,
     runWindowMinutes: Number.isFinite(runWindowMinutes) && runWindowMinutes > 0 ? runWindowMinutes : 60,
+    deprecatedTotalWindowAdmission: policy.deprecatedTotalWindowAdmission || null,
   };
 }
 
@@ -192,41 +199,30 @@ function isWorkerRun(run) {
   return ACTIVE_RUN_STATUSES.has(run.status) || FINAL_RUN_STATUSES.has(run.status);
 }
 
-function projectRunCounts(state, projectId, nowMs) {
+function projectRunCounts(state, projectId) {
   const projectRuns = (state.runs || []).filter((run) => (
     run.projectId === projectId
     && run.group !== "owner"
     && isWorkerRun(run)
   ));
   const active = projectRuns.filter((run) => runConsumesExecutionCapacity(state, run)).length;
-  return { active, runs: projectRuns.filter((run) => {
-    const created = Date.parse(run.createdAt || run.startedAt || "");
-    return Number.isFinite(created) && nowMs - created >= 0;
-  }) };
+  return { active };
 }
 
-function projectRunBudgetReason(state, project, action, selectedProjectRuns, nowMs) {
+function projectRunBudgetReason(state, project, action, selectedProjectRuns) {
   if (runGroupFor(action) === "owner") return "";
   if (!project) return "";
   const budget = projectRunBudget(project);
-  if (!budget.maxActiveRuns && !budget.maxRunsPerWindow) return "";
-  const existing = projectRunCounts(state, project.id, nowMs);
+  if (!budget.maxActiveRuns) return "";
+  const existing = projectRunCounts(state, project.id);
   const selected = Number(selectedProjectRuns.get(project.id) || 0);
   if (budget.maxActiveRuns && existing.active + selected >= budget.maxActiveRuns) {
     return "project_active_run_limit";
   }
-  if (budget.maxRunsPerWindow) {
-    const windowStart = nowMs - budget.runWindowMinutes * 60 * 1000;
-    const recent = existing.runs.filter((run) => {
-      const created = Date.parse(run.createdAt || run.startedAt || "");
-      return Number.isFinite(created) && created >= windowStart;
-    }).length;
-    if (recent + selected >= budget.maxRunsPerWindow) return "project_run_window_limit";
-  }
   return "";
 }
 
-function globalRunBudgetReason(state, action, selectedWorkerRuns, nowMs, options) {
+function globalRunBudgetReason(state, action, selectedWorkerRuns, options) {
   if (runGroupFor(action) === "owner") return "";
   if (!options.globalRunAdmission) return "";
   const budget = normalizeGlobalRunAdmission(options.globalRunAdmission);
@@ -235,16 +231,88 @@ function globalRunBudgetReason(state, action, selectedWorkerRuns, nowMs, options
   if (active + selectedWorkerRuns >= budget.maxActiveMeteredRuns) {
     return "global_active_run_limit";
   }
-  const windowStart = nowMs - budget.runWindowMinutes * 60 * 1000;
-  const recent = workerRuns.filter((run) => {
-    if (!isWorkerRun(run)) return false;
-    const created = Date.parse(run.createdAt || run.startedAt || "");
-    return Number.isFinite(created) && created >= windowStart && created <= nowMs;
-  }).length;
-  if (recent + selectedWorkerRuns >= budget.maxMeteredRunsPerWindow) {
-    return "global_run_window_limit";
-  }
   return "";
+}
+
+function failureProviderFor(task, options) {
+  const raw = options.failureProvider || task.preferredRunnerProvider || options.provider || "codex";
+  if (raw === "prompt-outbox") return "codex";
+  try {
+    return normalizeFailureProvider(raw);
+  } catch {
+    return /codex|openai|sdk|cli/i.test(String(raw)) ? "codex" : "local";
+  }
+}
+
+function failureCandidateIdentity(task = {}) {
+  const candidate = task.candidateIdentity || {};
+  return {
+    candidateId: task.candidateId || "",
+    commitSha: candidate.commitSha || task.reviewSubjectSha || "",
+    treeSha: candidate.treeSha || "",
+    baseSha: candidate.baseSha || "",
+    manifestDigest: task.candidateManifestDigest || "",
+    candidateCycle: candidate.candidateCycle || task.reviewSubjectCycle || 0,
+  };
+}
+
+function durableFailureAdmissionReason(task, action, options, nowMs) {
+  if (runGroupFor(action) === "owner") return null;
+  const actionIdentity = failureActionIdentity(action);
+  const provider = failureProviderFor(task, options);
+  const candidateIdentity = failureCandidateIdentity(task);
+  const matching = (options.failureIncidents || []).find((incident) => {
+    if (!incident || incident.taskId !== task.id || incident.action !== actionIdentity || incident.provider !== provider) {
+      return false;
+    }
+    try {
+      return failureFingerprint({
+        taskId: task.id,
+        action: actionIdentity,
+        candidateIdentity,
+        provider,
+        reasonCode: incident.reasonCode,
+      }).digest === incident.fingerprintDigest;
+    } catch {
+      return false;
+    }
+  });
+  if (!matching) return null;
+  if (matching.state === "open") {
+    return { reason: "failure_circuit_open", incident: matching, actionIdentity, provider };
+  }
+  if (matching.state === "backoff" && Date.parse(matching.backoffUntil || "") > nowMs) {
+    return { reason: "failure_backoff", incident: matching, actionIdentity, provider };
+  }
+  return null;
+}
+
+function totalWindowDeprecationDiagnostics(state, options) {
+  const diagnostics = [];
+  if (options.globalRunAdmission) {
+    const globalPolicy = normalizeGlobalRunAdmission(options.globalRunAdmission);
+    if (globalPolicy.deprecatedTotalWindowAdmission) {
+      diagnostics.push({
+        scope: "installation",
+        code: "total_run_window_deprecated",
+        status: "inert",
+        ...globalPolicy.deprecatedTotalWindowAdmission,
+      });
+    }
+  }
+  for (const project of (state.projects || []).slice(0, 50)) {
+    const policy = normalizeProjectRunAdmissionPolicy(project.wipPolicy || {});
+    if (!policy.deprecatedTotalWindowAdmission) continue;
+    diagnostics.push({
+      scope: "project",
+      projectId: project.id,
+      projectKey: project.key || "",
+      code: "total_run_window_deprecated",
+      status: "inert",
+      ...policy.deprecatedTotalWindowAdmission,
+    });
+  }
+  return diagnostics;
 }
 
 function recentDuplicateCandidateStageReason(state, task, action, nowMs, options) {
@@ -402,9 +470,6 @@ function dispatchSafetyReason(state, task, action, options) {
     && Number(creditAdmission.estimatedCredits || 0) > executionPolicy.costBudget
   ) return "task_budget:estimated_cost_exceeds_budget";
   if (!creditAdmission.allowed) return `credit_gate:${creditAdmission.code}`;
-  const attemptKey = executionAttemptKey(task, action);
-  const attemptCount = executionAttemptCount(state, attemptKey);
-  if (attemptCount >= executionPolicy.maxAttempts) return "attempt_budget_exhausted";
   return "";
 }
 
@@ -623,68 +688,6 @@ function skippedAction(actions, skipped) {
   )) || null;
 }
 
-function openExhaustedAttemptCircuits(state, actions, skipped, options, now) {
-  const openedTaskIds = new Set();
-  for (const item of skipped || []) {
-    if (item.reason !== "attempt_budget_exhausted" || openedTaskIds.has(item.taskId)) continue;
-    const task = findTask(state, item.taskId);
-    const action = skippedAction(actions, item);
-    if (!task || !action || task.automationCircuit?.state === "open") continue;
-    const policy = resolveExecutionPolicy(task, action, options);
-    const attemptKey = executionAttemptKey(task, action);
-    const attempts = executionAttemptCount(state, attemptKey);
-    const resumeStatus = task.status;
-    const snapshot = workflowSnapshotForTask(task);
-    task.status = "blocked";
-    task.assignedAgentRole = "owner";
-    task.retryNotBefore = "";
-    task.lastAutomationFailure = "attempt_budget_exhausted";
-    task.automationBlocker = {
-      type: "circuit",
-      reason: "attempt_budget_exhausted",
-      actionType: action.type,
-      attemptKey,
-      attempts,
-      maxAttempts: policy.maxAttempts,
-      resumeStatus,
-      blockedAt: now,
-      retryAt: "",
-    };
-    task.automationCircuit = {
-      state: "open",
-      scope: "task",
-      reasonCode: "attempt_budget_exhausted",
-      normalizedReason: `StudioOps suppressed ${action.type} after ${attempts}/${policy.maxAttempts} dispatch attempts.`,
-      failureFingerprint: `${task.id}:${attemptKey}:attempt_budget_exhausted`,
-      attemptsConsumed: attempts,
-      maxAttempts: policy.maxAttempts,
-      snapshot,
-      openedAt: now,
-      nextCheapProbe: "Inspect the preserved run outputs and verify the underlying blocker without launching another model.",
-      resumeAction: `studioops circuit-reset --task ${task.id} --expected-opened-at ${now} --reason verified`,
-      remediation: "Repair or verify the underlying blocker, then explicitly reset this task circuit.",
-    };
-    task.updatedAt = now;
-    state.comments.push({
-      id: nextId(state.comments, "comment"),
-      taskId: task.id,
-      author: "StudioOps Dispatcher",
-      body: `Opened the task automation circuit after suppressing ${action.type}: the ${attempts}/${policy.maxAttempts} dispatch-attempt budget is exhausted. No additional model run will start until the blocker is verified and the circuit is explicitly reset.`,
-      createdAt: now,
-    });
-    state.events.push({
-      id: nextId(state.events, "event"),
-      type: "automation_circuit_opened",
-      projectId: task.projectId,
-      taskId: task.id,
-      message: `${task.title}: ${action.type} attempt budget exhausted`,
-      createdAt: now,
-    });
-    openedTaskIds.add(task.id);
-  }
-  return openedTaskIds;
-}
-
 function ownerPrompt(action) {
   if (action.type === "notify_qa_review" || action.type === "qa_bundle_ready") {
     return `StudioOps local QA review requested.
@@ -868,6 +871,14 @@ function makeRun(state, task, action, options, now) {
         : null,
       snapshotStatus: creditAdmission.snapshotStatus,
     },
+    failureContainmentAdmission: {
+      consulted: true,
+      decision: "admitted",
+      authority: "dispatcher_read_only",
+      claimBoundary: "runner_pre_provider_launch",
+      actionIdentity: failureActionIdentity(action),
+      provider: failureProviderFor(task, options),
+    },
     attemptKey,
     attempt,
     maxAttempts: executionPolicy.maxAttempts,
@@ -934,13 +945,27 @@ export function planDispatches(state, actions, input = {}) {
       skipped.push({ action, reason: `task_status_changed:${action.taskStatus}->${task.status}` });
       continue;
     }
+    const failureAdmission = durableFailureAdmissionReason(task, action, options, nowMs);
+    if (failureAdmission) {
+      skipped.push({
+        action,
+        reason: failureAdmission.reason,
+        incidentId: failureAdmission.incident.incidentId,
+        generation: failureAdmission.incident.generation,
+        fingerprintDigest: failureAdmission.incident.fingerprintDigest,
+        backoffUntil: failureAdmission.incident.backoffUntil || "",
+        actionIdentity: failureAdmission.actionIdentity,
+        provider: failureAdmission.provider,
+      });
+      continue;
+    }
     const project = state.projects?.find((item) => item.id === task.projectId);
-    const globalBudgetReason = globalRunBudgetReason(state, action, selectedWorkerRuns, nowMs, options);
+    const globalBudgetReason = globalRunBudgetReason(state, action, selectedWorkerRuns, options);
     if (globalBudgetReason) {
       skipped.push({ action, reason: globalBudgetReason });
       continue;
     }
-    const runBudgetReason = projectRunBudgetReason(state, project, action, selectedProjectRuns, nowMs);
+    const runBudgetReason = projectRunBudgetReason(state, project, action, selectedProjectRuns);
     if (runBudgetReason) {
       skipped.push({ action, reason: runBudgetReason, projectId: task.projectId });
       continue;
@@ -996,6 +1021,7 @@ export function planDispatches(state, actions, input = {}) {
       globalRunAdmission: options.globalRunAdmission
         ? normalizeGlobalRunAdmission(options.globalRunAdmission)
         : null,
+      deprecationDiagnostics: totalWindowDeprecationDiagnostics(state, options),
       groups: effectiveGroupCapacity(options, initialCounts, counts),
     },
     selected: selected.map(({ action, task, group, profile }) => ({
@@ -1022,6 +1048,23 @@ export function planDispatches(state, actions, input = {}) {
 export async function dispatchSupervisorActions(actions, input = {}) {
   const { state: inputState, ...initialDispatchInput } = input;
   const dispatchInput = { ...initialDispatchInput };
+  if (
+    !Object.prototype.hasOwnProperty.call(dispatchInput, "failureIncidents")
+    && (!inputState || dispatchInput.loadFailureIncidents)
+  ) {
+    const taskIds = [...new Set((actions || [])
+      .filter((action) => DISPATCHABLE_ACTIONS.has(action.type))
+      .map((action) => String(action.taskId || ""))
+      .filter(Boolean))];
+    const incidentGroups = await Promise.all(taskIds.flatMap((taskId) => (
+      ["active", "backoff", "open"].map((state) => readFailureIncidents({ taskId, state, limit: 500 }))
+    )));
+    dispatchInput.failureIncidents = [...new Map(incidentGroups
+      .flat()
+      .map((incident) => [incident.incidentId, incident])).values()];
+  } else if (!Array.isArray(dispatchInput.failureIncidents)) {
+    dispatchInput.failureIncidents = [];
+  }
   const preflightOptions = { ...DEFAULTS, ...dispatchInput };
   if (!preflightOptions.dryRun && preflightOptions.creditPolicy?.enabled) {
     const preflightState = inputState || await readState();
@@ -1058,13 +1101,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       };
     }
 
-    const openedTaskIds = openExhaustedAttemptCircuits(
-      state,
-      actions,
-      plan.skipped,
-      options,
-      now,
-    );
+    const openedTaskIds = new Set();
     const creditBlockedTaskIds = openCreditAdmissionCircuits(
       state,
       actions,
@@ -1149,6 +1186,12 @@ export function formatDispatchReport(report) {
   if (capacityText) {
     lines.push(
       `Effective capacity: ${capacityText}; sweep limit ${report.effectiveCapacity.maxDispatchesPerSweep}`,
+    );
+  }
+  const admissionDiagnostics = report.effectiveCapacity?.deprecationDiagnostics || [];
+  if (admissionDiagnostics.length) {
+    lines.push(
+      `Admission diagnostics: ${admissionDiagnostics.length} completed-run window setting(s) are deprecated and inert.`,
     );
   }
   lines.push("");

@@ -10,6 +10,8 @@ import {
   extractConfigJson,
   normalizeConfig,
   normalizeCreditPolicyConfig,
+  normalizeGlobalRunAdmission,
+  normalizeProjectRunAdmissionPolicy,
   normalizeRunOutputGuard,
   normalizeWorkspaceRetention,
   projectFromConfig,
@@ -30,6 +32,44 @@ test("runner output guard defaults are finite and configurable", () => {
   });
   assert.equal(config.defaults.runner.outputGuard.maxCommandOutputChars, 12_000);
   assert.equal(config.defaults.runner.outputGuard.maxCumulativeCommandOutputChars, 160_000);
+});
+
+test("completed-run admission windows normalize to inert compatibility evidence", () => {
+  assert.deepEqual(normalizeGlobalRunAdmission(), {
+    maxActiveMeteredRuns: 2,
+    maxMeteredRunsPerWindow: 0,
+    runWindowMinutes: 60,
+  });
+
+  const legacyGlobal = normalizeGlobalRunAdmission({
+    maxActiveMeteredRuns: 3,
+    maxMeteredRunsPerWindow: 12,
+    runWindowMinutes: 45,
+  });
+  assert.equal(legacyGlobal.maxActiveMeteredRuns, 3);
+  assert.equal(legacyGlobal.maxMeteredRunsPerWindow, 0);
+  assert.deepEqual(legacyGlobal.deprecatedTotalWindowAdmission, {
+    schemaVersion: 1,
+    status: "inert",
+    configuredMaxRunsPerWindow: 12,
+    configuredRunWindowMinutes: 45,
+  });
+  assert.deepEqual(normalizeGlobalRunAdmission(legacyGlobal), legacyGlobal);
+
+  const legacyProject = normalizeProjectRunAdmissionPolicy({
+    maxActiveRuns: 1,
+    maxRunsPerWindow: 4,
+    runWindowMinutes: 60,
+  });
+  assert.equal(legacyProject.maxActiveRuns, 1);
+  assert.equal(legacyProject.maxRunsPerWindow, 0);
+  assert.deepEqual(legacyProject.deprecatedTotalWindowAdmission, {
+    schemaVersion: 1,
+    status: "inert",
+    configuredMaxRunsPerWindow: 4,
+    configuredRunWindowMinutes: 60,
+  });
+  assert.deepEqual(normalizeProjectRunAdmissionPolicy(legacyProject), legacyProject);
 });
 
 test("CLI wires output guard only inside the runner command scope", async () => {
