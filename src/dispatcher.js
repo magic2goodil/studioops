@@ -64,6 +64,18 @@ const DEFAULTS = {
   ownerConcurrency: 10,
 };
 
+export function resolveDispatcherProvider(input = {}) {
+  const candidates = [
+    input.requestedProvider,
+    input.dispatcherProvider,
+    input.runnerProvider,
+    "prompt-outbox",
+  ];
+  return candidates
+    .map((value) => String(value || "").trim())
+    .find(Boolean);
+}
+
 function nextId(items, prefix) {
   const max = (items || [])
     .map((item) => String(item.id || ""))
@@ -930,6 +942,10 @@ export function planDispatches(state, actions, input = {}) {
     const task = findTask(state, action.taskId);
     if (!task) {
       skipped.push({ action, reason: "missing_task" });
+      continue;
+    }
+    if (task.budgetPause?.runId && runGroupFor(action) !== "owner") {
+      skipped.push({ action, reason: "budget_pause" });
       continue;
     }
     if (hasExistingDispatch(state, action, task)) {
