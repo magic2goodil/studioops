@@ -7,6 +7,7 @@ import {
   dispatchSupervisorActions,
   formatDispatchReport,
   planDispatches,
+  resolveDispatcherProvider,
 } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
 import { fileScopesMayOverlap } from "../src/work-lanes.js";
@@ -577,6 +578,67 @@ test("three budget-paused queued runs free admission for unrelated eligible work
   assert.deepEqual(claimed.map((run) => run.taskId), ["task_ready"]);
   assert.equal(state.tasks.find((task) => task.id === "task_ready").status, "in_progress");
   assert.equal(state.runs.filter((run) => run.taskId.startsWith("task_paused_")).every((run) => run.status === "queued"), true);
+});
+
+test("dispatcher rejects budget-paused worker actions before they consume selection capacity", () => {
+  const state = fixtureState();
+  state.tasks[0] = {
+    ...state.tasks[0],
+    status: "backend_review",
+    assignedAgentRole: "backend-reviewer",
+    budgetPause: {
+      runId: "run_preserved",
+      reason: "raw_context_budget_exceeded",
+      resumeStatus: "backend_review",
+    },
+  };
+  state.tasks[1] = {
+    ...state.tasks[1],
+    status: "ready",
+    architectureRequired: false,
+    architectureStatus: "not_required",
+  };
+  const pausedReview = {
+    id: "task_1:continue_review",
+    type: "continue_review",
+    role: "backend-reviewer",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_1",
+    taskStatus: "backend_review",
+  };
+  const runnableBuilder = {
+    id: "task_2:start_builder",
+    type: "start_builder",
+    role: "builder",
+    projectId: "project_1",
+    projectKey: "demo",
+    taskId: "task_2",
+    taskStatus: "ready",
+    nextStatus: "in_progress",
+  };
+
+  const report = planDispatches(state, [pausedReview, runnableBuilder], {
+    maxDispatchesPerSweep: 1,
+    globalRunAdmission: { maxActiveMeteredRuns: 1 },
+  });
+
+  assert.deepEqual(report.selected.map((item) => item.taskId), ["task_2"]);
+  assert.equal(report.skipped.find((item) => item.taskId === "task_1")?.reason, "budget_pause");
+});
+
+test("dispatcher provider follows explicit, dispatcher, runner, then safe outbox precedence", () => {
+  assert.equal(resolveDispatcherProvider({
+    requestedProvider: "codex-cli",
+    dispatcherProvider: "prompt-outbox",
+    runnerProvider: "codex-sdk",
+  }), "codex-cli");
+  assert.equal(resolveDispatcherProvider({
+    dispatcherProvider: "prompt-outbox",
+    runnerProvider: "codex-sdk",
+  }), "prompt-outbox");
+  assert.equal(resolveDispatcherProvider({ runnerProvider: "codex-sdk" }), "codex-sdk");
+  assert.equal(resolveDispatcherProvider(), "prompt-outbox");
 });
 
 test("global completed-run windows are inert while exact recent candidate stages remain suppressed", () => {

@@ -2,7 +2,12 @@
 import { loadConfig } from "./config.js";
 import { readState } from "./store.js";
 import { createSupervisorReport } from "./supervisor.js";
-import { dispatchSupervisorActions, formatDispatchReport, planDispatches } from "./dispatcher.js";
+import {
+  dispatchSupervisorActions,
+  formatDispatchReport,
+  planDispatches,
+  resolveDispatcherProvider,
+} from "./dispatcher.js";
 import { runResilientWorkerLoop } from "./worker-heartbeat.js";
 import { getCodexCreditSnapshot } from "./credit-policy.js";
 
@@ -49,6 +54,7 @@ function dispatcherDefaults(config) {
 
 function optionsFrom(args, config) {
   const defaults = dispatcherDefaults(config);
+  const runnerProvider = config?.runner?.provider || config?.defaults?.runner?.provider;
   const intervalSeconds = secondsFrom(
     args.interval || args["interval-seconds"] || defaults.intervalSeconds,
     DEFAULT_INTERVAL_SECONDS,
@@ -60,7 +66,11 @@ function optionsFrom(args, config) {
     reviewerConcurrency: numberFrom(args["reviewer-concurrency"] || defaults.reviewerConcurrency, 3),
     ownerConcurrency: numberFrom(args["owner-concurrency"] || defaults.ownerConcurrency, 10),
     maxDispatchesPerSweep: numberFrom(args.limit || args["max-dispatches"] || defaults.maxDispatchesPerSweep, 6),
-    provider: args.provider || defaults.provider || "prompt-outbox",
+    provider: resolveDispatcherProvider({
+      requestedProvider: args.provider,
+      dispatcherProvider: defaults.provider,
+      runnerProvider,
+    }),
     executionPolicy: {
       ...(config?.defaults?.executionPolicy || {}),
       ...(config?.executionPolicy || {}),
