@@ -11,6 +11,8 @@ import {
   applyFailedRunToTask,
   branchReuseSafetyReason,
   boundedRunOutputEvent,
+  claimCurrentFailureAttempt,
+  classifyRunFailureReason,
   claimRuns,
   cloneFallbackSource,
   completeRun,
@@ -20,6 +22,7 @@ import {
   planRunnableRuns,
   prePushValidationScript,
   readPrePushValidationAttestation,
+  remediateStaleLinkedPrInState,
   preflightRun,
   prepareRunWorkspace,
   resolveProjectWorkflowMode,
@@ -27,6 +30,11 @@ import {
   runWorkspaceCleanup,
   runQueuedRuns,
 } from "../src/runner.js";
+import {
+  claimPaidFailureAttempt,
+  createFailureIncident,
+  failureFingerprint,
+} from "../src/failure-containment.js";
 import { materializeLocalCandidate } from "../src/workspace.js";
 import { eligibleRunWorkspaceSnapshotsInState, resumeBudgetPauseInState } from "../src/store.js";
 
@@ -58,6 +66,70 @@ test("worker output guard warns and bounds one oversized command but stops cumul
   }).violation.code, "cumulative_command_output_budget_exceeded");
 });
 
+test("runner normalizes provider failures to bounded reason codes", () => {
+  assert.equal(classifyRunFailureReason({}, "sdk_error", "network unavailable"), "provider_unavailable");
+  assert.equal(classifyRunFailureReason({}, "validation_evidence_missing", ""), "validation_failed");
+  assert.equal(classifyRunFailureReason({}, "unexpected", ""), "execution_failed");
+  assert.notEqual(classifyRunFailureReason({}, "sdk_error", ""), "sdk_error");
+});
+
+test("runner atomically claims the shared failure generation immediately before provider launch", async () => {
+  const run = builderRun({ provider: "codex-sdk", status: "running" });
+  const incident = createFailureIncident({
+    fingerprint: failureFingerprint({
+      taskId: run.taskId,
+      action: run.actionType,
+      provider: "codex",
+      reasonCode: "provider_unavailable",
+    }),
+    now: "2026-07-18T00:00:00.000Z",
+  });
+  let persisted = null;
+  const claim = await claimCurrentFailureAttempt(run, {
+    state: { tasks: [{ id: run.taskId }], projects: [], runs: [run] },
+    failureIncidents: [incident],
+    claimFailureAttempt: async (authority) => claimPaidFailureAttempt(incident, {
+      ...authority,
+      evidence: incident.evidence,
+      now: "2026-07-18T00:01:00.000Z",
+    }),
+    persistFailureClaim: async (_run, result) => { persisted = result; },
+  });
+  assert.equal(claim.admitted, true);
+  assert.equal(claim.incident.paidAttempts, 1);
+  assert.equal(persisted.incident.provider, "codex");
+});
+
+test("runner denies a third SDK or CLI launch from the same failure generation", async () => {
+  const run = builderRun({ provider: "codex-cli", status: "running" });
+  const base = createFailureIncident({
+    fingerprint: failureFingerprint({
+      taskId: run.taskId,
+      action: run.actionType,
+      provider: "codex",
+      reasonCode: "provider_unavailable",
+    }),
+    now: "2026-07-18T00:00:00.000Z",
+  });
+  const first = claimPaidFailureAttempt(base, { evidence: base.evidence, now: "2026-07-18T00:01:00.000Z" }).incident;
+  const second = claimPaidFailureAttempt(first, { evidence: first.evidence, now: "2026-07-18T00:02:00.000Z" }).incident;
+  let denied = null;
+  const claim = await claimCurrentFailureAttempt(run, {
+    state: { tasks: [{ id: run.taskId }], projects: [], runs: [run] },
+    failureIncidents: [second],
+    claimFailureAttempt: async (authority) => claimPaidFailureAttempt(second, {
+      ...authority,
+      evidence: second.evidence,
+      now: "2026-07-18T00:03:00.000Z",
+    }),
+    denyPaidFailureAttempt: async (_run, result) => { denied = result; },
+  });
+  assert.equal(claim.admitted, false);
+  assert.equal(claim.reason, "attempt_budget_exhausted");
+  assert.equal(claim.incident.state, "open");
+  assert.equal(denied.incident.paidAttempts, 2);
+});
+
 test("pre-push validation is local, bounded, and cached by exact SHA plus run context", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-prepush-"));
   const repo = path.join(root, "repo");
@@ -87,6 +159,8 @@ test("pre-push validation is local, bounded, and cached by exact SHA plus run co
   assert.equal(attestation.outcome, "passed");
   assert.match(attestation.digest, /^sha256:[0-9a-f]{64}$/);
   assert.equal((await lstat(attestation.path)).mode & 0o777, 0o600);
+  assert.equal(attestation.commandArtifacts.length, 1);
+  assert.equal((await lstat(attestation.commandArtifacts[0].path)).mode & 0o777, 0o600);
 
   const changedContextRun = {
     ...passingRun,
@@ -649,6 +723,74 @@ test("builder runs refuse to reuse closed linked PR branches", () => {
   });
 
   assert.match(reason, /closed/);
+});
+
+test("stale linked PR remediation atomically clears exact candidate and reviewer bindings", () => {
+  const run = builderRun({
+    status: "running",
+    reviewSubjectSha: "a".repeat(40),
+    candidateCycle: 2,
+  });
+  const state = {
+    tasks: [{
+      id: run.taskId,
+      projectId: run.projectId,
+      status: "needs_changes",
+      branchName: run.branchName,
+      prUrl: run.prUrl,
+      reviewCycle: 2,
+      reviewSubjectCycle: 2,
+      reviewSubjectSha: "a".repeat(40),
+      candidateId: "candidate_old",
+      qaBundleId: "bundle_old",
+      reviewerThreadId: "thread_old",
+      reviewerThreadIds: { backend: "thread_backend" },
+      candidateIdentity: { commitSha: "a".repeat(40), branch: run.branchName, candidateCycle: 2 },
+    }],
+    runs: [run],
+    reviews: [{ id: "review_old", taskId: run.taskId, subjectSha: "a".repeat(40), outcome: "changes_requested" }],
+    candidates: [{ id: "candidate_old", status: "qa_pending" }],
+    events: [],
+  };
+
+  remediateStaleLinkedPrInState(state, run, {
+    expectedPrUrl: run.prUrl,
+    expectedBranch: run.branchName,
+    newBranch: "codex/demo-task-r1",
+    branchGeneration: 1,
+    defaultBranch: "main",
+    baseSha: "b".repeat(40),
+    prState: "merged",
+    observationSource: "github_metadata",
+    now: "2026-07-18T00:00:00.000Z",
+  });
+
+  assert.equal(state.tasks[0].branchName, "codex/demo-task-r1");
+  assert.equal(state.tasks[0].prUrl, "");
+  assert.equal(state.tasks[0].candidateId, "");
+  assert.equal(state.tasks[0].qaBundleId, "");
+  assert.equal(state.tasks[0].reviewerThreadId, "");
+  assert.deepEqual(state.tasks[0].reviewerThreadIds, {});
+  assert.equal(state.tasks[0].remediationHandoff.status, "open");
+  assert.equal(state.runs[0].preflightBaseCommit, "b".repeat(40));
+  assert.equal(state.reviews[0].invalidationReason, "stale_pull_request");
+  assert.equal(state.candidates[0].status, "invalidated");
+  assert.equal(state.events[0].type, "stale_pull_request_remediated");
+});
+
+test("stale linked PR remediation fails closed when the task binding changed", () => {
+  const run = builderRun({ status: "running" });
+  const state = {
+    tasks: [{ id: run.taskId, branchName: run.branchName, prUrl: "https://github.com/example/repo/pull/99" }],
+    runs: [run], reviews: [], candidates: [], events: [],
+  };
+  assert.throws(() => remediateStaleLinkedPrInState(state, run, {
+    expectedPrUrl: run.prUrl,
+    expectedBranch: run.branchName,
+    newBranch: "codex/demo-task-r1",
+    defaultBranch: "main",
+    baseSha: "b".repeat(40),
+  }), /compare-and-set binding/);
 });
 
 test("reviewer runs are not blocked by closed PR branch reuse checks", () => {

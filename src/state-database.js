@@ -3062,7 +3062,7 @@ export async function claimFailureContainmentPaidAttempt(input = {}) {
   }
 }
 
-async function mutateFailureIncident(input, transition) {
+async function mutateFailureIncident(input, transition, options = {}) {
   const db = await ensureStateDatabase();
   const authority = failureClaimAuthority(input);
   db.exec("BEGIN IMMEDIATE");
@@ -3074,8 +3074,13 @@ async function mutateFailureIncident(input, transition) {
       authority.fingerprint.value.taskId,
       authority.fingerprint.digest,
     ));
-    if (!previous) throw new Error("Failure incident does not exist.");
-    const current = transition(previous, authority.evidence);
+    const initial = previous || (options.createIfMissing ? createFailureIncident({
+      fingerprint: authority.fingerprint,
+      evidence: authority.evidence,
+      now: input.now,
+    }) : null);
+    if (!initial) throw new Error("Failure incident does not exist.");
+    const current = transition(initial, authority.evidence);
     supersedePriorFailureGeneration(db, previous, current);
     upsertFailureIncidentRow(db, current);
     db.exec("COMMIT");
@@ -3090,7 +3095,7 @@ export async function recordFailureContainmentActivity(input = {}) {
   return mutateFailureIncident(input, (incident, evidence) => recordFailureRecoveryActivity(incident, {
     ...input,
     evidence,
-  }));
+  }), { createIfMissing: true });
 }
 
 export async function scheduleFailureContainmentBackoff(input = {}) {
