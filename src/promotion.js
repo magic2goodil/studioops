@@ -1394,7 +1394,7 @@ export function planPromotions(state, input = {}) {
       return projectCandidates
         .map((candidate) => {
           const validationToolchain = validationToolchainForCandidate(candidate);
-          const validationPolicyDigest = promotionValidationPolicyDigest({
+          const plannedValidationPolicyDigest = promotionValidationPolicyDigest({
             commands: validationCommands,
             timeoutMs: validationTimeoutMs,
             environmentPolicyVersion: promotionValidationEnvironmentPolicyVersion(validationToolchain),
@@ -1403,6 +1403,13 @@ export function planPromotions(state, input = {}) {
             validationStrategy: "disposable_full_clone",
             networkPolicy: "deny_all",
           });
+          const receiptPolicyDigest = candidate.status === "release_candidate_ready"
+            ? String(candidate.promotionValidationRecoveryReceipt?.policyDigest || "")
+            : "";
+          const validationPolicyDigest = receiptPolicyDigest
+            && validPromotionRecoveryReceipt(candidate, receiptPolicyDigest)
+            ? receiptPolicyDigest
+            : plannedValidationPolicyDigest;
           return { candidate, validationToolchain, validationPolicyDigest };
         })
         .filter(({ candidate, validationPolicyDigest }) => (
@@ -1512,6 +1519,15 @@ export function planPromotions(state, input = {}) {
 function authoritativePromotionPolicyDigest(state, projectPlan) {
   const project = (state.projects || []).find((item) => item.id === projectPlan.projectId);
   if (!project) throw new Error(`Promotion project ${projectPlan.projectId} no longer exists.`);
+  const receiptPolicyDigest = projectPlan.mode === "reconcile"
+    ? String(projectPlan.candidate?.promotionValidationRecoveryReceipt?.policyDigest || "")
+    : "";
+  if (
+    receiptPolicyDigest
+    && validPromotionRecoveryReceipt(projectPlan.candidate, receiptPolicyDigest)
+  ) {
+    return receiptPolicyDigest;
+  }
   const projectPolicy = promotionProjectPolicyBinding(project);
   const projectPolicyDigest = contentDigest(JSON.stringify(projectPolicy));
   return promotionValidationPolicyDigest({
