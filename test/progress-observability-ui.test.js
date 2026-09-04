@@ -21,6 +21,7 @@ test("project board exposes accessible progress loading retry and degraded contr
 
 test("task detail reports one exact containment reason and backoff-only retry time", () => {
   assert.match(app, /function renderContainmentPanel\(task\)/);
+  assert.match(app, /function renderTaskContainment\(\)/);
   assert.match(app, /waiting\.reasonCode/);
   assert.match(app, /waiting\.nextAction/);
   assert.match(app, /waiting\.retryAt/);

@@ -436,7 +436,7 @@ async function loadProgress() {
     state.progress = { status: "error", report: null, error: error.message };
   }
   renderProgressBoard();
-  if (state.selectedTaskId) renderDetail().catch(() => {});
+  renderTaskContainment();
 }
 
 function projectFor(task) {
@@ -527,6 +527,12 @@ function renderContainmentPanel(task) {
       <dl><div><dt>Next action</dt><dd>${escapeHtml(waiting.nextAction)}</dd></div>${waiting.retryAt ? `<div><dt>Retry after</dt><dd><time datetime="${escapeHtml(waiting.retryAt)}">${escapeHtml(new Date(waiting.retryAt).toLocaleString())}</time></dd></div>` : ""}</dl>
     </section>
   `;
+}
+
+function renderTaskContainment() {
+  const container = document.querySelector("#taskContainment");
+  const task = taskById(state.selectedTaskId);
+  if (container && task) container.innerHTML = renderContainmentPanel(task);
 }
 
 function notificationStatusText(notification) {
@@ -1250,7 +1256,7 @@ async function renderDetail() {
     </div>
     ${renderRemediationPanel(fullTask)}
     ${renderReviewPanel(fullTask, project)}
-    ${renderContainmentPanel(fullTask)}
+    <div id="taskContainment">${renderContainmentPanel(fullTask)}</div>
     <div class="detail-grid ${isFullPage ? "detail-grid-full" : ""}">
       <section class="detail-section">
         <h3>Description</h3>
@@ -1466,7 +1472,7 @@ taskBoard.addEventListener("click", (event) => {
 taskDetail.addEventListener("click", async (event) => {
   if (event.target.closest("[data-retry-progress]")) {
     state.progress = { status: "loading", report: null, error: "" };
-    renderDetail().catch(() => {});
+    renderTaskContainment();
     await loadProgress();
     return;
   }

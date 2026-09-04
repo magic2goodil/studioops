@@ -3146,7 +3146,10 @@ export async function readFailureIncidentPage(input = {}) {
   const where = [];
   const parameters = [];
   const taskIds = [...new Set((input.taskIds || []).map(String).filter(Boolean))].slice(0, 500);
-  if (taskIds.length) {
+  if (input.projectId) {
+    where.push("EXISTS (SELECT 1 FROM tasks AS scoped_task WHERE scoped_task.id = failure_incidents.task_id AND scoped_task.project_id = ?)");
+    parameters.push(String(input.projectId));
+  } else if (taskIds.length) {
     where.push(`task_id IN (${taskIds.map(() => "?").join(", ")})`);
     parameters.push(...taskIds);
   } else if (input.requireTaskScope !== false) {
@@ -3186,7 +3189,10 @@ export async function readFailureIncidentTotals(input = {}) {
   const where = [];
   const parameters = [];
   const taskIds = [...new Set((input.taskIds || []).map(String).filter(Boolean))].slice(0, 500);
-  if (taskIds.length) {
+  if (input.projectId) {
+    where.push("EXISTS (SELECT 1 FROM tasks AS scoped_task WHERE scoped_task.id = failure_incidents.task_id AND scoped_task.project_id = ?)");
+    parameters.push(String(input.projectId));
+  } else if (taskIds.length) {
     where.push(`task_id IN (${taskIds.map(() => "?").join(", ")})`);
     parameters.push(...taskIds);
   } else if (input.requireTaskScope !== false) {

@@ -286,26 +286,35 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/automation/progress") {
-    const state = await readState();
-    const window = normalizeProgressWindow(url.searchParams.get("window"));
-    const project = resolveProgressProject(state, url.searchParams.get("project"));
-    const taskIds = (state.tasks || []).filter((task) => !project || task.projectId === project.id).map((task) => task.id);
-    const cursor = decodeProgressCursor(url.searchParams.get("cursor"));
-    const requestedLimit = Number(url.searchParams.get("limit") || 100);
-    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
-      const error = new Error("Progress incident limit must be an integer from 1 through 100.");
-      error.code = "PROGRESS_LIMIT_INVALID";
-      error.status = 400;
-      throw error;
+    try {
+      const state = await readState();
+      const window = normalizeProgressWindow(url.searchParams.get("window"));
+      const project = resolveProgressProject(state, url.searchParams.get("project"));
+      const taskIds = project ? [] : (state.tasks || []).map((task) => task.id);
+      const cursor = decodeProgressCursor(url.searchParams.get("cursor"));
+      const requestedLimit = Number(url.searchParams.get("limit") || 100);
+      if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+        const error = new Error("Progress incident limit must be an integer from 1 through 100.");
+        error.code = "PROGRESS_LIMIT_INVALID";
+        error.status = 400;
+        throw error;
+      }
+      const nowMs = Date.now();
+      const updatedAfter = new Date(nowMs - ({ "1h": 1, "24h": 24, "7d": 168 }[window] * 3_600_000)).toISOString();
+      const scope = project ? { projectId: project.id } : { taskIds };
+      const [page, incidentTotals] = await Promise.all([
+        readFailureIncidentPage({ ...scope, cursor, limit: requestedLimit }),
+        readFailureIncidentTotals({ ...scope, updatedAfter }),
+      ]);
+      sendJson(res, 200, buildProgressReport(state, { ...page, incidentTotals }, { window, project, nowMs }));
+      return;
+    } catch (error) {
+      if (String(error.code || "").startsWith("PROGRESS_")) throw error;
+      const publicError = new Error("Progress diagnostics are temporarily unavailable.");
+      publicError.code = "PROGRESS_READ_UNAVAILABLE";
+      publicError.status = 503;
+      throw publicError;
     }
-    const nowMs = Date.now();
-    const updatedAfter = new Date(nowMs - ({ "1h": 1, "24h": 24, "7d": 168 }[window] * 3_600_000)).toISOString();
-    const [page, incidentTotals] = await Promise.all([
-      readFailureIncidentPage({ taskIds, cursor, limit: requestedLimit }),
-      readFailureIncidentTotals({ taskIds, updatedAfter }),
-    ]);
-    sendJson(res, 200, buildProgressReport(state, { ...page, incidentTotals }, { window, project, nowMs }));
-    return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/product") {

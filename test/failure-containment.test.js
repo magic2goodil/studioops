@@ -285,8 +285,8 @@ test("SQLite migration backfills legacy circuits and indexed incident queries av
     const pageOutput = await runDatabaseScript(root, `
       import { readFailureIncidentPage, readFailureIncidentTotals } from ${JSON.stringify(stateDatabaseModuleUrl)};
       console.log(JSON.stringify({
-        page: await readFailureIncidentPage({ taskIds: ["task_1"], limit: 1 }),
-        totals: await readFailureIncidentTotals({ taskIds: ["task_1"], updatedAfter: "2026-09-04T00:00:00.000Z" })
+        page: await readFailureIncidentPage({ projectId: "project_1", limit: 1 }),
+        totals: await readFailureIncidentTotals({ projectId: "project_1", updatedAfter: "2026-09-04T00:00:00.000Z" })
       }));
     `);
     const { page, totals } = JSON.parse(pageOutput.stdout.trim());
