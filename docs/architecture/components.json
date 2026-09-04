@@ -60,14 +60,14 @@
       "owner": "devops-runtime",
       "aliases": ["package scripts", "aggregate validation", "repository composition"],
       "capabilities": ["stable repository validation entry point"],
-      "paths": ["package.json"],
+      "paths": ["package.json", "scripts/run-tests.js", "scripts/test-environment.js", "test/test-environment.test.js"],
       "workflows": ["validation composition"],
       "publicContracts": ["npm run check aggregate contract"],
       "tests": [
         { "command": "npm run check", "layer": "composition" }
       ],
       "reviewOwners": ["backend-reviewer", "lead-reviewer"],
-      "fullRegressionPaths": ["package.json"],
+      "fullRegressionPaths": ["package.json", "scripts/run-tests.js", "scripts/test-environment.js"],
       "policyAuthorities": ["aggregate validation composition"],
       "dependsOn": ["component-impact-planning"],
       "shared": true,
@@ -99,7 +99,7 @@
     "workflow-state": {
       "owner": "backend-workflow-state",
       "aliases": ["task state", "SQLite state", "lifecycle"],
-      "paths": ["src/store.js", "src/state-database.js", "src/lifecycle-policy.js", "test/state-database.test.js", "test/resilience.test.js"],
+      "paths": ["src/store.js", "src/state-database.js", "src/lifecycle-policy.js", "test/state-database.test.js", "test/delivery-policy-enforcement.test.js", "test/resilience.test.js"],
       "data": ["projects", "tasks", "runs", "reviews", "events", "candidates"],
       "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle"],
       "tests": [{ "command": "node --test test/state-database.test.js", "layer": "persistence" }],

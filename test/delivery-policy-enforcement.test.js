@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
+import os from "node:os";
 import test from "node:test";
-import {
+import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+
+const deliveryPolicyEnvironment = await createHermeticTestEnvironment({ tempParent: os.tmpdir() });
+Object.assign(process.env, deliveryPolicyEnvironment.env);
+test.after(async () => deliveryPolicyEnvironment.cleanup());
+
+const {
   addProject,
   addTask,
   applyLifecycleTransitionInState,
@@ -9,7 +16,7 @@ import {
   dependencyGraphErrors,
   evaluateTaskReadiness,
   updateTask,
-} from "../src/store.js";
+} = await import("../src/store.js");
 
 const SHA = "a".repeat(40);
 
