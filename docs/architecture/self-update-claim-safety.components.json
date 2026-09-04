@@ -10,6 +10,7 @@
     "self-update-claim-safety": {
       "paths": [
         "src/self-update.js",
+        "src/qa-integration.js",
         "test/self-update.test.js",
         "test/qa-integration.test.js",
         "docs/LOCAL_AUTOMATION.md",
@@ -21,7 +22,8 @@
         "defer restart for unexpired QA-integration claims",
         "defer restart for unexpired promotion claims",
         "bounded non-sensitive blocker projection",
-        "atomic claim recheck before self-update lease acquisition"
+        "atomic claim recheck before self-update lease acquisition",
+        "bounded local preview startup health polling"
       ],
       "ownedData": [],
       "dependsOn": ["workflow-state", "qa-release", "runtime-self-update"],
@@ -48,6 +50,7 @@
     "newFeaturePathSelection": "full_regression",
     "pathRules": [
       { "pattern": "src/self-update.js", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "src/qa-integration.js", "component": "self-update-claim-safety", "selection": "full_regression" },
       { "pattern": "test/self-update.test.js", "component": "self-update-claim-safety", "selection": "full_regression" },
       { "pattern": "test/qa-integration.test.js", "component": "self-update-claim-safety", "selection": "full_regression" },
       { "pattern": "docs/LOCAL_AUTOMATION.md", "component": "self-update-claim-safety", "selection": "full_regression" },

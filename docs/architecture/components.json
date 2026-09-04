@@ -156,7 +156,7 @@
       "aliases": ["QA", "candidate", "promotion", "release"],
       "paths": ["src/qa-integration.js", "src/promotion.js", "src/candidate-manifest.js", "src/candidate-repository.js", "src/owner-qa-packet.js", "test/qa-integration.test.js", "test/promotion.test.js", "test/qa-review-discoverability.test.js"],
       "services": ["immutable QA candidate", "release promotion"],
-      "publicContracts": ["exact-SHA QA evidence", "owner-gated release candidate"],
+      "publicContracts": ["exact-SHA QA evidence", "owner-gated release candidate", "bounded preview startup identity polling"],
       "workflows": ["QA integration", "owner approval", "production promotion"],
       "deploySurfaces": ["protected production branch"],
       "tests": [{ "command": "node --test test/qa-integration.test.js test/promotion.test.js", "layer": "integration-release" }],

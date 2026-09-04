@@ -1597,21 +1597,25 @@ test("post-validation task and policy drift prevents every external mutation and
   }
 });
 
-test("successful QA integration freezes an immutable candidate at the healthy preview commit", localhostPreviewTest, async () => {
+test("successful QA integration waits through bounded preview startup before freezing the immutable candidate", localhostPreviewTest, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
   const previewPath = path.join(root, "preview");
   let attestsPreview = false;
+  let healthyPreviewRequests = 0;
   const healthServer = createServer(async (_request, response) => {
     try {
       const commitSha = await git(previewPath, ["rev-parse", "HEAD"]);
       const headers = {
         "content-type": "application/json",
       };
-      if (attestsPreview) headers["x-studioops-commit"] = commitSha;
+      healthyPreviewRequests += 1;
+      if (attestsPreview && healthyPreviewRequests >= 3) headers["x-studioops-commit"] = commitSha;
       response.writeHead(200, headers);
-      response.end(JSON.stringify(attestsPreview ? { ok: true, commitSha } : { ok: true }));
+      response.end(JSON.stringify(
+        attestsPreview && healthyPreviewRequests >= 3 ? { ok: true, commitSha } : { ok: true },
+      ));
     } catch {
       response.writeHead(503, { "content-type": "application/json" });
       response.end('{"ok":false}');
@@ -1713,7 +1717,8 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
       const report = await runQaIntegration({
         force: true,
         task: "task_1",
-        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))}
+        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))},
+        previewHealthRetryDelayMs: 10
       });
       console.log(JSON.stringify(report));
     `;
