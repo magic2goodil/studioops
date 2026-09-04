@@ -42,7 +42,10 @@
     "src/project-validation-sandbox.js",
     "src/qa-integration.js",
     "src/promotion.js",
-    "src/candidate-manifest.js"
+    "src/candidate-manifest.js",
+    "src/self-update.js",
+    "src/self-update-lease.js",
+    "src/runtime-install.js"
   ],
   "prohibitedDependencies": [
     { "from": "workflow-state", "to": "owner-console" },
@@ -144,10 +147,41 @@
       "shared": true,
       "rollback": "Stop promotion, preserve immutable candidates and approvals, and restore the previous release manager."
     },
+    "runtime-self-update": {
+      "owner": "devops-runtime",
+      "aliases": ["self update", "runtime install", "immutable runtime", "LaunchAgent restart"],
+      "capabilities": ["verified runtime publication", "bounded worker restart"],
+      "paths": ["src/self-update.js", "src/self-update-lease.js", "src/runtime-install.js", "test/self-update.test.js", "test/runtime-install.test.js"],
+      "services": ["self-update planner", "runtime installer", "maintenance lease"],
+      "publicContracts": ["clean fast-forward source update", "verified immutable runtime provenance"],
+      "workflows": ["StudioOps self-update", "runtime-only repair"],
+      "deploySurfaces": ["local immutable runtime", "managed LaunchAgents"],
+      "tests": [{ "command": "node --test test/self-update.test.js test/runtime-install.test.js", "layer": "runtime-release" }],
+      "reviewOwners": ["backend-reviewer", "lead-reviewer"],
+      "fullRegressionPaths": ["src/self-update.js", "src/self-update-lease.js", "src/runtime-install.js"],
+      "policyAuthorities": ["StudioOps runtime publication"],
+      "dependsOn": ["workflow-state"],
+      "shared": true,
+      "rollback": "Stop self-update and keep the last verified immutable runtime active while source state is repaired."
+    },
+    "plugin-interface": {
+      "owner": "developer-experience",
+      "aliases": ["StudioOps plugin", "Codex plugin", "plugin intake"],
+      "capabilities": ["structured Codex intake", "plugin packaging"],
+      "paths": ["plugins/studioops", "scripts/package-studioops-plugin.js", "test/plugin-submission.test.js", "test/studioops-plugin-client.test.js"],
+      "services": ["local StudioOps client", "plugin packager"],
+      "publicContracts": ["file-backed shell-safe intake", "public plugin manifest"],
+      "workflows": ["Codex-to-StudioOps intake", "plugin packaging"],
+      "deploySurfaces": ["local Codex plugin cache"],
+      "tests": [{ "command": "node --test test/plugin-submission.test.js test/studioops-plugin-client.test.js", "layer": "plugin-contract" }],
+      "reviewOwners": ["backend-reviewer", "lead-reviewer"],
+      "dependsOn": ["owner-console"],
+      "rollback": "Retain the prior packaged plugin and use the loopback API or board for intake."
+    },
     "owner-console": {
       "owner": "frontend-owner-experience",
       "aliases": ["board", "owner inbox", "notifications", "dashboard"],
-      "paths": ["src/server.js", "src/owner-inbox.js", "src/notifier.js", "public/app.js", "public/index.html", "public/styles.css", "test/owner-inbox-ui.test.js", "test/notifier.test.js"],
+      "paths": ["src/server.js", "src/owner-inbox.js", "src/notifier.js", "public/app.js", "public/index.html", "public/styles.css", "test/owner-inbox-ui.test.js", "test/notifier.test.js", "test/server-request-security.test.js"],
       "routes": ["loopback owner API", "mission-control board"],
       "ui": ["owner inbox", "task detail", "project status"],
       "services": ["local notifier"],

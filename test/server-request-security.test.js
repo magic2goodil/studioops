@@ -10,6 +10,7 @@ import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 const serverTestEnvironment = await createHermeticTestEnvironment();
 Object.assign(process.env, serverTestEnvironment.env);
 test.after(async () => serverTestEnvironment.cleanup());
+const OUTER_VALIDATION_SANDBOX = Boolean(process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX);
 
 const { createStudioOpsServer, isStudioOpsServerEntryPoint, startStudioOpsServer } = await import(`../src/server.js?request-security=${Date.now()}`);
 
@@ -69,7 +70,11 @@ async function directHttpRequest(target, options = {}) {
   });
 }
 
-test("local API mutations reject browser cross-origin requests and require JSON", async (t) => {
+test("local API mutations reject browser cross-origin requests and require JSON", {
+  skip: OUTER_VALIDATION_SANDBOX
+    ? "The outer release sandbox intentionally prohibits every loopback listener; this suite runs in builder validation."
+    : false,
+}, async (t) => {
   await t.test("non-loopback listen configurations fail before opening a server", () => {
     for (const host of ["0.0.0.0", "::", "192.168.1.10", "LOCALHOST"]) {
       assert.throws(
