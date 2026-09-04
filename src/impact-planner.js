@@ -2,7 +2,13 @@ import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { sha256Digest, loadProjectComponentImpactMap, normalizeRepositoryIdentity, projectRepositoryIdentity } from "./component-impact-map.js";
+import {
+  sha256Digest,
+  loadProjectComponentImpactMap,
+  loadProjectComponentImpactMapAtCommit,
+  normalizeRepositoryIdentity,
+  projectRepositoryIdentity,
+} from "./component-impact-map.js";
 
 const FULL_REGRESSION_WORDS = [
   "authorization", "identity", "consent", "privacy", "entitlement", "safety",
@@ -219,8 +225,11 @@ function fallbackPlan(project, task, loaded, sourceCommit) {
 export function resolveProjectImpactPlan(input = {}) {
   const project = input.project || {};
   const task = input.task || {};
-  const loaded = input.loadedMap || loadProjectComponentImpactMap(project, { repoRoot: input.repoRoot });
   const candidate = task.candidateIdentity || {};
+  const candidateCommit = exactSha(candidate.commitSha);
+  const loaded = input.loadedMap || (candidateCommit
+    ? loadProjectComponentImpactMapAtCommit(project, candidateCommit, { repoRoot: input.repoRoot })
+    : loadProjectComponentImpactMap(project, { repoRoot: input.repoRoot }));
   const sourceCommit = input.sourceCommit || candidate.commitSha || task.reviewSubjectSha || candidate.baseSha || "";
   if (!loaded.manifest) return fallbackPlan(project, task, loaded, sourceCommit);
   const text = taskSearchText(task);
@@ -346,6 +355,7 @@ export function formatImpactPlanForPrompt(plan = {}) {
 - Project binding: ${plan.project?.id || "(missing)"}/${plan.project?.key || "(missing)"} @ ${plan.project?.repository || "(local identity missing)"}
 - Source commit binding: ${plan.sourceCommit || "assigned during workspace preflight"}
 - Component manifest: ${plan.manifest?.path || "(missing)"} (${plan.manifest?.digest || "no digest"})
+- Manifest digest contract: SHA-256 of canonical JSON after schema validation and normalization; this is intentionally not the raw file-byte hash.
 - Selected components: ${components.join(", ") || "(unclassified)"}
 - Allowed file scope: ${scope.join(", ") || "(none; remap before editing)"}
 - Targeted implementation tests: ${tests.join(" && ") || "(none; use final aggregate only)"}

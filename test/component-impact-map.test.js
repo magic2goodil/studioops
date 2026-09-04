@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   ComponentMapIsolationError,
   loadProjectComponentImpactMap,
+  loadProjectComponentImpactMapAtCommit,
   sha256Digest,
   validateComponentImpactMap,
 } from "../src/component-impact-map.js";
@@ -93,6 +94,44 @@ test("repository identity prevents cross-project lookup even with identical comp
   }
 });
 
+test("candidate remapping reads the exact commit without crossing repository authority", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-candidate-map-"));
+  const project = {
+    id: "project_1",
+    key: "dollos",
+    repoUrl: "https://github.com/example/dollos",
+    repoPath: root,
+  };
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    execFileSync("git", ["config", "user.email", "studioops@example.invalid"], { cwd: root });
+    execFileSync("git", ["config", "user.name", "StudioOps Test"], { cwd: root });
+    execFileSync("git", ["remote", "add", "origin", `${project.repoUrl}.git`], { cwd: root });
+    await writeManifest(root, manifest(project.key, project.repoUrl, "src/original-catalog.js"));
+    execFileSync("git", ["add", "."], { cwd: root });
+    execFileSync("git", ["commit", "-qm", "base map"], { cwd: root });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+    await writeManifest(root, manifest(project.key, project.repoUrl, "src/candidate-catalog.js"));
+    execFileSync("git", ["add", "."], { cwd: root });
+    execFileSync("git", ["commit", "-qm", "candidate map"], { cwd: root });
+    const candidateSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+    execFileSync("git", ["checkout", "--detach", "-q", baseSha], { cwd: root });
+
+    const checkedOut = loadProjectComponentImpactMap(project);
+    const candidate = loadProjectComponentImpactMapAtCommit(project, candidateSha);
+    assert.deepEqual(checkedOut.manifest.components.catalog.paths[0], "src/original-catalog.js");
+    assert.deepEqual(candidate.manifest.components.catalog.paths[0], "src/candidate-catalog.js");
+    assert.notEqual(candidate.digest, checkedOut.digest);
+    assert.equal(candidate.sourceCommit, candidateSha);
+    assert.throws(
+      () => loadProjectComponentImpactMapAtCommit({ ...project, repoUrl: "https://github.com/example/team-robison" }, candidateSha),
+      ComponentMapIsolationError,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("planner emits a narrow context packet and targeted tests for mapped work", () => {
   const project = { id: "project_1", key: "dollos", repoUrl: "https://github.com/example/dollos" };
   const normalized = validateComponentImpactMap(manifest("dollos", project.repoUrl));
@@ -111,6 +150,7 @@ test("planner emits a narrow context packet and targeted tests for mapped work",
   assert.deepEqual(plan.targetedTests, ["node --test test/catalog.test.js"]);
   assertImpactPlanProjectBinding(plan, project);
   assert.match(formatImpactPlanForPrompt(plan), /SCOPED CONTEXT PACKET/);
+  assert.match(formatImpactPlanForPrompt(plan), /not the raw file-byte hash/);
   assert.match(formatImpactPlanForPrompt(plan), /Do not list or broadly search/);
 });
 
