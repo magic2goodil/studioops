@@ -19,7 +19,6 @@ test("validation transcripts are redacted and bounded by outcome", () => {
   assert.ok(boundedValidationTranscript("p".repeat(20_000), "passed").length <= MAX_VALIDATION_PASS_SUMMARY_CHARS);
   assert.ok(boundedValidationTranscript("f".repeat(20_000), "failed").length <= MAX_VALIDATION_FAILURE_EXCERPT_CHARS);
 });
-
 test("validation helper writes exact, private, redacted evidence artifacts", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-validation-evidence-"));
   try {
@@ -56,4 +55,3 @@ test("validation helper writes exact, private, redacted evidence artifacts", asy
     await rm(root, { recursive: true, force: true });
   }
 });
-
