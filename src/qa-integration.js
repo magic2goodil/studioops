@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -23,15 +23,35 @@ import {
   mutateState,
   readState,
 } from "./store.js";
-import { buildOwnerQaPacket, candidateCompletenessGate } from "./owner-inbox.js";
+import { buildOwnerQaPacket, candidateCompletenessGate } from "./owner-qa-packet.js";
 import { enqueueOwnerQaNotificationsInState } from "./notifier.js";
 import {
+  canonicalJson,
   createCandidateEnvelope,
   invalidateCandidate,
   normalizeGitSha,
 } from "./candidate-manifest.js";
-import { verifyCandidateRepositoryState } from "./candidate-repository.js";
+import {
+  createCandidateRepositoryTestGitRunner,
+  equivalentGitHubOriginSlug,
+  verifyCandidateRepositoryState,
+} from "./candidate-repository.js";
 import { defaultStudioOpsWorkspaceRoot } from "./runtime-paths.js";
+import {
+  cleanupProjectValidationSandbox,
+  DEFAULT_PROJECT_VALIDATION_PATH,
+  prepareProjectValidationSandbox,
+  PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+  runProjectValidationCommand,
+  verifyProjectValidationSandbox,
+} from "./project-validation-sandbox.js";
+import { redactPromotionValidationText } from "./promotion-validation-evidence.js";
+import {
+  assertCurrentIsolatedTestAuthority,
+  consumeIsolatedTestAuthority,
+  isolatedTestAdapterRun,
+  registerIsolatedTestAdapter,
+} from "./test-authority-realm.js";
 
 const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 120_000;
@@ -39,12 +59,56 @@ const VALIDATION_TIMEOUT_MS = 10 * 60_000;
 const MAX_OUTPUT_CHARS = 4_000;
 const WORKSPACE_COMMAND_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_QA_RETRY_DELAY_MS = 15 * 60_000;
+const QA_ATTEMPT_TTL_MS = 30 * 60_000;
 const DEFAULT_QA_WORKSPACE_ROOT = defaultStudioOpsWorkspaceRoot("qa");
 const DEFAULT_QA_INTEGRATION_PATH = [
   "/opt/homebrew/bin",
   "/usr/local/bin",
-  process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
 ].join(":");
+const TRUSTED_GIT_EXECUTABLE = "/usr/bin/git";
+const TRUSTED_GIT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+const QA_OUTER_TEST_VALIDATION_PATH_ROOTS = [
+  "/System",
+  "/bin",
+  "/sbin",
+  "/usr/bin",
+  "/usr/sbin",
+  "/usr/lib",
+  "/usr/libexec",
+  "/usr/share",
+  "/usr/local/bin",
+  "/usr/local/sbin",
+  "/usr/local/lib",
+  "/usr/local/share",
+  "/usr/local/Cellar",
+  "/usr/local/opt",
+  "/opt/homebrew/bin",
+  "/opt/homebrew/sbin",
+  "/opt/homebrew/lib",
+  "/opt/homebrew/share",
+  "/opt/homebrew/Cellar",
+  "/opt/homebrew/opt",
+  "/Applications/Xcode.app/Contents",
+  "/Library/Developer/CommandLineTools",
+  "/Library/Apple/usr/libexec/oah",
+  "/private/var/db/timezone",
+];
+const QA_ATTEMPT_CLAIM_SCHEMA_VERSION = "studioops.qa-integration-attempt-claim.v1";
+
+let trustedGitValidation = null;
+const qaIntegrationTestAuthority = consumeIsolatedTestAuthority((capability) => capability);
+
+function requireQaIntegrationTestAuthority() {
+  if (!qaIntegrationTestAuthority) {
+    throw new Error("QA integration test authority is unavailable.");
+  }
+  assertCurrentIsolatedTestAuthority(qaIntegrationTestAuthority);
+  return qaIntegrationTestAuthority;
+}
 
 function childEnv(options = {}) {
   return {
@@ -185,7 +249,7 @@ function integrationCandidateBranchName(projectPlan, commit) {
 
 function parseJsonOutput(result, label) {
   try {
-    return JSON.parse(String(result.output || "").trim() || "null");
+    return JSON.parse(String(result.stdout || result.output || "").trim() || "null");
   } catch {
     throw new Error(`${label} returned invalid JSON: ${truncateOutput(result.output)}`);
   }
@@ -257,10 +321,32 @@ function integrationPrStatus(pr, checkState) {
   return "pr_waiting";
 }
 
+function exactIntegrationPrIdentity(pr, projectPlan, candidateBranch, repository) {
+  const number = Number(pr?.number || 0);
+  let parsed;
+  try {
+    parsed = new URL(String(pr?.url || ""));
+  } catch {
+    return false;
+  }
+  return Number.isSafeInteger(number)
+    && number > 0
+    && parsed.protocol === "https:"
+    && parsed.hostname.toLowerCase() === "github.com"
+    && parsed.pathname.replace(/\/$/, "").toLowerCase() === `/${repository}/pull/${number}`.toLowerCase()
+    && String(pr?.baseRefName || "") === String(projectPlan.integrationBranch || "")
+    && String(pr?.headRefName || "") === String(candidateBranch || "")
+    && String(pr?.headRepository?.nameWithOwner || "").toLowerCase() === repository.toLowerCase();
+}
+
 async function findIntegrationPr(repoPath, projectPlan, candidateBranch, options = {}) {
+  const repository = githubRepositorySlug(projectPlan.repoUrl);
+  if (!repository) throw qaRemotePolicyError("QA integration requires an exact GitHub owner/repository URL for PR inspection.");
   const result = await runCommand("gh", [
     "pr",
     "list",
+    "--repo",
+    repository,
     "--base",
     projectPlan.integrationBranch,
     "--head",
@@ -270,7 +356,7 @@ async function findIntegrationPr(repoPath, projectPlan, candidateBranch, options
     "--limit",
     "10",
     "--json",
-    "number,url,state,headRefName,headRefOid,baseRefName,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit",
+    "number,url,state,headRefName,headRefOid,headRepository,baseRefName,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit",
   ], {
     cwd: repoPath,
     env: options.env,
@@ -283,19 +369,23 @@ async function findIntegrationPr(repoPath, projectPlan, candidateBranch, options
   }
   const prs = parseJsonOutput(result, "gh pr list");
   if (!Array.isArray(prs)) throw new Error("gh pr list did not return a pull request list.");
-  return prs.sort((a, b) => {
+  return prs.filter((pr) => exactIntegrationPrIdentity(pr, projectPlan, candidateBranch, repository)).sort((a, b) => {
     const rank = (pr) => ({ OPEN: 0, MERGED: 1, CLOSED: 2 }[String(pr.state || "").toUpperCase()] ?? 3);
     return rank(a) - rank(b) || Number(b.number || 0) - Number(a.number || 0);
   })[0] || null;
 }
 
 async function createIntegrationPr(repoPath, projectPlan, candidateBranch, commit, options = {}) {
+  const repository = githubRepositorySlug(projectPlan.repoUrl);
+  await guardQaExternalMutation(repoPath, projectPlan, options, "create_integration_pr");
   const taskList = projectPlan.tasks
     .map((task) => `- ${task.id}: ${task.title}${task.prUrl ? ` (${task.prUrl})` : ""} at ${task.expectedHeadSha}`)
     .join("\n");
   const result = await runCommand("gh", [
     "pr",
     "create",
+    "--repo",
+    repository,
     "--base",
     projectPlan.integrationBranch,
     "--head",
@@ -323,6 +413,13 @@ async function ensureIntegrationPr(repoPath, projectPlan, candidateBranch, commi
     pr = await findIntegrationPr(repoPath, projectPlan, candidateBranch, options);
   }
   if (!pr) throw new Error("The integration pull request could not be found after creation.");
+  if (String(pr.headRefOid || "").toLowerCase() !== String(commit || "").toLowerCase()) {
+    const error = new Error(
+      `Integration PR head drift: expected ${commit}, observed ${pr.headRefOid || "missing"}. StudioOps will not mutate this pull request.`,
+    );
+    error.code = "QA_CANDIDATE_DRIFT";
+    throw error;
+  }
   const checkState = integrationPrCheckState(pr);
   return {
     ...pr,
@@ -340,10 +437,20 @@ async function closeIntegrationPr(repoPath, projectPlan, pr, reason, options = {
       output: "The obsolete integration PR has no valid number, so StudioOps could not close it safely.",
     };
   }
+  const repository = githubRepositorySlug(projectPlan.repoUrl);
+  if (!exactIntegrationPrIdentity(pr, projectPlan, pr.headRefName, repository)) {
+    return {
+      ok: false,
+      output: "The obsolete integration PR identity does not exactly match the configured GitHub repository.",
+    };
+  }
+  await guardQaExternalMutation(repoPath, projectPlan, options, "close_integration_pr");
   const close = await runCommand("gh", [
     "pr",
     "close",
     String(prNumber),
+    "--repo",
+    repository,
     "--comment",
     reason,
   ], {
@@ -437,10 +544,35 @@ function syncDefaultBranchEnabled(projectPlan) {
 }
 
 function isGitHubRepoUrl(value) {
+  return Boolean(githubRepositorySlug(value));
+}
+
+function githubRepositorySlug(value) {
   const raw = String(value || "").trim();
-  return /^https:\/\/github\.com\//i.test(raw)
-    || /^git@github\.com:/i.test(raw)
-    || /^ssh:\/\/git@github\.com\//i.test(raw);
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return "";
+  }
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (
+    parsed.protocol !== "https:"
+    || parsed.hostname !== "github.com"
+    || parsed.port
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+    || segments.length !== 2
+    || segments.some((segment) => !/^[A-Za-z0-9_.-]+$/.test(segment))
+    || segments.some((segment) => segment === "." || segment === "..")
+    || segments[1].toLowerCase().endsWith(".git")
+  ) {
+    return "";
+  }
+  const canonical = `https://github.com/${segments[0]}/${segments[1]}`;
+  return raw === canonical ? `${segments[0]}/${segments[1]}` : "";
 }
 
 function qaIntegrationAuthEnabled(projectPlan, input = {}) {
@@ -476,7 +608,11 @@ async function runCommand(command, args, options = {}) {
   try {
     const result = await execFileAsync(command, args, {
       cwd: options.cwd,
-      env: options.projectCommand ? projectCommandEnv(options) : childEnv(options),
+      env: options.replaceEnv
+        ? { ...(options.env || {}) }
+        : options.projectCommand
+          ? projectCommandEnv(options)
+          : childEnv(options),
       timeout: Number(options.timeoutMs || COMMAND_TIMEOUT_MS),
       maxBuffer: 10 * 1024 * 1024,
     });
@@ -507,11 +643,484 @@ async function runCommand(command, args, options = {}) {
   }
 }
 
+function trustedGitEnvironment(options = {}) {
+  const auth = options.gitAuthEnv || {};
+  const isolatedTestRoot = process.env.NODE_ENV === "test"
+    && process.env.STUDIOOPS_TEST_ISOLATION === "1"
+    && path.isAbsolute(String(process.env.STUDIOOPS_TEST_ROOT || ""))
+    ? String(process.env.STUDIOOPS_TEST_ROOT)
+    : "";
+  const env = {
+    PATH: TRUSTED_GIT_PATH,
+    HOME: "/",
+    TMPDIR: isolatedTestRoot || "/tmp",
+    LANG: "C",
+    LC_ALL: "C",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_DISCOVERY_ACROSS_FILESYSTEM: "0",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  if (path.isAbsolute(String(auth.GIT_ASKPASS || ""))) env.GIT_ASKPASS = String(auth.GIT_ASKPASS);
+  if (auth.MISSION_CONTROL_GITHUB_TOKEN) {
+    env.MISSION_CONTROL_GITHUB_TOKEN = String(auth.MISSION_CONTROL_GITHUB_TOKEN);
+  }
+  if (auth.MISSION_CONTROL_GIT_USERNAME) {
+    env.MISSION_CONTROL_GIT_USERNAME = String(auth.MISSION_CONTROL_GIT_USERNAME);
+  }
+  return env;
+}
+
+async function validateTrustedGitExecutable() {
+  if (!trustedGitValidation) {
+    trustedGitValidation = (async () => {
+      const resolved = await realpath(TRUSTED_GIT_EXECUTABLE).catch(() => "");
+      if (resolved !== TRUSTED_GIT_EXECUTABLE) {
+        throw new Error("QA integration requires the system /usr/bin/git executable.");
+      }
+      const info = await lstat(resolved);
+      if (!info.isFile() || info.uid !== 0 || (info.mode & 0o022) !== 0) {
+        throw new Error("The QA integration Git executable has unsafe ownership or permissions.");
+      }
+      return resolved;
+    })().catch((error) => {
+      trustedGitValidation = null;
+      throw error;
+    });
+  }
+  return trustedGitValidation;
+}
+
+function testGitRunner(options = {}) {
+  const adapter = options.testGitRunner;
+  if (!adapter) return null;
+  const runner = isolatedTestAdapterRun(adapter, "candidate-repository-git");
+  if (!runner) {
+    throw new Error("QA integration test Git runner was rejected outside its isolated test capability.");
+  }
+  return runner;
+}
+
+export function createQaTestGitRunner(remotePath, repositoryUrl = "https://github.com/example/demo") {
+  requireQaIntegrationTestAuthority();
+  return createCandidateRepositoryTestGitRunner(remotePath, repositoryUrl);
+}
+
+function withQaTestAdapters(input = {}) {
+  if (process.env.NODE_ENV !== "test" || process.env.STUDIOOPS_TEST_ISOLATION !== "1") return input;
+  const adapted = { ...input };
+  const remotePath = String(process.env.STUDIOOPS_QA_TEST_REMOTE_PATH || "");
+  if (!adapted.testGitRunner && remotePath) {
+    adapted.testGitRunner = createQaTestGitRunner(
+      remotePath,
+      String(process.env.STUDIOOPS_QA_TEST_REPOSITORY_URL || "https://github.com/example/demo"),
+    );
+  }
+  if (remotePath && adapted.githubAppAuth === undefined) adapted.githubAppAuth = false;
+  if (
+    !adapted.projectValidationSandboxAdapter
+    && process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX === PROJECT_VALIDATION_SANDBOX_POLICY_ID
+  ) {
+    adapted.projectValidationSandboxAdapter = createQaOuterSandboxTestAdapter();
+  }
+  return adapted;
+}
+
 function git(repoPath, args, options = {}) {
-  return runCommand("git", args, {
-    cwd: repoPath,
-    ...options,
+  const trustedArgs = [
+    "--no-replace-objects",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "core.askPass=",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "commit.gpgSign=false",
+    "-c",
+    "tag.gpgSign=false",
+    "-c",
+    "push.gpgSign=false",
+    ...args,
+  ];
+  const execute = async (effectiveArgs = trustedArgs) => {
+    await validateTrustedGitExecutable();
+    return runCommand(TRUSTED_GIT_EXECUTABLE, effectiveArgs, {
+      cwd: repoPath || "/",
+      timeoutMs: options.timeoutMs,
+      allowFailure: options.allowFailure,
+      secrets: options.secrets,
+      replaceEnv: true,
+      env: trustedGitEnvironment(options),
+    });
+  };
+  const runner = testGitRunner(options);
+  return runner
+    ? runner({ executable: TRUSTED_GIT_EXECUTABLE, repoPath, args: trustedArgs, execute })
+    : execute();
+}
+
+function qaGitOptions(options = {}, overrides = {}) {
+  return {
+    gitAuthEnv: options.gitAuthEnv,
+    testGitRunner: options.testGitRunner,
+    secrets: options.secrets,
+    ...overrides,
+  };
+}
+
+function qaRemotePolicyError(message) {
+  const error = new Error(message);
+  error.code = "QA_REMOTE_POLICY";
+  return error;
+}
+
+async function qaRemotePolicy(repoPath, projectPlan, options = {}) {
+  const localInspectionOptions = { ...options, gitAuthEnv: undefined };
+  const configuredUrl = String(projectPlan.repoUrl || "").trim();
+  const expectedRepository = githubRepositorySlug(configuredUrl).toLowerCase();
+  if (!expectedRepository) {
+    throw qaRemotePolicyError(
+      "QA integration requires a configured canonical GitHub repository URL before any workspace or remote side effect.",
+    );
+  }
+  const fetch = await git(
+    repoPath,
+    ["config", "--local", "--no-includes", "--get-all", "remote.origin.url"],
+    qaGitOptions(localInspectionOptions, { allowFailure: true }),
+  );
+  const push = await git(
+    repoPath,
+    ["config", "--local", "--no-includes", "--get-all", "remote.origin.pushurl"],
+    qaGitOptions(localInspectionOptions, { allowFailure: true }),
+  );
+  const localKeys = await git(
+    repoPath,
+    ["config", "--local", "--no-includes", "--name-only", "--list"],
+    qaGitOptions(localInspectionOptions, { allowFailure: true }),
+  );
+  if (!fetch.ok && Number(fetch.error?.code) !== 1) {
+    throw qaRemotePolicyError(
+      `QA integration could not safely inspect the origin fetch URL: ${truncateOutput(fetch.output)}`,
+    );
+  }
+  if (!push.ok && Number(push.error?.code) !== 1) {
+    throw qaRemotePolicyError(
+      `QA integration could not safely inspect the origin push URL: ${truncateOutput(push.output)}`,
+    );
+  }
+  if (!localKeys.ok) throw qaRemotePolicyError("QA integration could not safely inspect local Git configuration.");
+  const unsafeKey = localKeys.stdout.split("\n").map((item) => item.trim().toLowerCase()).find((key) => (
+    key.startsWith("include.")
+    || (key.startsWith("url.") && (key.endsWith(".insteadof") || key.endsWith(".pushinsteadof")))
+    || /^remote\.origin\.(?:mirror|proxy|uploadpack|receivepack|vcs)$/.test(key)
+    || key === "http.proxy"
+    || key.startsWith("http.")
+    || key.startsWith("https.")
+    || key.startsWith("credential.")
+    || key === "core.gitproxy"
+    || key === "core.sshcommand"
+    || key === "core.worktree"
+    || key === "core.askpass"
+    || key === "core.alternaterefscommand"
+    || key === "core.editor"
+    || key === "core.excludesfile"
+    || key === "core.hookspath"
+    || key === "core.pager"
+    || key.startsWith("filter.")
+    || key.startsWith("diff.")
+    || (key.startsWith("merge.") && key.endsWith(".driver"))
+    || key.startsWith("gpg.")
+    || key === "commit.gpgsign"
+    || key === "tag.gpgsign"
+    || key.startsWith("push.")
+    || key === "remote.origin.pushoption"
+  ));
+  if (unsafeKey) {
+    throw qaRemotePolicyError(`QA integration refuses unsafe local Git configuration key ${unsafeKey}.`);
+  }
+  const fetchUrls = fetch.ok ? fetch.stdout.split("\n").map((item) => item.trim()).filter(Boolean) : [];
+  const explicitPushUrls = push.ok ? push.stdout.split("\n").map((item) => item.trim()).filter(Boolean) : [];
+  if (fetchUrls.length !== 1) {
+    throw qaRemotePolicyError("QA integration requires exactly one configured origin fetch URL.");
+  }
+  if (explicitPushUrls.length > 1) {
+    throw qaRemotePolicyError("QA integration refuses an origin with multiple push URLs.");
+  }
+  const pushUrls = explicitPushUrls.length ? explicitPushUrls : fetchUrls;
+  for (const [label, url] of [["fetch", fetchUrls[0]], ["push", pushUrls[0]]]) {
+    if (equivalentGitHubOriginSlug(url) !== expectedRepository) {
+      throw qaRemotePolicyError(
+        `QA integration ${label} remote does not match configured repository ${expectedRepository}.`,
+      );
+    }
+  }
+  return {
+    repository: expectedRepository,
+    transportUrl: configuredUrl,
+  };
+}
+
+function validationSandboxAdapter(options = {}) {
+  const adapter = options.projectValidationSandboxAdapter;
+  if (!adapter) {
+    return {
+      prepare: prepareProjectValidationSandbox,
+      run: runProjectValidationCommand,
+      verify: verifyProjectValidationSandbox,
+      cleanup: cleanupProjectValidationSandbox,
+    };
+  }
+  const resolve = isolatedTestAdapterRun(adapter, "qa-outer-validation-sandbox");
+  const resolved = resolve ? resolve() : null;
+  if (
+    !resolved
+    || [resolved.prepare, resolved.run, resolved.verify, resolved.cleanup]
+      .some((item) => typeof item !== "function")
+  ) {
+    throw new Error("QA project-validation adapter was rejected outside its isolated test capability.");
+  }
+  return resolved;
+}
+
+function outerValidationEnvironment(homePath, validationPath) {
+  return {
+    PATH: validationPath,
+    HOME: homePath,
+    TMPDIR: path.join(homePath, "tmp"),
+    XDG_CONFIG_HOME: path.join(homePath, ".config"),
+    XDG_CACHE_HOME: path.join(homePath, ".cache"),
+    GH_CONFIG_DIR: path.join(homePath, ".config", "gh"),
+    npm_config_cache: path.join(homePath, ".npm-cache"),
+    npm_config_userconfig: path.join(homePath, ".npmrc"),
+    npm_config_globalconfig: path.join(homePath, ".npm-globalrc"),
+    CI: "1",
+    NO_COLOR: "1",
+    TERM: "dumb",
+    LANG: "C",
+    LC_ALL: "C",
+    OPENSSL_CONF: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+    STUDIOOPS_PROJECT_VALIDATION_SANDBOX: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+  };
+}
+
+async function assertSafeOuterTestValidationPath(validationPath, sourceRepoPath) {
+  const approvedRoots = await Promise.all(
+    QA_OUTER_TEST_VALIDATION_PATH_ROOTS.map((entry) => realpath(entry).catch(() => "")),
+  );
+  for (const entry of String(validationPath || "").split(":")) {
+    if (!path.isAbsolute(entry)) {
+      const error = new Error(`Unsafe validation PATH entry: ${entry || "<empty>"}.`);
+      error.code = "PROJECT_VALIDATION_INPUT_INVALID";
+      throw error;
+    }
+    const toolRoot = await realpath(entry).catch(() => "");
+    if (!toolRoot) {
+      const error = new Error(`Unsafe validation PATH entry: ${entry} does not resolve to an existing directory.`);
+      error.code = "PROJECT_VALIDATION_INPUT_INVALID";
+      throw error;
+    }
+    const toolRootInfo = await lstat(toolRoot);
+    const approved = approvedRoots.some((approvedRoot) => (
+      approvedRoot && pathContains(approvedRoot, toolRoot)
+    ));
+    if (
+      !toolRootInfo.isDirectory()
+      || pathContains(sourceRepoPath, toolRoot)
+      || pathContains(os.homedir(), toolRoot)
+      || !approved
+    ) {
+      const error = new Error(`Unsafe validation PATH entry: ${toolRoot}.`);
+      error.code = "PROJECT_VALIDATION_INPUT_INVALID";
+      throw error;
+    }
+  }
+}
+
+async function runOuterValidationCommand(sandbox, command, options = {}) {
+  try {
+    const result = await execFileAsync(
+      "/bin/bash",
+      ["--noprofile", "--norc", "-c", String(command || "")],
+      {
+        cwd: sandbox.repoPath,
+        env: sandbox.environment,
+        timeout: Number(options.timeoutMs || VALIDATION_TIMEOUT_MS),
+        maxBuffer: 16 * 1024 * 1024,
+      },
+    );
+    return {
+      ok: true,
+      code: 0,
+      stdout: result.stdout || "",
+      stderr: result.stderr || "",
+      output: `${result.stdout || ""}${result.stderr || ""}`.trim(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      code: Number.isInteger(error?.code) ? error.code : null,
+      signal: error?.signal || "",
+      stdout: error?.stdout || "",
+      stderr: error?.stderr || "",
+      output: `${error?.stdout || ""}${error?.stderr || error?.message || ""}`.trim(),
+    };
+  }
+}
+
+/**
+ * Release tests execute inside one verified outer Seatbelt sandbox. This
+ * capability adapter preserves the disposable exact-SHA checkout and
+ * synthetic environment without attempting unsupported nested sandbox-exec.
+ */
+export function createQaOuterSandboxTestAdapter() {
+  const testAuthority = requireQaIntegrationTestAuthority();
+  if (
+    process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX !== PROJECT_VALIDATION_SANDBOX_POLICY_ID
+  ) {
+    throw new Error("The QA outer-sandbox adapter requires an isolated test already inside the verified project sandbox.");
+  }
+  const implementation = Object.freeze({
+    async prepare(input = {}) {
+      const sourceRepoPath = path.resolve(String(input.sourceRepoPath || ""));
+      const workspaceRoot = path.resolve(String(input.workspaceRoot || ""));
+      const expectedHeadSha = String(input.expectedHeadSha || "").trim().toLowerCase();
+      const validationPath = String(input.validationPath || DEFAULT_PROJECT_VALIDATION_PATH);
+      if (
+        !path.isAbsolute(String(input.sourceRepoPath || ""))
+        || !path.isAbsolute(String(input.workspaceRoot || ""))
+        || !/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(expectedHeadSha)
+        || pathContains(sourceRepoPath, workspaceRoot)
+      ) {
+        const error = new Error("Outer-sandbox validation requires safe absolute paths and an exact commit SHA.");
+        error.code = "PROJECT_VALIDATION_INPUT_INVALID";
+        throw error;
+      }
+      await assertSafeOuterTestValidationPath(validationPath, sourceRepoPath);
+      await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
+      const rootPath = await mkdtemp(path.join(workspaceRoot, "validation-sandbox-"));
+      let prepared = false;
+      try {
+        const repoPath = path.join(rootPath, "repo");
+        const homePath = path.join(rootPath, "home");
+        await mkdir(homePath, { recursive: true, mode: 0o700 });
+        await Promise.all([
+          mkdir(path.join(homePath, "tmp"), { recursive: true, mode: 0o700 }),
+          mkdir(path.join(homePath, ".config", "gh"), { recursive: true, mode: 0o700 }),
+          mkdir(path.join(homePath, ".cache"), { recursive: true, mode: 0o700 }),
+          mkdir(path.join(homePath, ".npm-cache"), { recursive: true, mode: 0o700 }),
+          writeFile(path.join(homePath, ".npmrc"), "", { mode: 0o600 }),
+          writeFile(path.join(homePath, ".npm-globalrc"), "", { mode: 0o600 }),
+        ]);
+        const gitOptions = qaGitOptions(input);
+        await git(undefined, [
+          "clone",
+          "--no-local",
+          "--no-hardlinks",
+          "--no-tags",
+          "--no-checkout",
+          "--",
+          sourceRepoPath,
+          repoPath,
+        ], gitOptions);
+        await git(repoPath, ["checkout", "--detach", expectedHeadSha], gitOptions);
+        await git(repoPath, ["remote", "remove", "origin"], gitOptions);
+        try {
+          await lstat(path.join(repoPath, ".git", "objects", "info", "alternates"));
+          const error = new Error("Outer-sandbox validation clone unexpectedly shares a Git object store.");
+          error.code = "PROJECT_VALIDATION_CLONE_UNSAFE";
+          throw error;
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+        const head = await git(repoPath, ["rev-parse", "--verify", "HEAD"], gitOptions);
+        if (head.stdout.trim().toLowerCase() !== expectedHeadSha) {
+          const error = new Error("Outer-sandbox validation clone identity mismatch.");
+          error.code = "PROJECT_VALIDATION_CLONE_UNSAFE";
+          throw error;
+        }
+        prepared = true;
+        return {
+          rootPath,
+          repoPath,
+          homePath,
+          environment: outerValidationEnvironment(
+            homePath,
+            validationPath,
+          ),
+          policyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+          strategy: "outer_verified_sandbox_disposable_full_clone",
+          networkPolicy: "deny_all",
+          processPolicy: "outer_sandbox_inherited",
+          expectedHeadSha,
+          testGitRunner: input.testGitRunner,
+        };
+      } finally {
+        if (!prepared) await rm(rootPath, { recursive: true, force: true });
+      }
+    },
+    run: runOuterValidationCommand,
+    async verify(sandbox) {
+      const gitOptions = { testGitRunner: sandbox.testGitRunner };
+      const head = await git(sandbox.repoPath, [
+        "-c",
+        "core.fsmonitor=false",
+        "rev-parse",
+        "--verify",
+        "HEAD",
+      ], gitOptions);
+      const clean = await git(sandbox.repoPath, [
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "diff",
+        "--quiet",
+        "HEAD",
+        "--",
+      ], { ...gitOptions, allowFailure: true });
+      if (head.stdout.trim().toLowerCase() !== sandbox.expectedHeadSha || !clean.ok) {
+        const error = new Error("Repository validation changed the exact candidate checkout; its result cannot be trusted.");
+        error.code = "PROJECT_VALIDATION_IDENTITY_DRIFT";
+        throw error;
+      }
+      return {
+        head: sandbox.expectedHeadSha,
+        policyId: sandbox.policyId,
+        strategy: sandbox.strategy,
+        networkPolicy: sandbox.networkPolicy,
+        processPolicy: sandbox.processPolicy,
+      };
+    },
+    async cleanup(sandbox) {
+      const rootPath = path.resolve(String(sandbox?.rootPath || ""));
+      if (!rootPath || rootPath === path.parse(rootPath).root || !path.basename(rootPath).startsWith("validation-sandbox-")) {
+        const error = new Error(`Refusing to remove unsafe outer validation sandbox path: ${rootPath}.`);
+        error.code = "PROJECT_VALIDATION_CLEANUP_UNSAFE";
+        throw error;
+      }
+      await rm(rootPath, { recursive: true, force: true });
+    },
   });
+  return registerIsolatedTestAdapter(
+    testAuthority,
+    "qa-outer-validation-sandbox",
+    () => implementation,
+  );
 }
 
 async function safeRemoveWorkspace(workspacePath, workspaceRoot) {
@@ -522,39 +1131,60 @@ async function safeRemoveWorkspace(workspacePath, workspaceRoot) {
   await rm(workspacePath, { recursive: true, force: true });
 }
 
-async function copyGitConfigValue(sourceRepoPath, workspacePath, key) {
-  const value = await git(sourceRepoPath, ["config", "--get", key], { allowFailure: true });
-  if (!value.ok || !value.output.trim()) return;
-  await git(workspacePath, ["config", key, value.output.trim()]);
+async function copyGitConfigValue(sourceRepoPath, workspacePath, key, options = {}) {
+  const value = await git(
+    sourceRepoPath,
+    ["config", "--local", "--no-includes", "--get", key],
+    qaGitOptions(options, { allowFailure: true }),
+  );
+  if (!value.ok || !value.stdout.trim()) return;
+  await git(workspacePath, ["config", "--local", key, value.stdout.trim()], qaGitOptions(options));
 }
 
-async function copyGitIdentity(sourceRepoPath, workspacePath) {
-  await copyGitConfigValue(sourceRepoPath, workspacePath, "user.name");
-  await copyGitConfigValue(sourceRepoPath, workspacePath, "user.email");
-}
-
-async function configureWorkspaceOrigin(sourceRepoPath, workspacePath, originUrl) {
-  const fetchUrl = String(originUrl || "").trim();
-  await git(workspacePath, ["remote", "set-url", "origin", fetchUrl]);
-
-  const pushUrlResult = await git(sourceRepoPath, ["remote", "get-url", "--push", "--all", "origin"], { allowFailure: true });
-  const pushUrls = pushUrlResult.ok
-    ? pushUrlResult.output.split("\n").map((item) => item.trim()).filter(Boolean)
-    : [];
-  if (pushUrls.length === 0 || (pushUrls.length === 1 && pushUrls[0] === fetchUrl)) return;
-
-  await git(workspacePath, ["remote", "set-url", "--push", "origin", pushUrls[0]]);
-  for (const pushUrl of pushUrls.slice(1)) {
-    await git(workspacePath, ["remote", "set-url", "--add", "--push", "origin", pushUrl]);
+async function copyGitIdentity(sourceRepoPath, workspacePath, options = {}) {
+  await copyGitConfigValue(sourceRepoPath, workspacePath, "user.name", options);
+  await copyGitConfigValue(sourceRepoPath, workspacePath, "user.email", options);
+  const name = await git(
+    workspacePath,
+    ["config", "--local", "--no-includes", "--get", "user.name"],
+    qaGitOptions(options, { allowFailure: true }),
+  );
+  const email = await git(
+    workspacePath,
+    ["config", "--local", "--no-includes", "--get", "user.email"],
+    qaGitOptions(options, { allowFailure: true }),
+  );
+  if (!name.ok || !name.stdout.trim()) {
+    await git(workspacePath, ["config", "--local", "user.name", "StudioOps Automation"], qaGitOptions(options));
+  }
+  if (!email.ok || !email.stdout.trim()) {
+    await git(workspacePath, ["config", "--local", "user.email", "studioops@localhost"], qaGitOptions(options));
   }
 }
 
-async function seedLocalBranchFromSourceClone(workspacePath, branchName) {
-  if (!branchName || await localBranchExists(workspacePath, branchName)) return;
+async function configureWorkspaceOrigin(workspacePath, remotePolicy, options = {}) {
+  const gitOptions = qaGitOptions(options);
+  await git(workspacePath, ["remote", "set-url", "origin", remotePolicy.transportUrl], gitOptions);
+  await git(workspacePath, ["config", "--local", "--unset-all", "remote.origin.pushurl"], {
+    ...gitOptions,
+    allowFailure: true,
+  });
+}
+
+async function seedLocalBranchFromSourceClone(workspacePath, branchName, options = {}) {
+  if (!branchName || await localBranchExists(workspacePath, branchName, options)) return;
   const clonedSourceRef = `refs/remotes/origin/${branchName}`;
-  const sourceBranch = await git(workspacePath, ["rev-parse", "--verify", clonedSourceRef], { allowFailure: true });
+  const sourceBranch = await git(
+    workspacePath,
+    ["rev-parse", "--verify", clonedSourceRef],
+    qaGitOptions(options, { allowFailure: true }),
+  );
   if (!sourceBranch.ok) return;
-  await git(workspacePath, ["branch", branchName, clonedSourceRef], { allowFailure: true });
+  await git(
+    workspacePath,
+    ["branch", branchName, clonedSourceRef],
+    qaGitOptions(options, { allowFailure: true }),
+  );
 }
 
 async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
@@ -568,10 +1198,7 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
     throw new Error(`QA workspace root must be outside the registered project repoPath: ${workspaceRoot}`);
   }
 
-  const originUrl = await git(sourceRepoPath, ["remote", "get-url", "origin"], { allowFailure: true });
-  if (!originUrl.ok || !originUrl.output.trim()) {
-    throw new Error("Project repoPath must have an origin remote before QA integration can fetch source branches or push integration updates.");
-  }
+  const remotePolicy = await qaRemotePolicy(sourceRepoPath, projectPlan, options);
 
   const projectSegment = workspaceSegment(projectPlan.projectKey || projectPlan.projectId || "project");
   const branchSegment = workspaceSegment(projectPlan.integrationBranch || "qa");
@@ -581,17 +1208,27 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
   const workspacePath = await mkdtemp(path.join(workspaceParent, `${branchSegment}-`));
 
   try {
-    await runCommand("git", ["clone", "--shared", "--no-tags", sourceRepoPath, workspacePath], {
+    await git(undefined, [
+      "clone",
+      "--no-local",
+      "--no-hardlinks",
+      "--no-tags",
+      "--",
+      remotePolicy.transportUrl,
+      workspacePath,
+    ], {
+      ...qaGitOptions(options),
       timeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
     });
-    await seedLocalBranchFromSourceClone(workspacePath, projectPlan.integrationBranch);
-    await configureWorkspaceOrigin(sourceRepoPath, workspacePath, originUrl.output);
-    await copyGitIdentity(sourceRepoPath, workspacePath);
+    await seedLocalBranchFromSourceClone(workspacePath, projectPlan.integrationBranch, options);
+    await configureWorkspaceOrigin(workspacePath, remotePolicy, options);
+    await copyGitIdentity(sourceRepoPath, workspacePath, options);
     return {
       executionRepoPath: workspacePath,
       workspacePath,
       workspaceRoot,
       strategy: "isolated_clone",
+      remotePolicy,
     };
   } catch (error) {
     await safeRemoveWorkspace(workspacePath, workspaceRoot);
@@ -600,21 +1237,29 @@ async function prepareQaWorkspace(sourceRepoPath, projectPlan, options = {}) {
 }
 
 async function localBranchExists(repoPath, branchName, options = {}) {
-  const result = await git(repoPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], { allowFailure: true });
+  const result = await git(
+    repoPath,
+    ["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`],
+    qaGitOptions(options, { allowFailure: true }),
+  );
   return result.ok;
 }
 
 async function remoteBranchExists(repoPath, branchName, options = {}) {
   const fetchResult = await git(repoPath, ["fetch", "origin", `refs/heads/${branchName}:refs/remotes/origin/${branchName}`], { ...options, allowFailure: true });
   if (fetchResult.ok) return true;
-  const result = await git(repoPath, ["rev-parse", "--verify", `refs/remotes/origin/${branchName}`], { allowFailure: true });
+  const result = await git(
+    repoPath,
+    ["rev-parse", "--verify", `refs/remotes/origin/${branchName}`],
+    qaGitOptions(options, { allowFailure: true }),
+  );
   return result.ok;
 }
 
 async function remoteRefHead(repoPath, ref, options = {}) {
   const result = await git(repoPath, ["ls-remote", "origin", ref], { ...options, allowFailure: true });
   if (!result.ok) return { ok: false, head: "", output: truncateOutput(result.output) };
-  const line = String(result.output || "").split("\n").find(Boolean) || "";
+  const line = String(result.stdout || "").split("\n").find(Boolean) || "";
   return {
     ok: true,
     head: line.trim().split(/\s+/)[0] || "",
@@ -638,15 +1283,19 @@ function taskSourceRef(task) {
 }
 
 async function prepareIntegrationBranch(repoPath, project, branchName, options = {}) {
-  await git(repoPath, ["check-ref-format", "--branch", branchName]);
+  await git(repoPath, ["check-ref-format", "--branch", branchName], qaGitOptions(options));
 
   const hasLocalBranch = await localBranchExists(repoPath, branchName, options);
   const hasRemoteBranch = await remoteBranchExists(repoPath, branchName, options);
 
   if (hasLocalBranch) {
-    await git(repoPath, ["checkout", branchName]);
+    await git(repoPath, ["checkout", branchName], qaGitOptions(options));
     if (hasRemoteBranch) {
-      const fastForward = await git(repoPath, ["merge", "--ff-only", `refs/remotes/origin/${branchName}`], { allowFailure: true });
+      const fastForward = await git(
+        repoPath,
+        ["merge", "--ff-only", `refs/remotes/origin/${branchName}`],
+        qaGitOptions(options, { allowFailure: true }),
+      );
       if (!fastForward.ok) {
         throw new Error(`Local integration branch ${branchName} cannot fast-forward to origin/${branchName}. Resolve or push local branch work before running QA integration.`);
       }
@@ -655,7 +1304,11 @@ async function prepareIntegrationBranch(repoPath, project, branchName, options =
   }
 
   if (hasRemoteBranch) {
-    await git(repoPath, ["checkout", "-b", branchName, `refs/remotes/origin/${branchName}`]);
+    await git(
+      repoPath,
+      ["checkout", "-b", branchName, `refs/remotes/origin/${branchName}`],
+      qaGitOptions(options),
+    );
     return "checked_out_remote_branch";
   }
 
@@ -664,19 +1317,27 @@ async function prepareIntegrationBranch(repoPath, project, branchName, options =
   if (!baseFetch.ok) {
     throw new Error(`Could not fetch default branch origin/${baseBranch} to create ${branchName}: ${baseFetch.output}`);
   }
-  await git(repoPath, ["checkout", "-b", branchName, `refs/remotes/origin/${baseBranch}`]);
+  await git(
+    repoPath,
+    ["checkout", "-b", branchName, `refs/remotes/origin/${baseBranch}`],
+    qaGitOptions(options),
+  );
   return "created_branch";
 }
 
-async function currentBranchName(repoPath) {
-  const branch = await git(repoPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], { allowFailure: true });
-  return branch.ok ? normalizeBranchName(branch.output) : "";
+async function currentBranchName(repoPath, options = {}) {
+  const branch = await git(
+    repoPath,
+    ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    qaGitOptions(options, { allowFailure: true }),
+  );
+  return branch.ok ? normalizeBranchName(branch.stdout) : "";
 }
 
-async function resetPreparedIntegrationBranch(repoPath, branchName, preparedHead) {
+async function resetPreparedIntegrationBranch(repoPath, branchName, preparedHead, options = {}) {
   if (!preparedHead) return { ok: true, output: "" };
 
-  const currentBranch = await currentBranchName(repoPath);
+  const currentBranch = await currentBranchName(repoPath, options);
   if (currentBranch !== branchName) {
     return {
       ok: false,
@@ -684,7 +1345,11 @@ async function resetPreparedIntegrationBranch(repoPath, branchName, preparedHead
     };
   }
 
-  return git(repoPath, ["reset", "--keep", preparedHead], { allowFailure: true });
+  return git(
+    repoPath,
+    ["reset", "--keep", preparedHead],
+    qaGitOptions(options, { allowFailure: true }),
+  );
 }
 
 async function fetchTaskSource(repoPath, task, options = {}) {
@@ -693,7 +1358,11 @@ async function fetchTaskSource(repoPath, task, options = {}) {
   const errors = [];
 
   if (branchName) {
-    const branchFormat = await git(repoPath, ["check-ref-format", "--branch", branchName], { allowFailure: true });
+    const branchFormat = await git(
+      repoPath,
+      ["check-ref-format", "--branch", branchName],
+      qaGitOptions(options, { allowFailure: true }),
+    );
     if (branchFormat.ok) {
       const branchFetch = await git(repoPath, ["fetch", "origin", `refs/heads/${branchName}:${localRef}`], { ...options, allowFailure: true });
       if (branchFetch.ok) {
@@ -734,14 +1403,18 @@ async function fetchTaskSource(repoPath, task, options = {}) {
   };
 }
 
-async function conflictFiles(repoPath) {
-  const result = await git(repoPath, ["diff", "--name-only", "--diff-filter=U"], { allowFailure: true });
-  return result.output ? result.output.split("\n").map((item) => item.trim()).filter(Boolean) : [];
+async function conflictFiles(repoPath, options = {}) {
+  const result = await git(
+    repoPath,
+    ["diff", "--name-only", "--diff-filter=U"],
+    qaGitOptions(options, { allowFailure: true }),
+  );
+  return result.stdout ? result.stdout.split("\n").map((item) => item.trim()).filter(Boolean) : [];
 }
 
 async function branchHead(repoPath, ref, options = {}) {
   const result = await git(repoPath, ["rev-parse", "--verify", ref], { ...options, allowFailure: true });
-  return result.ok ? result.output.trim() : "";
+  return result.ok ? result.stdout.trim() : "";
 }
 
 async function mergeDefaultBranchIntoIntegration(repoPath, projectPlan, options = {}) {
@@ -769,7 +1442,7 @@ async function mergeDefaultBranchIntoIntegration(repoPath, projectPlan, options 
 
   const merge = await git(repoPath, ["merge", "--no-ff", "--no-edit", remoteDefaultRef], { ...options, allowFailure: true });
   if (!merge.ok) {
-    const conflicts = await conflictFiles(repoPath);
+    const conflicts = await conflictFiles(repoPath, options);
     await git(repoPath, ["merge", "--abort"], { ...options, allowFailure: true });
     return {
       ok: false,
@@ -817,11 +1490,20 @@ async function ensureLocalQaPreviewCheckout(projectPlan, preview, options = {}) 
     };
   }
 
+  const remotePolicy = await qaRemotePolicy(projectPlan.repoPath, projectPlan, options);
   await mkdir(path.dirname(checkoutPath), { recursive: true });
-  const clone = await runCommand("git", ["clone", "--shared", "--no-tags", projectPlan.repoPath, checkoutPath], {
+  const clone = await git(undefined, [
+    "clone",
+    "--no-local",
+    "--no-hardlinks",
+    "--no-tags",
+    "--",
+    remotePolicy.transportUrl,
+    checkoutPath,
+  ], {
+    ...qaGitOptions(options),
     timeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
     allowFailure: true,
-    ...options,
   });
   if (!clone.ok) {
     return {
@@ -830,10 +1512,7 @@ async function ensureLocalQaPreviewCheckout(projectPlan, preview, options = {}) 
     };
   }
 
-  const originUrl = await git(projectPlan.repoPath, ["remote", "get-url", "origin"], { ...options, allowFailure: true });
-  if (originUrl.ok && originUrl.output.trim()) {
-    await configureWorkspaceOrigin(projectPlan.repoPath, checkoutPath, originUrl.output);
-  }
+  await configureWorkspaceOrigin(checkoutPath, remotePolicy, options);
   return { ok: true, created: true };
 }
 
@@ -911,7 +1590,8 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     return result;
   }
 
-  const gitOptions = { env: options.env, secrets: options.secrets };
+  const gitOptions = qaGitOptions(options);
+  await qaRemotePolicy(projectPlan.repoPath, projectPlan, options);
   const ensured = await ensureLocalQaPreviewCheckout(projectPlan, preview, gitOptions);
   result.created = Boolean(ensured.created);
   if (!ensured.ok) {
@@ -919,6 +1599,7 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     result.output = ensured.output;
     return result;
   }
+  await qaRemotePolicy(preview.checkoutPath, projectPlan, options);
 
   const dirty = await git(preview.checkoutPath, ["status", "--porcelain"], { ...gitOptions, allowFailure: true });
   if (!dirty.ok) {
@@ -926,7 +1607,7 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     result.output = `Could not inspect local QA preview checkout: ${truncateOutput(dirty.output)}`;
     return result;
   }
-  if (dirty.output.trim()) {
+  if (dirty.stdout.trim()) {
     if (!preview.stashDirty) {
       result.status = "blocked";
       result.output = "Local QA preview checkout has uncommitted changes. Enable localQaPreview.stashDirty or clean the checkout before syncing.";
@@ -948,7 +1629,7 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     return result;
   }
 
-  const currentBranch = await currentBranchName(preview.checkoutPath);
+  const currentBranch = await currentBranchName(preview.checkoutPath, gitOptions);
   if (currentBranch !== preview.branch) {
     const hasLocal = await localBranchExists(preview.checkoutPath, preview.branch, gitOptions);
     const checkoutArgs = hasLocal
@@ -1123,7 +1804,11 @@ async function mergeTaskSource(repoPath, task, options = {}) {
     };
   }
 
-  const merge = await git(repoPath, ["merge", "--no-ff", "--no-edit", source.ref], { allowFailure: true });
+  const merge = await git(
+    repoPath,
+    ["merge", "--no-ff", "--no-edit", source.ref],
+    qaGitOptions(options, { allowFailure: true }),
+  );
   if (merge.ok) {
     return {
       taskId: task.id,
@@ -1138,8 +1823,8 @@ async function mergeTaskSource(repoPath, task, options = {}) {
     };
   }
 
-  const conflicts = await conflictFiles(repoPath);
-  await git(repoPath, ["merge", "--abort"], { allowFailure: true });
+  const conflicts = await conflictFiles(repoPath, options);
+  await git(repoPath, ["merge", "--abort"], qaGitOptions(options, { allowFailure: true }));
   return {
     taskId: task.id,
     title: task.title,
@@ -1150,21 +1835,20 @@ async function mergeTaskSource(repoPath, task, options = {}) {
   };
 }
 
-async function runValidationCommands(repoPath, commands, options) {
+async function runValidationCommands(sandbox, commands, options) {
+  const sandboxOperations = validationSandboxAdapter(options);
   const results = [];
   for (const command of commands) {
-    const result = await runCommand("sh", ["-lc", command], {
-      cwd: repoPath,
-      env: options.env,
-      projectCommand: true,
-      secrets: options.secrets,
+    if (options.renewQaClaim) await options.renewQaClaim();
+    const result = await sandboxOperations.run(sandbox, command, {
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
-      allowFailure: true,
     });
     results.push({
       command,
       ok: result.ok,
-      output: truncateOutput(result.output),
+      output: truncateOutput(redactPromotionValidationText(
+        redactCommandOutput(result.output, options),
+      )),
     });
     if (!result.ok) break;
   }
@@ -1222,6 +1906,194 @@ function partialCandidateRequest(input = {}) {
 function retryWindowElapsed(task, nowMs) {
   const retryAt = Date.parse(task.integrationRetryNotBefore || "");
   return !Number.isFinite(retryAt) || retryAt <= nowMs;
+}
+
+function jsonValue(value, fallback) {
+  return JSON.parse(JSON.stringify(value === undefined ? fallback : value));
+}
+
+function qaProjectPolicyBinding(project = {}) {
+  return {
+    id: String(project.id || ""),
+    repoPath: String(project.repoPath || ""),
+    repoUrl: String(project.repoUrl || ""),
+    defaultBranch: String(project.defaultBranch || "main"),
+    trustLeadApprovals: trustLeadApprovalsEnabled(project),
+    integrationBranch: integrationBranchName(project),
+    eligible: projectUsesTrustLeadQa(project),
+    integrationSafetyError: integrationBranchSafetyError(project),
+    reviewPolicy: jsonValue(project.reviewPolicy, {}),
+    qaIntegration: jsonValue(project.qaIntegration, {}),
+    localQaPreview: jsonValue(project.localQaPreview, null),
+    validationCommands: normalizeList(project.validationCommands),
+  };
+}
+
+function qaTaskAuthorityBinding(state, task) {
+  const evidence = candidateReviewEvidenceForTask(state, task);
+  return {
+    id: String(task.id || ""),
+    projectId: String(task.projectId || ""),
+    stateVersion: Number(task.stateVersion || 0),
+    status: String(task.status || ""),
+    branchName: String(task.branchName || ""),
+    prUrl: String(task.prUrl || ""),
+    reviewCycle: Number(task.reviewCycle || 0),
+    reviewSubjectSha: String(task.reviewSubjectSha || ""),
+    reviewSubjectCycle: Number(task.reviewSubjectCycle || 0),
+    candidateIdentity: jsonValue(task.candidateIdentity, null),
+    integrationStatus: String(task.integrationStatus || ""),
+    integrationCandidateBranch: String(task.integrationCandidateBranch || ""),
+    integrationCandidateCommit: String(task.integrationCandidateCommit || ""),
+    integrationPrUrl: String(task.integrationPrUrl || ""),
+    integrationPrNumber: Number(task.integrationPrNumber || 0),
+    integrationPrState: String(task.integrationPrState || ""),
+    integrationPrHeadSha: String(task.integrationPrHeadSha || ""),
+    integrationSourceHeadSha: String(task.integrationSourceHeadSha || ""),
+    integrationSourceCandidateCycle: Number(task.integrationSourceCandidateCycle || 0),
+    reviewEvidence: evidence.ok
+      ? {
+          ok: true,
+          subjectSha: evidence.subjectSha,
+          candidateCycle: Number(evidence.candidateCycle || 0),
+          reviews: jsonValue(evidence.reviews, []),
+        }
+      : { ok: false, error: String(evidence.error || "") },
+  };
+}
+
+function qaAuthorityBinding(state, projectPlan) {
+  const project = (state.projects || []).find((item) => item.id === projectPlan.projectId);
+  if (!project) throw new Error(`QA project ${projectPlan.projectId} no longer exists.`);
+  const taskIds = (projectPlan.tasks || []).map((task) => task.id).sort();
+  const tasks = taskIds.map((taskId) => {
+    const task = (state.tasks || []).find((item) => item.id === taskId);
+    if (!task || task.projectId !== projectPlan.projectId) {
+      throw new Error(`QA task ${taskId} no longer belongs to project ${projectPlan.projectId}.`);
+    }
+    return qaTaskAuthorityBinding(state, task);
+  });
+  return {
+    schemaVersion: QA_ATTEMPT_CLAIM_SCHEMA_VERSION,
+    project: qaProjectPolicyBinding(project),
+    eligibleQaReviewTaskIds: (state.tasks || [])
+      .filter((task) => task.projectId === projectPlan.projectId && task.status === "qa_review")
+      .map((task) => task.id)
+      .sort(),
+    plan: {
+      integrationBranch: String(projectPlan.integrationBranch || ""),
+      syncDefaultBranchIntoIntegration: Boolean(projectPlan.syncDefaultBranchIntoIntegration),
+      validationCommands: normalizeList(projectPlan.validationCommands),
+      taskIds,
+      assembly: jsonValue(projectPlan.assembly, null),
+      deferredTaskCount: Number(projectPlan.deferredTaskCount || 0),
+    },
+    tasks,
+  };
+}
+
+function qaAuthorityDigest(state, projectPlan) {
+  return `sha256:${createHash("sha256").update(canonicalJson(
+    qaAuthorityBinding(state, projectPlan),
+  )).digest("hex")}`;
+}
+
+function qaAttemptNow(input = {}) {
+  const nowMs = Number(input.qaAttemptNowMs ?? Date.now());
+  if (!Number.isFinite(nowMs)) throw new Error("qaAttemptNowMs must be finite.");
+  return { nowMs, now: new Date(nowMs).toISOString() };
+}
+
+function qaAttemptClaims(state) {
+  state.meta = state.meta || {};
+  state.meta.qaIntegrationAttemptClaims = state.meta.qaIntegrationAttemptClaims || {};
+  return state.meta.qaIntegrationAttemptClaims;
+}
+
+function assertQaAuthorityInState(state, projectPlan) {
+  const observedDigest = qaAuthorityDigest(state, projectPlan);
+  if (!projectPlan.qaAuthorityDigest || observedDigest !== projectPlan.qaAuthorityDigest) {
+    const error = new Error("QA project policy, task state, review evidence, or candidate plan changed after planning.");
+    error.code = "QA_ATTEMPT_STALE";
+    throw error;
+  }
+  return observedDigest;
+}
+
+async function claimQaAttempt(projectPlan, input = {}) {
+  return mutateState((state) => {
+    const authorityDigest = assertQaAuthorityInState(state, projectPlan);
+    const claims = qaAttemptClaims(state);
+    const previous = claims[projectPlan.projectId] || null;
+    const { nowMs, now } = qaAttemptNow(input);
+    if (
+      previous?.status === "active"
+      && Number.isFinite(Date.parse(previous.expiresAt || ""))
+      && Date.parse(previous.expiresAt) > nowMs
+    ) {
+      return {
+        acquired: false,
+        claim: jsonValue(previous, null),
+        reason: `QA project ${projectPlan.projectId} already has an active fenced attempt.`,
+      };
+    }
+    const ttlMs = Math.max(1_000, Math.min(24 * 60 * 60_000, Number(input.qaAttemptTtlMs || QA_ATTEMPT_TTL_MS)));
+    const claim = {
+      schemaVersion: QA_ATTEMPT_CLAIM_SCHEMA_VERSION,
+      claimId: typeof input.qaClaimIdFactory === "function" ? input.qaClaimIdFactory() : randomUUID(),
+      projectId: projectPlan.projectId,
+      fence: Math.max(0, Number(previous?.fence || 0)) + 1,
+      status: "active",
+      authorityDigest,
+      acquiredAt: now,
+      renewedAt: now,
+      expiresAt: new Date(nowMs + ttlMs).toISOString(),
+    };
+    claims[projectPlan.projectId] = claim;
+    return { acquired: true, claim: jsonValue(claim, null), reason: "" };
+  }, { operationName: "qa_integration.claim_attempt" });
+}
+
+function assertExactQaClaimInState(state, projectPlan, claim, input = {}) {
+  const current = state.meta?.qaIntegrationAttemptClaims?.[projectPlan.projectId];
+  const { nowMs } = qaAttemptNow(input);
+  if (
+    !claim
+    || !current
+    || current.schemaVersion !== QA_ATTEMPT_CLAIM_SCHEMA_VERSION
+    || current.status !== "active"
+    || current.claimId !== claim.claimId
+    || Number(current.fence) !== Number(claim.fence)
+    || current.authorityDigest !== claim.authorityDigest
+    || Date.parse(current.expiresAt || "") <= nowMs
+  ) {
+    const error = new Error("The exact QA integration attempt claim is missing, replaced, terminal, or expired.");
+    error.code = "QA_ATTEMPT_STALE";
+    throw error;
+  }
+  const authorityDigest = assertQaAuthorityInState(state, projectPlan);
+  if (authorityDigest !== current.authorityDigest) {
+    const error = new Error("QA integration authority no longer matches its fenced attempt.");
+    error.code = "QA_ATTEMPT_STALE";
+    throw error;
+  }
+  return current;
+}
+
+async function renewQaAttempt(projectPlan, claim, input = {}) {
+  return mutateState((state) => {
+    const current = assertExactQaClaimInState(state, projectPlan, claim, input);
+    const { nowMs, now } = qaAttemptNow(input);
+    const ttlMs = Math.max(1_000, Math.min(24 * 60 * 60_000, Number(input.qaAttemptTtlMs || QA_ATTEMPT_TTL_MS)));
+    current.renewedAt = now;
+    current.expiresAt = new Date(nowMs + ttlMs).toISOString();
+    return jsonValue(current, null);
+  }, { operationName: "qa_integration.renew_attempt" });
+}
+
+async function assertQaAttempt(projectPlan, claim, input = {}) {
+  const state = await readState();
+  return assertExactQaClaimInState(state, projectPlan, claim, input);
 }
 
 export function planQaIntegrations(state, input = {}) {
@@ -1329,6 +2201,10 @@ export function planQaIntegrations(state, input = {}) {
       };
     });
 
+  for (const projectPlan of projectPlans) {
+    projectPlan.qaAuthorityDigest = qaAuthorityDigest(state, projectPlan);
+  }
+
   if (partialRequest) {
     const eligibleIncludedTaskIds = new Set(
       projectPlans.flatMap((project) => project.assembly.includedTaskIds),
@@ -1382,6 +2258,28 @@ function appendOutput(existing, addition) {
   return truncateOutput(`${current}\n${next}`);
 }
 
+async function guardQaExternalMutation(repoPath, projectPlan, options = {}, operation = "external_mutation") {
+  if (options.beforeQaExternalMutation) {
+    await options.beforeQaExternalMutation({
+      operation,
+      projectId: projectPlan.projectId,
+      repoPath,
+    });
+  }
+  if (!options.renewQaClaim || !options.assertQaClaim) {
+    const error = new Error("A live exact QA attempt claim is required before external mutation.");
+    error.code = "QA_ATTEMPT_STALE";
+    throw error;
+  }
+  await options.renewQaClaim();
+  await options.assertQaClaim();
+  const sourceRepoPath = String(options.sourceRepoPath || projectPlan.repoPath || "");
+  if (sourceRepoPath) await qaRemotePolicy(sourceRepoPath, projectPlan, options);
+  if (repoPath && path.resolve(repoPath) !== path.resolve(sourceRepoPath)) {
+    await qaRemotePolicy(repoPath, projectPlan, options);
+  }
+}
+
 function pendingProtectedHandoff(projectPlan) {
   if (!projectPlan.tasks.length) return null;
   const handoffTasks = projectPlan.tasks.filter((task) => (
@@ -1401,9 +2299,27 @@ function pendingProtectedHandoff(projectPlan) {
     };
   }
   const first = handoffTasks[0];
+  let commit = "";
+  try {
+    commit = normalizeGitSha(first.integrationCandidateCommit, "protected QA handoff commit");
+  } catch {
+    return {
+      error: "The unresolved protected-branch handoff has an invalid candidate commit identity. StudioOps will not inspect or delete its branch.",
+      tasks: projectPlan.tasks,
+      deferredTasks: [],
+    };
+  }
+  const expectedBranch = integrationCandidateBranchName(projectPlan, commit);
+  if (first.integrationCandidateBranch !== expectedBranch) {
+    return {
+      error: `The unresolved protected-branch handoff branch does not match its exact candidate identity (expected ${expectedBranch}). StudioOps will not inspect or delete it.`,
+      tasks: projectPlan.tasks,
+      deferredTasks: [],
+    };
+  }
   return {
     branch: first.integrationCandidateBranch,
-    commit: first.integrationCandidateCommit,
+    commit,
     prUrl: first.integrationPrUrl,
     tasks: handoffTasks,
     deferredTasks: projectPlan.tasks.filter((task) => !handoffTasks.includes(task)),
@@ -1556,12 +2472,14 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
         pr: inspectedPr,
       };
     }
-    const cleanup = remoteCandidate.head
-      ? await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
-          ...options,
-          allowFailure: true,
-        })
-      : { ok: true, output: "" };
+    let cleanup = { ok: true, output: "" };
+    if (remoteCandidate.head) {
+      await guardQaExternalMutation(repoPath, projectPlan, options, "delete_superseded_candidate_branch");
+      cleanup = await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+        ...options,
+        allowFailure: true,
+      });
+    }
     return {
       status: "superseded",
       blocker: "",
@@ -1612,12 +2530,14 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
       pr: inspectedPr,
     };
   }
-  const cleanup = remoteCandidate.head
-    ? await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
-        ...options,
-        allowFailure: true,
-      })
-    : { ok: true, output: "" };
+  let cleanup = { ok: true, output: "" };
+  if (remoteCandidate.head) {
+    await guardQaExternalMutation(repoPath, projectPlan, options, "delete_merged_candidate_branch");
+    cleanup = await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+      ...options,
+      allowFailure: true,
+    });
+  }
   return {
     status: "merged",
     blocker: "",
@@ -1723,8 +2643,8 @@ async function integrateProject(projectPlan, options = {}) {
 
   let mergedHandoff = null;
   if (pendingHandoff) {
-    const gitOptions = { env: options.env, secrets: options.secrets };
-    const inspected = await inspectPendingProtectedHandoff(repoPath, candidatePlan, pendingHandoff, gitOptions);
+    await qaRemotePolicy(repoPath, candidatePlan, options);
+    const inspected = await inspectPendingProtectedHandoff(repoPath, candidatePlan, pendingHandoff, options);
     if (inspected.status === "superseded") {
       candidatePlan.tasks = requestedTasks;
       candidatePlan.assembly = requestedAssembly;
@@ -1760,6 +2680,7 @@ async function integrateProject(projectPlan, options = {}) {
   }
 
   if (!candidatePlan.tasks.length && !shouldSyncDefaultBranch && shouldSyncLocalPreview) {
+    await guardQaExternalMutation(repoPath, candidatePlan, options, "sync_local_qa_preview");
     result.localQaPreview = await syncLocalQaPreview(candidatePlan, options);
     result.status = localPreviewFailed(result.localQaPreview)
       ? "preview_blocked"
@@ -1769,6 +2690,8 @@ async function integrateProject(projectPlan, options = {}) {
   }
 
   let workspace = null;
+  let validationSandbox = null;
+  const sandboxOperations = validationSandboxAdapter(options);
   let executionRepoPath = "";
   let preparedHead = "";
   let pushed = false;
@@ -1778,11 +2701,11 @@ async function integrateProject(projectPlan, options = {}) {
     result.workspacePath = workspace.workspacePath;
     result.workspaceStrategy = workspace.strategy;
 
-    const gitOptions = { env: options.env, secrets: options.secrets };
+    const gitOptions = qaGitOptions(options);
     const prepared = await prepareIntegrationBranch(executionRepoPath, project, candidatePlan.integrationBranch, gitOptions);
     result.output = appendOutput(result.output, prepared);
-    const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
-    preparedHead = preparedCommit.output.trim();
+    const preparedCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"], gitOptions);
+    preparedHead = preparedCommit.stdout.trim();
     const defaultBranchHead = await remoteRefHead(
       executionRepoPath,
       `refs/heads/${normalizeBranchName(candidatePlan.defaultBranch || "main")}`,
@@ -1879,7 +2802,36 @@ async function integrateProject(projectPlan, options = {}) {
       return result;
     }
 
-    result.validation = await runValidationCommands(executionRepoPath, validationCommands, options);
+    const candidateCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"], gitOptions);
+    result.commit = candidateCommit.stdout.trim();
+    const validationWorkspaceRoot = resolveWorkspaceRoot(
+      options.projectValidationWorkspaceRoot
+        || options.validationWorkspaceRoot
+        || path.join(workspace.workspaceRoot, "_project-validation"),
+    );
+    validationSandbox = await sandboxOperations.prepare({
+      sourceRepoPath: executionRepoPath,
+      workspaceRoot: validationWorkspaceRoot,
+      expectedHeadSha: result.commit,
+      validationPath: options.projectValidationPath
+        || options.path
+        || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH
+        || DEFAULT_PROJECT_VALIDATION_PATH,
+      sandboxExecutable: options.projectValidationSandboxExecutable,
+      cloneTimeoutMs: options.validationCloneTimeoutMs,
+      testGitRunner: options.testGitRunner,
+      gitAuthEnv: options.gitAuthEnv,
+      secrets: options.secrets,
+    });
+    result.validationSandbox = {
+      policyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+      strategy: validationSandbox.strategy,
+      networkPolicy: validationSandbox.networkPolicy,
+      processPolicy: validationSandbox.processPolicy || "",
+      expectedHeadSha: result.commit,
+    };
+    result.validation = await runValidationCommands(validationSandbox, validationCommands, options);
+    result.validationSandbox.attestation = await sandboxOperations.verify(validationSandbox);
     const failedValidation = result.validation.find((item) => !item.ok);
     if (failedValidation) {
       result.status = "validation_failed";
@@ -1888,8 +2840,17 @@ async function integrateProject(projectPlan, options = {}) {
       return result;
     }
 
-    const commit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"]);
-    result.commit = commit.output.trim();
+    const executionHead = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"], gitOptions);
+    const executionTree = await git(
+      executionRepoPath,
+      ["diff", "--quiet", "HEAD", "--"],
+      qaGitOptions(options, { allowFailure: true }),
+    );
+    if (executionHead.stdout.trim() !== result.commit || !executionTree.ok) {
+      const identityError = new Error("The trusted QA candidate changed while isolated validation was running.");
+      identityError.code = "PROJECT_VALIDATION_IDENTITY_DRIFT";
+      throw identityError;
+    }
 
     if (mergedHandoff) {
       result.status = "ready";
@@ -1897,6 +2858,7 @@ async function integrateProject(projectPlan, options = {}) {
       pushed = true;
       for (const task of mergedTasks) task.status = "ready";
     } else {
+      await guardQaExternalMutation(executionRepoPath, candidatePlan, options, "push_integration_branch");
       const push = await git(executionRepoPath, ["push", "origin", `HEAD:refs/heads/${candidatePlan.integrationBranch}`], { ...gitOptions, allowFailure: true });
       if (!push.ok) {
         if (assemblingCandidate && protectedBranchPushRejected(push)) {
@@ -1922,6 +2884,7 @@ async function integrateProject(projectPlan, options = {}) {
             return result;
           }
           if (!remoteCandidate.head) {
+            await guardQaExternalMutation(executionRepoPath, candidatePlan, options, "push_integration_candidate_branch");
             const candidatePush = await git(
               executionRepoPath,
               ["push", "origin", `HEAD:refs/heads/${integrationCandidateBranch}`],
@@ -1944,7 +2907,7 @@ async function integrateProject(projectPlan, options = {}) {
             candidatePlan,
             integrationCandidateBranch,
             result.commit,
-            gitOptions,
+            options,
           );
           result.integrationPr = pr;
           result.integrationCheckState = pr.checkState;
@@ -1981,6 +2944,7 @@ async function integrateProject(projectPlan, options = {}) {
       for (const task of mergedTasks) task.status = "ready";
     }
     if (shouldSyncLocalPreview) {
+      await guardQaExternalMutation(executionRepoPath, candidatePlan, options, "sync_local_qa_preview");
       result.localQaPreview = await syncLocalQaPreview(candidatePlan, options);
       result.output = appendOutput(result.output, result.localQaPreview.output);
       if (localPreviewFailed(result.localQaPreview)) {
@@ -2056,6 +3020,8 @@ async function integrateProject(projectPlan, options = {}) {
         assembly: result.assembly,
       },
     });
+    if (options.renewQaClaim) await options.renewQaClaim();
+    if (options.assertQaClaim) await options.assertQaClaim();
     const candidateVerification = await verifyCandidateRepositoryState(project, candidate, gitOptions);
     if (!candidateVerification.ok) {
       result.status = candidateVerification.status === "drift"
@@ -2069,22 +3035,39 @@ async function integrateProject(projectPlan, options = {}) {
     result.candidate = candidate;
     return result;
   } catch (error) {
-    result.status = "blocked";
-    result.output = truncateOutput(error.message);
+    const validationSandboxFailure = String(error?.code || "").startsWith("PROJECT_VALIDATION_");
+    result.status = validationSandboxFailure ? "validation_sandbox_unavailable" : "blocked";
+    result.output = truncateOutput(redactPromotionValidationText(
+      validationSandboxFailure
+        ? `Project validation sandbox unavailable; the QA candidate was not pushed: ${error.message}`
+        : error.message,
+    ));
     if (result.tasks.length) {
       for (const task of result.tasks) {
         if (task.status === "merged") {
-          task.status = "blocked";
+          task.status = result.status;
           task.output = result.output;
         }
       }
     } else {
-      result.tasks = allTaskResults(candidatePlan.tasks, "blocked", error.message);
+      result.tasks = allTaskResults(candidatePlan.tasks, result.status, result.output);
     }
     return result;
   } finally {
+    if (validationSandbox) {
+      try {
+        await sandboxOperations.cleanup(validationSandbox);
+      } catch (error) {
+        result.output = appendOutput(result.output, `Cleanup warning: ${error.message}`);
+      }
+    }
     if (preparedHead && !pushed && executionRepoPath) {
-      const reset = await resetPreparedIntegrationBranch(executionRepoPath, candidatePlan.integrationBranch, preparedHead);
+      const reset = await resetPreparedIntegrationBranch(
+        executionRepoPath,
+        candidatePlan.integrationBranch,
+        preparedHead,
+        qaGitOptions(options),
+      );
       if (!reset.ok) {
         result.output = appendOutput(
           result.output,
@@ -2217,6 +3200,10 @@ function commentForTask(projectResult, taskResult) {
     return `Protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
   }
 
+  if (taskResult.status === "validation_sandbox_unavailable") {
+    return `QA integration stopped before repository validation or push because its fail-closed validation sandbox was unavailable. StudioOps preserved the reviewed sources and will retry after the bounded delay.${workspaceLine}\n\n${projectResult.output}`;
+  }
+
   return `QA integration skipped for ${taskResult.source}: ${taskResult.output || projectResult.output || "No merge was attempted."}${workspaceLine}${previewLine}${supersededLine}`;
 }
 
@@ -2269,6 +3256,7 @@ export function qaResultFingerprint(projectResult, taskResult) {
       ok: !!item.ok,
       output: stableQaOutput(item.output, workspacePath),
     })),
+    validationSandbox: projectResult.validationSandbox || null,
   };
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
@@ -2294,7 +3282,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
   );
   const assignedAgentRole = taskResult.status === "ready"
     ? "owner"
-    : ["pr_waiting", "pr_merged"].includes(taskResult.status)
+    : ["pr_waiting", "pr_merged", "validation_sandbox_unavailable"].includes(taskResult.status)
       ? "qa-integration-worker"
       : taskResult.status === "pr_closed"
         ? "owner"
@@ -2328,15 +3316,37 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
     integrationValidation: {
       status: projectResult.status,
       commands: projectResult.validation || [],
+      sandbox: projectResult.validationSandbox || null,
     },
     assignedAgentRole,
     reviewerThreadId: "",
   };
 }
 
-async function recordProjectResult(projectResult) {
+async function recordProjectResult(projectResult, projectPlan = null, claim = null, input = {}) {
   return mutateState(async (state) => {
     const now = new Date().toISOString();
+    if (projectPlan && claim) {
+      try {
+        assertExactQaClaimInState(state, projectPlan, claim, input);
+      } catch (error) {
+        const current = state.meta?.qaIntegrationAttemptClaims?.[projectPlan.projectId];
+        if (
+          current?.claimId === claim.claimId
+          && Number(current?.fence) === Number(claim.fence)
+          && current.status === "active"
+        ) {
+          current.status = "stale";
+          current.terminalAt = now;
+          current.outcome = "stale_result_discarded";
+        }
+        return {
+          recorded: false,
+          stale: true,
+          reason: error.message,
+        };
+      }
+    }
     state.comments = state.comments || [];
     state.events = state.events || [];
     state.qaBundles = state.qaBundles || [];
@@ -2497,6 +3507,15 @@ async function recordProjectResult(projectResult) {
         });
       }
     }
+    if (projectPlan && claim) {
+      const current = state.meta?.qaIntegrationAttemptClaims?.[projectPlan.projectId];
+      if (current?.claimId === claim.claimId && Number(current?.fence) === Number(claim.fence)) {
+        current.status = "terminal";
+        current.terminalAt = now;
+        current.outcome = String(projectResult.status || "completed");
+      }
+    }
+    return { recorded: true, stale: false, reason: "" };
   }, { operationName: "qa_integration.record_result" });
 }
 
@@ -2520,6 +3539,7 @@ async function recordIneligibleProject(projectPlan) {
 }
 
 export async function runQaIntegration(input = {}) {
+  input = withQaTestAdapters(input);
   const state = await readState();
   const plan = planQaIntegrations(state, input);
 
@@ -2539,15 +3559,55 @@ export async function runQaIntegration(input = {}) {
       });
       continue;
     }
+    let claimed;
+    try {
+      claimed = await claimQaAttempt(projectPlan, input);
+    } catch (error) {
+      results.push({
+        ...projectPlan,
+        status: "claim_stale",
+        output: truncateOutput(`QA authority changed before the attempt could be claimed: ${error.message}`),
+        tasks: allTaskResults(projectPlan.tasks, "claim_stale", error.message),
+        validation: [],
+      });
+      continue;
+    }
+    if (!claimed.acquired) {
+      results.push({
+        ...projectPlan,
+        status: "claim_busy",
+        output: claimed.reason,
+        tasks: allTaskResults(projectPlan.tasks, "claim_busy", claimed.reason),
+        validation: [],
+        qaClaim: claimed.claim,
+      });
+      continue;
+    }
+    let qaClaim = claimed.claim;
+    const renewClaim = async () => {
+      qaClaim = await renewQaAttempt(projectPlan, qaClaim, input);
+      return qaClaim;
+    };
+    const assertClaim = async () => assertQaAttempt(projectPlan, qaClaim, input);
     let authContext = null;
     let result = null;
     try {
+      await assertClaim();
       authContext = await prepareQaIntegrationAuth(projectPlan, input);
       const secrets = normalizeSecrets(input.secrets, githubAppAuthSecrets(authContext));
+      const authenticatedEnv = githubAppAuthEnv(authContext, input.env || {});
       result = await integrateProject(projectPlan, {
         ...input,
-        env: githubAppAuthEnv(authContext, input.env || {}),
+        env: authenticatedEnv,
+        gitAuthEnv: authContext ? {
+          GIT_ASKPASS: authenticatedEnv.GIT_ASKPASS,
+          MISSION_CONTROL_GITHUB_TOKEN: authenticatedEnv.MISSION_CONTROL_GITHUB_TOKEN,
+          MISSION_CONTROL_GIT_USERNAME: authenticatedEnv.MISSION_CONTROL_GIT_USERNAME,
+        } : {},
         secrets,
+        sourceRepoPath: projectPlan.repoPath,
+        renewQaClaim: renewClaim,
+        assertQaClaim: assertClaim,
       });
     } catch (error) {
       const canFallback = authContext
@@ -2563,7 +3623,11 @@ export async function runQaIntegration(input = {}) {
             ...input,
             githubAppAuth: false,
             env: { ...(input.env || {}) },
+            gitAuthEnv: {},
             secrets: normalizeSecrets(input.secrets),
+            sourceRepoPath: projectPlan.repoPath,
+            renewQaClaim: renewClaim,
+            assertQaClaim: assertClaim,
           }));
         } catch (fallbackError) {
           result = authFailureProjectResult(
@@ -2575,7 +3639,14 @@ export async function runQaIntegration(input = {}) {
     } finally {
       await cleanupGitHubAppAuth(authContext);
     }
-    await recordProjectResult(result);
+    const recorded = await recordProjectResult(result, projectPlan, qaClaim, input);
+    if (!recorded.recorded) {
+      result.status = "stale_result_discarded";
+      result.output = truncateOutput(
+        `QA integration result was discarded without overwriting newer state: ${recorded.reason}`,
+      );
+      result.tasks = allTaskResults(projectPlan.tasks, "stale_result_discarded", result.output);
+    }
     results.push(result);
   }
 

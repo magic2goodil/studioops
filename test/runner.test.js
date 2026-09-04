@@ -194,6 +194,42 @@ test("runner does not launch queued work for a task paused after preserving an o
   assert.equal(report.skipped[0].reason, "budget_pause");
 });
 
+test("runner rechecks budget pause after preflight before claiming a queued run", async () => {
+  const state = {
+    projects: [{ id: "project_budget_pause", workflowMode: "local" }],
+    tasks: [{
+      id: "task_budget_pause",
+      projectId: "project_budget_pause",
+      status: "queued",
+      assignedAgentRole: "builder",
+    }],
+    runs: [{
+      id: "run_next",
+      taskId: "task_budget_pause",
+      projectId: "project_budget_pause",
+      group: "builder",
+      role: "builder",
+      actionType: "start_builder",
+      status: "queued",
+    }],
+    comments: [],
+    events: [],
+  };
+
+  const claimed = await claimRuns({
+    state,
+    limit: 1,
+    preflightRun: async () => {
+      state.tasks[0].budgetPause = { runId: "run_preserved", resumeStatus: "queued" };
+      return { ok: true, workflowMode: "local", baseRef: "HEAD", baseCommit: "test-commit" };
+    },
+  });
+
+  assert.deepEqual(claimed, []);
+  assert.equal(state.runs[0].status, "queued");
+  assert.equal(planRunnableRuns(state, { limit: 1 }).skipped[0].reason, "budget_pause");
+});
+
 test("owner can resume a preserved budget handoff with compare-and-set evidence", () => {
   const state = {
     projects: [{ id: "project_budget_pause" }],

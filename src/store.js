@@ -7,7 +7,17 @@ import {
   invalidateCandidate,
   normalizeGitSha,
 } from "./candidate-manifest.js";
-import { verifyCandidateRepositoryState } from "./candidate-repository.js";
+import {
+  assertCanonicalCandidateRepositoryAuthority,
+  createCandidateRepositoryTestVerificationObservation,
+  verifyCandidateRepositoryState,
+} from "./candidate-repository.js";
+import {
+  cleanupGitHubAppAuth,
+  githubAppAuthSecrets,
+  prepareGitHubAppAuth,
+  redactSecrets,
+} from "./github-app-auth.js";
 import {
   branchWebUrl,
   integrationBranchName,
@@ -15,8 +25,9 @@ import {
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "./integration-policy.js";
-import { missionControlDataDir } from "./runtime-paths.js";
+import { defaultStudioOpsCredentialsRoot, missionControlDataDir } from "./runtime-paths.js";
 import {
+  loadConfig,
   normalizeProjectWorkflowMode,
   normalizeWorkspaceRetention,
   withDefaultProjectStandards,
@@ -32,20 +43,51 @@ import {
   DATABASE_FILE,
   LEGACY_DATA_FILE,
   ensureStateDatabase,
+  mutateCandidateQaDecisionState,
   mutateDatabaseState,
+  mutateQaRevocationIntentState,
+  mutateQaRevocationSettlementState,
   readDatabaseState,
   readDatabaseStateReadOnly,
   writeDatabaseState,
 } from "./state-database.js";
+import {
+  assertQaRevocationIntent,
+  normalizeQaRevocationSettlement,
+} from "./qa-revocation-records.js";
 import {
   createRemediationHandoff,
   currentRemediationHandoff,
   remediationPromptSection,
   supersedeRemediationHandoff,
 } from "./remediation-handoff.js";
+import {
+  createQaRevocationTestObservation,
+  settleReleaseCandidatePullRequestForRevocation,
+} from "./qa-approval-revocation.js";
+import {
+  OWNER_QA_PROJECT_DEFINITION_FIELDS,
+  OWNER_QA_TASK_DEFINITION_FIELDS,
+  assertCurrentOwnerQaPacket,
+} from "./owner-qa-packet.js";
+import {
+  assertCurrentIsolatedTestAuthority,
+  consumeIsolatedTestAuthority,
+  isolatedTestAdapterRun,
+  registerIsolatedTestAdapter,
+} from "./test-authority-realm.js";
 
 const DATA_DIR = missionControlDataDir();
 const DATA_FILE = LEGACY_DATA_FILE;
+const qaDecisionTestAuthority = consumeIsolatedTestAuthority((capability) => capability);
+
+function requireQaDecisionTestAuthority() {
+  if (!qaDecisionTestAuthority) {
+    throw new Error("QA-decision test authority is unavailable.");
+  }
+  assertCurrentIsolatedTestAuthority(qaDecisionTestAuthority);
+  return qaDecisionTestAuthority;
+}
 
 const VALID_STATUSES = new Set(CANONICAL_LIFECYCLE_STATUSES.filter((status) => status !== "legacy_untrusted"));
 
@@ -94,12 +136,24 @@ const VALID_DELIVERY_MODES = new Set(["functional", "prototype", "visual-only"])
 const VALID_DELIVERY_POLICY_PROFILES = new Set(["standard", "prototype-fast-lane"]);
 const CAPABILITY_KEYS = ["backend", "frontend", "accessibility", "lead"];
 const ARCHITECTURE_TASK_PATTERN = /\b(app|application|platform|product|system|dashboard|portal|website|web app|mobile|native|mockup|redesign)\b/i;
+const RELEASE_CANDIDATE_REVOCATION_SETTLED = Symbol("studioops.release-candidate-revocation-settled");
+const RELEASE_RECONCILIATION_TASK_STATUSES = new Set([
+  "user_review",
+  "promotion_blocked",
+  "merged",
+  "deployed",
+  "done",
+]);
 
 export const READINESS_FIELDS = Object.freeze([
   "userStory", "expectedOutcome", "acceptanceCriteria", "affectedSurfaces",
   "workAreas", "validationPlan", "riskClassification", "privacyNotes",
   "securityNotes", "dependsOnTaskIds", "architectureDecision",
 ]);
+
+function fieldsChanged(previous = {}, current = {}, fields = []) {
+  return fields.some((field) => !isDeepStrictEqual(previous[field], current[field]));
+}
 
 function readinessValuePresent(field, value) {
   if (field === "dependsOnTaskIds") return Array.isArray(value);
@@ -1572,10 +1626,47 @@ export async function addProject(input) {
   }, { operationName: "project.add" });
 }
 
+function invalidateChangedProjectQaAuthorityInState(state, projectBeforePatch, project, now) {
+  if (!fieldsChanged(projectBeforePatch, project, OWNER_QA_PROJECT_DEFINITION_FIELDS)) return [];
+  const activeCandidates = (state.candidates || []).filter((candidate) => (
+    candidate.projectId === project.id
+    && !candidate.invalidation
+    && ["frozen", "qa_passed", "release_candidate_ready"].includes(candidate.status)
+  ));
+  if (activeCandidates.some((candidate) => candidate.status === "release_candidate_ready")) {
+    throw new Error("Project QA authority cannot change while a release-candidate pull request is active; revoke that QA approval first.");
+  }
+  for (const candidate of activeCandidates) {
+    const sourceTasks = candidate.manifest.sources.map((source) => {
+      const task = state.tasks.find((item) => item.id === source.taskId && item.candidateId === candidate.id);
+      if (!task) throw new Error(`Candidate task ${source.taskId} is missing during project-policy invalidation.`);
+      return task;
+    });
+    invalidateCandidateQaAuthorityInState(state, candidate, sourceTasks, {
+      author: "StudioOps Owner",
+      notes: "Project review, safety, repository, or validation authority changed after the immutable QA candidate was frozen.",
+    }, {
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      integrationSha: candidate.manifest.integration.sha,
+    }, now, {
+      action: candidate.status === "frozen" ? "request_changes" : "revoke_qa",
+      outcome: "project_authority_changed",
+      summary: "QA authority invalidated because project review or safety requirements changed. Returning this candidate to the builder.",
+      taskEventType: "qa_project_authority_changed",
+      candidateEventType: "candidate_qa_project_authority_changed",
+      eventMessage: `project QA authority changed after ${candidate.id} was frozen`,
+      candidateEventMessage: `QA authority invalidated after project policy changed for ${sourceTasks.length} task(s)`,
+    });
+  }
+  return activeCandidates.map((candidate) => candidate.id);
+}
+
 export async function updateProject(projectId, patch = {}) {
   return mutateState(async (state) => {
     const project = findProject(state, projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
+    const projectBeforePatch = structuredClone(project);
     const now = new Date().toISOString();
     const allowed = [
       "name",
@@ -1657,6 +1748,7 @@ export async function updateProject(projectId, patch = {}) {
     if (Object.prototype.hasOwnProperty.call(patch, "deliveryPolicy")) {
       project.deliveryPolicy = normalizeDeliveryPolicy(patch.deliveryPolicy);
     }
+    invalidateChangedProjectQaAuthorityInState(state, projectBeforePatch, project, now);
     project.updatedAt = now;
     state.events.push({
       id: nextId(state.events, "event"),
@@ -1672,6 +1764,7 @@ export async function updateProject(projectId, patch = {}) {
 export function adoptDefaultProjectStandardsInState(state, projectId, input = {}) {
   const project = findProject(state, projectId);
   if (!project) throw new Error(`Unknown project: ${projectId}`);
+  const projectBeforePatch = structuredClone(project);
   const previous = normalizeList(project.standards);
   const standards = withDefaultProjectStandards(previous);
   const added = standards.filter((standard) => !previous.includes(standard));
@@ -1679,6 +1772,7 @@ export function adoptDefaultProjectStandardsInState(state, projectId, input = {}
 
   const now = input.now || new Date().toISOString();
   project.standards = standards;
+  invalidateChangedProjectQaAuthorityInState(state, projectBeforePatch, project, now);
   project.updatedAt = now;
   state.events = state.events || [];
   state.events.push({
@@ -1827,7 +1921,60 @@ export async function addTask(input) {
   }, { operationName: "task.add" });
 }
 
-function lifecycleInvalidationIds(state, task, decision) {
+const PROMOTION_WORKER_LIFECYCLE = Symbol("studioops.promotion-worker-lifecycle");
+
+function exactPromotionWorkerLifecycleAuthority(state, candidate, decision, options = {}) {
+  if (options.promotionWorkerLifecycleCapability !== PROMOTION_WORKER_LIFECYCLE) return false;
+  if (
+    decision.actor?.role !== "promotion-worker"
+    || !["system", "worker"].includes(decision.actor?.actorType)
+    || !["record_promotion_outcome", "record_promotion_validation_evidence", "open_promotion_circuit", "record_merge"].includes(decision.action)
+    || decision.evidence?.candidateId !== candidate.id
+    || decision.evidence?.manifestDigest !== candidate.manifestDigest
+  ) return false;
+  const claim = state.meta?.promotionAttemptClaims?.[candidate.id];
+  const fence = Number(decision.evidence?.promotionClaimFence);
+  return Boolean(
+    claim
+    && ["active", "terminal"].includes(claim.status)
+    && claim.candidateId === candidate.id
+    && claim.claimId === decision.evidence?.promotionClaimId
+    && Number.isSafeInteger(fence)
+    && fence > 0
+    && Number(claim.fence) === fence
+  );
+}
+
+function assertReleaseCandidateLifecycleIsSettled(state, task, decision, options = {}) {
+  const promotionExposedCandidates = (state.candidates || []).filter((candidate) => (
+    !candidate.invalidation
+    && (
+      candidate.status === "release_candidate_ready"
+      || (
+        candidate.status === "qa_passed"
+        && Boolean(state.meta?.promotionAttemptClaims?.[candidate.id])
+      )
+    )
+    && (candidate.manifest?.sources || []).some((source) => source.taskId === task.id)
+  ));
+  for (const candidate of promotionExposedCandidates) {
+    const invalidatesCandidate = decision.invalidates.includes("candidate");
+    const strandsReconciliation = !RELEASE_RECONCILIATION_TASK_STATUSES.has(decision.to);
+    if (!invalidatesCandidate && !strandsReconciliation) continue;
+    if (exactPromotionWorkerLifecycleAuthority(state, candidate, decision, options)) continue;
+    if (
+      options.releaseCandidateRevocationCapability !== RELEASE_CANDIDATE_REVOCATION_SETTLED
+      || options.releaseCandidateId !== candidate.id
+    ) {
+      throw new Error(
+        `Task ${task.id} belongs to a promotion-exposed QA candidate; revoke that QA approval first so StudioOps can discover, close, and verify any exact release pull request.`,
+      );
+    }
+  }
+}
+
+function lifecycleInvalidationIds(state, task, decision, options = {}) {
+  assertReleaseCandidateLifecycleIsSettled(state, task, decision, options);
   if (!decision.invalidates.length) return [];
   const ids = [];
   const invalidatedAt = decision.occurredAt;
@@ -1911,7 +2058,7 @@ function appendLifecycleAuditEvent(state, task, decision, invalidationIds) {
   });
 }
 
-export function applyLifecycleTransitionInState(state, command, input = {}) {
+function applyLifecycleTransitionWithCapability(state, command, input = {}, capability = null) {
   const task = findTask(state, command?.taskId);
   if (!task) throw new Error(`Unknown task: ${command?.taskId || "(missing)"}`);
   const project = findProject(state, task.projectId);
@@ -1921,6 +2068,7 @@ export function applyLifecycleTransitionInState(state, command, input = {}) {
   const result = evaluateLifecycleTransition(command, task, {
     runs: state.runs || [],
     candidates: state.candidates || [],
+    promotionAttemptClaims: state.meta?.promotionAttemptClaims || {},
     reviews: state.reviews || [],
     reviewStages: project ? reviewStagesForTask(project, task) : [],
     completionEvidence,
@@ -1932,10 +2080,28 @@ export function applyLifecycleTransitionInState(state, command, input = {}) {
     now: input.now,
     nowMs: input.nowMs,
   });
+  const lifecycleOptions = capability === PROMOTION_WORKER_LIFECYCLE
+    ? { promotionWorkerLifecycleCapability: capability }
+    : {};
+  assertReleaseCandidateLifecycleIsSettled(state, task, result.decision, lifecycleOptions);
   Object.assign(task, result.task);
-  const invalidationIds = lifecycleInvalidationIds(state, task, result.decision);
+  const invalidationIds = lifecycleInvalidationIds(state, task, result.decision, lifecycleOptions);
   appendLifecycleAuditEvent(state, task, result.decision, invalidationIds);
   return { task, decision: { ...result.decision, invalidationIds } };
+}
+
+export function applyLifecycleTransitionInState(state, command, input = {}) {
+  return applyLifecycleTransitionWithCapability(state, command, input);
+}
+
+/** Exact promotion-claim path; ordinary lifecycle callers cannot bypass the release fence. */
+export function applyPromotionLifecycleTransitionInState(state, command, input = {}) {
+  return applyLifecycleTransitionWithCapability(
+    state,
+    command,
+    input,
+    PROMOTION_WORKER_LIFECYCLE,
+  );
 }
 
 function lifecycleEvidenceForTask(state, task, targetStatus, evidence = {}) {
@@ -2208,6 +2374,72 @@ export async function updateTask(taskId, patch) {
     validateTaskRelationships(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
     if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
       task.attachments = normalizeAttachments(patch.attachments);
+    }
+    const taskDefinitionChanged = fieldsChanged(
+      aggregateBeforePatch,
+      task,
+      OWNER_QA_TASK_DEFINITION_FIELDS,
+    );
+    const dependencyContextChanged = fieldsChanged(
+      aggregateBeforePatch,
+      task,
+      ["title", "expectedOutcome"],
+    );
+    const definitionCandidates = taskDefinitionChanged
+      ? (state.candidates || []).filter((candidate) => {
+        if (
+          candidate.invalidation
+          || !["frozen", "qa_passed", "release_candidate_ready"].includes(candidate.status)
+        ) return false;
+        if ((candidate.manifest?.sources || []).some((source) => source.taskId === task.id)) return true;
+        if (!dependencyContextChanged) return false;
+        return (candidate.manifest?.sources || []).some((source) => {
+          const sourceTask = state.tasks.find((item) => item.id === source.taskId);
+          return (sourceTask?.dependsOnTaskIds || []).includes(task.id);
+        });
+      })
+      : [];
+    if (definitionCandidates.length) {
+      if (definitionCandidates.some((candidate) => candidate.status === "release_candidate_ready")) {
+        throw new Error("Task QA requirements cannot change while an affected release-candidate pull request is active; revoke that QA approval first.");
+      }
+      const now = new Date().toISOString();
+      for (const definitionCandidate of definitionCandidates) {
+        const sourceTasks = definitionCandidate.manifest.sources.map((source) => {
+          const sourceTask = state.tasks.find((item) => item.id === source.taskId && item.candidateId === definitionCandidate.id);
+          if (!sourceTask) throw new Error(`Candidate task ${source.taskId} is missing during definition invalidation.`);
+          return sourceTask;
+        });
+        const action = definitionCandidate.status === "frozen" ? "request_changes" : "revoke_qa";
+        invalidateCandidateQaAuthorityInState(state, definitionCandidate, sourceTasks, {
+          author: "StudioOps Owner",
+          notes: definitionCandidate.manifest.sources.some((source) => source.taskId === task.id)
+            ? "Owner-visible task requirements changed after the immutable QA candidate was frozen."
+            : "A dependency's owner-visible requirements changed after the immutable QA candidate was frozen.",
+        }, {
+          candidateId: definitionCandidate.id,
+          manifestDigest: definitionCandidate.manifestDigest,
+          integrationSha: definitionCandidate.manifest.integration.sha,
+        }, now, {
+          action,
+          outcome: "definition_changed",
+          summary: "QA authority invalidated because task or dependency requirements changed. Returning this candidate to the builder.",
+          taskEventType: "qa_authority_definition_changed",
+          candidateEventType: "candidate_qa_authority_definition_changed",
+          eventMessage: `owner-visible requirements changed after ${definitionCandidate.id} was frozen`,
+          candidateEventMessage: `QA authority invalidated after owner-visible task or dependency requirements changed for ${sourceTasks.length} task(s)`,
+        });
+      }
+      task.updatedAt = now;
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "task_updated",
+        projectId: task.projectId,
+        taskId: task.id,
+        message: `Task updated and ${definitionCandidates.length} frozen QA candidate(s) invalidated: ${task.title}`,
+        createdAt: now,
+      });
+      return task;
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
@@ -2539,6 +2771,8 @@ export async function completeArchitecture(taskId, input = {}) {
 
 function qaDecisionSubject(candidate, input = {}) {
   assertCandidateEnvelope(candidate);
+  const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
+  if (!["passed", "failed"].includes(outcome)) throw new Error("QA decision outcome must be passed or failed.");
   const candidateId = String(input.candidateId || "").trim();
   const manifestDigest = String(input.manifestDigest || "").trim();
   const integrationSha = normalizeGitSha(input.integrationSha, "QA integration SHA");
@@ -2546,8 +2780,26 @@ function qaDecisionSubject(candidate, input = {}) {
   if (manifestDigest !== candidate.manifestDigest) throw new Error("QA decision manifest digest does not match.");
   if (integrationSha !== candidate.manifest.integration.sha) throw new Error("QA decision integration SHA does not match.");
   if (candidate.invalidation || candidate.status === "invalidated") throw new Error("Invalidated candidate cannot receive a QA decision.");
-  if (candidate.status !== "frozen") throw new Error(`Candidate must be frozen for QA. Current status: ${candidate.status}`);
-  return { candidateId, manifestDigest, integrationSha };
+  if (candidate.status === "frozen") {
+    return { candidateId, manifestDigest, integrationSha, mode: "decision" };
+  }
+  const revocable = outcome === "failed" && ["qa_passed", "release_candidate_ready"].includes(candidate.status);
+  if (!revocable) throw new Error(`Candidate must be frozen for QA. Current status: ${candidate.status}`);
+  const sourceTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
+  const recordedTaskIds = [...(candidate.qaDecision?.taskIds || [])].sort();
+  if (
+    candidate.qaDecision?.outcome !== "passed"
+    || candidate.qaDecision.candidateId !== candidate.id
+    || candidate.qaDecision.manifestDigest !== candidate.manifestDigest
+    || candidate.qaDecision.integrationSha !== candidate.manifest.integration.sha
+    || candidate.qaDecision.ownerQaPacketDigest !== candidate.qaPacket?.packetDigest
+    || candidate.qaDecision.ownerQaPacketDigest !== String(input.ownerQaPacketDigest || "").trim()
+    || JSON.stringify(recordedTaskIds) !== JSON.stringify(sourceTaskIds)
+    || candidate.promotionMerge
+  ) {
+    throw new Error("Only an exact unmerged QA approval can be revoked.");
+  }
+  return { candidateId, manifestDigest, integrationSha, mode: "revocation" };
 }
 
 function applyTaskQaOutcome(state, task, project, outcome, input, now) {
@@ -2565,6 +2817,7 @@ function applyTaskQaOutcome(state, task, project, outcome, input, now) {
     candidateId: input.candidateId,
     manifestDigest: input.manifestDigest,
     integrationSha: input.integrationSha,
+    ownerQaPacketDigest: input.ownerQaPacketDigest,
     repositoryVerifiedAt: input.repositoryVerifiedAt || "",
     author,
     notes,
@@ -2609,7 +2862,7 @@ function applyTaskQaOutcome(state, task, project, outcome, input, now) {
     promotionStatus: "",
     promotionUpdatedAt: now,
   }, now, {
-    action: "request_changes",
+    action: "fail_qa",
     actorContext: { actorId: author, actorType: "owner", role: "owner", trusted: true },
     evidence: { candidateId: input.candidateId, manifestDigest: input.manifestDigest },
   });
@@ -2631,10 +2884,117 @@ function applyTaskQaOutcome(state, task, project, outcome, input, now) {
   return task;
 }
 
+function resolveCandidateOwnerQaNotificationsInState(state, candidate, now, reason = "qa_authority_changed") {
+  for (const item of state.notificationOutbox || []) {
+    if (
+      !["owner_qa", "release_candidate"].includes(item.kind)
+      || item.candidateId !== candidate.id
+      || item.manifestDigest !== candidate.manifestDigest
+      || item.status === "acknowledged"
+    ) continue;
+    item.status = "acknowledged";
+    item.acknowledgedAt = now;
+    item.acknowledgedBy = "qa_authority_reconciliation";
+    item.resolutionReason = reason;
+    item.resolvedAt = now;
+    item.updatedAt = now;
+    delete item.claimToken;
+    delete item.claimExpiresAt;
+    delete item.retryNotBefore;
+  }
+}
+
+function invalidateCandidateQaAuthorityInState(state, candidate, tasks, input, subject, now, options = {}) {
+  const author = String(input.author || "Owner QA").trim();
+  const notes = String(input.notes || input.body || "").trim();
+  const action = options.action || "revoke_qa";
+  const outcome = options.outcome || "revoked";
+  const actorContext = options.actorContext
+    || { actorId: author, actorType: "owner", role: "owner", trusted: true };
+  const summary = options.summary || "Local QA approval revoked. Returning this task to the builder.";
+  const promotionSettlement = input.promotionSettlement ? {
+    status: String(input.promotionSettlement.status || ""),
+    prUrl: String(input.promotionSettlement.prUrl || candidate.promotion?.prUrl || ""),
+    observedAt: Number.isFinite(Date.parse(input.promotionSettlement.observedAt || ""))
+      ? new Date(input.promotionSettlement.observedAt).toISOString()
+      : now,
+    mergeCommit: String(input.promotionSettlement.mergeCommit || ""),
+    mergedAt: String(input.promotionSettlement.mergedAt || ""),
+  } : null;
+  const planned = tasks.map((task) => {
+    const evidence = lifecycleEvidenceForTask(state, task, "needs_changes", {
+      candidateId: subject.candidateId,
+      manifestDigest: subject.manifestDigest,
+    });
+    return {
+      task,
+      result: evaluateLifecycleTransition({
+        action,
+        taskId: task.id,
+        expectedStateVersion: positiveStateVersion(task.stateVersion),
+        actorContext,
+        evidence,
+      }, task, {
+        candidates: state.candidates || [],
+        now,
+      }),
+    };
+  });
+
+  const applied = planned.map(({ task, result }) => {
+    Object.assign(task, result.task, {
+      assignedAgentRole: "builder",
+      reviewerThreadId: "",
+      promotionStatus: "",
+      promotionUpdatedAt: now,
+    });
+    const invalidationIds = lifecycleInvalidationIds(state, task, result.decision, {
+      ...(["absent", "closed"].includes(input.promotionSettlement?.status) ? {
+        releaseCandidateRevocationCapability: RELEASE_CANDIDATE_REVOCATION_SETTLED,
+        releaseCandidateId: candidate.id,
+      } : {}),
+    });
+    appendLifecycleAuditEvent(state, task, result.decision, invalidationIds);
+    addAutomationComment(
+      state,
+      task,
+      `${summary}${notes ? `\n\n${notes}` : ""}`,
+      now,
+      author,
+    );
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: options.taskEventType || "qa_approval_revoked",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title}: ${options.eventMessage || `owner revoked QA approval for ${candidate.id}`}.`,
+      ...(promotionSettlement ? { promotionSettlement } : {}),
+      createdAt: now,
+    });
+    return task;
+  });
+  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  state.events.push({
+    id: nextId(state.events, "event"),
+    type: options.candidateEventType || "candidate_qa_approval_revoked",
+    projectId: candidate.projectId,
+    message: `${candidate.id}: ${options.candidateEventMessage || `QA authority invalidated atomically for ${applied.length} task(s)`} at ${subject.integrationSha}.`,
+    ...(promotionSettlement ? { promotionSettlement } : {}),
+    createdAt: now,
+  });
+  resolveCandidateOwnerQaNotificationsInState(state, candidate, now, outcome);
+  return {
+    candidate,
+    bundle,
+    outcome,
+    decisions: applied.map((task) => ({ task, outcome })),
+  };
+}
+
 function recordCandidateQaDecisionInState(state, candidate, input = {}) {
-  const subject = qaDecisionSubject(candidate, input);
   const outcome = String(input.outcome || input.decision || "").trim().toLowerCase();
   if (!["passed", "failed"].includes(outcome)) throw new Error("QA decision outcome must be passed or failed.");
+  const subject = qaDecisionSubject(candidate, input);
   const sourceTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
   const selectedTaskIds = normalizeList(input.taskIds || input.tasks).sort();
   if (selectedTaskIds.length && JSON.stringify(selectedTaskIds) !== JSON.stringify(sourceTaskIds)) {
@@ -2652,14 +3012,22 @@ function recordCandidateQaDecisionInState(state, candidate, input = {}) {
     if (!task) throw new Error(`Candidate task ${taskId} is missing or linked to another candidate.`);
     return task;
   });
+  if (subject.mode === "revocation") {
+    return invalidateCandidateQaAuthorityInState(state, candidate, tasks, input, subject, now);
+  }
   const applied = tasks.map((task) => applyTaskQaOutcome(state, task, project, outcome, {
     ...input,
-    ...subject,
+    candidateId: subject.candidateId,
+    manifestDigest: subject.manifestDigest,
+    integrationSha: subject.integrationSha,
   }, now));
   candidate.status = outcome === "passed" ? "qa_passed" : "qa_failed";
   candidate.qaDecision = {
     outcome,
-    ...subject,
+    candidateId: subject.candidateId,
+    manifestDigest: subject.manifestDigest,
+    integrationSha: subject.integrationSha,
+    ownerQaPacketDigest: input.ownerQaPacketDigest,
     taskIds: sourceTaskIds,
     repositoryVerifiedAt: input.repositoryVerifiedAt || "",
     author: String(input.author || "Owner QA").trim(),
@@ -2667,6 +3035,7 @@ function recordCandidateQaDecisionInState(state, candidate, input = {}) {
     decidedAt: now,
   };
   candidate.updatedAt = now;
+  resolveCandidateOwnerQaNotificationsInState(state, candidate, now, `qa_${outcome}`);
   const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
   if (bundle) {
     bundle.status = outcome;
@@ -2680,87 +3049,695 @@ function recordCandidateQaDecisionInState(state, candidate, input = {}) {
     message: `${candidate.id}: ${applied.length} task(s) marked ${outcome} at ${subject.integrationSha}.`,
     createdAt: now,
   });
-  return { candidate, bundle, decisions: applied.map((task) => ({ task, outcome })) };
+  return { candidate, bundle, outcome, decisions: applied.map((task) => ({ task, outcome })) };
 }
 
-async function verifyCandidateForQaInState(state, candidate) {
-  const project = findProject(state, candidate.projectId);
-  if (!project) throw new Error(`Candidate has missing project: ${candidate.projectId}`);
-  const verification = await verifyCandidateRepositoryState(project, candidate);
-  if (verification.ok) return { ok: true, verification };
-  if (verification.status !== "drift") {
+export function createQaDecisionTestDependencies(input = {}) {
+  const testAuthority = requireQaDecisionTestAuthority();
+  const guarded = (run, transform = (value) => value) => async (...args) => {
+    assertCurrentIsolatedTestAuthority(testAuthority);
+    const result = await run(...args);
+    assertCurrentIsolatedTestAuthority(testAuthority);
+    return transform(result, ...args);
+  };
+  const dependencies = Object.freeze({
+    ...(typeof input.verifyCandidateRepositoryState === "function"
+      ? {
+          verifyCandidateRepositoryState: guarded(
+            input.verifyCandidateRepositoryState,
+            (result, project, candidate) => createCandidateRepositoryTestVerificationObservation(
+              project,
+              candidate,
+              result,
+            ),
+          ),
+        }
+      : {}),
+    ...(typeof input.prepareGitHubAppAuth === "function"
+      ? { prepareGitHubAppAuth: guarded(input.prepareGitHubAppAuth) }
+      : {}),
+    ...(typeof input.cleanupGitHubAppAuth === "function"
+      ? { cleanupGitHubAppAuth: guarded(input.cleanupGitHubAppAuth) }
+      : {}),
+    ...(typeof input.loadConfig === "function" ? { loadConfig: guarded(input.loadConfig) } : {}),
+    ...(typeof input.settleReleaseCandidatePullRequestForRevocation === "function"
+      ? {
+          settleReleaseCandidatePullRequestForRevocation: guarded(
+            input.settleReleaseCandidatePullRequestForRevocation,
+            (result, project, candidate) => createQaRevocationTestObservation(
+              candidate,
+              result,
+            ),
+          ),
+        }
+      : {}),
+  });
+  return registerIsolatedTestAdapter(
+    testAuthority,
+    "qa-decision-dependencies",
+    () => dependencies,
+  );
+}
+
+function qaDecisionDependencies(adapter) {
+  if (!adapter) {
     return {
-      ok: false,
-      error: `Candidate integrity could not be verified: ${verification.reason}`,
+      verifyCandidateRepositoryState,
+      prepareGitHubAppAuth,
+      cleanupGitHubAppAuth,
+      loadConfig,
+      settleReleaseCandidatePullRequestForRevocation,
     };
   }
-  invalidateCandidate(candidate, verification);
-  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
-  if (bundle) {
-    bundle.status = "invalidated";
-    bundle.updatedAt = candidate.updatedAt;
+  const resolve = isolatedTestAdapterRun(adapter, "qa-decision-dependencies");
+  const dependencies = resolve ? resolve() : null;
+  if (!dependencies) {
+    throw new Error("QA-decision test dependencies were rejected outside their isolated capability.");
   }
-  state.events.push({
-      id: nextId(state.events, "event"),
-      type: "candidate_invalidated",
+  return {
+    verifyCandidateRepositoryState: dependencies.verifyCandidateRepositoryState || verifyCandidateRepositoryState,
+    prepareGitHubAppAuth: dependencies.prepareGitHubAppAuth || prepareGitHubAppAuth,
+    cleanupGitHubAppAuth: dependencies.cleanupGitHubAppAuth || cleanupGitHubAppAuth,
+    loadConfig: dependencies.loadConfig || loadConfig,
+    settleReleaseCandidatePullRequestForRevocation: dependencies.settleReleaseCandidatePullRequestForRevocation
+      || settleReleaseCandidatePullRequestForRevocation,
+  };
+}
+
+function qaDecisionAuthorityBinding(state, candidate, selector) {
+  const project = findProject(state, candidate.projectId);
+  if (!project) throw new Error(`Candidate has missing project: ${candidate.projectId}`);
+  const sourceTasks = candidate.manifest.sources
+    .map((source) => {
+      const task = state.tasks.find((item) => item.id === source.taskId);
+      if (!task) throw new Error(`Candidate task ${source.taskId} is missing.`);
+      return {
+        definition: Object.fromEntries(
+          OWNER_QA_TASK_DEFINITION_FIELDS.map((field) => [field, structuredClone(task[field] ?? null)]),
+        ),
+        id: task.id,
+        projectId: task.projectId,
+        title: task.title || "",
+        description: task.description || "",
+        userStory: task.userStory || "",
+        expectedOutcome: task.expectedOutcome || "",
+        acceptanceCriteria: task.acceptanceCriteria || [],
+        affectedSurfaces: task.affectedSurfaces || [],
+        workAreas: task.workAreas || [],
+        validationPlan: task.validationPlan || [],
+        riskClassification: task.riskClassification || "",
+        privacyNotes: task.privacyNotes || "",
+        securityNotes: task.securityNotes || "",
+        verificationEvidence: task.verificationEvidence || null,
+        updatedAt: task.updatedAt || "",
+        candidateId: task.candidateId || "",
+        qaBundleId: task.qaBundleId || "",
+        status: task.status,
+        stateVersion: Number(task.stateVersion || 0),
+        integrationStatus: task.integrationStatus || "",
+        integrationCommit: task.integrationCommit || "",
+        candidateManifestDigest: task.candidateManifestDigest || "",
+      };
+    })
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  const selectedTask = selector.kind === "task"
+    ? state.tasks.find((item) => item.id === selector.id)
+    : null;
+  const selectedBundle = selector.kind === "bundle"
+    ? state.qaBundles.find((item) => item.id === selector.id)
+    : null;
+  return {
+    selector,
+    project: {
+      definition: Object.fromEntries(
+        OWNER_QA_PROJECT_DEFINITION_FIELDS.map((field) => [field, structuredClone(project[field] ?? null)]),
+      ),
+      id: project.id,
+      updatedAt: project.updatedAt || "",
+      repoPath: project.repoPath || "",
+      repoUrl: project.repoUrl || "",
+      workflowMode: project.workflowMode || "",
+      defaultBranch: project.defaultBranch || "",
+      validationCommands: project.validationCommands || [],
+      standards: project.standards || [],
+      safetyRules: project.safetyRules || [],
+      reviewPipeline: project.reviewPipeline || [],
+      reviewPolicy: project.reviewPolicy || {},
+      qaIntegration: project.qaIntegration || {},
+      localQaPreview: project.localQaPreview || null,
+    },
+    candidate: {
+      id: candidate.id,
       projectId: candidate.projectId,
-      message: `${candidate.id}: ${verification.reason}`,
-      createdAt: candidate.updatedAt,
+      qaBundleId: candidate.qaBundleId || "",
+      manifestDigest: candidate.manifestDigest,
+      integrationSha: candidate.manifest.integration.sha,
+      status: candidate.status,
+      updatedAt: candidate.updatedAt || "",
+      invalidated: Boolean(candidate.invalidation),
+    },
+    sourceTasks,
+    candidateBundle: bundle ? {
+      id: bundle.id,
+      candidateId: bundle.candidateId || "",
+      manifestDigest: bundle.manifestDigest || "",
+      integrationCommit: bundle.integrationCommit || "",
+      status: bundle.status || "",
+      updatedAt: bundle.updatedAt || "",
+    } : null,
+    selectedTask: selectedTask ? {
+      id: selectedTask.id,
+      candidateId: selectedTask.candidateId || "",
+      stateVersion: Number(selectedTask.stateVersion || 0),
+    } : null,
+    selectedBundle: selectedBundle ? {
+      id: selectedBundle.id,
+      candidateId: selectedBundle.candidateId || "",
+      manifestDigest: selectedBundle.manifestDigest || "",
+      integrationCommit: selectedBundle.integrationCommit || "",
+      status: selectedBundle.status || "",
+      updatedAt: selectedBundle.updatedAt || "",
+    } : null,
+  };
+}
+
+export function qaDecisionCoordinatesForState(state) {
+  const coordinates = { tasks: {}, bundles: {} };
+  for (const candidate of state.candidates || []) {
+    try {
+      assertCandidateEnvelope(candidate);
+      if (
+        candidate.invalidation
+        || candidate.qaRevocationIntent
+        || !["frozen", "qa_passed", "release_candidate_ready"].includes(candidate.status)
+      ) continue;
+      const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+      if (candidate.manifest.sources.length === 1) {
+        const taskId = candidate.manifest.sources[0].taskId;
+        assertQaDecisionLinkage(state, candidate, { kind: "task", id: taskId });
+      }
+      if (candidate.qaBundleId) {
+        assertQaDecisionLinkage(state, candidate, { kind: "bundle", id: candidate.qaBundleId });
+      }
+      const packet = assertCurrentOwnerQaPacket(state, candidate, bundle);
+      if (candidate.manifest.sources.length === 1) {
+        coordinates.tasks[candidate.manifest.sources[0].taskId] = packet.packetDigest;
+      }
+      if (candidate.qaBundleId) coordinates.bundles[candidate.qaBundleId] = packet.packetDigest;
+    } catch {
+      // Corrupt candidates deliberately receive no actionable owner coordinate.
+    }
+  }
+  return coordinates;
+}
+
+function assertQaDecisionLinkage(state, candidate, selector) {
+  const sourceTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
+  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  if (!bundle) throw new Error("QA candidate has no exact bundle linkage.");
+  const bundleTaskIds = (bundle.tasks || []).map((item) => String(item?.id || item?.taskId || item)).sort();
+  if (
+    bundle.candidateId !== candidate.id
+    || bundle.projectId !== candidate.projectId
+    || bundle.manifestDigest !== candidate.manifestDigest
+    || bundle.integrationCommit !== candidate.manifest.integration.sha
+    || bundle.previewUrl !== candidate.manifest.preview.url
+    || JSON.stringify(bundleTaskIds) !== JSON.stringify(sourceTaskIds)
+  ) {
+    throw new Error("QA bundle does not match the immutable candidate authority.");
+  }
+  if (selector.kind === "bundle" && selector.id !== bundle.id) {
+    throw new Error("QA bundle selector does not match the immutable candidate.");
+  }
+  if (selector.kind === "task" && (sourceTaskIds.length !== 1 || sourceTaskIds[0] !== selector.id)) {
+    throw new Error("QA task selector does not match the immutable candidate source.");
+  }
+  const allowedTaskStatuses = candidate.status === "frozen"
+    ? new Set(["qa_review"])
+    : candidate.status === "qa_passed"
+      ? new Set(["approved_for_main", "promotion_blocked"])
+      : new Set(["user_review", "promotion_blocked"]);
+  const expectedBundleStatuses = candidate.status === "frozen"
+    ? new Set(["ready", "partially_reviewed"])
+    : candidate.status === "qa_passed"
+      ? new Set(["passed"])
+      : new Set(["release_candidate_ready"]);
+  const allowedTaskRoles = candidate.status === "frozen"
+    ? new Map([["qa_review", new Set(["owner"])]])
+    : candidate.status === "qa_passed"
+      ? new Map([
+          ["approved_for_main", new Set(["promotion-worker"])],
+          ["promotion_blocked", new Set(["owner", "promotion-worker"])],
+        ])
+      : new Map([
+          ["user_review", new Set(["owner"])],
+          ["promotion_blocked", new Set(["owner", "promotion-worker"])],
+        ]);
+  if (!expectedBundleStatuses.has(bundle.status)) {
+    throw new Error("QA bundle status does not match the immutable candidate lifecycle.");
+  }
+  for (const taskId of sourceTaskIds) {
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (
+      !task
+      || task.projectId !== candidate.projectId
+      || task.candidateId !== candidate.id
+      || task.qaBundleId !== bundle.id
+      || task.candidateManifestDigest !== candidate.manifestDigest
+      || task.integrationCommit !== candidate.manifest.integration.sha
+      || !allowedTaskStatuses.has(task.status)
+      || !allowedTaskRoles.get(task.status)?.has(task.assignedAgentRole)
+    ) {
+      throw new Error(`QA task ${taskId} does not match the immutable candidate authority.`);
+    }
+  }
+}
+
+function qaDecisionSnapshot(state, selector, input) {
+  let candidate;
+  if (selector.kind === "task") {
+    const task = state.tasks.find((item) => item.id === selector.id);
+    if (!task) throw new Error(`Unknown task: ${selector.id}`);
+    candidate = (state.candidates || []).find((item) => item.id === task.candidateId);
+    if (!candidate) throw new Error(`Task ${selector.id} has no immutable candidate.`);
+    if (candidate.manifest.sources.length !== 1) {
+      throw new Error("Use the candidate or QA bundle decision endpoint for a multi-task candidate.");
+    }
+  } else {
+    const bundle = (state.qaBundles || []).find((item) => item.id === selector.id);
+    if (!bundle) throw new Error(`Unknown QA bundle: ${selector.id}`);
+    if (!bundle.candidateId) throw new Error(`QA bundle ${selector.id} is legacy and has no immutable candidate.`);
+    candidate = (state.candidates || []).find((item) => item.id === bundle.candidateId);
+    if (!candidate || candidate.qaBundleId !== bundle.id) {
+      throw new Error(`QA bundle ${selector.id} has an invalid candidate link.`);
+    }
+  }
+  let boundInput = { ...input };
+  const outcome = String(boundInput.outcome || boundInput.decision || "").trim().toLowerCase();
+  if (!["passed", "failed"].includes(outcome)) throw new Error("QA decision outcome must be passed or failed.");
+  qaDecisionSubject(candidate, boundInput);
+  assertQaDecisionLinkage(state, candidate, selector);
+  const project = findProject(state, candidate.projectId);
+  if (!project) throw new Error(`Candidate has missing project: ${candidate.projectId}`);
+  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  const packet = assertCurrentOwnerQaPacket(state, candidate, bundle);
+  const binding = qaDecisionAuthorityBinding(state, candidate, selector);
+  const ownerQaPacketDigest = String(boundInput.ownerQaPacketDigest || "").trim();
+  if (ownerQaPacketDigest !== packet.packetDigest) {
+    throw new Error("Owner QA packet digest does not match the current candidate authority; refresh and retry.");
+  }
+  boundInput = { ...boundInput, ownerQaPacketDigest: packet.packetDigest };
+  return {
+    selector,
+    boundInput,
+    binding,
+    ownerQaPacketDigest: packet.packetDigest,
+    project: structuredClone(project),
+    candidate: structuredClone(candidate),
+  };
+}
+
+function assertQaDecisionSnapshotCurrent(state, snapshot) {
+  const candidate = (state.candidates || []).find((item) => item.id === snapshot.candidate.id);
+  if (!candidate) throw new Error("QA candidate authority changed during repository verification; refresh and retry.");
+  const current = qaDecisionAuthorityBinding(state, candidate, snapshot.selector);
+  if (!isDeepStrictEqual(current, snapshot.binding)) {
+    throw new Error("QA candidate authority changed during repository verification; refresh and retry.");
+  }
+  qaDecisionSubject(candidate, snapshot.boundInput);
+  assertQaDecisionLinkage(state, candidate, snapshot.selector);
+  const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  const packet = assertCurrentOwnerQaPacket(state, candidate, bundle);
+  if (packet.packetDigest !== snapshot.ownerQaPacketDigest) {
+    throw new Error("Owner QA packet changed during repository verification; refresh and retry.");
+  }
+  return candidate;
+}
+
+async function persistQaRevocationIntent(snapshot) {
+  return mutateQaRevocationIntentState(snapshot.candidate.id, snapshot.boundInput, (state, intent) => {
+    const candidate = (state.candidates || []).find((item) => item.id === snapshot.candidate.id);
+    if (!candidate) throw new Error(`Unknown QA revocation candidate: ${snapshot.candidate.id}`);
+    const duplicate = (state.events || []).some((event) => (
+      event.type === "candidate_qa_revocation_requested"
+      && event.projectId === candidate.projectId
+      && event.qaRevocationRequestId === intent.requestId
+    ));
+    if (duplicate) return structuredClone(intent);
+    state.events = state.events || [];
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: "candidate_qa_revocation_requested",
+      projectId: candidate.projectId,
+      message: `${candidate.id}: durable QA revocation requested before settling ${candidate.promotion?.prUrl || "the release pull request"}.`,
+      qaRevocationRequestId: intent.requestId,
+      createdAt: intent.requestedAt,
     });
+    return structuredClone(intent);
+  }, { operationName: "qa.persist_release_revocation_intent" });
+}
+
+async function finalizeQaRevocationSettlement(candidateId, settlement, input = {}) {
+  const finalize = (state, authorizedSettlement = null) => {
+    const candidate = (state.candidates || []).find((item) => item.id === candidateId);
+    if (!candidate) throw new Error(`Unknown QA revocation candidate: ${candidateId}`);
+    if (candidate.invalidation) {
+      return { status: "already_invalidated", candidate: structuredClone(candidate) };
+    }
+    if (!["qa_passed", "release_candidate_ready"].includes(candidate.status)) {
+      throw new Error(`QA revocation candidate is no longer QA-passed or release-candidate ready: ${candidate.status}`);
+    }
+    const intent = assertQaRevocationIntent(candidate, candidate.qaRevocationIntent);
+    const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+    assertQaDecisionLinkage(state, candidate, { kind: "bundle", id: candidate.qaBundleId });
+    const packet = assertCurrentOwnerQaPacket(state, candidate, bundle);
+    if (packet.packetDigest !== intent.ownerQaPacketDigest) {
+      throw new Error("QA revocation owner packet authority changed before local settlement.");
+    }
+    if (input.persisted === true && !candidate.qaRevocationSettlement) {
+      throw new Error("The persisted QA revocation settlement is no longer available.");
+    }
+    const normalizedSettlement = candidate.qaRevocationSettlement
+      || authorizedSettlement
+      || normalizeQaRevocationSettlement(candidate, settlement);
+    if (candidate.qaRevocationSettlement && !isDeepStrictEqual(
+      candidate.qaRevocationSettlement,
+      normalizeQaRevocationSettlement(candidate, settlement, {
+        now: candidate.qaRevocationSettlement.observedAt,
+      }),
+    )) {
+      throw new Error("QA revocation settlement conflicts with the durable candidate record.");
+    }
+    candidate.qaRevocationSettlement = normalizedSettlement;
+    const now = new Date().toISOString();
+    candidate.updatedAt = now;
+    if (normalizedSettlement.status === "merged") {
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "candidate_qa_revocation_merge_observed",
+        projectId: candidate.projectId,
+        message: `${candidate.id}: QA revocation stopped because the exact release pull request was already merged.`,
+        promotionSettlement: normalizedSettlement,
+        createdAt: now,
+      });
+      return { status: "merged", candidate: structuredClone(candidate), settlement: normalizedSettlement };
+    }
+    return recordCandidateQaDecisionInState(state, candidate, {
+      outcome: "failed",
+      candidateId: intent.candidateId,
+      manifestDigest: intent.manifestDigest,
+      integrationSha: intent.integrationSha,
+      ownerQaPacketDigest: intent.ownerQaPacketDigest,
+      taskIds: intent.taskIds,
+      author: intent.author,
+      notes: intent.notes,
+      promotionSettlement: normalizedSettlement,
+    });
+  };
+  if (input.persisted === true) {
+    return mutateState(finalize, { operationName: "qa.finalize_persisted_release_revocation" });
+  }
+  return mutateQaRevocationSettlementState(
+    candidateId,
+    settlement,
+    finalize,
+    { operationName: "qa.finalize_release_revocation" },
+  );
+}
+
+function redactQaVerification(value, secrets = []) {
+  const redactValue = (entry) => {
+    if (typeof entry === "string") return redactSecrets(entry, secrets);
+    if (Array.isArray(entry)) return entry.map(redactValue);
+    if (!entry || typeof entry !== "object") return entry;
+    return Object.fromEntries(Object.entries(entry).map(([key, child]) => [key, redactValue(child)]));
+  };
+  return redactValue(structuredClone(value));
+}
+
+async function prepareQaDecisionAuth(snapshot, dependencies, role = "qa-reviewer") {
+  assertCanonicalCandidateRepositoryAuthority(snapshot.project);
+  const config = await dependencies.loadConfig();
+  const githubApps = config?.githubApps && typeof config.githubApps === "object"
+    ? config.githubApps
+    : {};
+  const auth = await dependencies.prepareGitHubAppAuth({
+    id: `qa-decision-${snapshot.candidate.id}`,
+    role,
+    workflowMode: "github",
+    project: {
+      id: snapshot.project.id,
+      key: snapshot.project.key,
+      name: snapshot.project.name,
+      repoPath: snapshot.project.repoPath,
+      repoUrl: snapshot.project.repoUrl,
+      workflowMode: "github",
+    },
+  }, {
+    githubAppAuth: true,
+    githubAppCredentialsDir: githubApps.credentialsDir || defaultStudioOpsCredentialsRoot(),
+    githubAppRoleMap: githubApps.roleMap && typeof githubApps.roleMap === "object" ? githubApps.roleMap : {},
+    githubAppDefaultRole: String(githubApps.defaultRole || "builder"),
+  });
+  if (!auth?.token || !path.isAbsolute(String(auth.askpassPath || ""))) {
+    throw new Error("Repository-scoped owner QA authentication was unavailable.");
+  }
+  return auth;
+}
+
+async function settleQaRevocationPromotion(snapshot, dependencies) {
+  let auth = null;
+  try {
+    auth = await prepareQaDecisionAuth(snapshot, dependencies, "promotion-worker");
+    const result = await dependencies.settleReleaseCandidatePullRequestForRevocation(
+      snapshot.project,
+      snapshot.candidate,
+      { githubToken: auth.token },
+    );
+    if (["absent", "closed", "merged"].includes(result?.status)) return result;
+    return redactQaVerification(result, githubAppAuthSecrets(auth));
+  } catch (error) {
+    return {
+      status: "unavailable",
+      reason: redactSecrets(error.message || "Release-candidate pull request could not be settled.", githubAppAuthSecrets(auth)),
+    };
+  } finally {
+    await dependencies.cleanupGitHubAppAuth(auth);
+  }
+}
+
+export async function reconcilePendingQaRevocations(input = {}, testDependencies = null) {
+  const dependencies = qaDecisionDependencies(testDependencies);
+  const state = await readState();
+  const nowMs = Number.isFinite(Number(input.nowMs)) ? Number(input.nowMs) : Date.now();
+  const projectFilters = new Set(normalizeList(input.project || input.projects));
+  const taskFilters = new Set(normalizeList(input.task || input.tasks || input.taskId));
+  const limit = Math.max(1, Number(input.limit || 10));
+  const candidates = (state.candidates || []).filter((candidate) => {
+    if (
+      candidate.invalidation
+      || !["qa_passed", "release_candidate_ready"].includes(candidate.status)
+      || !candidate.qaRevocationIntent
+      || candidate.qaRevocationSettlement?.status === "merged"
+    ) return false;
+    const project = findProject(state, candidate.projectId);
+    if (projectFilters.size && !projectFilters.has(candidate.projectId) && !projectFilters.has(project?.key)) return false;
+    if (taskFilters.size && !candidate.manifest.sources.some((source) => taskFilters.has(source.taskId))) return false;
+    return true;
+  }).slice(0, limit);
+  const results = [];
+  for (const candidate of candidates) {
+    const project = findProject(state, candidate.projectId);
+    try {
+      assertQaRevocationIntent(candidate, candidate.qaRevocationIntent);
+      const hasPersistedSettlement = Boolean(candidate.qaRevocationSettlement);
+      const settlement = candidate.qaRevocationSettlement
+        || await settleQaRevocationPromotion({
+          project: structuredClone(project),
+          candidate: structuredClone(candidate),
+        }, dependencies);
+      const currentClaim = state.meta?.promotionAttemptClaims?.[candidate.id];
+      const activeClaim = currentClaim?.status === "active"
+        && Number.isFinite(Date.parse(currentClaim.expiresAt || ""))
+        && Date.parse(currentClaim.expiresAt) > nowMs;
+      if (settlement?.status === "absent" && activeClaim) {
+        results.push({
+          candidateId: candidate.id,
+          status: "pending",
+          reason: `An exact promotion attempt remains leased until ${currentClaim.expiresAt}; remote absence will be rechecked after it settles.`,
+        });
+        continue;
+      }
+      if (!["absent", "closed", "merged"].includes(settlement?.status)) {
+        results.push({
+          candidateId: candidate.id,
+          status: "pending",
+          reason: settlement?.reason || "The exact release pull request is not settled yet.",
+        });
+        continue;
+      }
+      const finalized = await finalizeQaRevocationSettlement(candidate.id, settlement, {
+        persisted: hasPersistedSettlement,
+      });
+      results.push({ candidateId: candidate.id, status: finalized.status || finalized.outcome || "completed" });
+    } catch (error) {
+      results.push({ candidateId: candidate.id, status: "failed", reason: String(error.message || error) });
+    }
+  }
+  return results;
+}
+
+async function verifyQaDecisionSnapshot(snapshot, input, dependencies) {
+  const verificationInput = { testGitRunner: input.testGitRunner };
+  const unauthenticated = await dependencies.verifyCandidateRepositoryState(
+    snapshot.project,
+    snapshot.candidate,
+    verificationInput,
+  );
+  if (unauthenticated.ok || unauthenticated.status === "drift") return unauthenticated;
+
+  let auth = null;
+  try {
+    auth = await prepareQaDecisionAuth(snapshot, dependencies);
+    const secrets = githubAppAuthSecrets(auth);
+    const authenticated = await dependencies.verifyCandidateRepositoryState(
+      snapshot.project,
+      snapshot.candidate,
+      {
+        ...verificationInput,
+        gitAuthEnv: {
+          GIT_ASKPASS: auth.askpassPath,
+          MISSION_CONTROL_GITHUB_TOKEN: auth.token,
+          MISSION_CONTROL_GIT_USERNAME: "x-access-token",
+        },
+      },
+    );
+    if (authenticated?.ok === true && authenticated?.status === "verified") return authenticated;
+    return redactQaVerification(authenticated, secrets);
+  } catch (error) {
+    const secrets = githubAppAuthSecrets(auth);
+    const publicReason = redactSecrets(unauthenticated.reason || "Unauthenticated verification failed.", secrets);
+    const authReason = redactSecrets(error.message || "GitHub App authentication failed.", secrets);
+    return {
+      ok: false,
+      status: "unavailable",
+      reason: `${publicReason} Repository-scoped owner QA verification also failed: ${authReason}`,
+      expected: "",
+      observed: "",
+      observations: [],
+    };
+  } finally {
+    await dependencies.cleanupGitHubAppAuth(auth);
+  }
+}
+
+function applyQaVerificationFailureInState(state, candidate, verification) {
+  const tasks = candidate.manifest.sources.map((source) => {
+    const task = state.tasks.find((item) => item.id === source.taskId && item.candidateId === candidate.id);
+    if (!task) throw new Error(`Candidate task ${source.taskId} is missing during repository-drift recovery.`);
+    return task;
+  });
+  const now = new Date().toISOString();
+  invalidateCandidateQaAuthorityInState(state, candidate, tasks, {
+    author: "StudioOps QA Integrity",
+    notes: verification.reason,
+  }, {
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationSha: candidate.manifest.integration.sha,
+  }, now, {
+    action: "request_changes",
+    outcome: "repository_drift",
+    actorContext: {
+      actorId: "qa-repository-integrity",
+      actorType: "system",
+      role: "workflow-engine",
+      trusted: true,
+    },
+    summary: "Repository drift invalidated this QA candidate. Returning it to the builder for a fresh immutable candidate.",
+    taskEventType: "qa_repository_drift_recovery",
+    candidateEventType: "candidate_invalidated",
+    eventMessage: `repository drift invalidated ${candidate.id}`,
+    candidateEventMessage: `repository drift invalidated QA authority for ${tasks.length} task(s)`,
+  });
   return {
     ok: false,
     error: `Candidate integrity verification failed: ${verification.reason}`,
   };
 }
 
-export async function recordQaDecision(taskId, input = {}) {
-  const operation = await mutateState(async (state) => {
-    const task = state.tasks.find((item) => item.id === taskId);
-    if (!task) throw new Error(`Unknown task: ${taskId}`);
-    const candidate = (state.candidates || []).find((item) => item.id === task.candidateId);
-    if (!candidate) throw new Error(`Task ${taskId} has no immutable candidate.`);
-    const verified = await verifyCandidateForQaInState(state, candidate);
-    if (!verified.ok) return verified;
-    if (candidate.manifest.sources.length !== 1) {
-      throw new Error("Use the candidate or QA bundle decision endpoint for a multi-task candidate.");
+async function recordQaDecisionFromSnapshot(snapshot, input, dependencies) {
+  const outcome = String(snapshot.boundInput.outcome || snapshot.boundInput.decision || "").trim().toLowerCase();
+  if (outcome === "failed" && ["qa_passed", "release_candidate_ready"].includes(snapshot.candidate.status)) {
+    await persistQaRevocationIntent(snapshot);
+    const currentState = await readState();
+    const currentCandidate = (currentState.candidates || []).find((item) => item.id === snapshot.candidate.id);
+    const hasPersistedSettlement = Boolean(currentCandidate?.qaRevocationSettlement);
+    const promotionSettlement = currentCandidate?.qaRevocationSettlement
+      || await settleQaRevocationPromotion({
+        ...snapshot,
+        candidate: structuredClone(currentCandidate),
+      }, dependencies);
+    const currentClaim = currentState.meta?.promotionAttemptClaims?.[snapshot.candidate.id];
+    const activeClaim = currentClaim?.status === "active"
+      && Number.isFinite(Date.parse(currentClaim.expiresAt || ""))
+      && Date.parse(currentClaim.expiresAt) > Date.now();
+    if (promotionSettlement?.status === "absent" && activeClaim) {
+      throw new Error(`QA approval revocation is durably pending: an exact promotion attempt remains leased until ${currentClaim.expiresAt}; remote absence will be rechecked automatically.`);
+    }
+    if (!["absent", "closed", "merged"].includes(promotionSettlement?.status)) {
+      throw new Error(`QA approval revocation is durably pending: ${promotionSettlement?.reason || "the exact release pull request was not authoritatively closed"}`);
+    }
+    const finalized = await finalizeQaRevocationSettlement(snapshot.candidate.id, promotionSettlement, {
+      persisted: hasPersistedSettlement,
+    });
+    if (finalized.status === "merged") {
+      throw new Error("QA approval cannot be revoked because the exact release pull request is already merged; promotion reconciliation is required.");
+    }
+    return finalized;
+  }
+  const verification = outcome === "passed"
+    ? await verifyQaDecisionSnapshot(snapshot, input, dependencies)
+    : null;
+  if (verification && !verification.ok && verification.status !== "drift") {
+    throw new Error(`Candidate integrity could not be verified: ${verification.reason}`);
+  }
+  const operation = await mutateCandidateQaDecisionState(snapshot.candidate.id, verification, (state) => {
+    const candidate = assertQaDecisionSnapshotCurrent(state, snapshot);
+    if (verification && !verification.ok) {
+      return applyQaVerificationFailureInState(state, candidate, verification);
     }
     return {
       ok: true,
       result: recordCandidateQaDecisionInState(state, candidate, {
-        ...input,
-        repositoryVerifiedAt: verified.verification.verifiedAt,
+        ...snapshot.boundInput,
+        repositoryVerifiedAt: verification?.verifiedAt || "",
       }),
     };
-  }, { operationName: "qa.record_task_decision" });
+  }, { operationName: snapshot.selector.kind === "task" ? "qa.record_task_decision" : "qa.record_bundle_decision" });
   if (!operation.ok) throw new Error(operation.error);
   return operation.result;
 }
 
-export async function recordQaBundleDecision(bundleId, input = {}) {
-  const operation = await mutateState(async (state) => {
-    const bundle = (state.qaBundles || []).find((item) => item.id === bundleId);
-    if (!bundle) throw new Error(`Unknown QA bundle: ${bundleId}`);
-    if (!bundle.candidateId) throw new Error(`QA bundle ${bundleId} is legacy and has no immutable candidate.`);
-    const candidate = (state.candidates || []).find((item) => item.id === bundle.candidateId);
-    if (!candidate || candidate.qaBundleId !== bundle.id) throw new Error(`QA bundle ${bundleId} has an invalid candidate link.`);
-    const verified = await verifyCandidateForQaInState(state, candidate);
-    if (!verified.ok) return verified;
-    const boundInput = {
-      ...input,
-      candidateId: input.candidateId || candidate.id,
-      manifestDigest: input.manifestDigest || candidate.manifestDigest,
-      integrationSha: input.integrationSha || candidate.manifest.integration.sha,
-    };
-    return {
-      ok: true,
-      result: recordCandidateQaDecisionInState(state, candidate, {
-        ...boundInput,
-        repositoryVerifiedAt: verified.verification.verifiedAt,
-      }),
-    };
-  }, { operationName: "qa.record_bundle_decision" });
-  if (!operation.ok) throw new Error(operation.error);
-  return operation.result;
+export async function recordQaDecision(taskId, input = {}, testDependencies = null) {
+  const dependencies = qaDecisionDependencies(testDependencies);
+  const snapshot = qaDecisionSnapshot(
+    await readState(),
+    { kind: "task", id: taskId },
+    input,
+  );
+  return recordQaDecisionFromSnapshot(snapshot, input, dependencies);
+}
+
+export async function recordQaBundleDecision(bundleId, input = {}, testDependencies = null) {
+  const dependencies = qaDecisionDependencies(testDependencies);
+  const snapshot = qaDecisionSnapshot(
+    await readState(),
+    { kind: "bundle", id: bundleId },
+    input,
+  );
+  return recordQaDecisionFromSnapshot(snapshot, input, dependencies);
 }
 
 export async function addComment(taskId, body, author = "user") {
@@ -3931,6 +4908,11 @@ function setTaskWorkflowState(state, task, patch, now, options = {}) {
 }
 
 function restartReviewsForSubjectChange(state, task, project, previousSha, subjectSha, now, options = {}) {
+  assertReleaseCandidateLifecycleIsSettled(state, task, {
+    action: "subject_change",
+    to: task.status,
+    invalidates: ["candidate"],
+  });
   const candidateIdentityChanged = options.candidateIdentityChanged === true;
   const candidateIdentityIncomplete = options.candidateIdentityIncomplete === true;
   if (!options.preserveCandidateCycle) {

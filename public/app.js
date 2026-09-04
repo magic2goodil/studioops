@@ -2,6 +2,7 @@ const state = {
   projects: [],
   tasks: [],
   qaBundles: [],
+  qaDecisionCoordinates: { tasks: {}, bundles: {} },
   ownerInbox: {
     count: 0,
     totalCount: 0,
@@ -89,7 +90,19 @@ function truthyFlag(value) {
 }
 
 function linkifyText(value) {
-  return escapeHtml(value).replace(/https?:\/\/[^\s<]+/g, (url) => `<a href="${url}" target="_blank" rel="noreferrer">${url}</a>`);
+  const text = String(value ?? "");
+  const pattern = /https?:\/\/[^\s<>"']+/g;
+  let output = "";
+  let offset = 0;
+  for (const match of text.matchAll(pattern)) {
+    output += escapeHtml(text.slice(offset, match.index));
+    const href = safeHttpUrl(match[0]);
+    output += href
+      ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${escapeHtml(match[0])}</a>`
+      : escapeHtml(match[0]);
+    offset = match.index + match[0].length;
+  }
+  return output + escapeHtml(text.slice(offset));
 }
 
 function taskPath(taskId) {
@@ -118,7 +131,7 @@ function isImageAttachment(item) {
 function attachmentImageSrc(item) {
   const value = item.url || item.label || "";
   if (!isImageAttachment(item) || !value) return "";
-  if (/^https?:\/\//i.test(value)) return value;
+  if (/^https?:\/\//i.test(value)) return safeHttpUrl(value);
   if (value.startsWith("/api/")) return value;
   if (value.startsWith("file://") || value.startsWith("/")) {
     return `/api/attachments/local-image?path=${encodeURIComponent(value)}`;
@@ -130,10 +143,10 @@ function repoWebUrl(project) {
   const raw = (project?.repoUrl || "").trim();
   if (!raw) return "";
   const sshMatch = raw.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
-  if (sshMatch) return `https://github.com/${sshMatch[1]}/${sshMatch[2].replace(/\.git$/, "")}`;
+  if (sshMatch) return safeHttpUrl(`https://github.com/${sshMatch[1]}/${sshMatch[2].replace(/\.git$/, "")}`);
   const httpsMatch = raw.match(/^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
-  if (httpsMatch) return `https://github.com/${httpsMatch[1]}/${httpsMatch[2].replace(/\.git$/, "")}`;
-  return raw.startsWith("https://github.com/") ? raw.replace(/\.git$/, "") : "";
+  if (httpsMatch) return safeHttpUrl(`https://github.com/${httpsMatch[1]}/${httpsMatch[2].replace(/\.git$/, "")}`);
+  return raw.startsWith("https://github.com/") ? safeHttpUrl(raw.replace(/\.git$/, "")) : "";
 }
 
 function branchUrl(project, branchName) {
@@ -155,8 +168,8 @@ function integrationBranch(task, project) {
 
 function integrationBranchUrl(task, project) {
   const linkedUrl = String(task.integrationBranchUrl || "").trim();
-  if (linkedUrl) return linkedUrl;
-  return branchUrl(project, integrationBranch(task, project));
+  if (linkedUrl) return safeHttpUrl(linkedUrl);
+  return safeHttpUrl(branchUrl(project, integrationBranch(task, project)));
 }
 
 function integrationStatusLabel(task) {
@@ -242,6 +255,7 @@ function reviewStageOptions(project) {
 
 function renderReviewPanel(task, project) {
   const reviews = task.reviews || [];
+  const prUrl = safeHttpUrl(task.prUrl);
   return `
     <section class="detail-section workflow-section">
       <div class="section-heading">
@@ -263,7 +277,7 @@ function renderReviewPanel(task, project) {
         </div>
         <div>
           <strong>Pull request</strong>
-          <span>${task.prUrl ? `<a href="${escapeHtml(task.prUrl)}" target="_blank" rel="noreferrer">Open PR</a>` : "not linked"}</span>
+          <span>${prUrl ? `<a href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open PR</a>` : "not linked"}</span>
         </div>
       </div>
       <div class="review-list">
@@ -301,6 +315,8 @@ function renderRemediationPanel(task) {
   const history = task.remediationHistory || [];
   if (!handoff && !history.length) return "";
   const findings = handoff?.findings || [];
+  const prUrl = safeHttpUrl(task.prUrl);
+  const artifactRef = safeHttpUrl(handoff?.artifactRef);
   return `
     <section class="detail-section remediation-section" id="remediation-handoff">
       <div class="section-heading">
@@ -311,8 +327,8 @@ function renderRemediationPanel(task) {
         <div class="remediation-meta">
           <span>Candidate ${escapeHtml(handoff.candidateCycle)}</span>
           <code title="Exact rejected subject SHA">${escapeHtml(handoff.subjectSha)}</code>
-          ${task.prUrl ? `<a href="${escapeHtml(task.prUrl)}" target="_blank" rel="noreferrer">Open PR</a>` : ""}
-          <a href="${escapeHtml(handoff.artifactRef)}">Open local artifact</a>
+          ${prUrl ? `<a href="${escapeHtml(prUrl)}" target="_blank" rel="noreferrer">Open PR</a>` : ""}
+          ${artifactRef ? `<a href="${escapeHtml(artifactRef)}">Open local artifact</a>` : `<span>Local artifact unavailable</span>`}
         </div>
         <ol class="remediation-findings">
           ${findings.map((finding) => `
@@ -367,6 +383,7 @@ async function loadState() {
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
   state.qaBundles = data.qaBundles || [];
+  state.qaDecisionCoordinates = data.qaDecisionCoordinates || { tasks: {}, bundles: {} };
   state.ownerInbox = data.ownerInbox || {
     count: 0,
     totalCount: 0,
@@ -743,23 +760,34 @@ function renderQaReviewPanel() {
     .filter((task) => ["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status));
   const bundles = state.qaBundles
     .filter((bundle) => bundle.projectId === project.id)
-    .filter((bundle) => ["ready", "partially_reviewed", "release_candidate_ready"].includes(bundle.status));
+    .filter((bundle) => ["ready", "partially_reviewed", "passed", "release_candidate_ready"].includes(bundle.status));
   qaReviewPanel.innerHTML = `
     <section class="qa-review-list">
       <div class="section-heading">
         <h3>QA Bundles</h3>
         <span>${bundles.length} active</span>
       </div>
-      ${bundles.map((bundle) => `
+      ${bundles.map((bundle) => {
+    const firstDecision = ["ready", "partially_reviewed"].includes(bundle.status);
+    const packetDigest = state.qaDecisionCoordinates.bundles?.[bundle.id] || "";
+    const promotionPrUrl = safeHttpUrl(bundle.promotionPrUrl);
+    const previewUrl = safeHttpUrl(bundle.previewUrl);
+    const presentation = qaBundlePresentation(bundle, state.ownerInbox);
+    return `
         <article class="qa-bundle-card">
           <div class="qa-bundle-heading">
             <span class="task-id-pill">${escapeHtml(bundle.id)}</span>
-            <strong>${escapeHtml(bundle.tasks?.length || 0)} changes ${bundle.status === "release_candidate_ready" ? "ready to merge" : "ready to test"}</strong>
+            <strong>${escapeHtml(presentation.summary)}</strong>
           </div>
           <p>${escapeHtml(bundle.integrationBranch || "QA branch")} · ${escapeHtml((bundle.integrationCommit || "").slice(0, 10))}</p>
-          ${bundle.status === "release_candidate_ready"
-    ? `<a href="${escapeHtml(bundle.promotionPrUrl || "#")}" target="_blank" rel="noreferrer">Open release-candidate PR</a>`
-    : bundle.previewUrl ? `<a href="${escapeHtml(bundle.previewUrl)}">Open local QA preview</a>` : `<code>${escapeHtml(bundle.previewCheckoutPath || "Preview URL not configured")}</code>`}
+          <p class="muted-note">Owner review packet <code>${escapeHtml(packetDigest.slice(0, 19) || "unavailable")}</code></p>
+          ${presentation.revocationPending
+    ? `<span class="empty-pill">QA revocation pending</span>`
+    : presentation.releaseReady
+    ? promotionPrUrl
+      ? `<a href="${escapeHtml(promotionPrUrl)}" target="_blank" rel="noreferrer">Open release-candidate PR</a>`
+      : `<span class="empty-pill">Release-candidate PR unavailable</span>`
+    : previewUrl ? `<a href="${escapeHtml(previewUrl)}">Open local QA preview</a>` : `<code>${escapeHtml(bundle.previewCheckoutPath || "Preview URL not configured")}</code>`}
           <div class="qa-bundle-tasks">
             ${(bundle.tasks || []).map((task) => `
               <button type="button" data-task-id="${escapeHtml(task.id)}">
@@ -768,19 +796,25 @@ function renderQaReviewPanel() {
               </button>
             `).join("")}
           </div>
-          ${bundle.status === "release_candidate_ready" ? `
+          ${presentation.revocationPending ? `
+            <p class="muted-note" role="status">This candidate has a durable QA revocation request. Release approval actions are unavailable until reconciliation completes.</p>
+          ` : presentation.releaseReady ? `
             <p class="muted-note">Lead review and local QA passed. Merging the PR updates main; production still requires an explicit release.</p>
-          ` : `
+          ` : bundle.status === "passed" ? `
+            <p class="muted-note">This exact candidate passed QA and is queued for promotion. You can still revoke approval before merge.</p>
+          ` : ""}
+          ${presentation.revocationPending ? "" : `
             <label>QA notes
               <textarea rows="2" data-qa-bundle-notes="${escapeHtml(bundle.id)}" placeholder="What you tested, or what needs to change"></textarea>
             </label>
             <div class="qa-bundle-actions">
-              <button type="button" data-qa-bundle-decision="passed" data-qa-bundle-id="${escapeHtml(bundle.id)}">Pass bundle</button>
-              <button type="button" class="secondary" data-qa-bundle-decision="failed" data-qa-bundle-id="${escapeHtml(bundle.id)}">Return bundle</button>
+              ${firstDecision ? `<button type="button" data-qa-bundle-decision="passed" data-qa-bundle-id="${escapeHtml(bundle.id)}" ${packetDigest ? "" : "disabled"}>Pass bundle</button>` : ""}
+              <button type="button" class="secondary" data-qa-bundle-decision="failed" data-qa-bundle-id="${escapeHtml(bundle.id)}" ${packetDigest ? "" : "disabled"}>${firstDecision ? "Return bundle" : "Revoke QA approval"}</button>
             </div>
           `}
         </article>
-      `).join("") || `<p class="muted-note">No validated QA bundle is ready yet.</p>`}
+      `;
+  }).join("") || `<p class="muted-note">No validated QA bundle is ready yet.</p>`}
       <div class="section-heading qa-task-heading">
         <h3>Tasks in QA</h3>
         <span>${items.length} active</span>
@@ -811,6 +845,34 @@ function renderQaReviewPanel() {
       ` : `<p class="muted-note">Nothing is waiting for local QA yet.</p>`}
     </section>
   `;
+}
+
+function qaBundlePresentation(bundle, inbox) {
+  const groups = Array.isArray(inbox?.groups) ? inbox.groups : [];
+  const fallbackItems = Array.isArray(inbox?.items) ? inbox.items : [];
+  const items = groups.length ? groups.flatMap((group) => group.items || []) : fallbackItems;
+  const revocationPending = items.some((item) => (
+    item.bundleId === bundle.id
+    && item.classification === "revocation_pending"
+  ));
+  const releaseApproval = items.some((item) => (
+    item.bundleId === bundle.id
+    && item.classification === "release_approval"
+  ));
+  const releaseReady = bundle.status === "release_candidate_ready"
+    && releaseApproval
+    && !revocationPending;
+  return {
+    revocationPending,
+    releaseReady,
+    summary: `${bundle.tasks?.length || 0} changes ${revocationPending
+      ? "blocked by pending QA revocation"
+      : releaseReady
+        ? "ready to merge"
+        : bundle.status === "release_candidate_ready"
+          ? "blocked pending release reconciliation"
+          : "ready to test"}`,
+  };
 }
 
 function renderTasks() {
@@ -880,8 +942,8 @@ function renderHierarchyPanel(task) {
 }
 
 function renderBranchPanel(task, project) {
-  const branchHref = branchUrl(project, task.branchName);
-  const prUrl = String(task.prUrl || "").trim();
+  const branchHref = safeHttpUrl(branchUrl(project, task.branchName));
+  const prUrl = safeHttpUrl(task.prUrl);
   return `
     <section class="detail-section branch-section">
       <div class="section-heading">
@@ -999,7 +1061,9 @@ function renderPromotionPanel(task, project) {
 }
 
 function renderQaDecisionPanel(task) {
-  if (!["qa_review", "approved_for_main"].includes(task.status)) return "";
+  if (!["qa_review", "approved_for_main", "promotion_blocked"].includes(task.status)) return "";
+  const firstDecision = task.status === "qa_review";
+  const packetDigest = state.qaDecisionCoordinates.tasks?.[task.id] || "";
   const ready = task.status === "approved_for_main" || !task.integrationStatus || task.integrationStatus === "ready";
   const disabledAttr = ready ? "" : "disabled";
   const statusCopy = task.status === "approved_for_main"
@@ -1014,6 +1078,7 @@ function renderQaDecisionPanel(task) {
         <span>${escapeHtml(task.status === "approved_for_main" ? "passed" : integrationStatusLabel(task))}</span>
       </div>
       <p class="muted-note">${escapeHtml(statusCopy)}</p>
+      <p class="muted-note">Owner review packet <code>${escapeHtml(packetDigest.slice(0, 19) || "unavailable")}</code></p>
       ${task.qaDecision ? `
         <div class="workflow-grid">
           <div>
@@ -1034,8 +1099,8 @@ function renderQaDecisionPanel(task) {
         <textarea name="qaDecisionNotes" rows="3" placeholder="What you checked locally, what failed, or anything the builder should know.">${escapeHtml(task.qaDecision?.notes || "")}</textarea>
       </label>
       <div class="qa-decision-actions">
-        <button type="button" data-qa-decision="passed" ${disabledAttr}>QA Passed</button>
-        <button type="button" data-qa-decision="failed">QA Failed</button>
+        ${firstDecision ? `<button type="button" data-qa-decision="passed" ${disabledAttr} ${packetDigest ? "" : "disabled"}>QA Passed</button>` : ""}
+        <button type="button" data-qa-decision="failed" ${packetDigest ? "" : "disabled"}>${firstDecision ? "QA Failed" : "Revoke QA approval"}</button>
       </div>
     </section>
   `;
@@ -1270,6 +1335,8 @@ qaReviewPanel.addEventListener("click", async (event) => {
   const decisionButton = event.target.closest("[data-qa-bundle-decision]");
   if (decisionButton) {
     const bundleId = decisionButton.dataset.qaBundleId;
+    const bundle = state.qaBundles.find((item) => item.id === bundleId);
+    if (!bundle) return;
     const notes = qaReviewPanel.querySelector(`[data-qa-bundle-notes="${CSS.escape(bundleId)}"]`)?.value || "";
     await api(`/api/qa/bundles/${encodeURIComponent(bundleId)}/decision`, {
       method: "POST",
@@ -1277,6 +1344,10 @@ qaReviewPanel.addEventListener("click", async (event) => {
         outcome: decisionButton.dataset.qaBundleDecision,
         notes,
         author: "Owner QA",
+        candidateId: bundle.candidateId || "",
+        manifestDigest: bundle.manifestDigest || "",
+        integrationSha: bundle.integrationCommit || "",
+        ownerQaPacketDigest: state.qaDecisionCoordinates.bundles?.[bundle.id] || "",
       }),
     });
     await loadState();
@@ -1346,12 +1417,18 @@ taskDetail.addEventListener("click", async (event) => {
 
   const qaDecisionButton = event.target.closest("[data-qa-decision]");
   if (qaDecisionButton && state.selectedTaskId) {
+    const task = taskById(state.selectedTaskId);
+    if (!task) return;
     await api(`/api/tasks/${state.selectedTaskId}/qa-decision`, {
       method: "POST",
       body: JSON.stringify({
         outcome: qaDecisionButton.dataset.qaDecision,
         notes: taskDetail.querySelector("[name='qaDecisionNotes']")?.value || "",
         author: "Owner QA",
+        candidateId: task.candidateId || "",
+        manifestDigest: task.candidateManifestDigest || "",
+        integrationSha: task.integrationCommit || "",
+        ownerQaPacketDigest: state.qaDecisionCoordinates.tasks?.[task.id] || "",
       }),
     });
     await loadState();

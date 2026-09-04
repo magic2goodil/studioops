@@ -81,6 +81,60 @@ test("standalone QA decisions render both the preview action and their task link
   assert.match(app, /\$\{showTaskLinks \? `<div class="owner-inbox-tasks"/);
 });
 
+test("owner QA actions submit the exact candidate authority displayed to the owner", async () => {
+  const { app } = await uiSources();
+  assert.match(app, /candidateId: task\.candidateId \|\| ""/);
+  assert.match(app, /manifestDigest: task\.candidateManifestDigest \|\| ""/);
+  assert.match(app, /integrationSha: task\.integrationCommit \|\| ""/);
+  assert.match(app, /candidateId: bundle\.candidateId \|\| ""/);
+  assert.match(app, /manifestDigest: bundle\.manifestDigest \|\| ""/);
+  assert.match(app, /integrationSha: bundle\.integrationCommit \|\| ""/);
+});
+
+test("pending QA revocation never presents a release candidate as ready to merge", async () => {
+  const { app } = await uiSources();
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(extractFunction(app, "qaBundlePresentation"), context);
+
+  const presentation = vm.runInContext(`qaBundlePresentation({
+    id: "qa_bundle_1",
+    status: "release_candidate_ready",
+    tasks: [{ id: "task_7" }]
+  }, {
+    groups: [{
+      id: "operations",
+      items: [{ bundleId: "qa_bundle_1", classification: "revocation_pending" }]
+    }]
+  })`, context);
+
+  assert.equal(presentation.revocationPending, true);
+  assert.equal(presentation.releaseReady, false);
+  assert.match(presentation.summary, /blocked by pending QA revocation/);
+  assert.doesNotMatch(presentation.summary, /ready to merge/);
+  assert.match(app, /presentation\.revocationPending \? "" : `/);
+  assert.match(app, /Release approval actions are unavailable until reconciliation completes/);
+});
+
+test("a release bundle without current inbox approval is reconciliation-blocked", async () => {
+  const { app } = await uiSources();
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(extractFunction(app, "qaBundlePresentation"), context);
+
+  const presentation = vm.runInContext(`qaBundlePresentation({
+    id: "qa_bundle_stale",
+    status: "release_candidate_ready",
+    tasks: [{ id: "task_8" }]
+  }, { groups: [{ id: "operations", items: [] }] })`, context);
+
+  assert.equal(presentation.revocationPending, false);
+  assert.equal(presentation.releaseReady, false);
+  assert.match(presentation.summary, /blocked pending release reconciliation/);
+  assert.doesNotMatch(presentation.summary, /ready to merge/);
+  assert.match(app, /presentation\.releaseReady\s*\?\s*promotionPrUrl/);
+});
+
 test("missing PR URLs cannot render a false pull request action", async () => {
   const { app } = await uiSources();
   const context = {
@@ -106,6 +160,53 @@ test("missing PR URLs cannot render a false pull request action", async () => {
   assert.equal(missingPrAction, "");
   assert.match(validPrAction, /Open pull request/);
   assert.match(validPrAction, /https:\/\/github\.com\/example\/repo\/pull\/1/);
+});
+
+test("untrusted URL schemes never render actionable task or remediation links", async () => {
+  const { app } = await uiSources();
+  const context = {
+    URL,
+    window: { location: { origin: "http://127.0.0.1:4317" } },
+  };
+  vm.createContext(context);
+  vm.runInContext([
+    extractFunction(app, "escapeHtml"),
+    extractFunction(app, "safeHttpUrl"),
+    extractFunction(app, "linkifyText"),
+    extractFunction(app, "repoWebUrl"),
+    extractFunction(app, "branchUrl"),
+    extractFunction(app, "renderBranchPanel"),
+    extractFunction(app, "renderRemediationPanel"),
+  ].join("\n"), context);
+
+  const branch = vm.runInContext(
+    'renderBranchPanel({ branchName: "main", prUrl: "javascript:fetch(\'/api/state\')" }, { repoUrl: "data:text/html,pwned" })',
+    context,
+  );
+  const remediation = vm.runInContext(`renderRemediationPanel({
+    prUrl: "javascript:alert(1)",
+    currentRemediationHandoff: {
+      status: "active",
+      candidateCycle: 1,
+      subjectSha: "${"a".repeat(40)}",
+      artifactRef: "data:text/html,pwned",
+      findings: [],
+    },
+    remediationHistory: [],
+  })`, context);
+  const linked = vm.runInContext(
+    'linkifyText("https://example.com/&quot; onclick=alert(1)")',
+    context,
+  );
+
+  for (const markup of [branch, remediation, linked]) {
+    assert.doesNotMatch(markup, /href="(?:javascript|data):/i);
+    assert.doesNotMatch(markup, /<a\b[^>]*\sonclick=/i);
+  }
+  assert.match(branch, /No PR linked yet/);
+  assert.match(remediation, /Local artifact unavailable/);
+  assert.match(app, /const promotionPrUrl = safeHttpUrl\(bundle\.promotionPrUrl\)/);
+  assert.match(app, /const previewUrl = safeHttpUrl\(bundle\.previewUrl\)/);
 });
 
 test("inbox layout defines desktop, tablet, mobile, focus, and reduced-motion behavior", async () => {

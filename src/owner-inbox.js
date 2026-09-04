@@ -4,10 +4,20 @@ import {
   findTask,
   taskAutomationCircuitIsCurrent,
 } from "./store.js";
-import { createHash } from "node:crypto";
-import { canonicalJson } from "./candidate-manifest.js";
 import { projectUsesTrustLeadQa } from "./integration-policy.js";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
+import { assertCanonicalCandidateRepositoryAuthority } from "./candidate-repository.js";
+import { assertCurrentOwnerQaPacket } from "./owner-qa-packet.js";
+
+export {
+  assertCurrentOwnerQaPacket,
+  assertOwnerQaPacket,
+  buildOwnerQaPacket,
+  candidateCompletenessGate,
+  OWNER_QA_PACKET_SCHEMA_VERSION,
+  OWNER_QA_PROJECT_DEFINITION_FIELDS,
+  OWNER_QA_TASK_DEFINITION_FIELDS,
+} from "./owner-qa-packet.js";
 
 const OWNER_ACTIONS = new Set(["notify_owner", "notify_qa_review", "qa_bundle_ready"]);
 const QA_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed", "release_candidate_ready"]);
@@ -19,89 +29,6 @@ const CREDENTIAL_PATTERN = /\b(?:Bearer\s+[A-Za-z0-9._~-]{16,}|github_pat_[A-Za-
 const SECRET_ASSIGNMENT_PATTERN = /\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi;
 const LOCAL_PATH_PATTERN = /(^|[\s("'=])\/(?:Users|home|private|var\/folders|tmp|Volumes|opt|etc)\/[^\s"'<>)]*/g;
 const WINDOWS_PATH_PATTERN = /\b[A-Za-z]:\\(?:[^\\\s"'<>]+\\)*[^\\\s"'<>]*/g;
-
-const OWNER_QA_ACTIONS = Object.freeze(["pass", "fail", "request_changes", "defer", "open_candidate"]);
-
-function packetDigest(packet) {
-  return `sha256:${createHash("sha256").update(canonicalJson(packet)).digest("hex")}`;
-}
-
-function criterionSteps(task) {
-  return (task.acceptanceCriteria || []).map((criterion, index) => {
-    const value = typeof criterion === "string" ? { text: criterion } : criterion || {};
-    return {
-      order: index + 1,
-      criterion: String(value.text || value.criterion || value.description || criterion || "").trim(),
-      steps: Array.isArray(value.steps) && value.steps.length ? value.steps.map(String) : ["Open the candidate preview and exercise the criterion.", "Record observed evidence for this criterion."],
-      expected: String(value.expected || value.expectedResult || "The criterion is satisfied without console errors.").trim(),
-    };
-  }).filter((item) => item.criterion);
-}
-
-/**
- * The single authoritative gate for owner QA. It deliberately fails closed on
- * missing manifest, membership, checks, or preview identity evidence.
- */
-export function candidateCompletenessGate(candidate, state = {}, bundle = null) {
-  const reasons = [];
-  let manifest;
-  try {
-    assertCandidateEnvelope(candidate);
-    manifest = candidate.manifest;
-  } catch (error) {
-    reasons.push(`invalid_manifest:${error.message}`);
-  }
-  if (!manifest) return { ready: false, reasons };
-  if (candidate.status !== "frozen" && candidate.status !== "qa_passed" && candidate.status !== "release_candidate_ready") reasons.push("candidate_not_frozen");
-  if (!candidate.manifestDigest) reasons.push("manifest_digest_missing");
-  if (!manifest.sources?.length) reasons.push("candidate_membership_empty");
-  const tasks = (manifest.sources || []).map((source) => findTask(state, source.taskId));
-  if (tasks.some((task) => !task)) reasons.push("candidate_membership_incomplete");
-  if (tasks.some((task) => task && task.projectId !== candidate.projectId)) reasons.push("candidate_cross_project_membership");
-  if ((manifest.checks || []).some((check) => check.outcome !== "passed" || check.subjectSha !== manifest.integration.sha)) reasons.push("required_gate_failed");
-  if (manifest.preview?.status !== "healthy" || manifest.preview?.commitSha !== manifest.integration.sha || manifest.preview?.attestation?.observedSha !== manifest.integration.sha) reasons.push("preview_not_verified_at_candidate_sha");
-  if (bundle && (bundle.candidateId !== candidate.id || bundle.manifestDigest !== candidate.manifestDigest)) reasons.push("bundle_manifest_mismatch");
-  return { ready: reasons.length === 0, reasons, taskIds: (manifest.sources || []).map((source) => source.taskId).sort() };
-}
-
-/** Create the immutable, owner-facing QA contract for a candidate. */
-export function buildOwnerQaPacket(state, candidate, input = {}) {
-  const gate = candidateCompletenessGate(candidate, state, input.bundle || null);
-  if (!gate.ready) throw new Error(`Candidate is not QA-ready: ${gate.reasons.join(", ")}`);
-  const project = findProject(state, candidate.projectId) || {};
-  const tasks = candidate.manifest.sources.map((source) => findTask(state, source.taskId));
-  const base = {
-    schemaVersion: "studioops.owner-qa-packet.v1",
-    candidateId: candidate.id,
-    manifestDigest: candidate.manifestDigest,
-    projectId: candidate.projectId,
-    projectKey: project.key || "",
-    projectName: project.name || project.key || "",
-    taskUrlBase: input.baseUrl ? String(input.baseUrl).replace(/\/+$/, "") : "",
-    candidateUrl: input.candidateUrl || "",
-    previewUrl: candidate.manifest.preview.url,
-    integration: { branch: candidate.manifest.integration.branch, sha: candidate.manifest.integration.sha },
-    tasks: tasks.map((task) => ({
-      id: task.id,
-      title: task.title,
-      expectedOutcome: task.expectedOutcome || task.title,
-      taskUrl: taskUrl(input.baseUrl, task.id),
-      prUrl: task.prUrl || "",
-      affectedSurfaces: Array.isArray(task.affectedSurfaces) ? task.affectedSurfaces : (task.workAreas || []),
-      orderedTests: criterionSteps(task),
-      accountsOrFixtures: task.accountsOrFixtures || task.fixtures || [],
-      resetSteps: task.resetSteps || ["Reset the preview data or fixture state before the next criterion."],
-      evidence: task.evidence || task.verificationEvidence || [],
-      knownRisks: task.knownRisks || task.risks || [],
-      migrations: task.migrations || [],
-      featureFlags: task.featureFlags || [],
-      rollback: task.rollback || "Revert the candidate commit and disable its feature flag, if applicable.",
-    })),
-    actions: OWNER_QA_ACTIONS.map((action) => ({ action, candidateId: candidate.id, manifestDigest: candidate.manifestDigest })),
-    generatedAt: input.generatedAt || new Date().toISOString(),
-  };
-  return Object.freeze({ ...base, packetDigest: packetDigest(base) });
-}
 
 const GROUP_DEFINITIONS = {
   decisions: {
@@ -191,6 +118,7 @@ function passedQaDecision(candidate, bundle, sourceTaskIds) {
     || decision.candidateId !== candidate.id
     || decision.manifestDigest !== candidate.manifestDigest
     || decision.integrationSha !== candidate.manifest.integration.sha
+    || decision.ownerQaPacketDigest !== candidate.qaPacket?.packetDigest
     || !Array.isArray(decision.taskIds)
     || JSON.stringify([...decision.taskIds].sort()) !== JSON.stringify(sourceTaskIds)
     || !String(decision.author || "").trim()
@@ -203,6 +131,7 @@ function passedQaDecision(candidate, bundle, sourceTaskIds) {
     && bundleDecision.candidateId === decision.candidateId
     && bundleDecision.manifestDigest === decision.manifestDigest
     && bundleDecision.integrationSha === decision.integrationSha
+    && bundleDecision.ownerQaPacketDigest === decision.ownerQaPacketDigest
     && Array.isArray(bundleDecision.taskIds)
     && JSON.stringify([...bundleDecision.taskIds].sort()) === JSON.stringify(sourceTaskIds)
     && bundleDecision.author === decision.author
@@ -241,6 +170,46 @@ function safeOwnerUrl(value, key = "") {
 function safeExternalOwnerUrl(value) {
   const safe = safeOwnerUrl(value);
   return /^https?:\/\//i.test(safe) ? safe : "";
+}
+
+function canonicalGitHubPullRequestRepository(value) {
+  const raw = String(value || "").trim();
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return "";
+  }
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (
+    parsed.protocol !== "https:"
+    || parsed.hostname !== "github.com"
+    || parsed.port
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+    || segments.length !== 4
+    || segments[2] !== "pull"
+    || !/^[1-9][0-9]*$/.test(segments[3])
+    || !segments.slice(0, 2).every((segment) => (
+      /^[A-Za-z0-9_.-]+$/.test(segment)
+      && segment !== "."
+      && segment !== ".."
+      && !segment.toLowerCase().endsWith(".git")
+    ))
+  ) return "";
+  const canonical = `https://github.com/${segments[0]}/${segments[1]}/pull/${segments[3]}`;
+  return raw === canonical ? `${segments[0]}/${segments[1]}`.toLowerCase() : "";
+}
+
+function promotionPullRequestMatchesProject(project, value) {
+  try {
+    return canonicalGitHubPullRequestRepository(value)
+      === assertCanonicalCandidateRepositoryAuthority(project).repository;
+  } catch {
+    return false;
+  }
 }
 
 function sanitizeOwnerValue(value, key = "") {
@@ -294,13 +263,21 @@ function candidateForBundle(state, bundle) {
       || task.candidateId !== candidate.id
     ))
   ) return null;
+  try {
+    assertCurrentOwnerQaPacket(state, candidate, bundle);
+  } catch {
+    return null;
+  }
   if (releaseReady) {
     const promotion = candidate.promotion;
+    const project = findProject(state, candidate.projectId);
     const promotedTaskIds = [...(bundle.promotedTaskIds || [])].sort();
     if (
-      !passedQaDecision(candidate, bundle, sourceTaskIds)
+      candidate.qaRevocationIntent
+      || !passedQaDecision(candidate, bundle, sourceTaskIds)
       || !promotion
       || !safeExternalOwnerUrl(bundle.promotionPrUrl)
+      || !promotionPullRequestMatchesProject(project, bundle.promotionPrUrl)
       || promotion.prUrl !== bundle.promotionPrUrl
       || promotion.branch !== bundle.promotionBranch
       || promotion.commitSha !== bundle.promotionCommit
@@ -308,6 +285,18 @@ function candidateForBundle(state, bundle) {
       || JSON.stringify(promotedTaskIds) !== JSON.stringify(sourceTaskIds)
     ) return null;
   }
+  return candidate;
+}
+
+function releaseCandidateWithPendingRevocation(state, bundle) {
+  if (bundle?.status !== "release_candidate_ready" || !bundle.candidateId) return null;
+  const candidate = (state.candidates || []).find((item) => item.id === bundle.candidateId);
+  if (
+    !candidate
+    || candidate.status !== "release_candidate_ready"
+    || candidate.invalidation
+    || !candidate.qaRevocationIntent
+  ) return null;
   return candidate;
 }
 
@@ -641,6 +630,60 @@ function bundleOperationItem(state, bundle, input = {}, evidenceInvalid = false)
   };
 }
 
+function revocationPendingOperationItem(state, bundle, candidate, input = {}) {
+  const { record } = bundleRecord(state, bundle, input);
+  const task = record.tasks[0];
+  const settlementStatus = String(candidate.qaRevocationSettlement?.status || "");
+  const reason = settlementStatus === "merged"
+    ? "The exact release pull request was already merged before QA revocation could complete."
+    : settlementStatus
+      ? `Remote revocation settlement is recorded as ${settlementStatus}, but local QA revocation has not completed.`
+      : "A durable QA revocation request exists, but remote settlement and local invalidation have not completed.";
+  return {
+    id: `bundle:${bundle.id}:revocation-pending`,
+    group: "operations",
+    classification: "revocation_pending",
+    kind: "qa_revocation_pending",
+    severity: "critical",
+    ...record,
+    candidateId: candidate.id,
+    title: "QA revocation needs reconciliation",
+    status: "revocation_pending",
+    prUrl: "",
+    previewUrl: "",
+    nextAction: `${reason} Reconcile the durable request before treating this candidate as release-ready.`,
+    primaryAction: task ? {
+      type: "task",
+      label: "Open recovery task",
+      href: taskUrl(input.baseUrl, task.id),
+      taskId: task.id,
+    } : {
+      type: "command",
+      label: "Copy candidate identifier",
+      value: candidate.id,
+    },
+    blocker: {
+      reason,
+      attempts: 0,
+      maxAttempts: 0,
+    },
+    checklistLabel: "Revocation recovery checklist",
+    checklist: recoveryChecklist({
+      nextCheapProbe: "Verify the durable revocation request and the exact promotion pull-request settlement.",
+      remediation: "Run pending QA-revocation reconciliation and confirm the candidate is locally invalidated or the merged promotion is reconciled.",
+    }),
+    notification: {
+      status: bundle.notificationStatus || "not_applicable",
+      channel: bundle.notificationChannel || "",
+      attemptedAt: bundle.notificationFailedAt || "",
+      error: bundle.notificationError || "",
+    },
+    diagnostic: false,
+    diagnosticLabel: "",
+    updatedAt: candidate.qaRevocationIntent.requestedAt || candidate.updatedAt || record.updatedAt,
+  };
+}
+
 function legacyBundleItem(state, bundle, input = {}) {
   const { project, record } = bundleRecord(state, bundle, input);
   const tasks = bundleTaskRecords(state, bundle);
@@ -734,6 +777,16 @@ export function buildOwnerInbox(state, input = {}) {
   for (const bundle of state.qaBundles || []) {
     const tasks = bundleTaskRecords(state, bundle);
     const activeBundle = QA_BUNDLE_STATUSES.has(bundle.status);
+    const revocationPending = activeBundle
+      ? releaseCandidateWithPendingRevocation(state, bundle)
+      : null;
+    if (revocationPending) {
+      groupedItems.operations.push(
+        revocationPendingOperationItem(state, bundle, revocationPending, input),
+      );
+      tasks.forEach((task) => representedTaskIds.add(task.id));
+      continue;
+    }
     const currentEvidence = activeBundle && bundleHasCurrentEvidence(state, bundle);
     if (currentEvidence) {
       const previewUrl = bundle.previewUrl || projectPreviewUrl(findProject(state, bundle.projectId));
