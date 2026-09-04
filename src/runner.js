@@ -61,6 +61,10 @@ import {
   sanitizeOriginUrl,
   verifyLocalCandidate,
 } from "./workspace.js";
+import {
+  assertImpactPlanProjectBinding,
+  formatImpactPlanForPrompt,
+} from "./impact-planner.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CODEX_BINS = [
@@ -1280,7 +1284,13 @@ function runnerPrompt(run, project, authContext = null) {
   const taskUrl = run.taskUrl || `http://127.0.0.1:4317/tasks/${run.taskId}`;
   const sourceRepoPath = project?.sourceRepoPath || project?.repoPath || "(not recorded)";
   const executionRepoPath = run.executionRepoPath || project?.repoPath || "(not recorded)";
-  return `StudioOps automation run: ${run.id}
+  if (run.impactPlan) assertImpactPlanProjectBinding(run.impactPlan, project);
+  const impactPacket = run.impactPlan
+    ? formatImpactPlanForPrompt(run.impactPlan)
+    : "SCOPED CONTEXT PACKET\n- No repository component map was available. Fail closed to the declared file scope and final aggregate validation.";
+  return `${impactPacket}
+
+StudioOps automation run: ${run.id}
 
 You are being launched automatically by StudioOps.
 

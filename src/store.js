@@ -62,6 +62,7 @@ import {
   remediationPromptSection,
   supersedeRemediationHandoff,
 } from "./remediation-handoff.js";
+import { assertChangedFilesWithinImpactPlan } from "./impact-planner.js";
 import {
   createQaRevocationTestObservation,
   settleReleaseCandidatePullRequestForRevocation,
@@ -2745,6 +2746,15 @@ export async function updateTask(taskId, patch) {
       ...task,
       reviewSubjectSha: patchedSubjectSha,
     });
+    if (requestedStatus === "builder_review" && task.impactPlan?.status === "mapped") {
+      const impactEvidence = Object.prototype.hasOwnProperty.call(patch, "impactEvidence")
+        ? normalizedImpactEvidence(patch.impactEvidence || {})
+        : normalizedImpactEvidence(task.impactEvidence || {});
+      if (!impactEvidence.changedFiles.length) {
+        throw new Error("Mapped builder handoff requires exact changed-file evidence for component-scope verification.");
+      }
+      assertChangedFilesWithinImpactPlan(task.impactPlan, impactEvidence.changedFiles);
+    }
     const unchangedCandidateTree = Object.prototype.hasOwnProperty.call(patch, "candidateIdentity")
       && Object.prototype.hasOwnProperty.call(patch, "subjectSha")
       && candidateIdentityIsComplete(candidateIdentityBeforePatch)

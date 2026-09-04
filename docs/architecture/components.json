@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "key": "studioops",
+    "repository": "https://github.com/magic2goodil/studioops"
+  },
+  "aggregateCommand": "npm run check",
+  "fullRegressionTriggers": [
+    "shared or multi-component change",
+    "identity authorization safety or privacy change",
+    "schema migration workflow deployment or composition-root change",
+    "ambiguous unclassified or out-of-scope path"
+  ],
+  "components": {
+    "component-impact-planning": {
+      "owner": "backend-architecture",
+      "aliases": ["component map", "impact map", "context packet", "scoped worker planning"],
+      "capabilities": ["repository-scoped architecture index", "impact-scoped validation"],
+      "paths": [
+        "src/component-impact-map.js",
+        "src/impact-planner.js",
+        "src/store.js",
+        "src/dispatcher.js",
+        "src/runner.js",
+        "docs/architecture/components.json",
+        "docs/architecture/*.components.json",
+        "test/component-impact-map.test.js",
+        "test/dispatcher.test.js",
+        "test/runner.test.js",
+        "test/modular-architecture-standard.test.js"
+      ],
+      "services": ["component map loader", "impact planner", "prompt context-packet adapter"],
+      "publicContracts": ["repository-bound component manifest", "content-addressed context packet", "out-of-scope handoff rejection"],
+      "workflows": ["dispatch planning", "builder handoff", "exact-SHA QA validation"],
+      "tests": [
+        { "command": "node --test test/component-impact-map.test.js", "layer": "unit-contract" }
+      ],
+      "reviewOwners": ["backend-reviewer", "lead-reviewer"],
+      "dependsOn": [],
+      "rollback": "Stop attaching context packets; retain in-repository manifests and use the full aggregate validation path."
+    },
+    "workflow-state": {
+      "owner": "backend-workflow-state",
+      "aliases": ["task state", "SQLite state", "lifecycle"],
+      "paths": ["src/store.js", "src/state-database.js", "src/lifecycle-policy.js", "test/state-database.test.js"],
+      "data": ["projects", "tasks", "runs", "reviews", "events", "candidates"],
+      "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle"],
+      "tests": [{ "command": "node --test test/state-database.test.js", "layer": "persistence" }],
+      "reviewOwners": ["backend-reviewer"],
+      "dependsOn": [],
+      "shared": true
+    },
+    "scheduling-dispatch": {
+      "owner": "backend-automation",
+      "aliases": ["dispatcher", "supervisor", "admission", "work lanes"],
+      "paths": ["src/dispatcher.js", "src/supervisor.js", "src/work-lanes.js", "src/execution-policy.js", "test/dispatcher.test.js"],
+      "services": ["supervisor planner", "dispatcher admission"],
+      "workflows": ["architecture builder reviewer and owner dispatch"],
+      "tests": [{ "command": "node --test test/dispatcher.test.js", "layer": "unit-contract" }],
+      "reviewOwners": ["backend-reviewer"],
+      "dependsOn": ["workflow-state"]
+    },
+    "worker-execution": {
+      "owner": "devops-runtime",
+      "aliases": ["runner", "workspace", "Codex worker", "validation"],
+      "paths": ["src/runner.js", "src/workspace.js", "src/project-validation-sandbox.js", "test/runner.test.js", "test/local-workspace-handoff.test.js"],
+      "services": ["worker runner", "isolated git worktree", "validation adapter"],
+      "workflows": ["builder execution", "review execution"],
+      "deploySurfaces": ["local LaunchAgent runner"],
+      "tests": [{ "command": "node --test test/runner.test.js", "layer": "adapter" }],
+      "reviewOwners": ["backend-reviewer", "lead-reviewer"],
+      "dependsOn": ["workflow-state", "scheduling-dispatch"]
+    },
+    "failure-recovery": {
+      "owner": "techops-reliability",
+      "aliases": ["failure containment", "watchdog", "TechOps", "circuit"],
+      "paths": ["src/watchdog.js", "src/techops.js", "src/remediation-handoff.js", "test/watchdog.test.js", "test/techops.test.js"],
+      "services": ["watchdog", "bounded TechOps repair", "remediation handoff"],
+      "workflows": ["failure recovery", "stale branch remediation"],
+      "tests": [{ "command": "node --test test/watchdog.test.js test/techops.test.js", "layer": "recovery" }],
+      "reviewOwners": ["backend-reviewer", "lead-reviewer"],
+      "dependsOn": ["workflow-state"]
+    },
+    "qa-release": {
+      "owner": "release-management",
+      "aliases": ["QA", "candidate", "promotion", "release"],
+      "paths": ["src/qa-integration.js", "src/promotion.js", "src/candidate-manifest.js", "src/owner-qa-packet.js", "test/qa-integration.test.js", "test/promotion.test.js"],
+      "services": ["immutable QA candidate", "release promotion"],
+      "workflows": ["QA integration", "owner approval", "production promotion"],
+      "deploySurfaces": ["protected production branch"],
+      "tests": [{ "command": "node --test test/qa-integration.test.js test/promotion.test.js", "layer": "integration-release" }],
+      "reviewOwners": ["lead-reviewer"],
+      "dependsOn": ["workflow-state"],
+      "shared": true
+    },
+    "owner-console": {
+      "owner": "frontend-owner-experience",
+      "aliases": ["board", "owner inbox", "notifications", "dashboard"],
+      "paths": ["src/server.js", "src/owner-inbox.js", "src/notifier.js", "public/app.js", "public/index.html", "public/styles.css", "test/owner-inbox-ui.test.js", "test/notifier.test.js"],
+      "routes": ["loopback owner API", "mission-control board"],
+      "ui": ["owner inbox", "task detail", "project status"],
+      "services": ["local notifier"],
+      "tests": [{ "command": "node --test test/owner-inbox-ui.test.js test/notifier.test.js", "layer": "browser-notification" }],
+      "reviewOwners": ["frontend-reviewer", "lead-reviewer"],
+      "dependsOn": ["workflow-state"]
+    }
+  }
+}
+
