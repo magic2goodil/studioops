@@ -99,7 +99,7 @@
     "workflow-state": {
       "owner": "backend-workflow-state",
       "aliases": ["task state", "SQLite state", "lifecycle"],
-      "paths": ["src/store.js", "src/state-database.js", "src/lifecycle-policy.js", "test/state-database.test.js", "test/failure-containment.test.js", "test/resilience.test.js"],
+      "paths": ["src/store.js", "src/state-database.js", "src/lifecycle-policy.js", "test/state-database.test.js", "test/resilience.test.js"],
       "data": ["projects", "tasks", "runs", "reviews", "events", "candidates"],
       "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle"],
       "tests": [{ "command": "node --test test/state-database.test.js", "layer": "persistence" }],
@@ -134,7 +134,7 @@
       "deploySurfaces": ["local LaunchAgent runner"],
       "tests": [{ "command": "node --test test/runner.test.js", "layer": "adapter" }],
       "reviewOwners": ["backend-reviewer", "lead-reviewer"],
-      "fullRegressionPaths": ["src/runner.js", "src/workspace.js", "src/project-validation-sandbox.js"],
+      "fullRegressionPaths": ["src/runner.js", "src/run-output-evidence.js", "src/workspace.js", "src/project-validation-sandbox.js"],
       "dependsOn": ["workflow-state", "scheduling-dispatch", "component-impact-planning"],
       "rollback": "Stop worker launches, retain isolated workspaces, and restore the prior runner release."
     },
@@ -208,6 +208,7 @@
       "publicContracts": ["loopback owner read model", "bounded project progress report", "deduplicated local notification"],
       "tests": [{ "command": "node --test test/owner-inbox-ui.test.js test/notifier.test.js", "layer": "browser-notification" }],
       "reviewOwners": ["frontend-reviewer", "lead-reviewer"],
+      "fullRegressionPaths": ["src/progress-report.js"],
       "dependsOn": ["workflow-state"],
       "rollback": "Hide the new owner view while retaining workflow state and notification audit records."
     }
