@@ -5,7 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { DEFAULT_RESTART_AGENT_LABELS, runSelfUpdate } from "../src/self-update.js";
+import {
+  classifyActiveWorkflowClaims,
+  DEFAULT_RESTART_AGENT_LABELS,
+  runSelfUpdate,
+} from "../src/self-update.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -314,6 +318,132 @@ test("self-update refuses fresh active builder or reviewer runs", async () => {
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("self-update defers while bounded QA integration or promotion claims are active", async () => {
+  const fixture = await createFixture();
+  try {
+    await commitFile(fixture.writerPath, "app.txt", "remote\n", "remote update");
+    await git(fixture.writerPath, ["push", "origin", "main"]);
+    const before = await git(fixture.repoPath, ["rev-parse", "main"]);
+    const nowMs = Date.parse("2026-07-17T21:00:00.000Z");
+    const state = emptyState();
+    state.meta.promotionAttemptClaims = {
+      candidate_1: {
+        status: "active",
+        claimId: "private-promotion-claim",
+        authorityDigest: "sha256:private",
+        projectId: "project_1",
+        candidateId: "candidate_1",
+        fence: 4,
+        acquiredAt: "2026-07-17T20:58:00.000Z",
+        renewedAt: "2026-07-17T20:59:00.000Z",
+        expiresAt: "2026-07-17T21:30:00.000Z",
+      },
+    };
+    state.meta.qaIntegrationAttemptClaims = {
+      project_2: {
+        status: "active",
+        claimId: "private-qa-claim",
+        authorityDigest: "sha256:also-private",
+        projectId: "project_2",
+        fence: 2,
+        acquiredAt: "2026-07-17T20:57:00.000Z",
+        renewedAt: "2026-07-17T20:59:30.000Z",
+        expiresAt: "2026-07-17T21:15:00.000Z",
+      },
+    };
+
+    const report = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state,
+      nowMs,
+      dryRun: true,
+      record: false,
+      notify: false,
+    });
+
+    assert.equal(report.status, "blocked_active_workflow_claims");
+    assert.equal(report.activeWorkflowClaimBlockers.length, 2);
+    assert.deepEqual(report.activeWorkflowClaimBlockers.map((item) => item.kind), [
+      "qa_integration",
+      "promotion",
+    ]);
+    assert.equal(report.activeWorkflowClaimBlockers[0].resourceId, "project_2");
+    assert.equal(report.activeWorkflowClaimBlockers[1].candidateId, "candidate_1");
+    assert.doesNotMatch(JSON.stringify(report.activeWorkflowClaimBlockers), /private|authorityDigest|claimId/);
+    assert.equal(await git(fixture.repoPath, ["rev-parse", "main"]), before);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("self-update lease acquisition rechecks workflow claims that arrive after planning", async () => {
+  const fixture = await createFixture();
+  try {
+    await commitFile(fixture.writerPath, "app.txt", "remote\n", "remote update");
+    await git(fixture.writerPath, ["push", "origin", "main"]);
+    const before = await git(fixture.repoPath, ["rev-parse", "main"]);
+    const nowMs = Date.parse("2026-07-17T21:00:00.000Z");
+    const state = emptyState();
+
+    const report = await runSelfUpdate({
+      repoPath: fixture.repoPath,
+      state,
+      nowMs,
+      restartAgents: false,
+      record: false,
+      notify: false,
+      beforeSelfUpdateLease() {
+        state.meta.qaIntegrationAttemptClaims = {
+          project_1: {
+            status: "active",
+            projectId: "project_1",
+            fence: 1,
+            acquiredAt: "2026-07-17T20:59:00.000Z",
+            renewedAt: "2026-07-17T20:59:00.000Z",
+            expiresAt: "2026-07-17T21:10:00.000Z",
+          },
+        };
+      },
+    });
+
+    assert.equal(report.status, "blocked_active_workflow_claims");
+    assert.equal(report.activeWorkflowClaimBlockers[0].kind, "qa_integration");
+    assert.equal(state.meta.selfUpdateLease, undefined);
+    assert.equal(await git(fixture.repoPath, ["rev-parse", "main"]), before);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("terminal, expired, and malformed workflow claims do not block self-update", () => {
+  const state = emptyState();
+  state.meta.promotionAttemptClaims = {
+    candidate_expired: {
+      status: "active",
+      projectId: "project_1",
+      candidateId: "candidate_expired",
+      expiresAt: "2026-07-17T20:59:59.999Z",
+    },
+    candidate_terminal: {
+      status: "terminal",
+      projectId: "project_1",
+      candidateId: "candidate_terminal",
+      expiresAt: "2026-07-17T21:30:00.000Z",
+    },
+  };
+  state.meta.qaIntegrationAttemptClaims = {
+    project_malformed: {
+      status: "active",
+      projectId: "project_malformed",
+      expiresAt: "not-a-time",
+    },
+  };
+
+  assert.deepEqual(classifyActiveWorkflowClaims(state, {
+    nowMs: Date.parse("2026-07-17T21:00:00.000Z"),
+  }), { blocking: [] });
 });
 
 test("self-update ignores stale running builder or reviewer runs", async () => {

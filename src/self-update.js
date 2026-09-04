@@ -158,6 +158,45 @@ export function classifyActiveRuns(state, input = {}) {
   return { blocking, stale };
 }
 
+function activeWorkflowClaim(kind, resourceId, claim, nowMs) {
+  const expiresAtMs = Date.parse(claim?.expiresAt || "");
+  if (claim?.status !== "active" || !Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) return null;
+  return {
+    kind,
+    resourceId: String(resourceId || ""),
+    projectId: String(claim.projectId || ""),
+    candidateId: kind === "promotion" ? String(claim.candidateId || resourceId || "") : "",
+    fence: Math.max(0, Number(claim.fence || 0)),
+    acquiredAt: String(claim.acquiredAt || ""),
+    renewedAt: String(claim.renewedAt || ""),
+    expiresAt: new Date(expiresAtMs).toISOString(),
+  };
+}
+
+/**
+ * Return only bounded workflow identity needed to explain why a restart is
+ * deferred. Claim IDs, authority digests, repository paths, and credentials
+ * deliberately remain outside this diagnostic projection.
+ */
+export function classifyActiveWorkflowClaims(state, input = {}) {
+  const nowMs = Number(input.nowMs ?? Date.now());
+  const blocking = [];
+  for (const [candidateId, claim] of Object.entries(state?.meta?.promotionAttemptClaims || {})) {
+    const item = activeWorkflowClaim("promotion", candidateId, claim, nowMs);
+    if (item) blocking.push(item);
+  }
+  for (const [projectId, claim] of Object.entries(state?.meta?.qaIntegrationAttemptClaims || {})) {
+    const item = activeWorkflowClaim("qa_integration", projectId, claim, nowMs);
+    if (item) blocking.push(item);
+  }
+  blocking.sort((left, right) => (
+    left.expiresAt.localeCompare(right.expiresAt)
+    || left.kind.localeCompare(right.kind)
+    || left.resourceId.localeCompare(right.resourceId)
+  ));
+  return { blocking };
+}
+
 async function mutateSelfUpdateState(input, mutator) {
   if (input.state) return mutator(input.state);
   return mutateState(mutator, { operationName: "self_update.lease" });
@@ -189,6 +228,19 @@ async function acquireSelfUpdateLease(plan, input = {}) {
       };
     }
 
+    const activeWorkflowClaims = classifyActiveWorkflowClaims(state, input);
+    if (activeWorkflowClaims.blocking.length) {
+      return {
+        acquired: false,
+        status: "blocked_active_workflow_claims",
+        canUpdate: false,
+        activeRunBlockers: [],
+        staleActiveRuns: activeRuns.stale,
+        activeWorkflowClaimBlockers: activeWorkflowClaims.blocking,
+        reason: `${activeWorkflowClaims.blocking.length} QA integration or promotion claim(s) are still active.`,
+      };
+    }
+
     const lease = createSelfUpdateLease({
       ...input,
       repoPath: plan.repoPath,
@@ -202,6 +254,7 @@ async function acquireSelfUpdateLease(plan, input = {}) {
       selfUpdateLease: lease,
       activeRunBlockers: [],
       staleActiveRuns: activeRuns.stale,
+      activeWorkflowClaimBlockers: [],
     };
   });
 }
@@ -363,7 +416,7 @@ async function inspectRuntimeDeployment(gitPlan, input = {}) {
   };
 }
 
-function applySafetyDecision(gitPlan, activeRuns) {
+function applySafetyDecision(gitPlan, activeRuns, activeWorkflowClaims) {
   const sourceUpdateAvailable = Boolean(gitPlan.sourceUpdateAvailable);
   const runtimeUpdateAvailable = Boolean(gitPlan.runtimeUpdateAvailable);
   if (!sourceUpdateAvailable && !runtimeUpdateAvailable) {
@@ -417,6 +470,15 @@ function applySafetyDecision(gitPlan, activeRuns) {
     };
   }
 
+  if (activeWorkflowClaims.blocking.length) {
+    return {
+      ...gitPlan,
+      status: "blocked_active_workflow_claims",
+      canUpdate: false,
+      reason: `${activeWorkflowClaims.blocking.length} QA integration or promotion claim(s) are still active.`,
+    };
+  }
+
   return {
     ...gitPlan,
     status: "ready",
@@ -448,7 +510,8 @@ export async function planSelfUpdate(input = {}) {
     updateAvailable: Boolean(sourcePlan.updateAvailable || runtimePlan.runtimeUpdateAvailable),
   };
   const activeRuns = classifyActiveRuns(state, input);
-  const safetyPlan = applySafetyDecision(gitPlan, activeRuns);
+  const activeWorkflowClaims = classifyActiveWorkflowClaims(state, input);
+  const safetyPlan = applySafetyDecision(gitPlan, activeRuns, activeWorkflowClaims);
   const restartAgentLabels = normalizeList(input.restartAgentLabels || input.agents, DEFAULT_RESTART_AGENT_LABELS);
 
   return {
@@ -457,6 +520,7 @@ export async function planSelfUpdate(input = {}) {
     ...safetyPlan,
     activeRunBlockers: activeRuns.blocking,
     staleActiveRuns: activeRuns.stale,
+    activeWorkflowClaimBlockers: activeWorkflowClaims.blocking,
     restartAgentLabels,
   };
 }
@@ -557,6 +621,15 @@ function selfUpdateComment(report) {
   if (report.status === "blocked_active_runs" && report.activeRunBlockers?.length) {
     lines.push("", "Active runs:", ...report.activeRunBlockers.map((run) => `- ${run.id} (${run.role || run.group}) task ${run.taskId}`));
   }
+  if (report.status === "blocked_active_workflow_claims" && report.activeWorkflowClaimBlockers?.length) {
+    lines.push(
+      "",
+      "Active workflow claims:",
+      ...report.activeWorkflowClaimBlockers.map((claim) => (
+        `- ${claim.kind} ${claim.resourceId} (project ${claim.projectId || "unknown"}) until ${claim.expiresAt}`
+      )),
+    );
+  }
   if (report.staleActiveRuns?.length) {
     lines.push("", "Stale active runs ignored:", ...report.staleActiveRuns.map((run) => `- ${run.id}: ${run.staleReason}`));
   }
@@ -625,6 +698,10 @@ export async function runSelfUpdate(input = {}) {
     };
     blockedReport.record = await recordSelfUpdateResult(blockedReport, input);
     return blockedReport;
+  }
+
+  if (typeof input.beforeSelfUpdateLease === "function") {
+    await input.beforeSelfUpdateLease({ plan, state: input.state || null });
   }
 
   const leaseResult = await acquireSelfUpdateLease(plan, input);
