@@ -36,6 +36,18 @@ import {
 } from "./test-authority-realm.js";
 import { fileExists } from "./config.js";
 import {
+  assertFailureIncident,
+  claimPaidFailureAttempt,
+  createFailureIncident,
+  failureEvidence,
+  failureFingerprint,
+  FAILURE_CONTAINMENT_MIGRATION_VERSION,
+  FAILURE_CONTAINMENT_SCHEMA_VERSION,
+  openFailureCircuit,
+  recordFailureRecoveryActivity,
+  scheduleFailureBackoff,
+} from "./failure-containment.js";
+import {
   assertIsolatedTestEnvironment,
   missionControlDataDir,
   missionControlRoot,
@@ -44,7 +56,7 @@ import {
 const ENTITY_TABLES = ["projects", "tasks", "comments", "reviews", "events", "runs", "qaBundles", "candidates", "notificationOutbox"];
 const TABLE_NAME = { qaBundles: "qa_bundles", notificationOutbox: "notification_outbox" };
 const MUTABLE_ENTITY_TABLES = new Set(["projects", "tasks", "reviews", "runs", "qaBundles", "candidates", "notificationOutbox"]);
-const STATE_INTEGRITY_VERSION = 6;
+const STATE_INTEGRITY_VERSION = 7;
 const LIFECYCLE_SCHEMA_VERSION = 1;
 export const COORDINATION_SCHEMA_VERSION = 2;
 const QA_COMMENT_AUTHORS = new Set(["Mission Control QA Integration", "StudioOps QA Integration"]);
@@ -241,6 +253,23 @@ function openDatabase() {
       retry_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS failure_incidents (
+      incident_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      fingerprint_digest TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('active', 'backoff', 'open', 'closed', 'superseded')),
+      generation INTEGER NOT NULL CHECK (generation > 0),
+      evidence_digest TEXT NOT NULL,
+      paid_attempts INTEGER NOT NULL DEFAULT 0 CHECK (paid_attempts >= 0),
+      cheap_probe_attempts INTEGER NOT NULL DEFAULT 0 CHECK (cheap_probe_attempts >= 0),
+      repair_attempts INTEGER NOT NULL DEFAULT 0 CHECK (repair_attempts >= 0),
+      avoided_retries INTEGER NOT NULL DEFAULT 0 CHECK (avoided_retries >= 0),
+      backoff_until TEXT NOT NULL DEFAULT '',
+      opened_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      UNIQUE(task_id, fingerprint_digest, generation)
+    );
     CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_updated_at ON tasks(updated_at);
     CREATE INDEX IF NOT EXISTS idx_comments_task_created ON comments(task_id, created_at);
@@ -254,6 +283,13 @@ function openDatabase() {
     CREATE INDEX IF NOT EXISTS idx_notification_outbox_status ON notification_outbox(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_operational_archive_task_created ON operational_archive(task_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_database_contention_created ON database_contention_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_failure_incidents_task_fingerprint_state
+      ON failure_incidents(task_id, fingerprint_digest, state);
+    CREATE INDEX IF NOT EXISTS idx_failure_incidents_state_backoff
+      ON failure_incidents(state, backoff_until);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_failure_incidents_active_generation
+      ON failure_incidents(task_id, fingerprint_digest)
+      WHERE state IN ('active', 'backoff', 'open');
   `);
   const contentionColumns = new Set(
     database.prepare("PRAGMA table_info(database_contention_events)").all().map((column) => column.name),
@@ -418,6 +454,46 @@ function coordinationSchemaIsCurrent(db, meta = {}) {
     && leaseColumns.has("aggregate_id")
     && operationColumns.has("aggregate_type")
     && operationColumns.has("aggregate_id");
+}
+
+function ensureFailureContainmentSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS failure_incidents (
+      incident_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      fingerprint_digest TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('active', 'backoff', 'open', 'closed', 'superseded')),
+      generation INTEGER NOT NULL CHECK (generation > 0),
+      evidence_digest TEXT NOT NULL,
+      paid_attempts INTEGER NOT NULL DEFAULT 0 CHECK (paid_attempts >= 0),
+      cheap_probe_attempts INTEGER NOT NULL DEFAULT 0 CHECK (cheap_probe_attempts >= 0),
+      repair_attempts INTEGER NOT NULL DEFAULT 0 CHECK (repair_attempts >= 0),
+      avoided_retries INTEGER NOT NULL DEFAULT 0 CHECK (avoided_retries >= 0),
+      backoff_until TEXT NOT NULL DEFAULT '',
+      opened_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      UNIQUE(task_id, fingerprint_digest, generation)
+    );
+    CREATE INDEX IF NOT EXISTS idx_failure_incidents_task_fingerprint_state
+      ON failure_incidents(task_id, fingerprint_digest, state);
+    CREATE INDEX IF NOT EXISTS idx_failure_incidents_state_backoff
+      ON failure_incidents(state, backoff_until);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_failure_incidents_active_generation
+      ON failure_incidents(task_id, fingerprint_digest)
+      WHERE state IN ('active', 'backoff', 'open');
+  `);
+}
+
+function failureContainmentSchemaIsCurrent(db, meta = {}) {
+  const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+  if (!tables.has("failure_incidents")) return false;
+  const indexes = new Set(db.prepare("PRAGMA index_list(failure_incidents)").all().map((index) => index.name));
+  return Number(meta.failureContainmentMigration?.schemaVersion || 0) >= FAILURE_CONTAINMENT_MIGRATION_VERSION
+    && meta.failureContainmentMigration?.contract === FAILURE_CONTAINMENT_SCHEMA_VERSION
+    && indexes.has("idx_failure_incidents_task_fingerprint_state")
+    && indexes.has("idx_failure_incidents_state_backoff")
+    && indexes.has("idx_failure_incidents_active_generation");
 }
 
 function ensureLifecycleSchema(db) {
@@ -1922,6 +1998,146 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
   }
 }
 
+function upsertFailureIncidentRow(db, incidentInput) {
+  const incident = assertFailureIncident(incidentInput);
+  db.prepare(`
+    INSERT INTO failure_incidents(
+      incident_id, task_id, fingerprint_digest, state, generation, evidence_digest,
+      paid_attempts, cheap_probe_attempts, repair_attempts, avoided_retries,
+      backoff_until, opened_at, updated_at, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(incident_id) DO UPDATE SET
+      state = excluded.state,
+      evidence_digest = excluded.evidence_digest,
+      paid_attempts = excluded.paid_attempts,
+      cheap_probe_attempts = excluded.cheap_probe_attempts,
+      repair_attempts = excluded.repair_attempts,
+      avoided_retries = excluded.avoided_retries,
+      backoff_until = excluded.backoff_until,
+      opened_at = excluded.opened_at,
+      updated_at = excluded.updated_at,
+      payload = excluded.payload
+  `).run(
+    incident.incidentId,
+    incident.taskId,
+    incident.fingerprintDigest,
+    incident.state,
+    incident.generation,
+    incident.evidenceDigest,
+    incident.paidAttempts,
+    incident.cheapProbeAttempts,
+    incident.repairAttempts,
+    incident.avoidedRetries,
+    incident.backoffUntil || "",
+    incident.openedAt || "",
+    incident.updatedAt,
+    JSON.stringify(incident),
+  );
+  return incident;
+}
+
+function legacyFailureReasonCode(value) {
+  const raw = String(value || "").toLowerCase();
+  if (/rate.?limit|quota|credit/.test(raw)) return "provider_rate_limited";
+  if (/auth|credential|permission/.test(raw)) return "provider_auth_failed";
+  if (/repository|remote|git|github/.test(raw)) return "repository_unavailable";
+  if (/config|policy/.test(raw)) return "configuration_invalid";
+  if (/dependency/.test(raw)) return "dependency_unavailable";
+  if (/validation|test|qa/.test(raw)) return "validation_failed";
+  if (/output|character|token/.test(raw)) return "output_guard_exceeded";
+  if (/service|health|database|postgres/.test(raw)) return "service_unhealthy";
+  if (/attempt|exhaust/.test(raw)) return "attempt_budget_exhausted";
+  return "execution_failed";
+}
+
+function legacyFailureProvider(value) {
+  const raw = String(value || "").toLowerCase();
+  if (/codex|openai|sdk|cli/.test(raw)) return "codex";
+  if (/github|git/.test(raw)) return "github";
+  return "local";
+}
+
+function failureCandidateIdentity(task = {}) {
+  const candidate = task.candidateIdentity || {};
+  return {
+    candidateId: task.candidateId || "",
+    commitSha: candidate.commitSha || task.reviewSubjectSha || "",
+    treeSha: candidate.treeSha || "",
+    baseSha: candidate.baseSha || "",
+    manifestDigest: task.candidateManifestDigest || "",
+    candidateCycle: candidate.candidateCycle || task.reviewSubjectCycle || 0,
+  };
+}
+
+function failureDependencyEvidence(state, task = {}) {
+  const tasks = new Map((state.tasks || []).map((item) => [item.id, item]));
+  return [...new Set((task.dependsOnTaskIds || []).map(String))]
+    .map((taskId) => tasks.get(taskId))
+    .filter(Boolean)
+    .map((dependency) => ({
+      taskId: dependency.id,
+      stateVersion: Number(dependency.stateVersion || 1),
+      status: dependency.status || "unknown",
+    }));
+}
+
+function legacyIncidentForTask(state, task, now) {
+  const relatedRuns = (state.runs || [])
+    .filter((run) => run.taskId === task.id && ["failed", "cancelled"].includes(run.status))
+    .sort((left, right) => String(right.updatedAt || right.completedAt || "").localeCompare(String(left.updatedAt || left.completedAt || "")));
+  const sourceRun = relatedRuns.find((run) => run.id === task.lastAutomationFailureRunId) || relatedRuns[0];
+  const circuit = task.automationCircuit?.state === "open" ? task.automationCircuit : null;
+  if (!circuit && !task.lastAutomationFailureRunId && !task.lastAutomationFailure) return null;
+  const reasonCode = legacyFailureReasonCode(circuit?.reasonCode || task.lastAutomationFailure || sourceRun?.exitCode);
+  const provider = legacyFailureProvider(sourceRun?.provider || sourceRun?.runnerProvider);
+  const action = sourceRun?.actionType || sourceRun?.reviewStage || task.status || "unknown";
+  const fingerprint = failureFingerprint({
+    taskId: task.id,
+    action,
+    candidateIdentity: failureCandidateIdentity(task),
+    provider,
+    reasonCode,
+  });
+  const evidence = failureEvidence({
+    repository: {
+      branch: task.branchName || "",
+      prUrl: task.prUrl || "",
+      commitSha: task.reviewSubjectSha || "",
+    },
+    dependencies: failureDependencyEvidence(state, task),
+    credentialClass: "unknown",
+    serviceHealth: {},
+  });
+  let incident = createFailureIncident({ fingerprint, evidence, now });
+  incident.paidAttempts = Math.min(2, Math.max(
+    Number(circuit?.attemptsConsumed || 0),
+    relatedRuns.filter((run) => (
+      (run.actionType || run.reviewStage || task.status || "unknown") === action
+    )).length,
+  ));
+  incident.cheapProbeAttempts = Math.max(0, Number(circuit?.cheapProbeCount || 0));
+  incident.repairAttempts = Math.max(0, Number(circuit?.recoveryCount || 0));
+  incident.avoidedRetries = Math.max(0, Number(circuit?.avoidedRetries || 0));
+  if (circuit) incident = openFailureCircuit(incident, { now: circuit.openedAt || now });
+  return assertFailureIncident(incident);
+}
+
+function backfillFailureIncidents(db, state, now) {
+  let migrated = 0;
+  for (const task of state.tasks || []) {
+    const incident = legacyIncidentForTask(state, task, now);
+    if (!incident) continue;
+    const existing = db.prepare(`
+      SELECT incident_id FROM failure_incidents
+      WHERE task_id = ? AND fingerprint_digest = ? AND generation = ?
+    `).get(incident.taskId, incident.fingerprintDigest, incident.generation);
+    if (existing) continue;
+    upsertFailureIncidentRow(db, incident);
+    migrated += 1;
+  }
+  return migrated;
+}
+
 async function preMigrationBackup(db) {
   const backupDir = path.join(DATA_DIR, "backups");
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1936,7 +2152,7 @@ async function preMigrationBackup(db) {
   try {
     const integrity = verification.prepare("PRAGMA integrity_check").get();
     if (integrity?.integrity_check !== "ok") throw new Error(`Pre-migration backup integrity check failed: ${integrity?.integrity_check || "unknown"}`);
-    for (const table of ["state_meta", ...ENTITY_TABLES.map((name) => TABLE_NAME[name] || name)]) {
+    for (const table of ["state_meta", ...ENTITY_TABLES.map((name) => TABLE_NAME[name] || name), "failure_incidents"]) {
       const sourceCount = Number(db.prepare(`SELECT count(*) count FROM ${table}`).get()?.count || 0);
       const backupCount = Number(verification.prepare(`SELECT count(*) count FROM ${table}`).get()?.count || 0);
       if (sourceCount !== backupCount) throw new Error(`Pre-migration backup verification failed for ${table}.`);
@@ -1955,6 +2171,7 @@ async function runStateIntegrityMigration(db) {
     Number(parsedMeta.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION
     && lifecycleSchemaIsCurrent(db, parsedMeta)
     && coordinationSchemaIsCurrent(db, parsedMeta)
+    && failureContainmentSchemaIsCurrent(db, parsedMeta)
   ) {
     integrityMigrated = true;
     return;
@@ -1971,6 +2188,7 @@ async function runStateIntegrityMigration(db) {
       Number(lockedMeta.stateIntegrityVersion || 0) >= STATE_INTEGRITY_VERSION
       && lifecycleSchemaIsCurrent(db, lockedMeta)
       && coordinationSchemaIsCurrent(db, lockedMeta)
+      && failureContainmentSchemaIsCurrent(db, lockedMeta)
     ) {
       db.exec("COMMIT");
       integrityMigrated = true;
@@ -1978,6 +2196,7 @@ async function runStateIntegrityMigration(db) {
     }
     ensureLifecycleSchema(db);
     ensureCoordinationSchema(db);
+    ensureFailureContainmentSchema(db);
     if (process.env.STUDIOOPS_TEST_FAIL_COORDINATION_MIGRATION === "after_schema") {
       if (!process.env.NODE_TEST_CONTEXT && !process.env.STUDIOOPS_TEST_ISOLATION) {
         throw new Error("Coordination migration fault injection is restricted to isolated tests.");
@@ -1994,6 +2213,7 @@ async function runStateIntegrityMigration(db) {
     reconcileStateIntegrity(state);
     const archived = compactOperationalHistory(state);
     archiveOperationalHistory(db, archived, now);
+    const migratedFailureIncidents = backfillFailureIncidents(db, state, now);
     state.meta = state.meta || {};
     state.meta.stateIntegrityVersion = Math.max(
       Number(state.meta.stateIntegrityVersion || 0),
@@ -2009,6 +2229,14 @@ async function runStateIntegrityMigration(db) {
     state.meta.coordinationMigration = {
       schemaVersion: COORDINATION_SCHEMA_VERSION,
       migratedAt: now,
+      backupPath,
+      backupVerified: true,
+    };
+    state.meta.failureContainmentMigration = {
+      schemaVersion: FAILURE_CONTAINMENT_MIGRATION_VERSION,
+      contract: FAILURE_CONTAINMENT_SCHEMA_VERSION,
+      migratedAt: now,
+      migratedIncidentCount: migratedFailureIncidents,
       backupPath,
       backupVerified: true,
     };
@@ -2757,6 +2985,154 @@ export async function mutateQaRevocationSettlementState(candidateId, observation
     get qaRevocationSettlementCandidateId() { return id; },
     get qaRevocationSettlementRecord() { return authorizedSettlement; },
   });
+}
+
+function failureIncidentFromRow(row) {
+  if (!row) return null;
+  const incident = assertFailureIncident(parsePayload(row.payload, null));
+  if (
+    incident.incidentId !== row.incident_id
+    || incident.taskId !== row.task_id
+    || incident.fingerprintDigest !== row.fingerprint_digest
+    || incident.state !== row.state
+    || incident.generation !== Number(row.generation)
+    || incident.evidenceDigest !== row.evidence_digest
+  ) throw new Error(`Failure incident ${row.incident_id} indexed fields do not match its payload.`);
+  return incident;
+}
+
+function latestFailureIncidentRow(db, taskId, fingerprintDigest) {
+  return db.prepare(`
+    SELECT * FROM failure_incidents
+    WHERE task_id = ? AND fingerprint_digest = ?
+    ORDER BY generation DESC
+    LIMIT 1
+  `).get(taskId, fingerprintDigest);
+}
+
+function supersedePriorFailureGeneration(db, previous, current) {
+  if (!previous || previous.incidentId === current.incidentId) return;
+  const superseded = assertFailureIncident({
+    ...previous,
+    state: "superseded",
+    backoffUntil: "",
+    updatedAt: current.updatedAt,
+  });
+  upsertFailureIncidentRow(db, superseded);
+}
+
+function failureClaimAuthority(input = {}) {
+  const fingerprint = failureFingerprint(input);
+  const evidence = failureEvidence(input.evidence || {});
+  return { fingerprint, evidence };
+}
+
+/**
+ * Atomically claim one paid model attempt from the current evidence generation.
+ * SDK, CLI, dispatcher, and watchdog callers share this single table and cap.
+ */
+export async function claimFailureContainmentPaidAttempt(input = {}) {
+  const db = await ensureStateDatabase();
+  const authority = failureClaimAuthority(input);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+    assertMaintenanceWriteAllowed({ meta });
+    const previous = failureIncidentFromRow(latestFailureIncidentRow(
+      db,
+      authority.fingerprint.value.taskId,
+      authority.fingerprint.digest,
+    ));
+    const initial = previous || createFailureIncident({
+      fingerprint: authority.fingerprint,
+      evidence: authority.evidence,
+      now: input.now,
+    });
+    const result = claimPaidFailureAttempt(initial, {
+      ...input,
+      evidence: authority.evidence,
+    });
+    supersedePriorFailureGeneration(db, previous, result.incident);
+    upsertFailureIncidentRow(db, result.incident);
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+async function mutateFailureIncident(input, transition) {
+  const db = await ensureStateDatabase();
+  const authority = failureClaimAuthority(input);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+    assertMaintenanceWriteAllowed({ meta });
+    const previous = failureIncidentFromRow(latestFailureIncidentRow(
+      db,
+      authority.fingerprint.value.taskId,
+      authority.fingerprint.digest,
+    ));
+    if (!previous) throw new Error("Failure incident does not exist.");
+    const current = transition(previous, authority.evidence);
+    supersedePriorFailureGeneration(db, previous, current);
+    upsertFailureIncidentRow(db, current);
+    db.exec("COMMIT");
+    return current;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export async function recordFailureContainmentActivity(input = {}) {
+  return mutateFailureIncident(input, (incident, evidence) => recordFailureRecoveryActivity(incident, {
+    ...input,
+    evidence,
+  }));
+}
+
+export async function scheduleFailureContainmentBackoff(input = {}) {
+  return mutateFailureIncident(input, (incident, evidence) => {
+    if (incident.evidenceDigest !== evidence.digest) throw new Error("Failure backoff evidence generation changed.");
+    return scheduleFailureBackoff(incident, input);
+  });
+}
+
+export async function openFailureContainmentCircuit(input = {}) {
+  return mutateFailureIncident(input, (incident, evidence) => {
+    if (incident.evidenceDigest !== evidence.digest) throw new Error("Failure circuit evidence generation changed.");
+    return openFailureCircuit(incident, input);
+  });
+}
+
+/** Indexed operational query; never scans run payloads. */
+export async function readFailureIncidents(input = {}) {
+  const db = await ensureStateDatabase();
+  const where = [];
+  const parameters = [];
+  if (input.taskId) {
+    where.push("task_id = ?");
+    parameters.push(String(input.taskId));
+  }
+  if (input.fingerprintDigest) {
+    where.push("fingerprint_digest = ?");
+    parameters.push(String(input.fingerprintDigest).toLowerCase());
+  }
+  if (input.state) {
+    where.push("state = ?");
+    parameters.push(String(input.state));
+  }
+  const limit = Math.floor(Math.min(500, Math.max(1, Number(input.limit || 100))));
+  parameters.push(limit);
+  const rows = db.prepare(`
+    SELECT * FROM failure_incidents
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+    ORDER BY updated_at DESC, incident_id DESC
+    LIMIT ?
+  `).all(...parameters);
+  return rows.map(failureIncidentFromRow);
 }
 
 export async function databaseContentionHealth(input = {}) {
