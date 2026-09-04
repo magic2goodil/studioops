@@ -62,6 +62,9 @@ const MAX_OUTPUT_CHARS = 4_000;
 const WORKSPACE_COMMAND_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_QA_RETRY_DELAY_MS = 15 * 60_000;
 const QA_ATTEMPT_TTL_MS = 30 * 60_000;
+const DEFAULT_PREVIEW_HEALTH_ATTEMPTS = 90;
+const MAX_PREVIEW_HEALTH_ATTEMPTS = 120;
+const DEFAULT_PREVIEW_HEALTH_RETRY_DELAY_MS = 1_000;
 const DEFAULT_QA_WORKSPACE_ROOT = defaultStudioOpsWorkspaceRoot("qa");
 const DEFAULT_QA_INTEGRATION_PATH = [
   "/opt/homebrew/bin",
@@ -1742,7 +1745,25 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
   }
   let healthError = "";
   let attestation = null;
-  const healthAttempts = Math.max(1, Number(options.previewHealthAttempts || 8));
+  const requestedHealthAttempts = Number(
+    options.previewHealthAttempts ?? DEFAULT_PREVIEW_HEALTH_ATTEMPTS,
+  );
+  const healthAttempts = Math.min(
+    MAX_PREVIEW_HEALTH_ATTEMPTS,
+    Math.max(
+      1,
+      Number.isFinite(requestedHealthAttempts)
+        ? Math.floor(requestedHealthAttempts)
+        : DEFAULT_PREVIEW_HEALTH_ATTEMPTS,
+    ),
+  );
+  const requestedRetryDelayMs = Number(
+    options.previewHealthRetryDelayMs ?? DEFAULT_PREVIEW_HEALTH_RETRY_DELAY_MS,
+  );
+  const retryDelayMs = Math.min(
+    5_000,
+    Math.max(10, Number.isFinite(requestedRetryDelayMs) ? Math.floor(requestedRetryDelayMs) : 1_000),
+  );
   for (let attempt = 1; attempt <= healthAttempts; attempt += 1) {
     try {
       const response = await fetch(preview.healthCheckUrl, { signal: AbortSignal.timeout(5_000) });
@@ -1759,7 +1780,9 @@ async function syncLocalQaPreview(projectPlan, options = {}) {
     } catch (error) {
       healthError = error.message;
     }
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    if (attempt < healthAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
   }
   if (!attestation) {
     result.status = healthError.startsWith("expected ") ? "identity_mismatch" : "health_check_failed";

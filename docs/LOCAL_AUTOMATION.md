@@ -423,7 +423,10 @@ LaunchAgents are bootstrapped from the configured plist (or the standard
 The health endpoint must attest the commit actually served by the running
 preview. Return the full Git SHA in the configured `identityHeader` (default
 `X-StudioOps-Commit`) or JSON `identityJsonField` (default `commitSha`). A plain
-HTTP 200 is insufficient and blocks candidate freeze.
+HTTP 200 is insufficient and blocks candidate freeze. After restarting a
+configured preview LaunchAgent, StudioOps polls that exact identity for up to
+90 bounded attempts (capped at 120) so a large local state migration or cold
+Node startup does not create a false identity failure.
 
 ## Local TechOps recovery
 
@@ -594,10 +597,11 @@ It refuses to update or republish the runtime when:
 - local `main` cannot fast-forward to `origin/main`
 - the checkout is on another branch
 - builder or reviewer Codex runs are actively running
+- an unexpired QA-integration or promotion claim is active
 
 An absent runtime, a runtime commit that differs from the verified source commit, or invalid runtime provenance is actionable drift. Runtime publication still uses the immutable release staging and atomic `current` symlink swap, so a repair does not execute files directly from the writable source checkout.
 
-Running builder/reviewer runs are ignored only when they are stale, such as a missing runner process when PID checks are enabled or a `startedAt` timestamp older than the configured stale-run window. After a successful update, the updater restarts these LaunchAgents:
+Running builder/reviewer runs are ignored only when they are stale, such as a missing runner process when PID checks are enabled or a `startedAt` timestamp older than the configured stale-run window. QA-integration and promotion claims use their durable expiry time: active unexpired claims defer self-update, while terminal, expired, or malformed claims do not. The planner exposes only claim kind, repository-local resource IDs, project ID, fence, timestamps, and expiry; claim IDs and authority digests remain private. After a successful update, the updater restarts these LaunchAgents:
 
 - `com.codex.mission-control.web`
 - `com.codex.mission-control.steward`
@@ -609,7 +613,7 @@ Running builder/reviewer runs are ignored only when they are stale, such as a mi
 - `com.codex.mission-control.promotion`
 - `com.codex.mission-control.watchdog`
 
-During an applied update, StudioOps records a short-lived self-update lease in local state. The runner checks that lease before claiming queued builder/reviewer work, so queued runs wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
+During an applied update, StudioOps records a short-lived self-update lease in local state. Claim admission and worker execution check that maintenance boundary, while self-update atomically rechecks active runs and workflow claims before acquiring it. Queued builder/reviewer work and new QA or promotion attempts therefore wait until the fast-forward and LaunchAgent restart window is over instead of being started and interrupted.
 
 Use `studioops.config.md` `defaults.selfUpdate` or CLI flags such as `--branch`, `--remote`, `--stale-run-ms`, `--task`, `--notify`, and `--no-restart` to tune local behavior. `--task` records a StudioOps comment on that task; all material non-dry-run outcomes are recorded as StudioOps events.
 

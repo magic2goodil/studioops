@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "key": "studioops",
+    "repository": "https://github.com/magic2goodil/studioops"
+  },
+  "workflowImpact": "full-regression",
+  "reason": "self-update restart coordination crosses runtime publication and durable QA/promotion claim ownership",
+  "components": {
+    "self-update-claim-safety": {
+      "paths": [
+        "src/self-update.js",
+        "src/qa-integration.js",
+        "test/self-update.test.js",
+        "test/qa-integration.test.js",
+        "docs/LOCAL_AUTOMATION.md",
+        "docs/architecture/components.json",
+        "docs/architecture/self-update-claim-safety.components.json"
+      ],
+      "owner": "devops-runtime",
+      "publicContracts": [
+        "defer restart for unexpired QA-integration claims",
+        "defer restart for unexpired promotion claims",
+        "bounded non-sensitive blocker projection",
+        "atomic claim recheck before self-update lease acquisition",
+        "bounded local preview startup health polling"
+      ],
+      "ownedData": [],
+      "dependsOn": ["workflow-state", "qa-release", "runtime-self-update"],
+      "rollback": "Keep the current immutable runtime active and restore the previous self-update planner; durable claims remain authoritative.",
+      "testLayers": ["unit", "race", "privacy", "runtime-release"]
+    }
+  },
+  "dependencyEdges": [
+    { "from": "self-update-claim-safety", "to": "workflow-state" },
+    { "from": "self-update-claim-safety", "to": "qa-release" },
+    { "from": "self-update-claim-safety", "to": "runtime-self-update" }
+  ],
+  "prohibited": [
+    "restart while an unexpired QA-integration claim is active",
+    "restart while an unexpired promotion claim is active",
+    "claim ID or authority digest in operator diagnostics",
+    "cross-repository mutation",
+    "time override outside tests"
+  ],
+  "impactClassifier": {
+    "input": "base/head diff plus this repository-owned manifest",
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "pathRules": [
+      { "pattern": "src/self-update.js", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "src/qa-integration.js", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "test/self-update.test.js", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "test/qa-integration.test.js", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "docs/LOCAL_AUTOMATION.md", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "docs/architecture/components.json", "component": "self-update-claim-safety", "selection": "full_regression" },
+      { "pattern": "docs/architecture/self-update-claim-safety.components.json", "component": "self-update-claim-safety", "selection": "full_regression" }
+    ],
+    "aggregateCommand": "npm run check"
+  }
+}
