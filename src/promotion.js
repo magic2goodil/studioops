@@ -263,7 +263,7 @@ function trustedGitEnvironment(options = {}) {
     : "";
   const env = {
     PATH: TRUSTED_GIT_PATH,
-    HOME: "/",
+    HOME: isolatedTestRoot || "/",
     TMPDIR: isolatedTestRoot || "/tmp",
     LANG: "C",
     LC_ALL: "C",

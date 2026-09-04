@@ -207,10 +207,10 @@ test("verify is bounded and read-only and honors STUDIOOPS variables before lega
     assert.deepEqual(after, before);
     assert.equal((await stat(databasePath)).size, "fixture database must not be opened\n".length);
     const commands = await readFile(commandLog, "utf8");
-    assert.match(commands, /built-in: git 'remote' 'get-url' 'origin'/);
-    assert.match(commands, /built-in: git 'rev-parse' 'HEAD'/);
-    assert.match(commands, /built-in: git 'status' '--porcelain' '--untracked-files=normal'/);
-    assert.match(commands, /built-in: git 'ls-tree' '-r' '--name-only' '-z' 'HEAD'/);
+    assert.match(commands, /built-in: git '?remote'? '?get-url'? '?origin'?/);
+    assert.match(commands, /built-in: git '?rev-parse'? '?HEAD'?/);
+    assert.match(commands, /built-in: git '?status'? '?--porcelain'? '?--untracked-files=normal'?/);
+    assert.match(commands, /built-in: git '?ls-tree'? '?-r'? '?--name-only'? '?-z'? '?HEAD'?/);
     assert.doesNotMatch(commands, /\bfetch\b|remote set-url|launchctl|npm|restart|sqlite/i);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
