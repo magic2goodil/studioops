@@ -1304,6 +1304,11 @@ function assertOwnerQaPacketMirrors(state, options = {}) {
   const bundlesById = new Map((state.qaBundles || []).map((bundle) => [bundle.id, bundle]));
   for (const candidate of state.candidates || []) {
     if (!candidate.qaPacket) continue;
+    // A durable invalidation permanently revokes this packet's authority. Older
+    // compaction passes could remove the bundle's task summaries afterwards,
+    // so only active packets need to satisfy the current bundle-shape mirror.
+    // Append-only transition guards still protect the historical packet itself.
+    if (candidate.invalidation) continue;
     const bundle = bundlesById.get(candidate.qaBundleId);
     if (!bundle) throw new Error(`Candidate ${candidate.id} owner QA packet has no immutable bundle.`);
     const packet = assertOwnerQaPacket(candidate.qaPacket, candidate, bundle);
@@ -1389,6 +1394,7 @@ function assertOwnerQaPacketMirrors(state, options = {}) {
     if (!candidate?.qaPacket) {
       throw new Error(`QA bundle ${bundle.id} owner packet has no matching candidate packet.`);
     }
+    if (candidate.invalidation) continue;
     const packet = assertOwnerQaPacket(bundle.qaPacket, candidate, bundle);
     if (
       candidate.qaPacket.packetDigest !== packet.packetDigest
