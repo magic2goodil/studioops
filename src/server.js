@@ -24,9 +24,15 @@ import {
 import { loadConfig } from "./config.js";
 import { buildOwnerInbox } from "./owner-inbox.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
-import { databaseContentionHealth } from "./state-database.js";
+import { databaseContentionHealth, readFailureIncidentPage, readFailureIncidentTotals } from "./state-database.js";
 import { currentRemediationHandoff } from "./remediation-handoff.js";
 import { buildQaReviewList } from "./qa-review-list.js";
+import {
+  buildProgressReport,
+  decodeProgressCursor,
+  normalizeProgressWindow,
+  resolveProgressProject,
+} from "./progress-report.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4317);
@@ -279,6 +285,29 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/automation/progress") {
+    const state = await readState();
+    const window = normalizeProgressWindow(url.searchParams.get("window"));
+    const project = resolveProgressProject(state, url.searchParams.get("project"));
+    const taskIds = (state.tasks || []).filter((task) => !project || task.projectId === project.id).map((task) => task.id);
+    const cursor = decodeProgressCursor(url.searchParams.get("cursor"));
+    const requestedLimit = Number(url.searchParams.get("limit") || 100);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+      const error = new Error("Progress incident limit must be an integer from 1 through 100.");
+      error.code = "PROGRESS_LIMIT_INVALID";
+      error.status = 400;
+      throw error;
+    }
+    const nowMs = Date.now();
+    const updatedAfter = new Date(nowMs - ({ "1h": 1, "24h": 24, "7d": 168 }[window] * 3_600_000)).toISOString();
+    const [page, incidentTotals] = await Promise.all([
+      readFailureIncidentPage({ taskIds, cursor, limit: requestedLimit }),
+      readFailureIncidentTotals({ taskIds, updatedAfter }),
+    ]);
+    sendJson(res, 200, buildProgressReport(state, { ...page, incidentTotals }, { window, project, nowMs }));
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/product") {
     sendJson(res, 200, { access: localProductAccess(), tiers: productCatalog() });
     return;
@@ -451,7 +480,7 @@ export function createStudioOpsServer(options = {}) {
       }
       await serveStatic(req, res, url);
     } catch (error) {
-      sendJson(res, 500, { error: error.message });
+      sendJson(res, Number(error.status || 500), { error: error.message, code: error.code || "STUDIOOPS_REQUEST_FAILED" });
     }
   });
 }
