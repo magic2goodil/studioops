@@ -778,3 +778,44 @@ name the full commit SHA, target host, candidate-manifest or artifact SHA-256
 digest, time of a successful health check that attested that exact commit, and a
 tested rollback commit or procedure. No task status, delivery mode, policy
 profile, comment, or prose substitutes for that packet.
+
+## Progress and containment observability
+
+The local owner board reads `GET /api/automation/progress`. The endpoint is
+loopback-only, defaults to `24h`, and accepts only `1h`, `24h`, or `7d`. An
+optional `project` value must resolve to one configured project ID or key. That
+binding filters tasks, runs, events, and durable failure incidents before any
+metric or waiting reason is assembled; records from another repository are not
+eligible for the response. Incident pages are ordered by durable update time,
+use an opaque cursor, contain at most 100 rows, and keep the complete response
+below 128 KiB.
+
+The summary distinguishes completed healthy runs and meaningful lifecycle or
+candidate advances from paid attempts. It separately reports contained failure
+generations, model-free probes and repairs, and model attempts avoided by an
+unchanged circuit. Every nonterminal task has one stable allowlisted waiting
+reason and one next action. A retry time is shown only for an active future
+backoff. Raw logs, provider payloads, credentials, private paths, local artifact
+URLs, and unbounded failure messages never enter this read model.
+
+The notifier uses the durable failure circuit's `notificationKey`, which binds
+the failure fingerprint and evidence generation. It creates at most one local
+notification for that unchanged generation, even when backoff time changes.
+Only verified evidence progression can replace it with a new generation; a
+resolved or superseded circuit terminalizes the older notification.
+
+Migration is additive: existing failure rows and compatibility task circuits
+remain authoritative, and no historical payload rewrite is required. Verify a
+deployment by checking `/api/health`, requesting every allowlisted progress
+window for one project, confirming the response stays below 128 KiB, restarting
+the server, and confirming the same durable counts and circuit generation. If
+the read model is degraded, the UI remains fail-closed and labels the missing
+detail; recover the SQLite service or restore the last verified local database
+backup before resuming workers.
+
+Rollback hides the progress panels and restores the prior server/notifier
+release while retaining all failure incident and notification audit rows. Do
+not delete incident rows, clear circuits because time passed, or bypass the
+repository-bound project filter during recovery. Pause worker admission before
+database repair and resume only after the loopback API, exact project boundary,
+notification deduplication, and durable restart checks pass.

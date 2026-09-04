@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { isDeepStrictEqual, promisify } from "node:util";
-import { mutateState, readState, findProject, findTask } from "./store.js";
+import { mutateState, readState, findProject, findTask, taskAutomationCircuitIsCurrent } from "./store.js";
 import { randomUUID } from "node:crypto";
 import {
   assertCurrentOwnerQaPacket,
@@ -321,6 +321,80 @@ export async function reconcilePipelineLivenessNotification(assessment = {}, inp
   return mutate(async (state) => (
     reconcilePipelineLivenessNotificationInState(state, assessment, input)
   ), { operationName: "notification.pipeline_liveness" });
+}
+
+function actionableFailureCircuit(task) {
+  const circuit = task?.automationCircuit;
+  return Boolean(
+    circuit?.state === "open"
+    && circuit.notificationKey
+    && taskAutomationCircuitIsCurrent(task)
+  );
+}
+
+/** One local notification per unchanged durable circuit generation. */
+export function enqueueFailureCircuitNotificationsInState(state, input = {}) {
+  state.notificationOutbox = state.notificationOutbox || [];
+  const now = input.now || nowIso();
+  const created = [];
+  for (const task of state.tasks || []) {
+    const currentKey = actionableFailureCircuit(task) ? task.automationCircuit.notificationKey : "";
+    for (const item of state.notificationOutbox) {
+      if (
+        item.kind !== "failure_circuit"
+        || item.taskId !== task.id
+        || item.status === "acknowledged"
+        || item.idempotencyKey === currentKey
+      ) continue;
+      item.status = "acknowledged";
+      item.acknowledgedAt = now;
+      item.acknowledgedBy = "failure_circuit_reconciliation";
+      item.resolutionReason = currentKey ? "failure_generation_changed" : "failure_circuit_resolved";
+      item.resolvedAt = now;
+      item.updatedAt = now;
+      delete item.claimToken;
+      delete item.claimExpiresAt;
+      delete item.retryNotBefore;
+    }
+    if (!currentKey || state.notificationOutbox.some((item) => item.kind === "failure_circuit" && item.idempotencyKey === currentKey)) continue;
+    const project = findProject(state, task.projectId);
+    const policy = policyFor(project, input);
+    const configured = configuredNotificationChannels(project, input);
+    const channel = configured.has("macos") ? "macos" : configured.has("in_app") ? "in_app" : "";
+    if (!channel) continue;
+    const circuit = task.automationCircuit;
+    const item = {
+      id: `notification_${randomUUID()}`,
+      idempotencyKey: currentKey,
+      kind: "failure_circuit",
+      projectId: task.projectId,
+      taskId: task.id,
+      channel,
+      status: "queued",
+      attempts: 0,
+      packet: {
+        projectKey: String(project?.key || task.projectId).slice(0, 120),
+        taskId: String(task.id).slice(0, 120),
+        taskTitle: String(task.title || "Project task").slice(0, 180),
+        reasonCode: String(circuit.reasonCode || "unknown_failure").slice(0, 120),
+        generation: Number(circuit.incidentGeneration || 1),
+      },
+      policy,
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.notificationOutbox.push(item);
+    created.push(structuredClone(item));
+  }
+  return created;
+}
+
+export async function enqueueFailureCircuitNotifications(input = {}) {
+  if (input.state) return enqueueFailureCircuitNotificationsInState(input.state, input);
+  return mutateState(
+    async (state) => enqueueFailureCircuitNotificationsInState(state, input),
+    { operationName: "notification.enqueue_failure_circuits" },
+  );
 }
 
 /** Enqueue once per candidate/channel. The manifest digest is the idempotency key. */
@@ -729,8 +803,18 @@ export function notificationForPipelineStall(item = {}) {
   };
 }
 
+export function notificationForFailureCircuit(item = {}) {
+  const incident = item.packet || item;
+  return {
+    title: "StudioOps contained a repeated failure",
+    subtitle: `${incident.projectKey || item.projectId || "StudioOps"} · ${incident.taskId || item.taskId || "task"}`,
+    body: `${incident.taskTitle || "Project work is waiting"}. Reason: ${incident.reasonCode || "unknown_failure"}. Paid retries remain stopped until verified evidence changes.`,
+  };
+}
+
 function notificationForOutboxItem(item) {
   if (item.kind === "pipeline_stall") return notificationForPipelineStall(item);
+  if (item.kind === "failure_circuit") return notificationForFailureCircuit(item);
   if (item.kind === "release_candidate") {
     return notificationForBundle({
       status: "release_candidate_ready",
@@ -783,6 +867,7 @@ export async function sendMacNotification(notification) {
 
 export async function planNotifications(input = {}) {
   const state = input.state || await readState();
+  enqueueFailureCircuitNotificationsInState(state, input);
   const pending = [];
   const skipped = [];
   const limit = Math.max(1, Number(input.limit || input.maxNotifications || 10));
@@ -929,6 +1014,7 @@ export async function sendPendingNotifications(input = {}) {
   if (!input.dryRun) {
     await escalateDueNotifications(input);
     await enqueueReleaseCandidateNotifications(input);
+    await enqueueFailureCircuitNotifications(input);
   }
   const plan = await planNotifications(input);
   const outboxItems = plan.pending.filter((item) => item.notificationType === "outbox");

@@ -4,10 +4,12 @@ import {
   authorizeNotificationOutboxDeliveryInState,
   claimNotificationOutboxInState,
   deliverNotificationOutboxItem,
+  enqueueFailureCircuitNotificationsInState,
   enqueueOwnerQaNotificationsInState,
   enqueueReleaseCandidateNotificationsInState,
   escalateDueNotificationsInState,
   notificationForBundle,
+  notificationForFailureCircuit,
   notificationForOwnerQaPacket,
   notificationForPipelineStall,
   notificationRetryReady,
@@ -796,4 +798,47 @@ test("pipeline recovery terminalizes a retryable failed stall notification", asy
     ids: [first.notifications[0].id],
     nowMs: Date.parse("2026-09-03T14:11:00.000Z"),
   }).length, 0);
+});
+
+test("one unchanged failure circuit generation creates one local notification independent of backoff time", async () => {
+  const state = {
+    meta: {},
+    projects: [{ id: "project_1", key: "demo", notificationPolicy: { channels: ["in_app", "macos"] } }],
+    tasks: [{
+      id: "task_9",
+      projectId: "project_1",
+      title: "Repair bounded failure",
+      status: "blocked",
+      retryNotBefore: "2026-09-05T13:00:00.000Z",
+      automationBlocker: { type: "circuit", reason: "execution_failed" },
+      automationCircuit: {
+        state: "open",
+        reasonCode: "execution_failed",
+        incidentGeneration: 2,
+        notificationKey: "failure:aaaaaaaaaaaaaaaaaaaaaa:2",
+      },
+    }],
+    notificationOutbox: [],
+    events: [],
+  };
+
+  const first = enqueueFailureCircuitNotificationsInState(state, { now: "2026-09-05T12:00:00.000Z" });
+  state.tasks[0].retryNotBefore = "2026-09-05T14:00:00.000Z";
+  const repeated = enqueueFailureCircuitNotificationsInState(state, { now: "2026-09-05T12:05:00.000Z" });
+  assert.equal(first.length, 1);
+  assert.equal(repeated.length, 0);
+  assert.equal(state.notificationOutbox.length, 1);
+  assert.equal(state.notificationOutbox[0].channel, "macos");
+  assert.match(notificationForFailureCircuit(first[0]).body, /Paid retries remain stopped/);
+
+  state.tasks[0].automationCircuit = {
+    ...state.tasks[0].automationCircuit,
+    incidentGeneration: 3,
+    notificationKey: "failure:aaaaaaaaaaaaaaaaaaaaaa:3",
+  };
+  const nextGeneration = enqueueFailureCircuitNotificationsInState(state, { now: "2026-09-05T12:10:00.000Z" });
+  assert.equal(nextGeneration.length, 1);
+  assert.equal(state.notificationOutbox.length, 2);
+  assert.equal(state.notificationOutbox[0].status, "acknowledged");
+  assert.equal(state.notificationOutbox[0].resolutionReason, "failure_generation_changed");
 });

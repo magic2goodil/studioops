@@ -11,6 +11,9 @@ const state = {
     items: [],
     operatorPause: null,
   },
+  progress: { status: "loading", report: null, error: "" },
+  progressWindow: "24h",
+  progressRequestId: 0,
   selectedProjectId: "",
   selectedTaskId: "",
   routeTaskId: "",
@@ -41,6 +44,9 @@ const ownerInbox = document.querySelector("#ownerInbox");
 const ownerInboxCount = document.querySelector("#ownerInboxCount");
 const ownerInboxSummary = document.querySelector("#ownerInboxSummary");
 const ownerInboxList = document.querySelector("#ownerInboxList");
+const projectProgress = document.querySelector("#projectProgress");
+const projectProgressBody = document.querySelector("#projectProgressBody");
+const progressWindow = document.querySelector("#progressWindow");
 const detailPanel = document.querySelector(".detail-panel");
 const detailHeading = document.querySelector(".detail-panel .panel-header h2");
 const imageModal = document.querySelector("#imageModal");
@@ -410,7 +416,27 @@ async function loadState() {
   configStatus.textContent = data.configLoaded
     ? "Local StudioOps configuration loaded"
     : "No local configuration yet. Run npm run setup or studioops setup.";
+  state.progress = { status: "loading", report: null, error: "" };
   render();
+  await loadProgress();
+}
+
+async function loadProgress() {
+  const project = selectedProject();
+  const requestId = ++state.progressRequestId;
+  const projectId = project?.id || "";
+  const requestWindow = state.progressWindow;
+  const projectQuery = project ? `&project=${encodeURIComponent(project.key || project.id)}` : "";
+  try {
+    const report = await api(`/api/automation/progress?window=${encodeURIComponent(requestWindow)}${projectQuery}`);
+    if (requestId !== state.progressRequestId || selectedProject()?.id !== projectId || state.progressWindow !== requestWindow) return;
+    state.progress = { status: "ready", report, error: "" };
+  } catch (error) {
+    if (requestId !== state.progressRequestId || selectedProject()?.id !== projectId || state.progressWindow !== requestWindow) return;
+    state.progress = { status: "error", report: null, error: error.message };
+  }
+  renderProgressBoard();
+  renderTaskContainment();
 }
 
 function projectFor(task) {
@@ -449,6 +475,64 @@ function renderProjects() {
 
 function selectedProject() {
   return state.projects.find((project) => project.id === state.selectedProjectId) || null;
+}
+
+function metricCard(value, label, note) {
+  return `<article class="progress-metric"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span><small>${escapeHtml(note)}</small></article>`;
+}
+
+function renderProgressBoard() {
+  if (!projectProgress || !projectProgressBody) return;
+  const progress = state.progress;
+  projectProgress.setAttribute("aria-busy", progress.status === "loading" ? "true" : "false");
+  if (progress.status === "loading") {
+    projectProgressBody.className = "progress-state";
+    projectProgressBody.innerHTML = `<span>Loading durable progress and containment records…</span>`;
+    return;
+  }
+  if (progress.status === "error") {
+    projectProgressBody.className = "progress-state error";
+    projectProgressBody.innerHTML = `<strong>Progress is temporarily unavailable.</strong><span>${escapeHtml(progress.error)}</span><button type="button" data-retry-progress>Retry</button>`;
+    return;
+  }
+  const report = progress.report;
+  const summary = report?.summary || {};
+  projectProgressBody.className = "progress-state";
+  projectProgressBody.innerHTML = `
+    ${report?.degraded?.length ? `<div class="progress-degraded"><strong>Degraded view</strong><span>${escapeHtml(report.degraded.join(", ").replaceAll("_", " "))}</span></div>` : ""}
+    <div class="progress-metrics">
+      ${metricCard(summary.productiveCompletions || 0, "completed runs", "productive")}
+      ${metricCard(summary.meaningfulAdvances || 0, "stage advances", "meaningful")}
+      ${metricCard(summary.containedFingerprintGenerations || 0, "contained failures", "stable generations")}
+      ${metricCard(summary.cheapProbesAndRepairs || 0, "probes + repairs", "model-free")}
+      ${metricCard(summary.paidModelAttempts || 0, "paid attempts", "bounded")}
+      ${metricCard(summary.avoidedModelRetries || 0, "avoided retries", "usage protected")}
+    </div>
+    ${report?.waiting?.length
+      ? `<p class="progress-footnote">${plural(report.waiting.length, "task")} waiting with an exact next action.</p>`
+      : `<p class="progress-footnote">No project tasks are waiting.</p>`}
+  `;
+}
+
+function renderContainmentPanel(task) {
+  const progress = state.progress;
+  if (progress.status === "loading") return `<section class="detail-section containment-panel" aria-busy="true"><h3>Automation containment</h3><p class="muted-note">Loading the durable waiting reason…</p></section>`;
+  if (progress.status === "error") return `<section class="detail-section containment-panel degraded"><h3>Automation containment</h3><p>Waiting diagnostics are temporarily unavailable.</p><button type="button" data-retry-progress>Retry</button></section>`;
+  const waiting = progress.report?.waiting?.find((item) => item.taskId === task.id);
+  if (!waiting) return `<section class="detail-section containment-panel empty"><h3>Automation containment</h3><p class="muted-note">No active containment or waiting condition.</p></section>`;
+  return `
+    <section class="detail-section containment-panel">
+      <div class="section-heading"><h3>Automation containment</h3><span>${escapeHtml(waiting.reasonCode.replaceAll("_", " "))}</span></div>
+      <p>${escapeHtml(waiting.reason)}</p>
+      <dl><div><dt>Next action</dt><dd>${escapeHtml(waiting.nextAction)}</dd></div>${waiting.retryAt ? `<div><dt>Retry after</dt><dd><time datetime="${escapeHtml(waiting.retryAt)}">${escapeHtml(new Date(waiting.retryAt).toLocaleString())}</time></dd></div>` : ""}</dl>
+    </section>
+  `;
+}
+
+function renderTaskContainment() {
+  const container = document.querySelector("#taskContainment");
+  const task = taskById(state.selectedTaskId);
+  if (container && task) container.innerHTML = renderContainmentPanel(task);
 }
 
 function notificationStatusText(notification) {
@@ -1172,6 +1256,7 @@ async function renderDetail() {
     </div>
     ${renderRemediationPanel(fullTask)}
     ${renderReviewPanel(fullTask, project)}
+    <div id="taskContainment">${renderContainmentPanel(fullTask)}</div>
     <div class="detail-grid ${isFullPage ? "detail-grid-full" : ""}">
       <section class="detail-section">
         <h3>Description</h3>
@@ -1309,7 +1394,23 @@ projectList.addEventListener("click", (event) => {
   state.selectedTaskId = visibleTasks()[0]?.id || "";
   state.routeTaskId = "";
   window.history.pushState(null, "", "/");
+  state.progress = { status: "loading", report: null, error: "" };
   render();
+  loadProgress();
+});
+
+projectProgress.addEventListener("click", (event) => {
+  if (!event.target.closest("[data-retry-progress]")) return;
+  state.progress = { status: "loading", report: null, error: "" };
+  renderProgressBoard();
+  loadProgress();
+});
+
+progressWindow.addEventListener("change", () => {
+  state.progressWindow = progressWindow.value;
+  state.progress = { status: "loading", report: null, error: "" };
+  renderProgressBoard();
+  loadProgress();
 });
 
 projectSettings.addEventListener("submit", async (event) => {
@@ -1369,6 +1470,12 @@ taskBoard.addEventListener("click", (event) => {
 });
 
 taskDetail.addEventListener("click", async (event) => {
+  if (event.target.closest("[data-retry-progress]")) {
+    state.progress = { status: "loading", report: null, error: "" };
+    renderTaskContainment();
+    await loadProgress();
+    return;
+  }
   const taskPreviewButton = event.target.closest("[data-task-preview-id]");
   if (taskPreviewButton) {
     await openTaskModal(taskPreviewButton.dataset.taskPreviewId);

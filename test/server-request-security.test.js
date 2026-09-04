@@ -59,7 +59,7 @@ async function directHttpRequest(target, options = {}) {
       response.on("data", (chunk) => { rawBody += chunk; });
       response.on("end", () => {
         try {
-          resolve({ status: response.statusCode, body: rawBody ? JSON.parse(rawBody) : {} });
+          resolve({ status: response.statusCode, body: rawBody ? JSON.parse(rawBody) : {}, rawBody });
         } catch (error) {
           reject(error);
         }
@@ -94,6 +94,22 @@ test("local API mutations reject browser cross-origin requests and require JSON"
     await new Promise((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });
+  });
+
+  await t.test("progress reads are local, allowlisted, and return bounded fields", async () => {
+    const valid = await directHttpRequest(`${origin}/api/automation/progress?window=24h&limit=1`);
+    assert.equal(valid.status, 200);
+    assert.equal(valid.body.schemaVersion, "studioops.progress-report.v1");
+    assert.ok(Array.isArray(valid.body.waiting));
+    assert.ok(Buffer.byteLength(valid.rawBody) < 128 * 1024);
+
+    const invalidWindow = await directHttpRequest(`${origin}/api/automation/progress?window=30d`);
+    assert.equal(invalidWindow.status, 400);
+    assert.equal(invalidWindow.body.code, "PROGRESS_WINDOW_INVALID");
+
+    const invalidLimit = await directHttpRequest(`${origin}/api/automation/progress?limit=101`);
+    assert.equal(invalidLimit.status, 400);
+    assert.equal(invalidLimit.body.code, "PROGRESS_LIMIT_INVALID");
   });
 
   await t.test("cross-origin text/plain QA decisions fail before route handling", async () => {
