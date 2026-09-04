@@ -25,6 +25,88 @@ export const DEFAULT_GLOBAL_RUN_ADMISSION = Object.freeze({
   maxMeteredRunsPerWindow: 12,
   runWindowMinutes: 60,
 });
+export const DEFAULT_TECHOPS_POLICY = Object.freeze({
+  enabled: false,
+  healthCheckIntervalSeconds: 60,
+  healthTimeoutMs: 5_000,
+  commandTimeoutMs: 60_000,
+  maxAttempts: 3,
+  initialBackoffSeconds: 60,
+  maxBackoffSeconds: 15 * 60,
+  leaseSeconds: 5 * 60,
+  maxConcurrentRecoveries: 1,
+  maxCommandsPerAttempt: 8,
+  maxOutputChars: 4_000,
+  verificationAttempts: 5,
+  verificationDelayMs: 1_000,
+});
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum
+    ? parsed
+    : fallback;
+}
+
+function normalizeTechOpsCommand(item, type) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  const id = String(item.id || "").trim();
+  const argv = Array.isArray(item.argv) ? item.argv.map((part) => String(part)) : [];
+  if (!/^[a-z][a-z0-9_.-]{0,63}$/i.test(id) || !argv.length || argv.some((part) => !part || part.length > 2_000)) {
+    return null;
+  }
+  return {
+    id,
+    type,
+    argv,
+    ...(item.cwd ? { cwd: expandHome(String(item.cwd)) } : {}),
+    timeoutMs: boundedInteger(item.timeoutMs, DEFAULT_TECHOPS_POLICY.commandTimeoutMs, 1_000, 5 * 60_000),
+  };
+}
+
+/** Canonical local-only policy consumed by the TechOps worker. */
+export function normalizeTechOpsPolicy(value = {}) {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const diagnostics = Array.isArray(raw.diagnosticCommands) ? raw.diagnosticCommands : [];
+  const recoveries = Array.isArray(raw.recoveryCommands) ? raw.recoveryCommands : [];
+  const canonicalCommands = Array.isArray(raw.commands) ? raw.commands : [];
+  const commands = [
+    ...canonicalCommands.map((item) => normalizeTechOpsCommand(
+      item,
+      item?.type === "diagnostic" ? "diagnostic" : "recovery",
+    )),
+    ...diagnostics.map((item) => normalizeTechOpsCommand(item, "diagnostic")),
+    ...recoveries.map((item) => normalizeTechOpsCommand(item, "recovery")),
+  ].filter(Boolean);
+  const uniqueCommands = commands.filter((item, index) => (
+    commands.findIndex((candidate) => candidate.id === item.id) === index
+  ));
+  const initialBackoffSeconds = boundedInteger(
+    raw.initialBackoffSeconds,
+    DEFAULT_TECHOPS_POLICY.initialBackoffSeconds,
+    1,
+    24 * 60 * 60,
+  );
+  return {
+    enabled: raw.enabled === true,
+    healthCheckIntervalSeconds: boundedInteger(raw.healthCheckIntervalSeconds, DEFAULT_TECHOPS_POLICY.healthCheckIntervalSeconds, 5, 24 * 60 * 60),
+    healthTimeoutMs: boundedInteger(raw.healthTimeoutMs, DEFAULT_TECHOPS_POLICY.healthTimeoutMs, 250, 60_000),
+    commandTimeoutMs: boundedInteger(raw.commandTimeoutMs, DEFAULT_TECHOPS_POLICY.commandTimeoutMs, 1_000, 5 * 60_000),
+    maxAttempts: boundedInteger(raw.maxAttempts, DEFAULT_TECHOPS_POLICY.maxAttempts, 1, 10),
+    initialBackoffSeconds,
+    maxBackoffSeconds: boundedInteger(raw.maxBackoffSeconds, DEFAULT_TECHOPS_POLICY.maxBackoffSeconds, initialBackoffSeconds, 24 * 60 * 60),
+    leaseSeconds: boundedInteger(raw.leaseSeconds, DEFAULT_TECHOPS_POLICY.leaseSeconds, 30, 30 * 60),
+    maxConcurrentRecoveries: boundedInteger(raw.maxConcurrentRecoveries, DEFAULT_TECHOPS_POLICY.maxConcurrentRecoveries, 1, 4),
+    maxCommandsPerAttempt: boundedInteger(raw.maxCommandsPerAttempt, DEFAULT_TECHOPS_POLICY.maxCommandsPerAttempt, 1, 16),
+    maxOutputChars: boundedInteger(raw.maxOutputChars, DEFAULT_TECHOPS_POLICY.maxOutputChars, 256, 24_000),
+    verificationAttempts: boundedInteger(raw.verificationAttempts, DEFAULT_TECHOPS_POLICY.verificationAttempts, 1, 10),
+    verificationDelayMs: boundedInteger(raw.verificationDelayMs, DEFAULT_TECHOPS_POLICY.verificationDelayMs, 0, 30_000),
+    commands: uniqueCommands,
+    restartLaunchAgents: [...new Set((Array.isArray(raw.restartLaunchAgents) ? raw.restartLaunchAgents : [])
+      .map((item) => String(item).trim())
+      .filter((item) => /^[a-z0-9][a-z0-9_.-]{0,127}$/i.test(item)))],
+  };
+}
 
 export function normalizeRunOutputGuard(value = {}) {
   const raw = value && typeof value === "object" ? value : {};
@@ -363,6 +445,10 @@ export function projectFromConfig(rawProject, defaults = {}) {
     },
     deliveryPolicy: rawProject.deliveryPolicy || defaults.deliveryPolicy || {},
     localQaPreview: rawProject.localQaPreview || rawProject.qaIntegration?.localPreview || null,
+    techOps: normalizeTechOpsPolicy({
+      ...(defaults.techOps || {}),
+      ...(rawProject.techOps || {}),
+    }),
     trustLeadApprovals: trustLeadApprovalsEnabled({ ...rawProject, reviewPolicy }),
     integrationBranch: integrationBranchName({ ...rawProject, reviewPolicy }) || integrationBranchName(defaults),
   };

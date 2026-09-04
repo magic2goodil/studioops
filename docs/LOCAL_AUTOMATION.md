@@ -316,6 +316,7 @@ node src/mission-control-cli.js runs
 npm run runner -- --plan
 npm run dispatcher -- --plan
 npm run qa-integrate -- --plan
+node src/mission-control-techops.js --plan
 npm run promotion -- --plan
 npm run self-update -- --plan
 ```
@@ -423,6 +424,75 @@ The health endpoint must attest the commit actually served by the running
 preview. Return the full Git SHA in the configured `identityHeader` (default
 `X-StudioOps-Commit`) or JSON `identityJsonField` (default `commitSha`). A plain
 HTTP 200 is insufficient and blocks candidate freeze.
+
+## Local TechOps recovery
+
+The optional TechOps worker rechecks the loopback health endpoint for active
+`ready` and `partially_reviewed` QA bundles after they have been frozen. It
+checks both availability and the full immutable candidate SHA, so a previously
+healthy preview that stops or begins serving a stale checkout becomes a
+dedicated `techops_check_qa_preview` action rather than another feature build.
+
+Configure the policy per project (or under `defaults.techOps`):
+
+```json
+{
+  "techOps": {
+    "enabled": true,
+    "healthCheckIntervalSeconds": 60,
+    "healthTimeoutMs": 5000,
+    "commandTimeoutMs": 60000,
+    "maxAttempts": 3,
+    "initialBackoffSeconds": 60,
+    "maxBackoffSeconds": 900,
+    "leaseSeconds": 300,
+    "maxConcurrentRecoveries": 1,
+    "maxCommandsPerAttempt": 8,
+    "maxOutputChars": 4000,
+    "verificationAttempts": 5,
+    "verificationDelayMs": 1000,
+    "diagnosticCommands": [
+      {
+        "id": "postgres-status",
+        "argv": ["docker", "compose", "ps", "postgres"]
+      }
+    ],
+    "recoveryCommands": [
+      {
+        "id": "postgres-start",
+        "argv": ["docker", "compose", "up", "-d", "postgres"]
+      }
+    ],
+    "restartLaunchAgents": ["com.example.myapp.local"]
+  }
+}
+```
+
+Commands must be explicit argument arrays; shell strings are ignored. Their
+working directories must resolve inside the registered project or its local QA
+preview checkout. TechOps rejects Git/GitHub, shell, privilege-escalation,
+deletion, volume-reset, and LaunchAgent commands. LaunchAgents are restarted by
+the worker only when their labels also appear in
+`localPreview.restartLaunchAgents`. Keep secrets out of command arguments and
+output; stored output is bounded and common credential forms are redacted, and
+the durable audit records command identifiers rather than argv values.
+
+Run a read-only plan or one sweep manually:
+
+```bash
+node src/mission-control-techops.js --plan
+node src/mission-control-techops.js --json
+```
+
+The installed `com.codex.mission-control.techops` LaunchAgent runs one sweep per
+minute. A fenced lease deduplicates overlapping sweeps. Failures use durable
+exponential backoff; after `maxAttempts`, the QA bundle records one
+`circuit_open` incident with the final actionable blocker and no further
+recovery is claimed. A successful recovery must again attest the exact
+candidate SHA before the incident is cleared. Changing candidate or recovery
+policy identity starts a new bounded series. TechOps never merges, pushes,
+deploys, deletes databases, resets volumes, or runs a command rooted in another
+project.
 
 ## Main Promotion
 
