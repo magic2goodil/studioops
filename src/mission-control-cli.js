@@ -11,6 +11,7 @@ import {
   automationTick,
   completeArchitecture,
   generatePrompt,
+  recordQaBundleDecision,
   recordQaDecision,
   recordReview,
   readState,
@@ -49,6 +50,7 @@ import {
   defaultStudioOpsGitLockRoot,
   defaultStudioOpsWorkspaceRoot,
 } from "./runtime-paths.js";
+import { buildQaReviewList } from "./qa-review-list.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -446,9 +448,9 @@ Commands:
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
   qa-integrate                  Assemble reviewed commits into immutable local QA candidates
-  qa-pass TASK_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --body NOTES
+  qa-pass TASK_ID|--bundle BUNDLE_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --owner-qa-packet-digest DIGEST --body NOTES
                                 Approve the exact immutable candidate tested in local QA
-  qa-fail TASK_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --body NOTES
+  qa-fail TASK_ID|--bundle BUNDLE_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --owner-qa-packet-digest DIGEST --body NOTES
                                 Fail the exact immutable candidate and return its tasks for changes
   promote                       Create a release-candidate PR from an owner-approved candidate
   notifier                      Send local owner/failure notifications
@@ -458,7 +460,7 @@ Commands:
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
   prompt TASK_ID --role         Print builder, architect, reviewer, QA, or release-manager prompt
-  qa-list                       List tasks waiting for local QA review
+  qa-list [--json]              List actionable QA tasks/bundles and exact decision coordinates
 
 Task fields:
   --story                       User story, such as "As a customer..."
@@ -514,7 +516,9 @@ Automation:
   studioops self-update --plan
   studioops runs --status queued
   studioops review task_1 --stage backend --outcome approved --body "Reviewed API and migrations."
-  studioops qa-pass task_1 --body "Looks good locally."
+  studioops qa-list --json
+  studioops qa-pass task_1 --candidate candidate_ID --manifest-digest sha256:DIGEST --integration-sha FULL_SHA --owner-qa-packet-digest sha256:PACKET_DIGEST --body "Looks good locally."
+  studioops qa-fail --bundle qa_bundle_ID --candidate candidate_ID --manifest-digest sha256:DIGEST --integration-sha FULL_SHA --owner-qa-packet-digest sha256:PACKET_DIGEST --body "The bundle needs changes."
 `);
     return;
   }
@@ -555,37 +559,99 @@ Automation:
       ? state.projects.find((project) => project.id === args.project || project.key === args.project)
       : null;
     if (args.project && !projectFilter) throw new Error(`Unknown project: ${args.project}`);
-    const tasks = state.tasks
-      .filter((task) => task.status === "qa_review")
-      .filter((task) => !projectFilter || task.projectId === projectFilter.id);
-    printTable(tasks.map((task) => {
+    const reviewList = buildQaReviewList(state, { projectId: projectFilter?.id || "" });
+    const tasks = reviewList.tasks.map(({ task, ...authority }) => ({ ...task, ...authority }));
+    const bundles = reviewList.bundles.map(({ bundle, ...authority }) => ({ ...bundle, ...authority }));
+    if (args.json) {
+      console.log(JSON.stringify({ project: projectFilter || null, tasks, bundles }, null, 2));
+      return;
+    }
+    const taskRows = tasks.map((task) => {
       const project = state.projects.find((item) => item.id === task.projectId);
       const integrationBranch = task.integrationBranch || integrationBranchName(project);
       const integrationLink = task.integrationBranchUrl || branchWebUrl(project, integrationBranch);
       return {
+        kind: "task",
         id: task.id,
         project: project?.key || task.projectId,
+        actionable: task.actionable ? "yes" : "no",
+        decisionSelector: task.decisionSelector
+          ? `${task.decisionSelector.kind}:${task.decisionSelector.id}`
+          : "",
+        qaBundleId: task.qaBundleId,
+        candidateId: task.candidateId,
+        manifestDigest: task.manifestDigest,
+        integrationSha: task.integrationSha,
+        ownerQaPacketDigest: task.ownerQaPacketDigest,
         integrationBranch,
         integrationLink,
         branch: task.branchName || "",
         pr: task.prUrl || "",
         title: task.title,
       };
-    }), ["id", "project", "integrationBranch", "integrationLink", "branch", "pr", "title"]);
+    });
+    const bundleRows = bundles.map((bundle) => {
+      const project = state.projects.find((item) => item.id === bundle.projectId);
+      return {
+        kind: "bundle",
+        id: bundle.id,
+        project: project?.key || bundle.projectId,
+        actionable: "yes",
+        decisionSelector: `bundle:${bundle.id}`,
+        qaBundleId: bundle.id,
+        candidateId: bundle.candidateId,
+        manifestDigest: bundle.manifestDigest,
+        integrationSha: bundle.integrationSha,
+        ownerQaPacketDigest: bundle.ownerQaPacketDigest,
+        integrationBranch: bundle.integrationBranch || "",
+        integrationLink: bundle.integrationBranchUrl || branchWebUrl(project, bundle.integrationBranch || ""),
+        branch: "",
+        pr: "",
+        title: `${(bundle.tasks || []).length} task(s)`,
+      };
+    });
+    printTable([...taskRows, ...bundleRows], [
+      "kind",
+      "id",
+      "project",
+      "actionable",
+      "decisionSelector",
+      "qaBundleId",
+      "candidateId",
+      "manifestDigest",
+      "integrationSha",
+      "ownerQaPacketDigest",
+      "integrationBranch",
+      "integrationLink",
+      "branch",
+      "pr",
+      "title",
+    ]);
     return;
   }
 
   if (command === "qa-pass" || command === "qa-fail") {
     const taskId = args._[1] || args.task || args["task-id"];
-    const result = await recordQaDecision(taskId, {
+    const hasBundleSelector = Object.prototype.hasOwnProperty.call(args, "bundle");
+    const bundleId = typeof args.bundle === "string" ? args.bundle.trim() : "";
+    if (hasBundleSelector && !bundleId) throw new Error("--bundle requires an exact QA bundle ID.");
+    if (taskId && bundleId) throw new Error("Choose exactly one QA decision selector: TASK_ID or --bundle BUNDLE_ID.");
+    if (!taskId && !bundleId) {
+      throw new Error(`Usage: ${command} TASK_ID|--bundle BUNDLE_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --owner-qa-packet-digest DIGEST --body NOTES`);
+    }
+    const input = {
       outcome: command === "qa-pass" ? "passed" : "failed",
       body: args.body || args.notes || "",
       author: args.author || "Owner QA",
       candidateId: args.candidate || args["candidate-id"],
       manifestDigest: args.digest || args["manifest-digest"],
       integrationSha: args["integration-sha"] || args.sha,
-    });
-    console.log(`${result.candidate.id}: QA ${result.candidate.qaDecision.outcome}. Status now ${result.candidate.status}.`);
+      ownerQaPacketDigest: args["owner-qa-packet-digest"] || args["packet-digest"],
+    };
+    const result = bundleId
+      ? await recordQaBundleDecision(bundleId, input)
+      : await recordQaDecision(taskId, input);
+    console.log(`${result.candidate.id}: QA ${result.outcome || result.candidate.qaDecision.outcome}. Status now ${result.candidate.status}.`);
     return;
   }
 

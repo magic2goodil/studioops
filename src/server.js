@@ -8,6 +8,7 @@ import {
   addTask,
   automationTick,
   generatePrompt,
+  qaDecisionCoordinatesForState,
   readState,
   recordQaBundleDecision,
   recordQaDecision,
@@ -24,6 +25,7 @@ import { buildOwnerInbox } from "./owner-inbox.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
 import { databaseContentionHealth } from "./state-database.js";
 import { currentRemediationHandoff } from "./remediation-handoff.js";
+import { buildQaReviewList } from "./qa-review-list.js";
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 4317);
@@ -45,6 +47,12 @@ const MIME_TYPES = {
 const IMAGE_MIME_TYPES = new Map(
   Object.entries(MIME_TYPES).filter(([, value]) => value.startsWith("image/")),
 );
+
+const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const JSON_MUTATION_METHODS = new Set(["POST", "PUT", "PATCH"]);
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const LOOPBACK_LISTEN_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const LOOPBACK_SOCKET_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -69,6 +77,97 @@ async function readJsonBody(req) {
     if (body.length > 1_000_000) throw new Error("Request body too large.");
   }
   return body ? JSON.parse(body) : {};
+}
+
+function localListenHost(value) {
+  const host = String(value || "");
+  if (!LOOPBACK_LISTEN_HOSTS.has(host)) {
+    const error = new Error("StudioOps requires a canonical loopback listen host (127.0.0.1, localhost, or ::1).");
+    error.code = "STUDIOOPS_LOOPBACK_HOST_REQUIRED";
+    throw error;
+  }
+  return host;
+}
+
+function exactRequestOrigin(req) {
+  const rawHost = req.headers.host;
+  if (typeof rawHost !== "string" || !rawHost.trim()) return "";
+  const protocol = req.socket?.encrypted === true ? "https:" : "http:";
+  try {
+    const expected = new URL(`${protocol}//${rawHost}`);
+    const effectivePort = Number(expected.port || (protocol === "https:" ? 443 : 80));
+    const localPort = Number(req.socket?.localPort);
+    if (
+      expected.username
+      || expected.password
+      || expected.pathname !== "/"
+      || expected.search
+      || expected.hash
+      || !LOOPBACK_HOSTNAMES.has(expected.hostname.toLowerCase())
+      || !LOOPBACK_SOCKET_ADDRESSES.has(String(req.socket?.localAddress || "").toLowerCase())
+      || !LOOPBACK_SOCKET_ADDRESSES.has(String(req.socket?.remoteAddress || "").toLowerCase())
+      || !Number.isSafeInteger(localPort)
+      || effectivePort !== localPort
+    ) {
+      return "";
+    }
+    return expected.origin;
+  } catch {
+    return "";
+  }
+}
+
+function exactPresentedOrigin(req) {
+  const rawOrigin = req.headers.origin;
+  if (typeof rawOrigin !== "string" || !rawOrigin.trim() || rawOrigin.trim() === "null") return "";
+  try {
+    const parsed = new URL(rawOrigin);
+    if (
+      !["http:", "https:"].includes(parsed.protocol)
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.origin !== rawOrigin
+    ) {
+      return "";
+    }
+    return parsed.origin;
+  } catch {
+    return "";
+  }
+}
+
+function hasApplicationJsonContentType(req) {
+  const contentType = req.headers["content-type"];
+  if (typeof contentType !== "string") return false;
+  return contentType.split(";", 1)[0].trim().toLowerCase() === "application/json";
+}
+
+function allowApiRequest(req, res, url) {
+  if (!url.pathname.startsWith("/api/")) return true;
+  const requestOrigin = exactRequestOrigin(req);
+  if (!requestOrigin) {
+    sendJson(res, 403, { error: "API requests require a trusted local Host." });
+    return false;
+  }
+
+  if (!MUTATION_METHODS.has(req.method || "")) return true;
+
+  if (Object.prototype.hasOwnProperty.call(req.headers, "origin")) {
+    const presentedOrigin = exactPresentedOrigin(req);
+    if (!presentedOrigin || presentedOrigin !== requestOrigin) {
+      sendJson(res, 403, { error: "Cross-origin API mutation requests are forbidden." });
+      return false;
+    }
+  }
+
+  if (JSON_MUTATION_METHODS.has(req.method || "") && !hasApplicationJsonContentType(req)) {
+    sendJson(res, 415, { error: "API mutation requests require Content-Type application/json." });
+    return false;
+  }
+  return true;
 }
 
 async function serveStatic(req, res, url) {
@@ -166,6 +265,7 @@ async function handleApi(req, res, url) {
       projects: state.projects || [],
       tasks: state.tasks || [],
       qaBundles: state.qaBundles || [],
+      qaDecisionCoordinates: qaDecisionCoordinatesForState(state),
       ownerInbox: buildOwnerInbox(state),
       configLoaded: !!config,
       productAccess: localProductAccess(),
@@ -266,11 +366,21 @@ async function handleApi(req, res, url) {
       sendJson(res, 404, { error: "Project not found." });
       return;
     }
-    const tasks = state.tasks
-      .filter((task) => task.status === "qa_review")
-      .filter((task) => !project || task.projectId === project.id)
-      .map((task) => taskWithProject(state, task));
-    sendJson(res, 200, { generatedAt: new Date().toISOString(), project: project || null, tasks });
+    const reviewList = buildQaReviewList(state, { projectId: project?.id || "" });
+    const tasks = reviewList.tasks.map(({ task, ...authority }) => ({
+      ...taskWithProject(state, task),
+      ...authority,
+    }));
+    const bundles = reviewList.bundles.map(({ bundle, ...authority }) => ({
+      ...bundle,
+      ...authority,
+    }));
+    sendJson(res, 200, {
+      generatedAt: new Date().toISOString(),
+      project: project || null,
+      tasks,
+      bundles,
+    });
     return;
   }
 
@@ -327,19 +437,36 @@ async function handleApi(req, res, url) {
   sendJson(res, 404, { error: "API route not found." });
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
-  try {
-    if (url.pathname.startsWith("/api/")) {
-      await handleApi(req, res, url);
-      return;
+export function createStudioOpsServer(options = {}) {
+  const host = localListenHost(options.host || HOST);
+  const port = Number(options.port ?? PORT);
+  return http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, `http://${req.headers.host || `${host}:${port}`}`);
+      if (!allowApiRequest(req, res, url)) return;
+      if (url.pathname.startsWith("/api/")) {
+        await handleApi(req, res, url);
+        return;
+      }
+      await serveStatic(req, res, url);
+    } catch (error) {
+      sendJson(res, 500, { error: error.message });
     }
-    await serveStatic(req, res, url);
-  } catch (error) {
-    sendJson(res, 500, { error: error.message });
-  }
-});
+  });
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`StudioOps running at http://${HOST}:${PORT}`);
-});
+export function startStudioOpsServer(options = {}) {
+  const host = localListenHost(options.host || HOST);
+  const port = Number(options.port ?? PORT);
+  const server = createStudioOpsServer({ host, port });
+  server.listen(port, host, () => {
+    const address = server.address();
+    const listeningPort = address && typeof address === "object" ? address.port : port;
+    console.log(`StudioOps running at http://${host}:${listeningPort}`);
+  });
+  return server;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startStudioOpsServer();
+}

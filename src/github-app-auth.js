@@ -12,6 +12,7 @@ const DEFAULT_CREDENTIALS_DIR = defaultStudioOpsCredentialsRoot();
 const DEFAULT_RUNTIME_DIR = path.join(missionControlDataDir(), "run-outputs", "github-app-auth");
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
+const GITHUB_API_TIMEOUT_MS = 30_000;
 const TOKEN_REDACTION = "[REDACTED_GITHUB_APP_TOKEN]";
 
 const ROLE_PERMISSIONS = {
@@ -47,6 +48,9 @@ const ROLE_PERMISSIONS = {
     contents: "write",
     issues: "write",
     pull_requests: "write",
+  },
+  "qa-reviewer": {
+    contents: "read",
   },
   "promotion-worker": {
     contents: "write",
@@ -176,22 +180,51 @@ async function readCredentialFile(filePath, label) {
   throw new Error(`could not read ${label}`);
 }
 
-async function githubJson(pathname, { method = "GET", token, body } = {}) {
-  const response = await fetch(`${GITHUB_API_BASE}${pathname}`, {
-    method,
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      "User-Agent": "studioops",
-      "X-GitHub-Api-Version": GITHUB_API_VERSION,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await response.text();
+async function githubJson(pathname, {
+  method = "GET",
+  token,
+  body,
+  timeoutMs = GITHUB_API_TIMEOUT_MS,
+} = {}) {
+  const configuredTimeoutMs = Number(timeoutMs);
+  const requestTimeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+    ? Math.floor(configuredTimeoutMs)
+    : GITHUB_API_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  let response;
+  let text;
+  try {
+    response = await fetch(`${GITHUB_API_BASE}${pathname}`, {
+      method,
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "User-Agent": "studioops",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+    text = await response.text();
+  } catch (error) {
+    const requestError = controller.signal.aborted
+      ? new Error(`GitHub API ${method} ${pathname} timed out after ${requestTimeoutMs}ms.`)
+      : new Error(
+        `GitHub API ${method} ${pathname} request failed: ${redactSecrets(error?.message || "Unknown request error", [token])}`,
+      );
+    requestError.code = controller.signal.aborted
+      ? "github_api_request_timeout"
+      : "github_api_request_failed";
+    requestError.pathname = pathname;
+    throw requestError;
+  } finally {
+    clearTimeout(timeout);
+  }
   const payload = parseJson(text, { message: text });
   if (!response.ok) {
-    const detail = payload.message || "Unknown GitHub API error";
+    const detail = redactSecrets(payload.message || "Unknown GitHub API error", [token]);
     const error = new Error(`GitHub API ${method} ${pathname} failed with HTTP ${response.status}: ${detail}`);
     error.status = response.status;
     error.pathname = pathname;
@@ -224,27 +257,50 @@ export function parseGitHubRepoUrl(value) {
 async function gitRemoteUrl(repoPath) {
   if (!repoPath) return "";
   try {
-    const result = await execFileAsync("git", ["remote", "get-url", "origin"], {
-      cwd: repoPath,
+    const result = await execFileAsync("/usr/bin/git", [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "credential.helper=",
+      "-C",
+      repoPath,
+      "config",
+      "--local",
+      "--no-includes",
+      "--get-all",
+      "remote.origin.url",
+    ], {
+      env: {
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        HOME: "/",
+        LANG: "C",
+        LC_ALL: "C",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+      },
       timeout: 30_000,
       maxBuffer: 1024 * 1024,
     });
-    return String(result.stdout || "").trim();
+    const urls = String(result.stdout || "").split("\n").map((item) => item.trim()).filter(Boolean);
+    return urls.length === 1 ? urls[0] : "";
   } catch {
     return "";
   }
 }
 
 async function resolveRunRepository(run) {
-  const candidates = [
+  const configuredCandidates = [
     run.project?.repoUrl,
     run.project?.remoteUrl,
-    await gitRemoteUrl(run.project?.sourceRepoPath || run.project?.repoPath),
   ];
-  for (const candidate of candidates) {
+  for (const candidate of configuredCandidates) {
     const repo = parseGitHubRepoUrl(candidate);
     if (repo) return repo;
   }
+  const localRemote = await gitRemoteUrl(run.project?.sourceRepoPath || run.project?.repoPath);
+  const localRepo = parseGitHubRepoUrl(localRemote);
+  if (localRepo) return localRepo;
   throw new Error(`GitHub App auth requires a github.com origin or repoUrl for ${run.project?.key || run.projectId || "the project"}.`);
 }
 
@@ -489,11 +545,12 @@ export async function prepareGitHubAppAuth(run, input = {}) {
   const repo = await resolveRunRepository(run);
   const app = await loadConfiguredApp(credentialsDir, role, { roleMap, defaultRole });
   const jwt = createGitHubAppJwt(app.appId, app.privateKey);
+  const requestTimeoutMs = input.githubAppRequestTimeoutMs || GITHUB_API_TIMEOUT_MS;
   let installation;
   try {
     installation = await githubJson(
       `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/installation`,
-      { token: jwt },
+      { token: jwt, timeoutMs: requestTimeoutMs },
     );
   } catch (error) {
     if (Number(error?.status) === 404) {
@@ -512,6 +569,7 @@ export async function prepareGitHubAppAuth(run, input = {}) {
     {
       method: "POST",
       token: jwt,
+      timeoutMs: requestTimeoutMs,
       body: {
         repositories: [repo.name],
         permissions,

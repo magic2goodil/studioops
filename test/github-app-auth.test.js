@@ -59,6 +59,7 @@ test("malformed role-specific GitHub App credentials fail before default fallbac
       () => prepareGitHubAppAuth(runFixture(), {
         githubAppCredentialsDir: root,
         githubAppRuntimeDir: path.join(root, "runtime"),
+        githubAppRoleMap: {},
       }),
       (error) => {
         assert.match(error.message, /backend-reviewer/);
@@ -109,6 +110,7 @@ test("default GitHub App credentials remain an intentional fallback when no role
     auth = await prepareGitHubAppAuth(runFixture(), {
       githubAppCredentialsDir: root,
       githubAppRuntimeDir: path.join(root, "runtime"),
+      githubAppRoleMap: {},
     });
 
     assert.equal(auth.app.key, "default");
@@ -140,6 +142,7 @@ test("missing repository installation reports the exact repository and remediati
       () => prepareGitHubAppAuth(runFixture(), {
         githubAppCredentialsDir: root,
         githubAppRuntimeDir: path.join(root, "runtime"),
+        githubAppRoleMap: {},
       }),
       (error) => {
         assert.equal(error.code, "github_app_not_installed_on_repository");
@@ -189,6 +192,7 @@ test("accessibility reviewer GitHub App credentials resolve as a reviewer role",
     auth = await prepareGitHubAppAuth(runFixture("accessibility-reviewer"), {
       githubAppCredentialsDir: root,
       githubAppRuntimeDir: path.join(root, "runtime"),
+      githubAppRoleMap: {},
     });
 
     assert.equal(auth.app.key, "accessibility-reviewer");
@@ -196,6 +200,167 @@ test("accessibility reviewer GitHub App credentials resolve as a reviewer role",
   } finally {
     globalThis.fetch = originalFetch;
     await cleanupGitHubAppAuth(auth);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner QA verification requests a read-only repository token", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+  let auth = null;
+
+  try {
+    await writeApp(root, "lead-reviewer", { role: "lead-reviewer" });
+    globalThis.fetch = async (url, options = {}) => {
+      if (String(url).endsWith("/repos/example/repo/installation")) {
+        return {
+          ok: true,
+          text: async () => JSON.stringify({ id: 98765 }),
+        };
+      }
+      if (String(url).endsWith("/app/installations/98765/access_tokens")) {
+        const body = JSON.parse(options.body);
+        assert.deepEqual(body.repositories, ["repo"]);
+        assert.deepEqual(body.permissions, { contents: "read" });
+        return {
+          ok: true,
+          text: async () => JSON.stringify({
+            token: "ghs_read_only_qa_token",
+            expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          }),
+        };
+      }
+      throw new Error(`Unexpected GitHub API call: ${url}`);
+    };
+
+    auth = await prepareGitHubAppAuth(runFixture("qa-reviewer"), {
+      githubAppCredentialsDir: root,
+      githubAppRuntimeDir: path.join(root, "runtime"),
+      githubAppRoleMap: { "qa-reviewer": "lead-reviewer" },
+    });
+
+    assert.equal(auth.role, "qa-reviewer");
+    assert.equal(auth.app.key, "lead-reviewer");
+    assert.deepEqual(auth.permissions, { contents: "read" });
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanupGitHubAppAuth(auth);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("installation lookup aborts at its bounded timeout without exposing the app JWT", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+  let authorization = "";
+
+  try {
+    await writeApp(root, "backend-reviewer", { role: "backend-reviewer" });
+    globalThis.fetch = async (url, options = {}) => {
+      assert.ok(String(url).endsWith("/repos/example/repo/installation"));
+      assert.ok(options.signal instanceof AbortSignal);
+      authorization = options.headers.Authorization;
+      return await new Promise((_, reject) => {
+        options.signal.addEventListener("abort", () => {
+          reject(new Error(`request aborted with ${authorization}`));
+        }, { once: true });
+      });
+    };
+
+    await assert.rejects(
+      () => prepareGitHubAppAuth(runFixture(), {
+        githubAppCredentialsDir: root,
+        githubAppRuntimeDir: path.join(root, "runtime"),
+        githubAppRoleMap: {},
+        githubAppRequestTimeoutMs: 10,
+      }),
+      (error) => {
+        assert.equal(error.code, "github_api_request_timeout");
+        assert.match(error.message, /GET \/repos\/example\/repo\/installation timed out after 10ms/);
+        assert.equal(error.message.includes(authorization.slice("Bearer ".length)), false);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("installation token exchange has its own bounded timeout", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+  const signals = [];
+
+  try {
+    await writeApp(root, "backend-reviewer", { role: "backend-reviewer" });
+    globalThis.fetch = async (url, options = {}) => {
+      signals.push(options.signal);
+      assert.ok(options.signal instanceof AbortSignal);
+      if (String(url).endsWith("/repos/example/repo/installation")) {
+        return {
+          ok: true,
+          text: async () => JSON.stringify({ id: 98765 }),
+        };
+      }
+      if (String(url).endsWith("/app/installations/98765/access_tokens")) {
+        return await new Promise((_, reject) => {
+          options.signal.addEventListener("abort", () => reject(new Error("token exchange aborted")), { once: true });
+        });
+      }
+      throw new Error(`Unexpected GitHub API call: ${url}`);
+    };
+
+    await assert.rejects(
+      () => prepareGitHubAppAuth(runFixture(), {
+        githubAppCredentialsDir: root,
+        githubAppRuntimeDir: path.join(root, "runtime"),
+        githubAppRoleMap: {},
+        githubAppRequestTimeoutMs: 10,
+      }),
+      (error) => {
+        assert.equal(error.code, "github_api_request_timeout");
+        assert.match(error.message, /POST \/app\/installations\/98765\/access_tokens timed out after 10ms/);
+        return true;
+      },
+    );
+    assert.equal(signals.length, 2);
+    assert.notEqual(signals[0], signals[1]);
+    assert.equal(signals[1].aborted, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitHub App request failures redact the app JWT", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
+  const originalFetch = globalThis.fetch;
+  let jwt = "";
+
+  try {
+    await writeApp(root, "backend-reviewer", { role: "backend-reviewer" });
+    globalThis.fetch = async (url, options = {}) => {
+      assert.ok(String(url).endsWith("/repos/example/repo/installation"));
+      jwt = options.headers.Authorization.slice("Bearer ".length);
+      throw new Error(`socket rejected credential ${jwt}`);
+    };
+
+    await assert.rejects(
+      () => prepareGitHubAppAuth(runFixture(), {
+        githubAppCredentialsDir: root,
+        githubAppRuntimeDir: path.join(root, "runtime"),
+        githubAppRoleMap: {},
+      }),
+      (error) => {
+        assert.equal(error.code, "github_api_request_failed");
+        assert.match(error.message, /\[REDACTED_GITHUB_APP_TOKEN\]/);
+        assert.equal(error.message.includes(jwt), false);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
     await rm(root, { recursive: true, force: true });
   }
 });

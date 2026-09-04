@@ -5,6 +5,11 @@ import {
   evaluateLifecycleTransition,
 } from "../src/lifecycle-policy.js";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
+import { buildOwnerQaPacket } from "../src/owner-qa-packet.js";
+import {
+  claimPromotionAttemptInState,
+  terminalPromotionAttemptClaimInState,
+} from "../src/promotion-attempt-claim.js";
 import { applyLifecycleTransitionInState, capabilityRoutingForTask, reviewMatchesCurrentCandidate } from "../src/store.js";
 
 const NOW = Date.parse("2026-08-17T12:00:00.000Z");
@@ -272,6 +277,292 @@ test("QA transitions require the exact immutable candidate digest", () => {
     /immutable current candidate/,
   );
   assert.equal(task.stateVersion, 6);
+});
+
+test("QA failure preserves the exact frozen candidate as terminal traceability evidence", () => {
+  const candidate = candidateFixture();
+  const task = {
+    id: "task_1", status: "qa_review", stateVersion: 6, assignedAgentRole: "owner",
+    reviewSubjectSha: SHA, reviewSubjectCycle: 2, candidateId: candidate.id,
+  };
+  const command = {
+    action: "fail_qa",
+    taskId: task.id,
+    expectedStateVersion: task.stateVersion,
+    actorContext: { actorId: "Owner QA", actorType: "owner", role: "owner", trusted: true },
+    evidence: {
+      targetStatus: "needs_changes",
+      candidateCycle: 2,
+      subjectSha: SHA,
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+    },
+  };
+
+  const result = evaluateLifecycleTransition(command, task, { candidates: [candidate], nowMs: NOW });
+  assert.equal(result.task.status, "needs_changes");
+  assert.equal(result.task.stateVersion, 7);
+  assert.deepEqual(result.decision.invalidates, []);
+  assert.throws(
+    () => evaluateLifecycleTransition({
+      ...command,
+      actorContext: { actorId: "workflow", actorType: "system", role: "workflow-engine", trusted: true },
+    }, task, { candidates: [candidate], nowMs: NOW }),
+    /cannot perform fail_qa/i,
+  );
+  assert.throws(
+    () => evaluateLifecycleTransition(command, { ...task, status: "approved_for_main" }, { candidates: [candidate], nowMs: NOW }),
+    /prohibits approved_for_main -> needs_changes/i,
+  );
+});
+
+test("only the owner can revoke an exact pre-merge QA approval with full evidence invalidation", () => {
+  const candidate = candidateFixture();
+  candidate.status = "qa_passed";
+  candidate.qaDecision = {
+    outcome: "passed",
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationSha: candidate.manifest.integration.sha,
+    taskIds: ["task_1"],
+    author: "Owner QA",
+    repositoryVerifiedAt: "2026-08-17T11:20:00.000Z",
+    decidedAt: "2026-08-17T11:21:00.000Z",
+  };
+  const task = {
+    id: "task_1", status: "approved_for_main", stateVersion: 7, assignedAgentRole: "promotion-worker",
+    reviewSubjectSha: SHA, reviewSubjectCycle: 2, candidateId: candidate.id,
+  };
+  const command = {
+    action: "revoke_qa",
+    taskId: task.id,
+    expectedStateVersion: task.stateVersion,
+    actorContext: { actorId: "Owner QA", actorType: "owner", role: "owner", trusted: true },
+    evidence: {
+      targetStatus: "needs_changes",
+      candidateCycle: 2,
+      subjectSha: SHA,
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+    },
+  };
+
+  const result = evaluateLifecycleTransition(command, task, { candidates: [candidate], nowMs: NOW });
+  assert.equal(result.task.status, "needs_changes");
+  assert.equal(result.task.stateVersion, 8);
+  assert.deepEqual(result.decision.invalidates, ["reviews", "qa", "candidate", "promotion"]);
+  assert.throws(
+    () => evaluateLifecycleTransition({
+      ...command,
+      actorContext: { actorId: "worker", actorType: "system", role: "promotion-worker", trusted: true },
+    }, task, { candidates: [candidate], nowMs: NOW }),
+    /cannot perform revoke_qa/i,
+  );
+  assert.throws(
+    () => evaluateLifecycleTransition(command, { ...task, status: "merged" }, { candidates: [candidate], nowMs: NOW }),
+    /prohibits merged -> needs_changes/i,
+  );
+});
+
+test("a rejected release-candidate lifecycle transition leaves the in-memory aggregate unchanged", () => {
+  const candidate = candidateFixture();
+  candidate.status = "release_candidate_ready";
+  const task = {
+    id: "task_1",
+    projectId: "project_1",
+    title: "Release candidate",
+    status: "user_review",
+    stateVersion: 8,
+    assignedAgentRole: "owner",
+    reviewSubjectSha: SHA,
+    reviewSubjectCycle: 2,
+    candidateId: candidate.id,
+  };
+  const state = {
+    meta: {},
+    projects: [{ id: "project_1" }],
+    tasks: [task],
+    candidates: [candidate],
+    reviews: [],
+    runs: [],
+    qaBundles: [],
+    events: [],
+  };
+  const before = structuredClone(task);
+
+  assert.throws(
+    () => applyLifecycleTransitionInState(state, {
+      action: "request_changes",
+      taskId: task.id,
+      expectedStateVersion: task.stateVersion,
+      actorContext: { actorId: "Owner QA", actorType: "owner", role: "owner", trusted: true },
+      evidence: {
+        targetStatus: "needs_changes",
+        candidateCycle: 2,
+        subjectSha: SHA,
+        candidateId: candidate.id,
+        manifestDigest: candidate.manifestDigest,
+      },
+    }, { nowMs: NOW }),
+    /revoke that QA approval first/i,
+  );
+  assert.deepEqual(task, before);
+  assert.deepEqual(state.events, []);
+});
+
+test("the promotion worker can record an exact merged candidate after its PR was previously closed", () => {
+  const candidate = candidateFixture();
+  candidate.status = "release_candidate_ready";
+  candidate.qaDecision = {
+    outcome: "passed",
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationSha: candidate.manifest.integration.sha,
+    taskIds: ["task_1"],
+    author: "Owner QA",
+    repositoryVerifiedAt: "2026-08-17T11:20:00.000Z",
+    decidedAt: "2026-08-17T11:21:00.000Z",
+  };
+  candidate.promotion = {
+    branch: "qa/promotion-candidate-1",
+    prUrl: "https://github.com/example/demo/pull/42",
+    commitSha: candidate.manifest.integration.sha,
+    manifestDigest: candidate.manifestDigest,
+    readyAt: "2026-08-17T11:30:00.000Z",
+  };
+  const task = {
+    id: "task_1",
+    projectId: "project_1",
+    title: "Reopened release candidate",
+    status: "promotion_blocked",
+    stateVersion: 9,
+    assignedAgentRole: "promotion-worker",
+    reviewCycle: 2,
+    reviewSubjectCycle: 2,
+    reviewSubjectSha: SHA,
+    candidateId: candidate.id,
+    qaBundleId: candidate.qaBundleId,
+    promotionStatus: "promotion_closed",
+    promotionBranch: candidate.promotion.branch,
+    promotionPrUrl: candidate.promotion.prUrl,
+    promotionCommit: candidate.promotion.commitSha,
+  };
+  const project = {
+    id: "project_1",
+    repoPath: "/tmp/studioops-lifecycle-promotion",
+    repoUrl: "https://github.com/example/demo",
+    defaultBranch: "main",
+    promotion: { enabled: true, targetBranch: "main" },
+  };
+  const bundle = {
+    id: candidate.qaBundleId,
+    projectId: candidate.projectId,
+    candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest,
+    integrationBranch: candidate.manifest.integration.branch,
+    integrationCommit: candidate.manifest.integration.sha,
+    previewUrl: candidate.manifest.preview.url,
+    status: "release_candidate_ready",
+    tasks: [{ id: task.id }],
+  };
+  const claimState = {
+    meta: {},
+    projects: [project],
+    tasks: [task],
+    candidates: [candidate],
+    qaBundles: [bundle],
+  };
+  const packet = buildOwnerQaPacket(claimState, candidate, {
+    bundle,
+    generatedAt: "2026-08-17T11:19:00.000Z",
+  });
+  candidate.qaPacket = structuredClone(packet);
+  bundle.qaPacket = structuredClone(packet);
+  bundle.packetDigest = packet.packetDigest;
+  candidate.qaDecision.ownerQaPacketDigest = packet.packetDigest;
+  bundle.qaDecision = structuredClone(candidate.qaDecision);
+  const acquired = claimPromotionAttemptInState(claimState, {
+    projectId: project.id,
+    candidateId: candidate.id,
+    mode: "reconcile",
+    policyDigest: `sha256:${"f".repeat(64)}`,
+    projectPolicy: project,
+    nowMs: NOW - 1_000,
+    claimIdFactory: () => "claim_merged_1",
+  });
+  const terminalClaim = terminalPromotionAttemptClaimInState(claimState, acquired.claim, {
+    projectId: project.id,
+    candidateId: candidate.id,
+    mode: "reconcile",
+    policyDigest: `sha256:${"f".repeat(64)}`,
+    projectPolicy: project,
+    outcome: "merged",
+    terminalResult: {
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      prUrl: candidate.promotion.prUrl,
+      mergeCommit: "e".repeat(40),
+      mergedAt: "2026-08-17T11:45:00.000Z",
+    },
+    nowMs: NOW,
+  });
+  const command = {
+    action: "record_merge",
+    taskId: task.id,
+    expectedStateVersion: task.stateVersion,
+    actorContext: {
+      actorId: "promotion-worker",
+      actorType: "worker",
+      role: "promotion-worker",
+      trusted: true,
+    },
+    evidence: {
+      targetStatus: "merged",
+      candidateCycle: 2,
+      candidateId: candidate.id,
+      manifestDigest: candidate.manifestDigest,
+      subjectSha: SHA,
+      prUrl: candidate.promotion.prUrl,
+      mergeCommit: "e".repeat(40),
+      mergedAt: "2026-08-17T11:45:00.000Z",
+      promotionClaimId: "claim_merged_1",
+      promotionClaimFence: terminalClaim.fence,
+      promotionClaimOutcome: "merged",
+    },
+  };
+  assert.throws(
+    () => evaluateLifecycleTransition(command, task, { runs: [], candidates: [candidate], nowMs: NOW }),
+    /exact terminal merged promotion claim/i,
+  );
+  const result = evaluateLifecycleTransition(command, task, {
+    runs: [],
+    candidates: [candidate],
+    promotionAttemptClaims: { [candidate.id]: terminalClaim },
+    nowMs: NOW,
+  });
+
+  assert.equal(result.task.status, "merged");
+  assert.equal(result.task.stateVersion, 10);
+  for (const mutate of [
+    (claim, evidence) => { evidence.promotionClaimFence += 1; },
+    (claim) => { claim.status = "active"; },
+    (claim, evidence) => { evidence.mergeCommit = "f".repeat(40); },
+    (claim, evidence) => { evidence.prUrl = "https://github.com/example/demo/pull/43"; },
+    (claim) => { claim.terminalResultDigest = `sha256:${"0".repeat(64)}`; },
+    (claim) => { claim.schemaVersion = "studioops.promotion-attempt-claim.v2"; },
+  ]) {
+    const claim = structuredClone(terminalClaim);
+    const evidence = structuredClone(command.evidence);
+    mutate(claim, evidence);
+    assert.throws(
+      () => evaluateLifecycleTransition(
+        { ...command, evidence },
+        task,
+        { candidates: [candidate], promotionAttemptClaims: { [candidate.id]: claim }, nowMs: NOW },
+      ),
+      /terminal merged promotion claim|terminal claim and exact candidate promotion PR/i,
+    );
+  }
 });
 
 test("review routing cannot skip an incomplete required gate for the exact candidate", () => {

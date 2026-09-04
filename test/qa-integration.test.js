@@ -7,14 +7,25 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { environmentForTestControlRoot } from "../scripts/test-environment.js";
+import {
+  createHermeticTestEnvironment,
+  environmentForTestControlRoot,
+} from "../scripts/test-environment.js";
 import { projectFromConfig } from "../src/config.js";
+import {
+  assertCanonicalCandidateRepositoryAuthority,
+  createCandidateRepositoryTestGitRunner,
+  verifyCandidateRepositoryState,
+} from "../src/candidate-repository.js";
+import { createCandidateEnvelope } from "../src/candidate-manifest.js";
 import {
   integrationBranchName,
   projectUsesTrustLeadQa,
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
 import {
+  createQaOuterSandboxTestAdapter,
+  createQaTestGitRunner,
   githubAppLocalFallbackEnabled,
   isGitHubAppPermissionError,
   planQaIntegrations,
@@ -26,6 +37,127 @@ import { readPersistedState } from "./state-database-helper.js";
 const execFileAsync = promisify(execFile);
 const qaIntegrationModuleUrl = pathToFileURL(path.join(process.cwd(), "src/qa-integration.js")).href;
 const storeModuleUrl = pathToFileURL(path.join(process.cwd(), "src/store.js")).href;
+const GITHUB_REPO_URL = "https://github.com/example/demo";
+const OUTER_VALIDATION_SANDBOX = Boolean(process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX);
+const localhostPreviewTest = OUTER_VALIDATION_SANDBOX
+  ? { skip: "The verified outer release sandbox intentionally denies localhost preview listeners." }
+  : {};
+
+test("candidate auth preflight accepts only the verifier's exact canonical GitHub authority", () => {
+  assert.deepEqual(
+    assertCanonicalCandidateRepositoryAuthority({ repoUrl: "https://github.com/Example/Demo" }),
+    {
+      repository: "example/demo",
+      transportUrl: "https://github.com/Example/Demo",
+    },
+  );
+  for (const repoUrl of [
+    "git@github.com:Example/Demo.git",
+    "https://github.com/Example/Demo.git",
+    "https://github.com/Example/Demo?token=secret",
+    "https://github.com/Example/Demo/extra",
+    "file:///tmp/demo.git",
+  ]) {
+    assert.throws(
+      () => assertCanonicalCandidateRepositoryAuthority({ repoUrl }),
+      /configured canonical GitHub repository URL/,
+    );
+  }
+});
+
+test("candidate verification accepts only exact equivalent GitHub origins and keeps HTTPS as transport authority", async () => {
+  const root = await mkdtemp(path.join(process.env.STUDIOOPS_TEST_ROOT, "candidate-verification-"));
+  try {
+    const fixture = await createSandboxedQaValidationFixture(root, [
+      `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+    ]);
+    const candidate = candidateForRepositoryFixture(fixture);
+    const transportUrls = [];
+    const testGitRunner = createCandidateRepositoryTestGitRunner(
+      fixture.remotePath,
+      GITHUB_REPO_URL,
+      (payload) => {
+        const remoteIndex = payload.args.indexOf("ls-remote");
+        if (remoteIndex >= 0) transportUrls.push(payload.args[remoteIndex + 3]);
+      },
+    );
+    const project = {
+      id: "project_1",
+      repoPath: fixture.repoPath,
+      repoUrl: GITHUB_REPO_URL,
+    };
+    const clearPushUrl = async () => run(
+      "/usr/bin/git",
+      ["config", "--local", "--unset-all", "remote.origin.pushurl"],
+      { cwd: fixture.repoPath },
+    ).catch(() => {});
+
+    for (const origin of [
+      GITHUB_REPO_URL,
+      `${GITHUB_REPO_URL}.git`,
+      "git@github.com:example/demo.git",
+      "ssh://git@github.com/example/demo.git",
+    ]) {
+      await git(fixture.repoPath, ["remote", "set-url", "origin", origin]);
+      await clearPushUrl();
+      const verification = await verifyCandidateRepositoryState(project, candidate, { testGitRunner });
+      assert.equal(verification.ok, true, `${origin}: ${verification.reason || "verification failed"}`);
+    }
+
+    await git(fixture.repoPath, ["remote", "set-url", "origin", GITHUB_REPO_URL]);
+    await clearPushUrl();
+    await git(fixture.repoPath, [
+      "remote",
+      "set-url",
+      "--add",
+      "--push",
+      "origin",
+      "git@github.com:example/demo.git",
+    ]);
+    assert.equal(
+      (await verifyCandidateRepositoryState(project, candidate, { testGitRunner })).ok,
+      true,
+    );
+    await clearPushUrl();
+    await git(fixture.repoPath, [
+      "remote",
+      "set-url",
+      "--add",
+      "--push",
+      "origin",
+      "git@github.com:example/other.git",
+    ]);
+    const mismatchedPush = await verifyCandidateRepositoryState(project, candidate, { testGitRunner });
+    assert.equal(mismatchedPush.ok, false);
+    assert.equal(mismatchedPush.status, "unavailable");
+
+    for (const origin of [
+      ` ${GITHUB_REPO_URL}`,
+      "https://token@github.com/example/demo.git",
+      "https://github.com:443/example/demo.git",
+      "https://github.com/example/demo.git?credential=secret",
+      "https://github.com/example/demo.git#fragment",
+      "https://github.com/example/demo/extra",
+      "https://example.com/example/demo.git",
+      "https://github.com/example/other.git",
+      "ssh://builder@github.com/example/demo.git",
+      "ssh://git:secret@github.com/example/demo.git",
+      "ssh://git@github.com:22/example/demo.git",
+      "git@example.com:example/demo.git",
+    ]) {
+      await git(fixture.repoPath, ["remote", "set-url", "origin", origin]);
+      await clearPushUrl();
+      const verification = await verifyCandidateRepositoryState(project, candidate, { testGitRunner });
+      assert.equal(verification.ok, false, `unexpectedly accepted ${origin}`);
+      assert.equal(verification.status, "unavailable");
+    }
+
+    assert.ok(transportUrls.length >= 5);
+    assert.deepEqual([...new Set(transportUrls)], [GITHUB_REPO_URL]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function run(command, args, options = {}) {
   const baseEnv = options.cwd && command === process.execPath
@@ -36,6 +168,7 @@ async function run(command, args, options = {}) {
     env: {
       ...baseEnv,
       GIT_TERMINAL_PROMPT: "0",
+      ...(options.cwd ? { STUDIOOPS_QA_TEST_REMOTE_PATH: path.join(options.cwd, "remote.git") } : {}),
       ...(options.env || {}),
     },
     timeout: options.timeout || 60_000,
@@ -44,7 +177,16 @@ async function run(command, args, options = {}) {
 }
 
 async function git(repoPath, args) {
-  const result = await run("git", args, { cwd: repoPath });
+  const inferredRemotePath = String(repoPath).endsWith(".git")
+    ? repoPath
+    : path.join(path.dirname(repoPath), "remote.git");
+  const result = await run("git", [
+    "-c",
+    "protocol.file.allow=always",
+    "-c",
+    `url.file://${path.resolve(inferredRemotePath)}.insteadOf=${GITHUB_REPO_URL}`,
+    ...args,
+  ], { cwd: repoPath });
   return `${result.stdout || ""}${result.stderr || ""}`.trim();
 }
 
@@ -78,18 +220,53 @@ async function stateWithReviewEvidence(state) {
       // Negative repository fixtures intentionally remain untrusted.
     }
   }
+  for (const project of state.projects || []) {
+    if (!path.isAbsolute(String(project.repoPath || ""))) continue;
+    try {
+      await git(project.repoPath, ["remote", "set-url", "origin", GITHUB_REPO_URL]);
+      await run("git", ["config", "--local", "--unset-all", "remote.origin.pushurl"], {
+        cwd: project.repoPath,
+      }).catch(() => {});
+      project.repoUrl = GITHUB_REPO_URL;
+    } catch {
+      // Negative repository fixtures intentionally remain untrusted.
+    }
+    const previewPath = project.localQaPreview?.checkoutPath
+      || project.qaIntegration?.localPreview?.checkoutPath
+      || project.qaIntegration?.localQaPreview?.checkoutPath;
+    if (!path.isAbsolute(String(previewPath || ""))) continue;
+    try {
+      await git(previewPath, ["remote", "set-url", "origin", GITHUB_REPO_URL]);
+      await run("git", ["config", "--local", "--unset-all", "remote.origin.pushurl"], {
+        cwd: previewPath,
+      }).catch(() => {});
+    } catch {
+      // Negative local-preview fixtures intentionally remain untrusted.
+    }
+  }
   return state;
 }
 
 async function runQaIntegrationFixture(root, options = {}) {
+  const remotePath = path.resolve(options.remotePath || path.join(root, "remote.git"));
   const script = `
-    import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
-    const report = await runQaIntegration(${JSON.stringify({
+    import {
+      createQaOuterSandboxTestAdapter,
+      createQaTestGitRunner,
+      runQaIntegration,
+    } from ${JSON.stringify(qaIntegrationModuleUrl)};
+    const outerAdapter = process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX
+      ? createQaOuterSandboxTestAdapter()
+      : null;
+    const report = await runQaIntegration({
+      ...${JSON.stringify({
       workspaceRoot: path.join(root, "qa-workspaces"),
-      ...(options.env?.PATH ? { path: options.env.PATH } : {}),
       ...(options.env ? { env: options.env } : {}),
       ...options.input,
-    })});
+    })},
+      testGitRunner: createQaTestGitRunner(${JSON.stringify(remotePath)}, ${JSON.stringify(GITHUB_REPO_URL)}),
+      ...(outerAdapter ? { projectValidationSandboxAdapter: outerAdapter } : {}),
+    });
     console.log(JSON.stringify(report));
   `;
   const result = await run(process.execPath, ["--input-type=module", "-e", script], {
@@ -97,6 +274,115 @@ async function runQaIntegrationFixture(root, options = {}) {
     env: options.env,
   });
   return JSON.parse(result.stdout.trim());
+}
+
+async function createSandboxedQaValidationFixture(root, validationCommands) {
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  await git(root, ["init", "--bare", remotePath]);
+  await git(root, ["clone", remotePath, repoPath]);
+  await git(repoPath, ["config", "user.email", "mission-control-test@example.com"]);
+  await git(repoPath, ["config", "user.name", "StudioOps Test"]);
+  await git(repoPath, ["checkout", "-b", "main"]);
+  await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+  await git(repoPath, ["add", "app.txt"]);
+  await git(repoPath, ["commit", "-m", "base"]);
+  await git(repoPath, ["push", "origin", "main"]);
+  await git(repoPath, ["push", "origin", "main:qa/integration"]);
+  const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+
+  await git(repoPath, ["checkout", "-b", "feature/task"]);
+  await writeFile(path.join(repoPath, "feature.txt"), "sandboxed QA feature\n", "utf8");
+  await git(repoPath, ["add", "feature.txt"]);
+  await git(repoPath, ["commit", "-m", "feature"]);
+  const featureSha = await git(repoPath, ["rev-parse", "HEAD"]);
+  await git(repoPath, ["push", "origin", "feature/task"]);
+  await git(repoPath, ["checkout", "main"]);
+
+  await mkdir(path.join(root, "data"), { recursive: true });
+  await writeFile(path.join(root, "data", "mission-control.json"), `${JSON.stringify(await stateWithReviewEvidence({
+    meta: {},
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath,
+      repoUrl: "",
+      defaultBranch: "main",
+      validationCommands,
+      reviewPolicy: {
+        trustLeadApprovals: true,
+        integrationBranch: "qa/integration",
+      },
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Feature task",
+      status: "qa_review",
+      branchName: "feature/task",
+      prUrl: "",
+    }],
+    comments: [],
+    events: [],
+    reviews: [],
+    runs: [],
+  }), null, 2)}\n`, "utf8");
+
+  return { remotePath, repoPath, baseSha, featureSha };
+}
+
+function candidateForRepositoryFixture(fixture) {
+  const reviewedAt = "2026-07-25T12:00:00.000Z";
+  return createCandidateEnvelope({
+    createdAt: reviewedAt,
+    manifest: {
+      candidateId: "candidate_repository_origin_equivalence",
+      projectId: "project_1",
+      base: { branch: "main", sha: fixture.baseSha },
+      sources: [{
+        taskId: "task_1",
+        sourceRef: "refs/heads/feature/task",
+        headSha: fixture.featureSha,
+        candidateCycle: 1,
+        reviews: [{
+          id: "review_1",
+          stageKey: "lead",
+          role: "lead-reviewer",
+          outcome: "approved",
+          subjectSha: fixture.featureSha,
+          candidateCycle: 1,
+          reviewedAt,
+        }],
+      }],
+      integration: { branch: "qa/integration", sha: fixture.baseSha },
+      checks: [{
+        id: "check_1",
+        kind: "command",
+        name: "repository fixture",
+        outcome: "passed",
+        subjectSha: fixture.baseSha,
+        evidenceDigest: `sha256:${"0".repeat(64)}`,
+      }],
+      preview: {
+        url: "http://127.0.0.1:3000/",
+        status: "healthy",
+        commitSha: fixture.baseSha,
+        verifiedAt: reviewedAt,
+        attestation: {
+          kind: "header",
+          key: "x-studioops-commit",
+          observedSha: fixture.baseSha,
+        },
+      },
+      assembly: {
+        mode: "atomic",
+        requestedTaskIds: ["task_1"],
+        includedTaskIds: ["task_1"],
+        excludedTaskIds: [],
+      },
+    },
+  });
 }
 
 async function addReviewedQaTask(root, task, subjectSha) {
@@ -203,6 +489,15 @@ exit 0
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 const args = process.argv.slice(2);
+const gitEnv = {
+  ...process.env,
+  HOME: "/",
+  TMPDIR: process.env.STUDIOOPS_TEST_ROOT || "/tmp",
+  GIT_ATTR_NOSYSTEM: "1",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0"
+};
 const marker = process.env.FAKE_GH_PR_MARKER;
 const createLog = process.env.FAKE_GH_CREATE_LOG;
 const closeLog = process.env.FAKE_GH_CLOSE_LOG;
@@ -257,7 +552,7 @@ if (args[0] === "pr" && args[1] === "list") {
     console.log("[]");
     process.exit(0);
   }
-  const line = execFileSync("git", ["ls-remote", "origin", "refs/heads/" + head], { encoding: "utf8" }).trim();
+  const line = execFileSync("/usr/bin/git", ["--git-dir", process.env.FAKE_GIT_REMOTE, "show-ref", "refs/heads/" + head], { encoding: "utf8", env: gitEnv }).trim();
   const oid = line.split(/\\s+/)[0] || "";
   const checkMode = String(record.number) === process.env.FAKE_GH_FAILED_PR_NUMBER
     ? "failed"
@@ -273,6 +568,7 @@ if (args[0] === "pr" && args[1] === "list") {
     state: process.env.FAKE_GH_PR_STATE || record.state,
     headRefName: head,
     headRefOid: oid,
+    headRepository: { nameWithOwner: "example/demo" },
     baseRefName: base,
     mergeStateStatus: process.env.FAKE_GH_MERGE_STATE || "BLOCKED",
     reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || "REVIEW_REQUIRED",
@@ -332,6 +628,7 @@ process.exit(1);
       FAKE_GH_PR_MARKER: prMarker,
       FAKE_GH_CREATE_LOG: prCreateLog,
       FAKE_GH_CLOSE_LOG: prCloseLog,
+      FAKE_GIT_REMOTE: remotePath,
     },
   };
 }
@@ -678,7 +975,7 @@ test("ready QA fingerprints ignore transient push and preview transitions", () =
   assert.notEqual(first, changedCommit);
 });
 
-test("validation commands use the QA integration PATH override", async () => {
+test("QA validation rejects non-system PATH roots before running project code", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-path-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
@@ -704,7 +1001,7 @@ test("validation commands use the QA integration PATH override", async () => {
     await git(repoPath, ["checkout", "-b", "feature/task"]);
     await writeFile(path.join(repoPath, "app.txt"), "feature\n", "utf8");
     await git(repoPath, ["commit", "-am", "feature"]);
-    await git(repoPath, ["push", "origin", "feature/task"]);
+    await git(repoPath, ["push", remotePath, "feature/task"]);
     await git(repoPath, ["checkout", "main"]);
 
     await mkdir(path.join(root, "data"), { recursive: true });
@@ -740,6 +1037,10 @@ test("validation commands use the QA integration PATH override", async () => {
       reviews: [],
       runs: [],
     }), null, 2)}\n`, "utf8");
+    assert.equal(
+      await git(repoPath, ["config", "--local", "--get-all", "remote.origin.url"]),
+      GITHUB_REPO_URL,
+    );
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -756,18 +1057,31 @@ test("validation commands use the QA integration PATH override", async () => {
     });
     const report = JSON.parse(runResult.stdout.trim());
 
-    assert.equal(report.projects[0].status, "preview_missing");
-    assert.equal(report.projects[0].tasks[0].status, "preview_missing");
+    assert.equal(
+      report.projects[0].status,
+      "validation_sandbox_unavailable",
+      JSON.stringify(report.projects[0], null, 2),
+    );
+    assert.equal(report.projects[0].tasks[0].status, "validation_sandbox_unavailable");
+    assert.equal(
+      await git(remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      await git(remotePath, ["rev-parse", "refs/heads/main"]),
+    );
 
     const state = readPersistedState(root);
-    assert.equal(state.tasks[0].integrationStatus, "preview_missing");
-    assert.equal(state.tasks[0].integrationValidation.commands[0].ok, true);
+    assert.equal(state.tasks[0].integrationStatus, "validation_sandbox_unavailable");
+    assert.equal(state.tasks[0].status, "qa_review");
+    assert.deepEqual(state.tasks[0].integrationValidation.commands, []);
+    assert.match(
+      report.projects[0].output,
+      /Unsafe validation PATH entry/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("QA integration removes repository credentials from validation environments", async () => {
+test("QA integration uses a synthetic validation environment without host credentials or markers", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-redaction-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
@@ -855,11 +1169,164 @@ test("QA integration removes repository credentials from validation environments
     assert.equal(report.projects[0].status, "preview_missing");
     assert.equal(report.projects[0].tasks[0].status, "preview_missing");
     assert.equal(reportText.includes(fakeToken), false);
-    assert.equal(validationOutput, '{"marker":"safe-value"}');
+    assert.equal(validationOutput, '{}');
     assert.doesNotMatch(reportText, /credential-helper|agent\.sock/);
     assert.equal(stateText.includes(fakeToken), false);
-    assert.equal(persistedValidationOutput, '{"marker":"safe-value"}');
+    assert.equal(persistedValidationOutput, '{}');
     assert.doesNotMatch(stateText, /credential-helper|agent\.sock/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trusted QA Git ignores hostile PATH, HOME, Git control variables, and proxy environment", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-trusted-git-"));
+  const fakeBin = path.join(root, "fake-bin");
+  const fakeHome = path.join(root, "fake-home");
+  const fakeGitMarker = path.join(root, "fake-git-ran");
+  const attackerRemotePath = path.join(root, "attacker.git");
+
+  try {
+    const fixture = await createSandboxedQaValidationFixture(root, [
+      `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+    ]);
+    await git(root, ["init", "--bare", attackerRemotePath]);
+    await mkdir(fakeBin, { recursive: true });
+    await mkdir(fakeHome, { recursive: true });
+    await writeFile(
+      path.join(fakeBin, "git"),
+      `#!/bin/sh\nprintf invoked > ${JSON.stringify(fakeGitMarker)}\nexit 91\n`,
+      "utf8",
+    );
+    await chmod(path.join(fakeBin, "git"), 0o755);
+    await writeFile(
+      path.join(fakeHome, ".gitconfig"),
+      `[url "file://${attackerRemotePath}"]\n\tinsteadOf = ${GITHUB_REPO_URL}\n`,
+      "utf8",
+    );
+
+    const report = await runQaIntegrationFixture(root, {
+      input: { githubAppAuth: false },
+      env: {
+        PATH: `${fakeBin}:${process.env.PATH}`,
+        HOME: fakeHome,
+        GIT_CONFIG_COUNT: "not-a-number",
+        GIT_DIR: attackerRemotePath,
+        GIT_WORK_TREE: root,
+        GIT_SSH_COMMAND: `sh -c 'printf ssh > ${fakeGitMarker}'`,
+        HTTPS_PROXY: "http://127.0.0.1:1",
+        ALL_PROXY: "socks5://127.0.0.1:1",
+      },
+    });
+
+    assert.equal(report.projects[0].status, "preview_missing", JSON.stringify(report, null, 2));
+    assert.equal(report.projects[0].tasks[0].status, "preview_missing");
+    assert.equal(
+      await git(fixture.remotePath, ["show", "refs/heads/qa/integration:feature.txt"]),
+      "sandboxed QA feature",
+    );
+    await assert.rejects(readFile(fakeGitMarker, "utf8"), { code: "ENOENT" });
+    const attackerRef = await run(
+      "/usr/bin/git",
+      ["show-ref", "--verify", "--quiet", "refs/heads/qa/integration"],
+      { cwd: attackerRemotePath },
+    ).then(() => true, () => false);
+    assert.equal(attackerRef, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QA validation cannot read host siblings or poison trusted repositories", {
+  skip: process.platform !== "darwin",
+}, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-sandbox-wiring-"));
+  const hostSecretPath = path.join(root, "host-secret.txt");
+  const sourceHookPath = path.join(root, "repo", ".git", "hooks", "pre-push");
+  const remoteHookPath = path.join(root, "remote.git", "hooks", "pre-receive");
+  const deniedReadPath = OUTER_VALIDATION_SANDBOX ? "/private/etc/hosts" : hostSecretPath;
+  const deniedSourceWritePath = OUTER_VALIDATION_SANDBOX
+    ? "/private/etc/studioops-qa-source-hook"
+    : sourceHookPath;
+  const deniedRemoteWritePath = OUTER_VALIDATION_SANDBOX
+    ? "/private/etc/studioops-qa-remote-hook"
+    : remoteHookPath;
+  const sourceHook = "#!/bin/sh\nexit 0\n# trusted-source-hook\n";
+  const remoteHook = "#!/bin/sh\nexit 0\n# trusted-remote-hook\n";
+  const validationProgram = [
+    'const { execFileSync } = require("node:child_process")',
+    'const { mkdirSync, readFileSync, writeFileSync } = require("node:fs")',
+    'const denied = new Set(["EACCES", "EPERM"])',
+    'const expectDenied = (operation) => { try { operation(); process.exit(71); } catch (error) { if (!denied.has(error.code)) { console.error(error.code || error.message); process.exit(72); } } }',
+    `expectDenied(() => readFileSync(${JSON.stringify(deniedReadPath)}, "utf8"))`,
+    `expectDenied(() => writeFileSync(${JSON.stringify(deniedSourceWritePath)}, "poisoned-source-hook"))`,
+    `expectDenied(() => writeFileSync(${JSON.stringify(deniedRemoteWritePath)}, "poisoned-remote-hook"))`,
+    'mkdirSync(".git/hooks", { recursive: true })',
+    'writeFileSync(".git/hooks/pre-push", "#!/bin/sh\\nexit 91\\n", { mode: 0o755 })',
+    'execFileSync("git", ["config", "core.hooksPath", ".git/hooks"])',
+    'console.log("isolated-validation-passed")',
+  ].join(";");
+  const validationCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(validationProgram)}`;
+
+  try {
+    await writeFile(hostSecretPath, "sibling-host-secret\n", "utf8");
+    const fixture = await createSandboxedQaValidationFixture(root, [validationCommand]);
+    await writeFile(sourceHookPath, sourceHook, { mode: 0o755 });
+    await writeFile(remoteHookPath, remoteHook, { mode: 0o755 });
+
+    const report = await runQaIntegrationFixture(root, {
+      input: {
+        githubAppAuth: false,
+        projectValidationWorkspaceRoot: path.join(root, "validation-workspaces"),
+      },
+    });
+    const project = report.projects[0];
+    const integrationSha = await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]);
+
+    assert.equal(project.status, "preview_missing", JSON.stringify(project, null, 2));
+    assert.equal(project.validation[0].ok, true);
+    assert.match(project.validation[0].output, /^isolated-validation-passed(?:\n|$)/);
+    assert.equal(project.validationSandbox.networkPolicy, "deny_all");
+    assert.notEqual(integrationSha, fixture.baseSha);
+    await git(fixture.remotePath, ["merge-base", "--is-ancestor", fixture.featureSha, integrationSha]);
+    assert.equal(await readFile(hostSecretPath, "utf8"), "sibling-host-secret\n");
+    assert.equal(await readFile(sourceHookPath, "utf8"), sourceHook);
+    assert.equal(await readFile(remoteHookPath, "utf8"), remoteHook);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QA sandbox unavailability runs no validation command and performs no push", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-sandbox-unavailable-"));
+  const validationMarker = path.join(root, "validation-ran.txt");
+  const validationProgram = `require("node:fs").writeFileSync(${JSON.stringify(validationMarker)}, "ran")`;
+  const validationCommand = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(validationProgram)}`;
+
+  try {
+    const fixture = await createSandboxedQaValidationFixture(root, [validationCommand]);
+    const report = await runQaIntegrationFixture(root, {
+      input: {
+        githubAppAuth: false,
+        projectValidationWorkspaceRoot: path.join(root, "validation-workspaces"),
+        ...(OUTER_VALIDATION_SANDBOX
+          ? { projectValidationPath: path.join(root, "missing-validation-bin") }
+          : { projectValidationSandboxExecutable: path.join(root, "missing-sandbox-exec") }),
+      },
+    });
+    const project = report.projects[0];
+
+    assert.equal(project.status, "validation_sandbox_unavailable", JSON.stringify(project, null, 2));
+    assert.equal(project.tasks[0].status, "validation_sandbox_unavailable");
+    assert.deepEqual(project.validation, []);
+    await assert.rejects(readFile(validationMarker, "utf8"), { code: "ENOENT" });
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      fixture.baseSha,
+    );
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].integrationStatus, "validation_sandbox_unavailable");
+    assert.equal(persisted.tasks[0].assignedAgentRole, "qa-integration-worker");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1027,7 +1494,7 @@ test("QA integration rejects source drift before merge or candidate push", async
     await writeFile(path.join(repoPath, "feature.txt"), "moved after review\n", "utf8");
     await git(repoPath, ["commit", "-am", "move source after review"]);
     const movedSourceSha = await git(repoPath, ["rev-parse", "HEAD"]);
-    await git(repoPath, ["push", "origin", "feature/task"]);
+    await git(repoPath, ["push", remotePath, "feature/task"]);
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
@@ -1055,7 +1522,71 @@ test("QA integration rejects source drift before merge or candidate push", async
   }
 });
 
-test("successful QA integration freezes an immutable candidate at the healthy preview commit", async () => {
+test("post-validation task and policy drift prevents every external mutation and preserves live state", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-attempt-drift-"));
+
+  try {
+    const fixture = await createSandboxedQaValidationFixture(root, [
+      `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+    ]);
+    const driftedValidationCommand = `${JSON.stringify(process.execPath)} -e "process.exit(17)"`;
+    const script = `
+      import {
+        createQaOuterSandboxTestAdapter,
+        createQaTestGitRunner,
+        runQaIntegration,
+      } from ${JSON.stringify(qaIntegrationModuleUrl)};
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      let drifted = false;
+      const outerAdapter = process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX
+        ? createQaOuterSandboxTestAdapter()
+        : null;
+      const report = await runQaIntegration({
+        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))},
+        githubAppAuth: false,
+        testGitRunner: createQaTestGitRunner(
+          ${JSON.stringify(fixture.remotePath)},
+          ${JSON.stringify(GITHUB_REPO_URL)}
+        ),
+        ...(outerAdapter ? { projectValidationSandboxAdapter: outerAdapter } : {}),
+        beforeQaExternalMutation: async ({ operation }) => {
+          if (drifted || operation !== "push_integration_branch") return;
+          drifted = true;
+          await mutateState((state) => {
+            const project = state.projects.find((item) => item.id === "project_1");
+            const task = state.tasks.find((item) => item.id === "task_1");
+            project.validationCommands = [${JSON.stringify(driftedValidationCommand)}];
+            task.status = "needs_changes";
+            task.assignedAgentRole = "builder";
+          }, { operationName: "test.qa_post_validation_drift" });
+        },
+      });
+      console.log(JSON.stringify(report));
+    `;
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const report = JSON.parse(runResult.stdout.trim());
+    const state = readPersistedState(root);
+
+    assert.equal(report.projects[0].status, "stale_result_discarded");
+    assert.equal(report.projects[0].tasks[0].status, "stale_result_discarded");
+    assert.match(report.projects[0].output, /discarded without overwriting newer state/);
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      fixture.baseSha,
+    );
+    assert.equal(state.tasks[0].status, "needs_changes");
+    assert.equal(state.tasks[0].assignedAgentRole, "builder");
+    assert.equal(state.tasks[0].integrationStatus || "", "");
+    assert.deepEqual(state.projects[0].validationCommands, [driftedValidationCommand]);
+    assert.equal(state.comments.length, 0);
+    assert.equal(state.candidates.length, 0);
+    assert.equal(state.meta.qaIntegrationAttemptClaims.project_1.status, "stale");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("successful QA integration freezes an immutable candidate at the healthy preview commit", localhostPreviewTest, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
@@ -1231,7 +1762,7 @@ test("successful QA integration freezes an immutable candidate at the healthy pr
   }
 });
 
-test("QA integration can sync default branch changes into QA and refresh a local preview checkout", async () => {
+test("QA integration can sync default branch changes into QA and refresh a local preview checkout", localhostPreviewTest, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-default-sync-"));
   const remotePath = path.join(root, "remote.git");
   const repoPath = path.join(root, "repo");
@@ -1328,7 +1859,7 @@ test("QA integration can sync default branch changes into QA and refresh a local
   }
 });
 
-test("QA integration preserves a distinct origin push URL in the isolated workspace", async () => {
+test("QA integration rejects a distinct origin push URL before creating a workspace or pushing", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-qa-integration-"));
   const fetchRemotePath = path.join(root, "fetch-remote.git");
   const pushRemotePath = path.join(root, "push-remote.git");
@@ -1390,22 +1921,136 @@ test("QA integration preserves a distinct origin push URL in the isolated worksp
       reviews: [],
       runs: [],
     }), null, 2)}\n`, "utf8");
+    await git(repoPath, ["remote", "set-url", "--push", "origin", pushRemotePath]);
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
       const report = await runQaIntegration({ workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))} });
       console.log(JSON.stringify(report));
     `;
-    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: root,
+      env: { STUDIOOPS_QA_TEST_REMOTE_PATH: fetchRemotePath },
+    });
     const report = JSON.parse(runResult.stdout.trim());
 
-    assert.equal(report.projects[0].status, "preview_missing");
-    assert.equal(await git(pushRemotePath, ["show", `refs/heads/${report.projects[0].integrationBranch}:app.txt`]), "feature");
+    assert.equal(report.projects[0].status, "blocked");
+    assert.equal(report.projects[0].tasks[0].status, "blocked");
+    assert.match(report.projects[0].output, /push remote does not match configured repository/);
+    assert.equal(report.projects[0].workspacePath, "");
+    assert.equal(await git(pushRemotePath, ["show", "refs/heads/qa/integration:app.txt"]), "base");
     assert.equal(await git(fetchRemotePath, ["show", "refs/heads/qa/integration:app.txt"]), "base");
     assert.equal(await git(repoPath, ["symbolic-ref", "--short", "HEAD"]), "owner/work");
     assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QA integration accepts exact equivalent GitHub fetch and push remotes", async () => {
+  for (const origin of [
+    "git@github.com:example/demo.git",
+    "ssh://git@github.com/example/demo.git",
+    `${GITHUB_REPO_URL}.git`,
+  ]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-equivalent-origin-"));
+    try {
+      const fixture = await createSandboxedQaValidationFixture(root, [
+        `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+      ]);
+      await git(fixture.repoPath, ["remote", "set-url", "origin", origin]);
+      const report = await runQaIntegrationFixture(root, { input: { githubAppAuth: false } });
+
+      assert.equal(report.projects[0].status, "preview_missing", `${origin}: ${report.projects[0].output}`);
+      assert.equal(report.projects[0].tasks[0].status, "preview_missing", origin);
+      assert.doesNotMatch(report.projects[0].output, /remote does not match configured repository/i, origin);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("QA integration rejects non-equivalent or unsafe GitHub fetch and push remotes", async () => {
+  const cases = [
+    {
+      name: "local fetch URL",
+      configure: async ({ repoPath, remotePath }) => {
+        await git(repoPath, ["remote", "set-url", "origin", remotePath]);
+      },
+      error: /fetch remote does not match configured repository/,
+    },
+    {
+      name: "ext fetch URL",
+      configure: async ({ repoPath, root }) => {
+        await git(repoPath, ["remote", "set-url", "origin", `ext::${path.join(root, "untrusted-transport")}`]);
+      },
+      error: /fetch remote does not match configured repository/,
+    },
+    {
+      name: "different GitHub repository",
+      configure: async ({ repoPath }) => {
+        await git(repoPath, ["remote", "set-url", "origin", "https://github.com/attacker/other"]);
+      },
+      error: /fetch remote does not match configured repository/,
+    },
+    {
+      name: "multiple push URLs",
+      configure: async ({ repoPath }) => {
+        await git(repoPath, ["config", "--add", "remote.origin.pushurl", GITHUB_REPO_URL]);
+        await git(repoPath, ["config", "--add", "remote.origin.pushurl", "https://github.com/attacker/other"]);
+      },
+      error: /multiple push URLs/,
+    },
+    {
+      name: "HTTP resolver override",
+      configure: async ({ repoPath }) => {
+        await git(repoPath, ["config", "--local", "http.curloptResolve", "github.com:443:127.0.0.1"]);
+      },
+      error: /unsafe local Git configuration key http\.curloptresolve/,
+    },
+    {
+      name: "mirror push policy",
+      configure: async ({ repoPath }) => {
+        await git(repoPath, ["config", "--local", "remote.origin.mirror", "true"]);
+      },
+      error: /unsafe local Git configuration key remote\.origin\.mirror/,
+    },
+    {
+      name: "commit signing executable policy",
+      configure: async ({ repoPath }) => {
+        await git(repoPath, ["config", "--local", "commit.gpgSign", "true"]);
+      },
+      error: /unsafe local Git configuration key commit\.gpgsign/,
+    },
+    {
+      name: "implicit tag push policy",
+      configure: async ({ repoPath }) => {
+        await git(repoPath, ["config", "--local", "push.followTags", "true"]);
+      },
+      error: /unsafe local Git configuration key push\.followtags/,
+    },
+  ];
+
+  for (const scenario of cases) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-remote-policy-"));
+    try {
+      const fixture = await createSandboxedQaValidationFixture(root, [
+        `${JSON.stringify(process.execPath)} -e "process.exit(0)"`,
+      ]);
+      await scenario.configure({ ...fixture, root });
+      const report = await runQaIntegrationFixture(root, { input: { githubAppAuth: false } });
+
+      assert.equal(report.projects[0].status, "blocked", scenario.name);
+      assert.equal(report.projects[0].workspacePath, "", scenario.name);
+      assert.match(report.projects[0].output, scenario.error, scenario.name);
+      assert.equal(
+        await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+        fixture.baseSha,
+        scenario.name,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -1471,12 +2116,15 @@ test("QA integration refuses a repo without origin instead of pushing back into 
       const report = await runQaIntegration({ workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))} });
       console.log(JSON.stringify(report));
     `;
-    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+    const runResult = await run(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: root,
+      env: { STUDIOOPS_QA_TEST_REMOTE_PATH: repoPath },
+    });
     const report = JSON.parse(runResult.stdout.trim());
 
     assert.equal(report.projects[0].status, "blocked");
     assert.equal(report.projects[0].tasks[0].status, "blocked");
-    assert.match(report.projects[0].output, /origin remote/);
+    assert.match(report.projects[0].output, /canonical GitHub repository URL|origin fetch URL/);
     assert.equal(report.projects[0].workspacePath, "");
     assert.equal(await git(repoPath, ["symbolic-ref", "--short", "HEAD"]), "owner/work");
     assert.equal(await git(repoPath, ["status", "--porcelain"]), ownerStatusBefore);
@@ -1618,7 +2266,10 @@ test("GitHub QA integration fails explicitly when app credentials are missing", 
 
     const script = `
       import { runQaIntegration } from ${JSON.stringify(qaIntegrationModuleUrl)};
-      const report = await runQaIntegration({ workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))} });
+      const report = await runQaIntegration({
+        workspaceRoot: ${JSON.stringify(path.join(root, "qa-workspaces"))},
+        githubAppAuth: true
+      });
       console.log(JSON.stringify(report));
     `;
     const runResult = await run(process.execPath, ["--input-type=module", "-e", script], {
@@ -2089,6 +2740,26 @@ test("protected QA handoff refuses changed candidate heads without force-pushing
     assert.equal(
       await git(fixture.remotePath, ["rev-parse", `refs/heads/${project.integrationCandidateBranch}`]),
       changedHead,
+    );
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+
+    const corruptHandoff = `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        state.tasks[0].integrationCandidateBranch = "qa/integration";
+      }, { operationName: "test.corrupt_qa_handoff_branch" });
+    `;
+    await run(process.execPath, ["--input-type=module", "-e", corruptHandoff], { cwd: root });
+    const protectedHead = await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]);
+    const unsafeCleanup = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: fixture.env,
+    });
+    assert.equal(unsafeCleanup.projects[0].status, "blocked");
+    assert.match(unsafeCleanup.projects[0].output, /branch does not match its exact candidate identity/);
+    assert.equal(
+      await git(fixture.remotePath, ["rev-parse", "refs/heads/qa/integration"]),
+      protectedHead,
     );
     assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
   } finally {

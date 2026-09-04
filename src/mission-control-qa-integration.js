@@ -87,8 +87,10 @@ Usage:
 
 The worker assembles exact reviewed task commits into a unique, non-production
 candidate branch only when trustLeadApprovals is enabled. It freezes a candidate
-only after configured checks pass and the healthy local preview resolves to the
-same integration commit. It does not merge to production, deploy, or force-push.
+only after configured checks pass in a disposable no-network sandbox and the
+healthy local preview resolves to the same integration commit. A missing
+sandbox fails closed before project code or push. It does not merge to
+production, deploy, or force-push.
 
 For GitHub repositories, the worker uses short-lived GitHub App installation
 tokens by default. If no dedicated qa-integration-worker app exists, it falls

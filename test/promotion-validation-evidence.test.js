@@ -145,6 +145,46 @@ test("promotion validation redaction removes complete credential-bearing HTTP he
   );
 });
 
+test("promotion validation redaction removes JSON credentials, raw tokens, JWTs, and private keys", () => {
+  const privateKey = [
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "b3BlbnNzaC1rZXktdjEAAAAAraw-private-key-material",
+    "-----END OPENSSH PRIVATE KEY-----",
+  ].join("\n");
+  const probes = [
+    ['{"access_token":"raw-json-access-token"}', "raw-json-access-token"],
+    ['{"api_key" : "raw-json-api-key"}', "raw-json-api-key"],
+    ['{"aws_secret_access_key":"raw-json-aws-secret"}', "raw-json-aws-secret"],
+    ['{"private_key":"line-one\\nline-two"}', "line-one\\nline-two"],
+    [`openai sk-proj-${"a".repeat(32)} suffix`, `sk-proj-${"a".repeat(32)}`],
+    [`aws AKIA${"B".repeat(16)} suffix`, `AKIA${"B".repeat(16)}`],
+    [`npm npm_${"c".repeat(24)} suffix`, `npm_${"c".repeat(24)}`],
+    [`gitlab glpat-${"d".repeat(24)} suffix`, `glpat-${"d".repeat(24)}`],
+    [`slack xoxb-${"1".repeat(12)}-${"e".repeat(24)} suffix`, `xoxb-${"1".repeat(12)}-${"e".repeat(24)}`],
+    [`google AIza${"F".repeat(32)} suffix`, `AIza${"F".repeat(32)}`],
+    [
+      "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLW1hdGVyaWFs suffix",
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLW1hdGVyaWFs",
+    ],
+    [`prefix\n${privateKey}\nsuffix`, privateKey],
+  ];
+
+  for (const [probe, rawValue] of probes) {
+    const redacted = redactPromotionValidationText(probe);
+    assert.equal(redacted.includes(rawValue), false, probe);
+    assert.match(redacted, /\[REDACTED\]/);
+  }
+
+  assert.equal(
+    redactPromotionValidationText('{"access_token":"raw-json-access-token","safe":"visible"}'),
+    '{"access_token":"[REDACTED]","safe":"visible"}',
+  );
+  assert.equal(
+    redactPromotionValidationText(`before\n${privateKey}\nafter`),
+    "before\n[REDACTED]\nafter",
+  );
+});
+
 test("same-destination promotion evidence persistence has exactly one concurrent winner", async () => {
   const temporary = await mkdtemp(path.join(os.tmpdir(), "studioops-promotion-evidence-exclusive-"));
   const root = path.join(temporary, "private-evidence", "promotion-validation");

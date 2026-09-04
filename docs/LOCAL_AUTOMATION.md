@@ -368,7 +368,9 @@ Tasks already marked with `integrationStatus: ready` are skipped on later sweeps
 
 The worker refuses `main`, `master`, `production`, and the configured default branch as integration targets. It prepares each QA bundle in an isolated workspace under `~/.codex/studioops/qa-workspaces/` by default, so the registered project checkout can stay on the owner's active branch with local changes. Override the workspace root with `STUDIOOPS_QA_WORKSPACE_ROOT` or its legacy `MISSION_CONTROL_QA_WORKSPACE_ROOT` alias when needed, but keep it outside the registered project checkout.
 
-QA integration requires the registered project checkout to have an `origin` remote. It aborts merge conflicts, records comments on affected tasks, runs validation commands from the isolated workspace, and only then pushes the non-production integration branch to that remote. Reports and task comments include the workspace path and strategy used for the run. It does not merge PRs, deploy, force-push, or checkout the registered project repoPath.
+QA integration requires the registered project checkout to have an `origin` remote. It aborts merge conflicts, records comments on affected tasks, and prepares a full disposable clone at the exact integration SHA before running validation. Project validation runs with a synthetic environment inside the macOS Seatbelt sandbox: network access, arbitrary process inspection, reads outside the disposable clone and approved tool roots, and execution outside the clone and approved tool roots are denied. Only a bounded set of non-process operating-system and hardware metadata needed by normal runtimes is readable. A pre-validation byte, executable-mode, and symlink manifest verifies the original worktree afterward without trusting candidate-controlled Git indexes, replace refs, filters, or local configuration. If that data-and-egress boundary is unavailable, QA fails closed before running project code or pushing the non-production integration branch. Reports and task comments include the workspace and sandbox strategies used for the run. QA integration does not merge PRs, deploy, force-push, or checkout the registered project `repoPath`.
+
+Validation commands must remain owner-authorized. The post-command manifest proves that tracked checkout bytes, executable modes, and symlinks match their pre-command state; it cannot prove that a command never modified and restored them while it ran. Seatbelt restrictions follow forked and executed descendants, and StudioOps kills the leader's ordinary process group after success, failure, timeout, or output overflow, then closes inherited output pipes after a bounded drain. macOS does not provide StudioOps an unprivileged atomic way to kill a descendant that deliberately creates a new session or process group. Such a descendant remains unable to read disallowed host paths, write outside the disposable root, inspect other processes, or use the network, but it can consume host resources until separately terminated. Use a VM- or cgroup-backed validation provider when hostile-code availability or immutable-execution containment is required.
 
 Projects can also opt into keeping their QA branch and local preview checkout current:
 
@@ -427,20 +429,38 @@ HTTP 200 is insufficient and blocks candidate freeze.
 After the owner reviews the local QA preview, mark the task from the UI or CLI:
 
 ```bash
+studioops qa-list --json
+
 studioops qa-pass task_123 \
   --candidate candidate_opaque \
   --manifest-digest sha256:full-digest \
   --integration-sha full-git-sha \
+  --owner-qa-packet-digest sha256:owner-packet-digest \
   --body "Checked locally."
 
 studioops qa-fail task_123 \
   --candidate candidate_opaque \
   --manifest-digest sha256:full-digest \
   --integration-sha full-git-sha \
+  --owner-qa-packet-digest sha256:owner-packet-digest \
   --body "Hero image still covers the full page."
+
+studioops qa-pass --bundle qa_bundle_opaque \
+  --candidate candidate_opaque \
+  --manifest-digest sha256:full-digest \
+  --integration-sha full-git-sha \
+  --owner-qa-packet-digest sha256:owner-packet-digest \
+  --body "Checked the complete bundle locally."
 ```
 
-`qa-pass` moves the task to `approved_for_main` and queues it for the promotion worker. `qa-fail` moves it back to `needs_changes` with the owner notes preserved as a task comment.
+Copy all four immutable decision coordinates from the same actionable task or
+bundle returned by `qa-list`; do not mix coordinates from separate rows. Use
+the positional task ID for a task selector and `--bundle BUNDLE_ID` for a
+bundle selector. Multi-task candidates must use the bundle selector so the
+decision applies atomically to every task in the immutable candidate.
+`qa-pass` moves the task to `approved_for_main` and queues it for the promotion
+worker. `qa-fail` moves it back to `needs_changes` with the owner notes
+preserved as a task comment.
 
 Promotion is configured per project and defaults to the project's `defaultBranch`:
 
@@ -461,7 +481,11 @@ npm run promotion -- --plan
 npm run promotion -- --project myapp
 ```
 
-The promotion worker uses an isolated clone under `~/.codex/studioops/promotion-workspaces/`, fetches the task branch or PR head, merges it locally on top of the target branch, runs validation, pushes a uniquely named release-candidate branch, and opens a ready PR against the target. It never pushes directly to the protected target branch. It records conflicts, validation failures, push failures, and the release-candidate PR back on the task and QA bundle.
+The promotion worker uses an isolated clone under `~/.codex/studioops/promotion-workspaces/`, verifies the immutable QA candidate, and runs validation in a second full disposable clone under the same no-network macOS sandbox used by QA integration. Missing sandbox support fails closed before project code, push, or PR creation. After successful validation it performs a non-force push to a deterministic release-candidate branch, then authoritatively re-observes exactly one GitHub PR whose repository, base, head branch, head SHA, state, and immutable-candidate marker all match. Ambiguous PR identity is a failure, never release-ready. It never pushes directly to the protected target branch.
+
+Merged-PR reconciliation never reruns project validation or resolves project validation executables. It re-observes the exact GitHub merge and independently fetches the protected branch into a fresh private bare repository using the canonical HTTPS URL with repository-local rewrites and non-HTTPS transports disabled. The final SQLite write accepts only fresh, in-process observations bound to the current fenced claim. Historical recovery is deliberately narrower still: it requires exact persisted handoff and event chronology, and retains any post-handoff validation failure as an owner-visible warning instead of converting it into passing evidence.
+
+Operational authentication, evidence, push, and PR failures retry with durable exponential delays. Three failures for the same candidate and live project policy open an owner-visible circuit; changing `repoPath`, `repoUrl`, promotion enablement, target branch, validation policy, or an explicit circuit reset starts a newly bound attempt series.
 
 Promotion does not deploy production. It prepares the target branch for owner release-candidate review. Production deploys should remain behind explicit release or tag workflows.
 

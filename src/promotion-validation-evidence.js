@@ -35,7 +35,11 @@ const PROJECT_REPOSITORY_CREDENTIAL_KEYS = new Set([
 ]);
 
 const URL_USERINFO_PATTERN = /(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi;
-const GITHUB_TOKEN_PATTERN = /\b(?:github_pat_|gh[pousr]_)[a-z0-9_]{8,}\b/gi;
+const GITHUB_TOKEN_PATTERN = /\b(?:github_pat_|gh[pousr]_)[a-z0-9_]{8,512}\b/gi;
+const JSON_CREDENTIAL_PATTERN = /("(?:access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|api[_-]?key|client[_-]?secret|private[_-]?key|authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|credential|password|passwd|secret|token|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token)|npm[_-]?token|openai[_-]?api[_-]?key)"[ \t\r\n]*:[ \t\r\n]*)"(?:\\(?:["\\/bfnrt]|u[a-f0-9]{4})|[^"\\\r\n]){0,16384}"/gi;
+const COMMON_RAW_TOKEN_PATTERN = /\b(?:sk-(?:proj-|svcacct-)?[a-z0-9_-]{16,512}|(?:AKIA|ASIA)[A-Z0-9]{16}|npm_[a-z0-9]{20,256}|glpat-[a-z0-9_-]{16,256}|xox[baprs]-[a-z0-9-]{10,512}|AIza[a-z0-9_-]{20,128}|(?:sk|rk)_(?:live|test)_[a-z0-9]{16,256})\b/gi;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{4,2048}\.[A-Za-z0-9_-]{4,8192}\.[A-Za-z0-9_-]{4,8192}\b/g;
+const PRIVATE_KEY_PEM_PATTERN = /-----BEGIN ((?:[A-Z0-9]+[ \t]+){0,4}PRIVATE KEY)-----[\s\S]{0,524288}?-----END \1-----/g;
 const BEARER_PATTERN = /\bbearer\s+(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
 const CREDENTIAL_ASSIGNMENT_PATTERN = /\b((?:(?:[a-z][a-z0-9_]*(?:token|secret|password|passwd|private_key|api_key|access_key)[a-z0-9_]*)|(?:api[-_ ]?key|access[-_ ]?token|authorization|client[-_ ]?secret|credential|password|passwd|private[-_ ]?key|secret|token))\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
 const HTTP_CREDENTIAL_HEADER_PATTERN = /(^|[\r\n])([ \t]*(?:authorization|proxy-authorization|cookie|set-cookie)[ \t]*:[ \t]*)[^\r\n]*/gi;
@@ -88,9 +92,13 @@ function safePathSegment(value, label) {
 
 export function redactPromotionValidationText(value) {
   return String(value ?? "")
+    .replace(PRIVATE_KEY_PEM_PATTERN, "[REDACTED]")
     .replace(HTTP_CREDENTIAL_HEADER_PATTERN, "$1$2[REDACTED]")
+    .replace(JSON_CREDENTIAL_PATTERN, '$1"[REDACTED]"')
     .replace(URL_USERINFO_PATTERN, "$1[REDACTED]@")
     .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]")
+    .replace(COMMON_RAW_TOKEN_PATTERN, "[REDACTED]")
+    .replace(JWT_PATTERN, "[REDACTED]")
     .replace(BEARER_PATTERN, "Bearer [REDACTED]")
     .replace(CREDENTIAL_ASSIGNMENT_PATTERN, "$1[REDACTED]");
 }
@@ -139,6 +147,18 @@ export function promotionValidationPolicyDigest(input = {}) {
     "promotion validation environment policy version",
     160,
   );
+  const projectPolicyDigest = input.projectPolicyDigest
+    ? requiredDigest(input.projectPolicyDigest, "promotion project policy digest")
+    : "";
+  const sandboxPolicyId = input.sandboxPolicyId
+    ? requiredBoundedString(input.sandboxPolicyId, "promotion validation sandbox policy", 160)
+    : "";
+  const validationStrategy = input.validationStrategy
+    ? requiredBoundedString(input.validationStrategy, "promotion validation strategy", 160)
+    : "";
+  const networkPolicy = input.networkPolicy
+    ? requiredBoundedString(input.networkPolicy, "promotion validation network policy", 80)
+    : "";
   const payload = {
     schemaVersion: 1,
     commands: commands.map((command) => String(
@@ -148,6 +168,10 @@ export function promotionValidationPolicyDigest(input = {}) {
     )),
     timeoutMs,
     environmentPolicyVersion,
+    projectPolicyDigest,
+    sandboxPolicyId,
+    validationStrategy,
+    networkPolicy,
   };
   return sha256(JSON.stringify(payload));
 }
