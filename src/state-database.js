@@ -63,6 +63,7 @@ const CANDIDATE_QA_DECISION_WRITE = Symbol("studioops.candidate-qa-decision-writ
 const CANDIDATE_PROMOTION_WRITE = Symbol("studioops.candidate-promotion-write");
 const PROMOTION_CLAIM_WRITE = Symbol("studioops.promotion-claim-write");
 const MERGED_PROMOTION_RECOVERY_WRITE = Symbol("studioops.merged-promotion-recovery-write");
+const STATE_INTEGRITY_MIGRATION_WRITE = Symbol("studioops.state-integrity-migration-write");
 const TEST_FIXTURE_LEGACY_AUTHORITY_BOOTSTRAP = (() => {
   if (process.env.STUDIOOPS_TEST_TRUST_LEGACY_AUTHORITY_BOOTSTRAP !== "1") return null;
   if (process.env.NODE_ENV !== "test" || process.env.STUDIOOPS_TEST_ISOLATION !== "1") {
@@ -1299,6 +1300,20 @@ function taskHasPromotionExposureAuthority(task, candidate, status, claim) {
   return ["merged", "deployed", "done"].includes(status);
 }
 
+function exactIntegrityMigrationPreservation(state, candidate, bundle, options = {}) {
+  const snapshot = options.stateIntegrityMigrationSnapshot;
+  if (
+    options.stateIntegrityMigrationCapability !== STATE_INTEGRITY_MIGRATION_WRITE
+    || !snapshot?.tables
+    || snapshot.tables.candidates.get(candidate.id)?.payload !== JSON.stringify(candidate)
+    || snapshot.tables.qaBundles.get(bundle.id)?.payload !== JSON.stringify(bundle)
+  ) return false;
+  const tasks = new Map((state.tasks || []).map((task) => [task.id, task]));
+  return candidate.manifest.sources.every((source) => (
+    snapshot.tables.tasks.get(source.taskId)?.payload === JSON.stringify(tasks.get(source.taskId))
+  ));
+}
+
 function assertOwnerQaPacketMirrors(state, options = {}) {
   const candidatesById = new Map((state.candidates || []).map((candidate) => [candidate.id, candidate]));
   const bundlesById = new Map((state.qaBundles || []).map((bundle) => [bundle.id, bundle]));
@@ -1318,6 +1333,15 @@ function assertOwnerQaPacketMirrors(state, options = {}) {
     ) {
       throw new Error(`Candidate ${candidate.id} and QA bundle ${bundle.id} owner packet mirrors differ.`);
     }
+    // A migration may carry a pre-existing legacy release handoff through to
+    // the new schema only when the candidate, bundle, and every source task are
+    // byte-for-byte unchanged from the locked database snapshot. The dedicated
+    // recovery writer must still reconcile that unsafe lifecycle afterwards.
+    if (
+      candidate.status === "release_candidate_ready"
+      && packet.schemaVersion === LEGACY_OWNER_QA_PACKET_SCHEMA_VERSION
+      && exactIntegrityMigrationPreservation(state, candidate, bundle, options)
+    ) continue;
     if (
       !candidate.invalidation
       && ["frozen", "qa_passed", "release_candidate_ready"].includes(candidate.status)
@@ -1990,7 +2014,11 @@ async function runStateIntegrityMigration(db) {
     };
     recordOperationalArchiveMetadata(state, archived, now, backupPath);
     state.meta.updatedAt = now;
-    writeMutationToOpenDatabase(db, state, snapshot, { validateTaskStatuses: false });
+    writeMutationToOpenDatabase(db, state, snapshot, {
+      validateTaskStatuses: false,
+      stateIntegrityMigrationCapability: STATE_INTEGRITY_MIGRATION_WRITE,
+      stateIntegrityMigrationSnapshot: snapshot,
+    });
     db.exec("COMMIT");
     integrityMigrated = true;
   } catch (error) {
