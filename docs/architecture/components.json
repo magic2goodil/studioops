@@ -38,6 +38,7 @@
     "src/progress-report.js",
     "src/lifecycle-policy.js",
     "src/dispatcher.js",
+    "src/mission-control-dispatcher.js",
     "src/execution-policy.js",
     "src/runner.js",
     "src/run-output-evidence.js",
@@ -113,13 +114,13 @@
     "scheduling-dispatch": {
       "owner": "backend-automation",
       "aliases": ["dispatcher", "supervisor", "admission", "work lanes"],
-      "paths": ["src/dispatcher.js", "src/supervisor.js", "src/work-lanes.js", "src/execution-policy.js", "src/config.js", "src/mission-control-cli.js", "studioops.config.example.md", "docs/LOCAL_AUTOMATION.md", "test/dispatcher.test.js", "test/config.test.js"],
+      "paths": ["src/dispatcher.js", "src/mission-control-dispatcher.js", "src/supervisor.js", "src/work-lanes.js", "src/execution-policy.js", "src/config.js", "src/mission-control-cli.js", "studioops.config.example.md", "docs/LOCAL_AUTOMATION.md", "test/dispatcher.test.js", "test/config.test.js"],
       "services": ["supervisor planner", "dispatcher admission"],
       "publicContracts": ["dispatch admission decision", "lane-safe immutable run snapshot"],
       "workflows": ["architecture builder reviewer and owner dispatch"],
       "tests": [{ "command": "node --test test/dispatcher.test.js", "layer": "unit-contract" }],
       "reviewOwners": ["backend-reviewer"],
-      "fullRegressionPaths": ["src/dispatcher.js", "src/execution-policy.js"],
+      "fullRegressionPaths": ["src/dispatcher.js", "src/mission-control-dispatcher.js", "src/execution-policy.js"],
       "policyAuthorities": ["worker admission"],
       "dependsOn": ["workflow-state", "component-impact-planning"],
       "rollback": "Disable scoped admission and route all eligible work through the prior full-regression dispatcher path."

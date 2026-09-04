@@ -25,7 +25,11 @@ import {
   updateRun,
 } from "./store.js";
 import { createSupervisorReport, formatSupervisorReport } from "./supervisor.js";
-import { dispatchSupervisorActions, formatDispatchReport } from "./dispatcher.js";
+import {
+  dispatchSupervisorActions,
+  formatDispatchReport,
+  resolveDispatcherProvider,
+} from "./dispatcher.js";
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
@@ -1102,7 +1106,11 @@ Automation:
     const options = {
       project: args.project || args.projects,
       dryRun: args["dry-run"] || args.dryRun,
-      provider: args.provider || dispatcherDefaults.provider || "prompt-outbox",
+      provider: resolveDispatcherProvider({
+        requestedProvider: args.provider,
+        dispatcherProvider: dispatcherDefaults.provider,
+        runnerProvider: config?.runner?.provider || config?.defaults?.runner?.provider,
+      }),
       failureProvider: args["failure-provider"]
         || config?.runner?.provider
         || config?.defaults?.runner?.provider
