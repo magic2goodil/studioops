@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "workflowImpact": "full-regression",
+  "reason": "shared dispatcher admission contract, project-policy migration, and durable failure-ledger read boundary",
+  "components": {
+    "dispatcher-admission": {
+      "paths": ["src/dispatcher.js", "test/dispatcher.test.js"],
+      "owner": "backend-automation",
+      "publicContracts": ["active-capacity admission", "exact candidate-stage duplicate suppression", "read-only durable failure-incident consultation", "bounded deprecation diagnostics"],
+      "ownedData": ["run.failureContainmentAdmission"],
+      "ownedEvents": ["dispatch_created"],
+      "dependsOn": ["failure-containment-authority", "workflow-state-policy", "component-impact-planning"],
+      "rollback": "Pause the operator and restore the prior dispatcher while preserving run admission evidence.",
+      "testLayers": ["unit", "contract", "scope-isolation"]
+    },
+    "workflow-state-policy": {
+      "paths": ["src/store.js", "src/config.js", "test/config.test.js", "test/resilience.test.js"],
+      "owner": "backend-workflow-state",
+      "publicContracts": ["normalizeProjectRunAdmissionPolicy", "normalizeGlobalRunAdmission", "idempotent legacy-window migration"],
+      "ownedData": ["project.wipPolicy.deprecatedTotalWindowAdmission"],
+      "ownedEvents": ["run_window_policy_deprecated"],
+      "dependsOn": [],
+      "rollback": "Keep the normalized zero window values and restore the prior read model only; do not reactivate historical completed-run quotas.",
+      "testLayers": ["unit", "migration", "idempotence"]
+    },
+    "failure-containment-authority": {
+      "paths": ["src/failure-containment.js"],
+      "owner": "techops-reliability",
+      "publicContracts": ["failureActionIdentity", "failureFingerprint", "readFailureIncidents"],
+      "ownedData": ["failure fingerprint identity"],
+      "dependsOn": [],
+      "rollback": "Keep durable incidents authoritative and pause dispatch if exact identity consultation is unavailable.",
+      "testLayers": ["contract"]
+    },
+    "operator-interface": {
+      "paths": ["src/mission-control-cli.js", "studioops.config.example.md", "docs/LOCAL_AUTOMATION.md"],
+      "owner": "developer-experience",
+      "publicContracts": ["dispatcher plan output", "one-release legacy configuration compatibility"],
+      "ownedData": [],
+      "dependsOn": ["dispatcher-admission", "workflow-state-policy"],
+      "rollback": "Retain explicit active-run configuration and remove only the compatibility explanation after its release window.",
+      "testLayers": ["CLI", "documentation"]
+    },
+    "component-impact-planning": {
+      "paths": ["docs/architecture/components.json", "docs/architecture/progress-aware-dispatcher-admission.components.json"],
+      "owner": "shared-validation",
+      "publicContracts": ["repository-bound component ownership"],
+      "ownedData": [],
+      "dependsOn": [],
+      "testLayers": ["composition"]
+    }
+  },
+  "dependencyEdges": [
+    { "from": "dispatcher-admission", "to": "failure-containment-authority" },
+    { "from": "dispatcher-admission", "to": "workflow-state-policy" },
+    { "from": "dispatcher-admission", "to": "component-impact-planning" },
+    { "from": "operator-interface", "to": "dispatcher-admission" },
+    { "from": "operator-interface", "to": "workflow-state-policy" }
+  ],
+  "prohibited": ["completed-run launch quota", "cross-project failure suppression", "cross-repository component lookup", "dispatcher-side paid-attempt claim", "unbounded deprecation output", "dependency cycles"],
+  "impactClassifier": {
+    "input": "base/head diff plus this repository-owned manifest",
+    "ambiguousPathSelection": "full_regression",
+    "unclassifiedPathSelection": "full_regression",
+    "newFeaturePathSelection": "full_regression",
+    "pathRules": [
+      { "pattern": "src/dispatcher.js", "component": "dispatcher-admission", "selection": "full_regression" },
+      { "pattern": "src/store.js", "component": "workflow-state-policy", "selection": "full_regression" },
+      { "pattern": "src/config.js", "component": "workflow-state-policy", "selection": "full_regression" },
+      { "pattern": "src/failure-containment.js", "component": "failure-containment-authority", "selection": "full_regression" },
+      { "pattern": "src/mission-control-cli.js", "component": "operator-interface", "selection": "full_regression" },
+      { "pattern": "studioops.config.example.md", "component": "operator-interface", "selection": "full_regression" },
+      { "pattern": "docs/LOCAL_AUTOMATION.md", "component": "operator-interface", "selection": "full_regression" },
+      { "pattern": "test/dispatcher.test.js", "component": "dispatcher-admission", "selection": "full_regression" },
+      { "pattern": "test/config.test.js", "component": "workflow-state-policy", "selection": "full_regression" },
+      { "pattern": "test/resilience.test.js", "component": "workflow-state-policy", "selection": "full_regression" },
+      { "pattern": "docs/architecture/components.json", "component": "component-impact-planning", "selection": "full_regression" },
+      { "pattern": "docs/architecture/progress-aware-dispatcher-admission.components.json", "component": "component-impact-planning", "selection": "full_regression" }
+    ],
+    "fullRegressionTriggers": ["shared admission contract", "migration", "manifest change", "ambiguous or unclassified path"],
+    "aggregateCommand": "npm run check"
+  },
+  "retention": { "legacyWindowDiagnostics": "one release", "failureIncidents": "durable" }
+}

@@ -22,7 +22,7 @@ export const DEFAULT_RUN_OUTPUT_GUARD = Object.freeze({
 });
 export const DEFAULT_GLOBAL_RUN_ADMISSION = Object.freeze({
   maxActiveMeteredRuns: 2,
-  maxMeteredRunsPerWindow: 12,
+  maxMeteredRunsPerWindow: 0,
   runWindowMinutes: 60,
 });
 export const DEFAULT_TECHOPS_POLICY = Object.freeze({
@@ -211,10 +211,53 @@ export function normalizeRunOutputGuard(value = {}) {
 
 export function normalizeGlobalRunAdmission(value = {}) {
   const raw = value && typeof value === "object" ? value : {};
+  const configuredWindowLimit = Number(raw.maxMeteredRunsPerWindow ?? raw.globalRunWindowLimit ?? 0);
+  const runWindowMinutes = positiveInteger(raw.runWindowMinutes, DEFAULT_GLOBAL_RUN_ADMISSION.runWindowMinutes);
+  const priorDiagnostic = raw.deprecatedTotalWindowAdmission
+    && typeof raw.deprecatedTotalWindowAdmission === "object"
+    && !Array.isArray(raw.deprecatedTotalWindowAdmission)
+    ? raw.deprecatedTotalWindowAdmission
+    : null;
+  const deprecatedTotalWindowAdmission = Number.isSafeInteger(configuredWindowLimit) && configuredWindowLimit > 0
+    ? {
+      schemaVersion: 1,
+      status: "inert",
+      configuredMaxRunsPerWindow: configuredWindowLimit,
+      configuredRunWindowMinutes: runWindowMinutes,
+    }
+    : priorDiagnostic;
   return {
     maxActiveMeteredRuns: positiveInteger(raw.maxActiveMeteredRuns ?? raw.globalActiveRunLimit, DEFAULT_GLOBAL_RUN_ADMISSION.maxActiveMeteredRuns),
-    maxMeteredRunsPerWindow: positiveInteger(raw.maxMeteredRunsPerWindow ?? raw.globalRunWindowLimit, DEFAULT_GLOBAL_RUN_ADMISSION.maxMeteredRunsPerWindow),
-    runWindowMinutes: positiveInteger(raw.runWindowMinutes, DEFAULT_GLOBAL_RUN_ADMISSION.runWindowMinutes),
+    maxMeteredRunsPerWindow: 0,
+    runWindowMinutes,
+    ...(deprecatedTotalWindowAdmission ? { deprecatedTotalWindowAdmission } : {}),
+  };
+}
+
+export function normalizeProjectRunAdmissionPolicy(value = {}) {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const configuredWindowLimit = Number(raw.maxRunsPerWindow || 0);
+  const runWindowMinutes = positiveInteger(raw.runWindowMinutes, 60);
+  const priorDiagnostic = raw.deprecatedTotalWindowAdmission
+    && typeof raw.deprecatedTotalWindowAdmission === "object"
+    && !Array.isArray(raw.deprecatedTotalWindowAdmission)
+    ? raw.deprecatedTotalWindowAdmission
+    : null;
+  const deprecatedTotalWindowAdmission = Number.isSafeInteger(configuredWindowLimit) && configuredWindowLimit > 0
+    ? {
+      schemaVersion: 1,
+      status: "inert",
+      configuredMaxRunsPerWindow: configuredWindowLimit,
+      configuredRunWindowMinutes: runWindowMinutes,
+    }
+    : priorDiagnostic;
+  return {
+    ...raw,
+    maxActiveTasks: nonnegativeInteger(raw.maxActiveTasks, 0),
+    maxActiveRuns: nonnegativeInteger(raw.maxActiveRuns, 0),
+    maxRunsPerWindow: 0,
+    runWindowMinutes,
+    ...(deprecatedTotalWindowAdmission ? { deprecatedTotalWindowAdmission } : {}),
   };
 }
 
@@ -285,6 +328,11 @@ export function normalizeWorkspaceRetention(value = {}) {
 function positiveInteger(value, fallback) {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function nonnegativeInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 export function effectiveAutomationCapacity(config = {}) {

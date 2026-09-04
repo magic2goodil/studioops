@@ -117,6 +117,15 @@ export function normalizeFailureReasonCode(value) {
   return reasonCode;
 }
 
+export function failureActionIdentity(input = {}) {
+  const action = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  return safeToken(
+    action.action || action.actionType || action.type || action.reviewStage || action.role,
+    "Failure action",
+    120,
+  );
+}
+
 function candidateIdentity(value = {}) {
   const identity = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const normalized = {
@@ -141,7 +150,7 @@ export function failureFingerprint(input = {}) {
   const value = {
     schemaVersion: FAILURE_CONTAINMENT_SCHEMA_VERSION,
     taskId: safeToken(input.taskId, "Failure task ID", 180),
-    action: safeToken(input.action || input.actionType || input.reviewStage, "Failure action", 120),
+    action: failureActionIdentity(input),
     candidate: candidateIdentity(input.candidate || input.candidateIdentity),
     provider: normalizeFailureProvider(input.provider),
     reasonCode: normalizeFailureReasonCode(input.reasonCode),
