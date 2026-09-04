@@ -4,7 +4,7 @@ import { realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { normalizeTechOpsPolicy } from "./config.js";
+import { normalizeTechOpsPolicy, techOpsCommandInvocation } from "./config.js";
 import {
   claimQaTechOpsRecovery,
   finalizeQaTechOpsRecovery,
@@ -15,10 +15,7 @@ import {
 const execFileAsync = promisify(execFile);
 const ACTIVE_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed"]);
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
-const TRUSTED_EXECUTABLE_ROOTS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-const DEFAULT_COMMAND_PATH = TRUSTED_EXECUTABLE_ROOTS.join(path.delimiter);
-const PROHIBITED_EXECUTABLES = new Set(["git", "gh", "rm", "rmdir", "dd", "sudo", "launchctl", "sh", "bash", "zsh"]);
-const PROHIBITED_ARGUMENT = /(?:^|[-_:])(?:down|destroy|delete|drop|prune|reset|volume|volumes)(?:$|[-_:])/i;
+const DEFAULT_COMMAND_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(path.delimiter);
 
 function boundedText(value, limit = 4_000) {
   return String(value || "")
@@ -231,41 +228,40 @@ async function safeCommandCwd(command, project) {
   return actual;
 }
 
-function assertSafeCommand(command) {
-  const executable = path.basename(command.argv[0] || "").toLowerCase();
-  if (PROHIBITED_EXECUTABLES.has(executable)) throw new Error(`Command ${command.id} uses prohibited executable ${executable}.`);
-  if (command.argv.slice(1).some((argument) => PROHIBITED_ARGUMENT.test(argument))) {
-    throw new Error(`Command ${command.id} contains a destructive argument.`);
-  }
+function dockerComposeProjectName(project) {
+  const slug = String(project.key || project.id || "project")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[^a-z0-9]+/, "")
+    .slice(0, 32) || "project";
+  const suffix = createHash("sha256").update(`${project.id}:${project.key || ""}`).digest("hex").slice(0, 10);
+  return `studioops-${slug}-${suffix}`;
 }
 
 async function executeConfiguredCommand(command, project, policy, input = {}) {
   const startedAt = Date.now();
   try {
-    assertSafeCommand(command);
     const cwd = await safeCommandCwd(command, project);
-    if (command.argv[0].includes(path.sep)) {
-      const requestedExecutable = path.resolve(cwd, command.argv[0]);
-      const executable = await realpath(requestedExecutable);
-      const projectRoots = [project.repoPath, previewConfig(project).checkoutPath || previewConfig(project).path]
-        .filter(Boolean)
-        .map((item) => path.resolve(item));
-      if (![...TRUSTED_EXECUTABLE_ROOTS, ...projectRoots].some((root) => pathWithin(executable, root))) {
-        throw new Error(`Command ${command.id} executable resolves outside approved system and project roots.`);
-      }
-    }
+    const invocation = techOpsCommandInvocation(command);
+    const args = [
+      "--context",
+      "default",
+      "compose",
+      "--project-name",
+      dockerComposeProjectName(project),
+      "--project-directory",
+      cwd,
+      ...invocation.args,
+    ];
     const timeout = Math.min(command.timeoutMs || policy.commandTimeoutMs, policy.commandTimeoutMs);
     const execute = input.execCommand || (async (file, args, options) => execFileAsync(file, args, options));
-    const result = await execute(command.argv[0], command.argv.slice(1), {
+    const result = await execute(invocation.executable, args, {
       cwd,
       timeout,
       maxBuffer: Math.max(1_024, policy.maxOutputChars * 2),
       env: input.env || Object.fromEntries([
         "HOME",
         "TMPDIR",
-        "DOCKER_HOST",
-        "DOCKER_CONTEXT",
-        "COMPOSE_PROJECT_NAME",
       ].filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]]).concat([["PATH", DEFAULT_COMMAND_PATH]])),
     });
     return {
@@ -313,6 +309,24 @@ async function restartLaunchAgent(label, input = {}) {
 
 async function executeRecovery(action, project, input = {}) {
   const policy = action.policy;
+  if (policy.configurationErrors.length) {
+    const commands = policy.configurationErrors.slice(0, policy.maxCommandsPerAttempt).map((error) => ({
+      id: error.id,
+      type: error.type,
+      ok: false,
+      timedOut: false,
+      durationMs: 0,
+      output: `configuration_error:${error.code}`,
+    }));
+    const blocker = `TechOps recovery policy rejected ${commands.map((command) => `${command.id}:${command.output}`).join(", ")}.`;
+    return {
+      ok: false,
+      commands,
+      restartResults: [],
+      health: { status: "unavailable", reason: blocker, observedSha: "" },
+      blocker,
+    };
+  }
   const selected = policy.commands.slice(0, policy.maxCommandsPerAttempt);
   const commands = [];
   for (const command of selected.filter((item) => item.type === "diagnostic")) {

@@ -38,8 +38,8 @@ function fixture(overrides = {}) {
       maxOutputChars: 1_000,
       verificationAttempts: 1,
       verificationDelayMs: 0,
-      diagnosticCommands: [{ id: "postgres-status", argv: ["docker", "compose", "ps", "postgres"] }],
-      recoveryCommands: [{ id: "postgres-start", argv: ["docker", "compose", "up", "-d", "postgres"] }],
+      diagnosticCommands: [{ id: "postgres-status", operation: "docker_compose_ps", services: ["postgres"] }],
+      recoveryCommands: [{ id: "postgres-start", operation: "docker_compose_up", services: ["postgres"] }],
       restartLaunchAgents: ["com.example.sample-preview"],
     },
   };
@@ -80,11 +80,12 @@ function responseFor(sha = SHA, status = 200) {
   return new Response("", { status, headers: { "x-studioops-commit": sha } });
 }
 
-test("TechOps policy normalization is stable and ignores shell strings", () => {
+test("TechOps policy normalization is stable and accepts only typed operations", () => {
   const raw = fixture().projects[0].techOps;
   const first = normalizeTechOpsPolicy({ ...raw, recoveryCommands: [...raw.recoveryCommands, "rm -rf data"] });
   assert.deepEqual(normalizeTechOpsPolicy(first), first);
   assert.deepEqual(first.commands.map((command) => command.id), ["postgres-status", "postgres-start"]);
+  assert.deepEqual(first.configurationErrors, [{ id: "recovery-2", type: "recovery", code: "invalid_command_shape" }]);
 });
 
 test("plans periodic checks only for current active ready QA bundles", () => {
@@ -121,6 +122,7 @@ test("stopped dependency is recovered and exact candidate health clears the inci
   const state = fixture();
   let healthCalls = 0;
   const executed = [];
+  const executionOptions = [];
   const report = await runTechOps({
     state,
     nowMs: Date.parse("2026-01-01T00:01:00Z"),
@@ -130,9 +132,10 @@ test("stopped dependency is recovered and exact candidate health clears the inci
       if (healthCalls === 1) throw new Error("connect ECONNREFUSED");
       return responseFor();
     },
-    execCommand: async (file, args) => {
+    execCommand: async (file, args, options) => {
       executed.push([file, ...args]);
-      return { stdout: "ok", stderr: "" };
+      executionOptions.push(options);
+      return { stdout: args.includes("ps") ? "x".repeat(5_000) : "ok", stderr: "" };
     },
     restartLaunchAgent: async (label) => ({ label, ok: true, output: "restarted" }),
     claimRecovery: async (input) => claimQaTechOpsRecoveryInState(state, input),
@@ -140,16 +143,21 @@ test("stopped dependency is recovered and exact candidate health clears the inci
     recordHealth: async () => assert.fail("initial health should be unavailable"),
   });
   assert.equal(report.results[0].outcome, "recovered");
-  assert.deepEqual(executed, [
-    ["docker", "compose", "ps", "postgres"],
-    ["docker", "compose", "up", "-d", "postgres"],
-  ]);
+  assert.equal(executed.length, 2);
+  assert.equal(executed.every(([file]) => file === "docker"), true);
+  assert.deepEqual(executed[0].slice(1, 4), ["--context", "default", "compose"]);
+  assert.match(executed[0][5], /^studioops-sample-[a-f0-9]{10}$/);
+  assert.deepEqual(executed[0].slice(-3), ["ps", "--all", "postgres"]);
+  assert.deepEqual(executed[1].slice(-5), ["up", "--detach", "--no-deps", "--no-recreate", "postgres"]);
+  assert.equal(executionOptions.every((options) => options.timeout === 1_000), true);
+  assert.equal(executionOptions.every((options) => options.maxBuffer === 2_000), true);
   assert.equal(state.qaBundles[0].techOps.state, "healthy");
   assert.equal(state.qaBundles[0].techOps.health.observedSha, SHA);
   assert.deepEqual(
     state.qaBundles[0].techOps.attempts[0].commands.map((item) => item.id),
     ["postgres-status", "postgres-start"],
   );
+  assert.equal(state.qaBundles[0].techOps.attempts[0].commands[0].output.length, 1_000);
 });
 
 test("recovery claims deduplicate, back off exponentially, and open a durable circuit", () => {
@@ -224,4 +232,63 @@ test("non-allowlisted LaunchAgents fail closed", async () => {
   });
   assert.equal(report.results[0].outcome, "backoff");
   assert.match(state.qaBundles[0].techOps.blocker, /not allowlisted/);
+});
+
+test("destructive and interpreter command bypasses are rejected before execution", async () => {
+  const unsafeCommands = [
+    { id: "docker-rm", argv: ["docker", "rm", "postgres"] },
+    { id: "compose-rm", argv: ["docker", "compose", "rm", "postgres"] },
+    { id: "drop-database", argv: ["psql", "-c", "DROP DATABASE app"] },
+    { id: "find-delete", argv: ["find", ".", "-delete"] },
+    { id: "node-eval", argv: ["node", "-e", "process.exit()"] },
+    { id: "python-eval", argv: ["python3", "-c", "raise SystemExit"] },
+    { id: "compose-rm-typed", operation: "docker_compose_rm", services: ["postgres"] },
+    { id: "volume-flag", operation: "docker_compose_up", services: ["postgres", "--volumes"] },
+  ];
+  const normalized = normalizeTechOpsPolicy({ enabled: true, recoveryCommands: unsafeCommands });
+  assert.deepEqual(normalized.commands, []);
+  assert.equal(normalized.configurationErrors.length, unsafeCommands.length);
+
+  for (const unsafeCommand of unsafeCommands) {
+    const state = fixture();
+    state.projects[0].techOps = {
+      ...state.projects[0].techOps,
+      diagnosticCommands: [],
+      recoveryCommands: [unsafeCommand],
+      restartLaunchAgents: [],
+    };
+    let executions = 0;
+    let restarts = 0;
+    const report = await runTechOps({
+      state,
+      fetch: async () => { throw new Error("preview stopped"); },
+      execCommand: async () => {
+        executions += 1;
+        return { stdout: "must not run", stderr: "" };
+      },
+      restartLaunchAgent: async () => {
+        restarts += 1;
+        return { ok: true };
+      },
+      claimRecovery: async (input) => claimQaTechOpsRecoveryInState(state, input),
+      finalizeRecovery: async (claim, result, input) => finalizeQaTechOpsRecoveryInState(state, claim, result, input),
+    });
+    assert.equal(executions, 0, `${unsafeCommand.id} must not execute`);
+    assert.equal(restarts, 0, `${unsafeCommand.id} must not restart a LaunchAgent`);
+    assert.equal(report.results[0].outcome, "backoff");
+    assert.match(state.qaBundles[0].techOps.blocker, /recovery policy rejected/);
+  }
+});
+
+test("typed operations cannot cross diagnostic and recovery capabilities", () => {
+  const policy = normalizeTechOpsPolicy({
+    enabled: true,
+    diagnosticCommands: [{ id: "bad-diagnostic", operation: "docker_compose_up", services: ["postgres"] }],
+    recoveryCommands: [{ id: "bad-recovery", operation: "docker_compose_ps", services: ["postgres"] }],
+  });
+  assert.deepEqual(policy.commands, []);
+  assert.deepEqual(policy.configurationErrors.map((item) => item.code), [
+    "operation_type_mismatch",
+    "operation_type_mismatch",
+  ]);
 });

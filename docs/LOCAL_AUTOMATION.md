@@ -454,13 +454,15 @@ Configure the policy per project (or under `defaults.techOps`):
     "diagnosticCommands": [
       {
         "id": "postgres-status",
-        "argv": ["docker", "compose", "ps", "postgres"]
+        "operation": "docker_compose_ps",
+        "services": ["postgres"]
       }
     ],
     "recoveryCommands": [
       {
         "id": "postgres-start",
-        "argv": ["docker", "compose", "up", "-d", "postgres"]
+        "operation": "docker_compose_up",
+        "services": ["postgres"]
       }
     ],
     "restartLaunchAgents": ["com.example.myapp.local"]
@@ -468,14 +470,28 @@ Configure the policy per project (or under `defaults.techOps`):
 }
 ```
 
-Commands must be explicit argument arrays; shell strings are ignored. Their
-working directories must resolve inside the registered project or its local QA
-preview checkout. TechOps rejects Git/GitHub, shell, privilege-escalation,
-deletion, volume-reset, and LaunchAgent commands. LaunchAgents are restarted by
-the worker only when their labels also appear in
+Commands must use the typed operation records above; arbitrary executables,
+argument arrays, shell strings, SQL, interpreter/eval commands, filesystem
+utilities, and raw Docker subcommands are rejected before execution. Supported
+diagnostic operations are `docker_compose_ps`; supported recovery operations
+are `docker_compose_up`, `docker_compose_start`, and
+`docker_compose_restart`. Every operation requires one or more validated Compose
+service names. StudioOps generates the Docker argv internally, pins the local
+`default` Docker context, assigns a deterministic project-specific Compose
+project name, supplies the project directory, and never exposes delete, remove,
+down, prune, or volume flags. The `docker_compose_up` operation always includes
+`--no-recreate`, so it can start or create a missing service but cannot replace
+an existing database container. A malformed command makes the entire recovery
+policy fail closed; it cannot be skipped while other commands or LaunchAgent
+restarts continue.
+
+Command working directories must resolve inside the registered project or its
+local QA preview checkout. LaunchAgents are restarted by the worker only when
+their labels also appear in
 `localPreview.restartLaunchAgents`. Keep secrets out of command arguments and
 output; stored output is bounded and common credential forms are redacted, and
-the durable audit records command identifiers rather than argv values.
+the durable audit records command identifiers and typed result codes rather
+than generated argv values.
 
 Run a read-only plan or one sweep manually:
 
