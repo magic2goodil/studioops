@@ -96,6 +96,20 @@ test("local API mutations reject browser cross-origin requests and require JSON"
     });
   });
 
+  await t.test("health reads bounded storage metadata without returning workflow payloads", async () => {
+    const startedAt = performance.now();
+    const { status, body, rawBody } = await directHttpRequest(`${origin}/api/health`);
+    const durationMs = performance.now() - startedAt;
+    assert.equal(status, 200);
+    assert.equal(body.status, "ok");
+    assert.equal(body.storage, "sqlite");
+    assert.ok(body.updatedAt);
+    assert.ok(durationMs < 1_000, `health endpoint took ${durationMs}ms`);
+    assert.equal(Object.prototype.hasOwnProperty.call(body, "tasks"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(body, "comments"), false);
+    assert.equal(rawBody.includes("same-origin"), false);
+  });
+
   await t.test("progress reads are local, allowlisted, and return bounded fields", async () => {
     const valid = await directHttpRequest(`${origin}/api/automation/progress?window=24h&limit=1`);
     assert.equal(valid.status, 200);
