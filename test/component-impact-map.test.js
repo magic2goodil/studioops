@@ -135,14 +135,38 @@ test("checked-in StudioOps map produces a bounded single-component context packe
     "src/impact-planner.js",
     "test/component-impact-map.test.js",
   ]);
-  assert.deepEqual(plan.targetedTests, ["node --test test/component-impact-map.test.js"]);
+  assert.deepEqual(plan.targetedTests, ["node scripts/run-tests.js --test-file test/component-impact-map.test.js"]);
   assert.deepEqual(plan.requiredReviewLanes, ["backend-reviewer", "lead-reviewer"]);
   assertImpactPlanProjectBinding(plan, studioOpsProject);
 
   const packet = formatImpactPlanForPrompt(plan);
   assert.match(packet, /Project binding: project_6\/studioops @ https:\/\/github\.com\/magic2goodil\/studioops/);
   assert.match(packet, /Selected components: component-impact-planning/);
-  assert.match(packet, /Targeted implementation tests: node --test test\/component-impact-map\.test\.js/);
+  assert.match(packet, /Targeted implementation tests: node scripts\/run-tests\.js --test-file test\/component-impact-map\.test\.js/);
+});
+
+test("StudioOps scoped commands bootstrap isolation and cover every owned test", () => {
+  const loaded = loadProjectComponentImpactMap(studioOpsProject);
+  const testFiles = [...new Set(execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "test"],
+    { cwd: repositoryRoot, encoding: "utf8" }).split("\0"))].filter((file) => file.endsWith(".test.js"));
+  for (const component of Object.values(loaded.manifest.components)) {
+    if (component.id === "repository-composition") {
+      assert.deepEqual(component.tests.map((entry) => entry.command), ["npm run check"]);
+      continue;
+    }
+    const selectedTests = [];
+    for (const { command } of component.tests) {
+      assert.match(command, /^node scripts\/run-tests\.js(?: --test-file [a-zA-Z0-9_./-]+\.test\.js)+$/, `${component.id} must use hermetic test execution`);
+      selectedTests.push(...[...command.matchAll(/ --test-file ([a-zA-Z0-9_./-]+\.test\.js)/g)].map((match) => match[1]));
+    }
+    const ownedTests = testFiles.filter((file) => component.paths.some((scope) => pathMatchesImpactScope(file, scope)));
+    assert.deepEqual([...new Set(selectedTests)].sort(), ownedTests.sort(), `${component.id} must execute every owned test`);
+  }
+  const plan = resolveProjectImpactPlan({ project: studioOpsProject, loadedMap: loaded,
+    task: { title: "Adjust owner inbox grouping", workAreas: ["src/owner-inbox.js"] } });
+  assert.equal(plan.fullRegression, false, "the regression must exercise an eligible scoped component");
+  assert.equal(plan.selectedComponents[0].id, "owner-console");
+  assert.match(plan.targetedTests.join("\n"), /--test-file test\/owner-inbox\.test\.js(?: |$)/);
 });
 
 test("checked-in StudioOps map fails closed for uncertain and release-sensitive impact", () => {
