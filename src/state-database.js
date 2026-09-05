@@ -67,6 +67,7 @@ const ACTIVE_TERMINAL_RUNS_PER_WORKFLOW_ACTION = 3;
 const SQLITE_BUSY_TIMEOUT_MS = 250;
 const DEFAULT_MUTATION_RETRIES = 4;
 const MAX_MUTATION_RETRIES = 8;
+const SERIALIZED_REPLAY_LOCK_DEADLINE_MS = 10_000;
 const CONTENTION_EVENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_CONTENTION_EVENTS = 1_000;
 const QA_REVOCATION_SETTLEMENT_WRITE = Symbol("studioops.qa-revocation-settlement-write");
@@ -369,6 +370,28 @@ function readStateSnapshot(db) {
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
+  }
+}
+
+function serializedReplayDeadlineError(operationName, retryCount) {
+  const error = new Error(
+    `StudioOps serialized mutation lock deadline exceeded during ${operationName}.`,
+  );
+  error.code = "STUDIOOPS_SERIALIZED_REPLAY_TIMEOUT";
+  error.operationName = operationName;
+  error.retryCount = retryCount;
+  return error;
+}
+
+function beginSerializedReplayTransaction(db, operationName, deadlineAt, retryCount) {
+  const remainingMs = Math.floor(deadlineAt - Date.now());
+  if (remainingMs <= 0) throw serializedReplayDeadlineError(operationName, retryCount);
+  const busyTimeoutMs = Math.max(1, Math.min(SQLITE_BUSY_TIMEOUT_MS, remainingMs));
+  db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  try {
+    db.exec("BEGIN IMMEDIATE");
+  } finally {
+    db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
   }
 }
 
@@ -2447,6 +2470,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
   let retryCount = 0;
   let lockWaitMs = 0;
   let serializedReplay = false;
+  let serializedReplayDeadlineAt = 0;
 
   while (true) {
     let transactionStarted = false;
@@ -2456,7 +2480,12 @@ export async function mutateDatabaseState(mutator, options = {}) {
       if (serializedReplay) {
         const lockAttemptStartedAt = Date.now();
         try {
-          db.exec("BEGIN IMMEDIATE");
+          beginSerializedReplayTransaction(
+            db,
+            operationName,
+            serializedReplayDeadlineAt,
+            retryCount,
+          );
         } finally {
           lockWaitMs += Date.now() - lockAttemptStartedAt;
         }
@@ -2511,14 +2540,28 @@ export async function mutateDatabaseState(mutator, options = {}) {
     } catch (error) {
       if (transactionStarted) db.exec("ROLLBACK");
       const retryableConflict = error.code === "STUDIOOPS_STATE_CONFLICT" || isSqliteBusy(error);
-      if (!retryableConflict || !retryPolicy.idempotent || retryCount >= retryPolicy.maxRetries) {
+      const serializedLockCanWait = serializedReplay
+        && isSqliteBusy(error)
+        && Date.now() < serializedReplayDeadlineAt;
+      if (
+        !retryableConflict
+        || !retryPolicy.idempotent
+        || (!serializedLockCanWait && retryCount >= retryPolicy.maxRetries)
+      ) {
         error.operationName = operationName;
         error.retryCount = retryCount;
         throw error;
       }
       retryCount += 1;
-      serializedReplay = true;
-      await sleep(retryDelayMs(retryCount));
+      if (!serializedReplay) {
+        serializedReplay = true;
+        serializedReplayDeadlineAt = Date.now() + SERIALIZED_REPLAY_LOCK_DEADLINE_MS;
+      }
+      const delayMs = Math.min(
+        retryDelayMs(retryCount),
+        Math.max(1, serializedReplayDeadlineAt - Date.now()),
+      );
+      await sleep(delayMs);
     }
   }
 }
