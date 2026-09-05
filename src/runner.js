@@ -69,6 +69,7 @@ import {
   writeBoundedDiscoveryArtifact,
 } from "./impact-planner.js";
 import { sha256Digest } from "./component-impact-map.js";
+import { withRepositoryContext } from "./repository-context-service.js";
 import { MAX_VALIDATION_ARTIFACT_BYTES } from "./run-output-evidence.js";
 import { createRemediationHandoff } from "./remediation-handoff.js";
 import {
@@ -1705,6 +1706,7 @@ function runnerPrompt(run, project, authContext = null) {
     ? formatImpactPlanForPrompt(run.impactPlan)
     : "SCOPED CONTEXT PACKET\n- No repository component map was available. Fail closed to the declared file scope and final aggregate validation.";
   return `${impactPacket}
+${run.repositoryContextPacket ? `\n${run.repositoryContextPacket}\n` : ""}
 
 StudioOps automation run: ${run.id}
 
@@ -2945,6 +2947,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
+    executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
+    log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
     const failureClaim = await claimCurrentFailureAttempt(run, input);
     if (!failureClaim.admitted) {
       status = "cancelled";
@@ -3086,6 +3090,8 @@ async function runClaimedRunWithCli(run, input = {}) {
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
+    executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
+    log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
     const failureClaim = await claimCurrentFailureAttempt(run, input);
     if (!failureClaim.admitted) {
       log.write(`StudioOps skipped provider launch because ${failureClaim.reason} is active for ${failureClaim.incident.incidentId}.\n`);

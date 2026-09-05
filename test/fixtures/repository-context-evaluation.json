@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "labelPolicy": "Queries and needed files were selected by reading source before running retrieval. Labels are deliberately narrow: non-labeled results are unjudged, not proven irrelevant. No-match and isolation cases have no needed files.",
+  "cutoff": 5,
+  "maxBytes": 10000,
+  "repositories": [
+    {
+      "key": "studioops",
+      "repository": "https://github.com/magic2goodil/studioops",
+      "commitSha": "1cc6d4498e8a2adf7bc88b70628c18342b3e1208",
+      "queries": [
+        { "id": "lease-symbol", "kind": "exact", "query": "createSelfUpdateLease", "neededFiles": ["src/self-update-lease.js"], "evidence": "createSelfUpdateLease constructs the maintenance lease and expiration." },
+        { "id": "output-path", "kind": "exact", "query": "src/run-output-evidence.js", "neededFiles": ["src/run-output-evidence.js"], "evidence": "This exact tracked path implements bounded validation transcripts and redaction." },
+        { "id": "retry-symbol", "kind": "exact", "query": "notificationRetryReady", "neededFiles": ["src/notifier.js"], "evidence": "notificationRetryReady checks notification attempts and retry time." },
+        { "id": "notification-delay", "kind": "conceptual", "query": "A desktop alert failed and should wait before another delivery attempt", "neededFiles": ["src/notifier.js"], "evidence": "notificationRetryReady and sendPendingNotifications implement delivery retry readiness." },
+        { "id": "dead-worker", "kind": "conceptual", "query": "Find background workers whose last heartbeat is too old", "neededFiles": ["src/worker-heartbeat.js"], "evidence": "staleWorkerNames compares worker heartbeats with staleAfterMs." },
+        { "id": "lease-expiry", "kind": "conceptual", "query": "The temporary maintenance lock should stop blocking when its expiration time passes", "neededFiles": ["src/self-update-lease.js"], "evidence": "activeSelfUpdateLease returns null when the lease expires." },
+        { "id": "validation-redaction", "kind": "conceptual", "query": "Remove credentials from test output and keep a bounded transcript", "neededFiles": ["src/run-output-evidence.js"], "evidence": "redactValidationOutput and boundedValidationTranscript implement these two responsibilities." },
+        { "id": "sandbox-dependencies", "kind": "conceptual", "query": "Install prepared dependencies inside the isolated project validation sandbox", "neededFiles": ["src/project-validation-sandbox.js"], "evidence": "installPreparedProjectValidationDependencies is the sandbox installation entry point." },
+        { "id": "ancestry-not-remote", "kind": "confusing", "query": "Prove promotion branch ancestry using Git commits", "neededFiles": ["src/promotion-ancestry-observation.js"], "confusingFiles": ["src/promotion-remote-observation.js", "src/promotion-validation-evidence.js"], "evidence": "The ancestry module runs trusted Git; remote-observation checks GitHub API observations." },
+        { "id": "claim-not-maintenance", "kind": "confusing", "query": "claimPromotionAttemptInState", "neededFiles": ["src/promotion-attempt-claim.js"], "confusingFiles": ["src/self-update-lease.js", "src/promotion.js"], "evidence": "The attempt-claim module owns this exact function and persisted promotion claim lifecycle." },
+        { "id": "frozen-qa", "kind": "conceptual", "query": "Build the owner QA packet with acceptance criteria and candidate completeness", "neededFiles": ["src/owner-qa-packet.js"], "evidence": "buildOwnerQaPacket and candidateCompletenessGate build and validate the owner packet." },
+        { "id": "failure-backoff", "kind": "conceptual", "query": "Schedule failure recovery backoff after repeated attempts", "neededFiles": ["src/failure-containment.js"], "evidence": "scheduleFailureBackoff and failure-recovery budget helpers live here." },
+        { "id": "nonexistent", "kind": "no-match", "query": "quuxNebulaZebra923", "neededFiles": [], "evidence": "Deliberately absent identifier." },
+        { "id": "foreign-rewards", "kind": "repository-isolation", "query": "PublicRewardsController", "neededFiles": [], "forbiddenFiles": ["docroot/modules/custom/vb_rewards/src/Controller/PublicRewardsController.php"], "evidence": "The named controller belongs to vbwinery, outside the StudioOps repository." }
+      ]
+    },
+    {
+      "key": "dollos",
+      "repository": "https://github.com/magic2goodil/DollOS-Discord-Bot",
+      "commitSha": "3ddeec37fc77f1e1148d0b7d4d1ca374a2515f72",
+      "queries": [
+        { "id": "schedule-symbol", "kind": "exact", "query": "SchedulingService schedule_now", "neededFiles": ["dollos/scheduling_service.py"], "evidence": "SchedulingService.schedule_now is the assignment scheduling entry point." },
+        { "id": "snooze", "kind": "conceptual", "query": "Snooze an existing assignment for twenty four hours", "neededFiles": ["dollos/scheduling_service.py"], "evidence": "SchedulingService.snooze defaults hours to 24." },
+        { "id": "foreign-rewards", "kind": "repository-isolation", "query": "PublicRewardsController", "neededFiles": [], "forbiddenFiles": ["docroot/modules/custom/vb_rewards/src/Controller/PublicRewardsController.php"], "evidence": "The controller belongs to another repository." }
+      ]
+    },
+    {
+      "key": "miss-dolly-site",
+      "repository": "https://github.com/magic2goodil/miss-dolly-site",
+      "commitSha": "311c0b2cc2c609788644527b1ff9a3cbb5afaf56",
+      "queries": [
+        { "id": "attribution-symbol", "kind": "exact", "query": "captureAttribution", "neededFiles": ["assets/site.js"], "evidence": "The browser script declares captureAttribution." },
+        { "id": "catalog-path", "kind": "exact", "query": "scripts/render_audio_catalog.py", "neededFiles": ["scripts/render_audio_catalog.py"], "evidence": "The exact tracked script renders catalog pages." },
+        { "id": "foreign-lease", "kind": "repository-isolation", "query": "createSelfUpdateLease", "neededFiles": [], "forbiddenFiles": ["src/self-update-lease.js"], "evidence": "This function belongs to StudioOps." }
+      ]
+    },
+    {
+      "key": "vbwinery-redesign",
+      "repository": "https://github.com/magic2goodil/vbwinery",
+      "commitSha": "3bf9d8cbae7635736a84ab7733cbafdeb7dee292",
+      "queries": [
+        { "id": "rewards-controller", "kind": "exact", "query": "PublicRewardsController", "neededFiles": ["docroot/modules/custom/vb_rewards/src/Controller/PublicRewardsController.php"], "evidence": "This PHP class owns public rewards hub, feed, leaderboard, and profile endpoints." },
+        { "id": "profile-label", "kind": "confusing", "query": "publicCustomerLabel anonymousCustomerLabel", "neededFiles": ["docroot/modules/custom/vb_rewards/src/Controller/PublicRewardsController.php"], "evidence": "The controller has both private label helpers." },
+        { "id": "foreign-lease", "kind": "repository-isolation", "query": "createSelfUpdateLease", "neededFiles": [], "forbiddenFiles": ["src/self-update-lease.js"], "evidence": "This function belongs to StudioOps." }
+      ]
+    },
+    {
+      "key": "event-horizons-web",
+      "repository": "https://github.com/magic2goodil/event-horizons-prototype",
+      "commitSha": "7bcec4dd6a99829aa383c5bd8f139528e92a4c96",
+      "queries": [
+        { "id": "nearby-symbol", "kind": "exact", "query": "parseNearbySpatialQuery", "neededFiles": ["apps/api/src/spatial-query.mjs"], "evidence": "This function validates nearby coordinates, radius, cursor, limit, and resolution." },
+        { "id": "legacy-password", "kind": "conceptual", "query": "Upgrade the old password hash after successful verification", "neededFiles": ["apps/api/src/identity/passwords.mjs"], "evidence": "verifyAndUpgradePassword calls verifyPassword and replaces a hash when needsRehash is true." },
+        { "id": "foreign-rewards", "kind": "repository-isolation", "query": "PublicRewardsController", "neededFiles": [], "forbiddenFiles": ["docroot/modules/custom/vb_rewards/src/Controller/PublicRewardsController.php"], "evidence": "This PHP controller belongs to vbwinery." }
+      ]
+    }
+  ]
+}
