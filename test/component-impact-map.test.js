@@ -131,11 +131,30 @@ test("checked-in StudioOps map produces a bounded single-component context packe
     "docs/architecture/*.components.json",
     "docs/architecture/component-mapping.md",
     "docs/architecture/components.json",
+    "docs/architecture/repository-context-evaluation.md",
+    "scripts/evaluate-repository-context.js",
     "src/component-impact-map.js",
     "src/impact-planner.js",
+    "src/mission-control-context.js",
+    "src/repository-context-extractor.js",
+    "src/repository-context-index.js",
+    "src/repository-context-packet.js",
+    "src/repository-context-service.js",
+    "src/task-context-retrieval.js",
     "test/component-impact-map.test.js",
+    "test/fixtures/repository-context-evaluation.json",
+    "test/repository-context-evaluation.test.js",
+    "test/repository-context-index.test.js",
+    "test/repository-context-service.test.js",
+    "test/task-context-retrieval.test.js",
   ]);
-  assert.deepEqual(plan.targetedTests, ["node scripts/run-tests.js --test-file test/component-impact-map.test.js"]);
+  assert.deepEqual(plan.targetedTests, [
+    "node scripts/run-tests.js --test-file test/component-impact-map.test.js",
+    "node scripts/run-tests.js --test-file test/repository-context-index.test.js",
+    "node scripts/run-tests.js --test-file test/task-context-retrieval.test.js",
+    "node scripts/run-tests.js --test-file test/repository-context-service.test.js",
+    "node scripts/run-tests.js --test-file test/repository-context-evaluation.test.js",
+  ]);
   assert.deepEqual(plan.requiredReviewLanes, ["backend-reviewer", "lead-reviewer"]);
   assertImpactPlanProjectBinding(plan, studioOpsProject);
 
