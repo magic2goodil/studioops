@@ -23,7 +23,7 @@ import {
   normalizeGlobalRunAdmission,
   normalizeProjectRunAdmissionPolicy,
 } from "./config.js";
-import { resolveProjectImpactPlan } from "./impact-planner.js";
+import { impactScopeDigest, resolveProjectImpactPlan } from "./impact-planner.js";
 import {
   failureActionIdentity,
   failureFingerprint,
@@ -816,6 +816,10 @@ function makeRun(state, task, action, options, now) {
     repoRoot: project.sourceRepoPath || project.repoPath,
     sourceCommit: task.candidateIdentity?.baseSha || task.reviewSubjectSha || "",
   });
+  if (task.impactScopePlan) {
+    impactPlan.allowedFileScope = [...task.impactScopePlan.allowedFileScope];
+    impactPlan.editScopeDigest = impactScopeDigest(task.impactScopePlan);
+  }
   const scopedFileScope = impactPlan.allowedFileScope.length
     ? impactPlan.allowedFileScope
     : profile.fileScope;
@@ -1152,6 +1156,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       if (nextStatus) task.status = nextStatus;
       task.assignedAgentRole = run.role;
       task.impactPlan = structuredClone(run.impactPlan);
+      if (run.group === "builder") task.impactScopePlan ||= structuredClone(run.impactPlan);
       task.retryNotBefore = "";
       task.updatedAt = now;
 

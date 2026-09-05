@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import { assertIsolatedTestEnvironment } from "./runtime-paths.js";
-import { ensureStateDatabase } from "./state-database.js";
+import { withStateDatabaseConnection, withStateDatabaseRead } from "./state-database.js";
 
 const MAX_TEXT = 512;
 const DEFAULT_LEASE_TTL_MS = 30_000;
@@ -151,16 +151,17 @@ function leasePredicate(input) {
 }
 
 async function transaction(callback) {
-  const db = await ensureStateDatabase();
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const result = callback(db);
-    db.exec("COMMIT");
-    return result;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  return withStateDatabaseConnection((db) => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = callback(db);
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }, { operationName: "coordination.transaction" });
 }
 
 function currentLease(db, input, nowMs, activeOnly = true) {
@@ -367,13 +368,11 @@ export async function compactCoordinationHistory(input = {}) {
 }
 
 export async function listDueExternalOperations(input = {}) {
-  const db = await ensureStateDatabase();
   const limit = Math.min(100, Math.max(1, Number(input.limit || 50)));
-  return db.prepare("SELECT * FROM external_operations WHERE status = 'prepared' ORDER BY prepared_at ASC LIMIT ?").all(limit).map(rowToOperation);
+  return withStateDatabaseRead((db) => db.prepare("SELECT * FROM external_operations WHERE status = 'prepared' ORDER BY prepared_at ASC LIMIT ?").all(limit).map(rowToOperation));
 }
 
 export async function listExpiringLeases(input = {}) {
-  const db = await ensureStateDatabase();
   const limit = Math.min(100, Math.max(1, Number(input.limit || 50)));
-  return db.prepare("SELECT * FROM coordination_leases WHERE status = 'active' AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?").all(iso(coordinatorNow()), limit).map(rowToLease);
+  return withStateDatabaseRead((db) => db.prepare("SELECT * FROM coordination_leases WHERE status = 'active' AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?").all(iso(coordinatorNow()), limit).map(rowToLease));
 }

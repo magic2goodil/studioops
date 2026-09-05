@@ -12,7 +12,7 @@ import test from "node:test";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { canonicalJson, createCandidateEnvelope } from "../src/candidate-manifest.js";
 import { buildOwnerQaPacket } from "../src/owner-qa-packet.js";
-import { planPromotions, truncateOutput } from "../src/promotion.js";
+import { planPromotions, promotionSweepHealthPatch, truncateOutput } from "../src/promotion.js";
 import { promotionProjectPolicyBinding, validPromotionRecoveryReceipt } from "../src/promotion-attempt-claim.js";
 import { promotionValidationPolicyDigest } from "../src/promotion-validation-evidence.js";
 import {
@@ -473,15 +473,15 @@ function productionOwnerQaPacketV1(state, candidate) {
   return { ...base, packetDigest: sha256(canonicalJson(base)) };
 }
 
-function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen" }) {
+function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen", projectId = "project_1", taskId = "task_1", candidateId = "candidate_1", bundleId = "qa_bundle_1" }) {
   const candidate = createCandidateEnvelope({
-    qaBundleId: "qa_bundle_1",
+    qaBundleId: bundleId,
     manifest: {
-      candidateId: "candidate_1",
-      projectId: "project_1",
+      candidateId,
+      projectId,
       base: { branch: "main", sha: baseSha },
       sources: [{
-        taskId: "task_1",
+        taskId,
         sourceRef: "refs/heads/feature/task",
         headSha: sourceSha,
         candidateCycle: 1,
@@ -517,14 +517,14 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
       },
       assembly: {
         mode: "atomic",
-        requestedTaskIds: ["task_1"],
-        includedTaskIds: ["task_1"],
+        requestedTaskIds: [taskId],
+        includedTaskIds: [taskId],
         excludedTaskIds: [],
       },
     },
     createdAt: "2026-07-25T12:00:00.000Z",
   });
-  candidate.qaBundleId = "qa_bundle_1";
+  candidate.qaBundleId = bundleId;
   candidate.status = status;
   if (status === "qa_passed") {
     candidate.qaDecision = {
@@ -532,7 +532,7 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
       candidateId: candidate.id,
       manifestDigest: candidate.manifestDigest,
       integrationSha,
-      taskIds: ["task_1"],
+      taskIds: [taskId],
       author: "Owner QA",
       notes: "",
       repositoryVerifiedAt: "2026-07-25T12:29:59.000Z",
@@ -542,8 +542,8 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
   return candidate;
 }
 
-function releaseCandidateFixture({ baseSha, sourceSha, integrationSha, prUrl }) {
-  const candidate = candidateFixture({ baseSha, sourceSha, integrationSha, status: "qa_passed" });
+function releaseCandidateFixture({ baseSha, sourceSha, integrationSha, prUrl, ...identifiers }) {
+  const candidate = candidateFixture({ baseSha, sourceSha, integrationSha, status: "qa_passed", ...identifiers });
   candidate.status = "release_candidate_ready";
   candidate.promotion = {
     branch: "qa/promotion-demo",
@@ -776,20 +776,18 @@ test("promotion validation policy binds the canonical effective PATH and executa
     defaultPlan.validationToolchain.commandExecutables.find((entry) => entry.command === "npm")?.digest || "",
     /^sha256:[a-f0-9]{64}$/,
   );
-  assert.throws(() => planPromotions(state, { validationPath: "" }), /non-empty absolute directories/i);
-  assert.throws(() => planPromotions(state, { validationPath: "relative/bin" }), /non-empty absolute directories/i);
-  assert.throws(
-    () => planPromotions(state, { validationPath: path.join(process.cwd(), "does-not-exist") }),
-    /not an existing directory/i,
-  );
-  assert.throws(
-    () => planPromotions(state, { validationPath: path.join(process.cwd(), "package.json") }),
-    /not an existing directory/i,
-  );
-  assert.throws(
-    () => planPromotions(state, { validationPath: os.tmpdir() }),
-    /unsafe promotion validation PATH entry/i,
-  );
+  for (const [validationPath, reason] of [
+    ["", /non-empty absolute directories/i],
+    ["relative/bin", /non-empty absolute directories/i],
+    [path.join(process.cwd(), "does-not-exist"), /not an existing directory/i],
+    [path.join(process.cwd(), "package.json"), /not an existing directory/i],
+    [os.tmpdir(), /unsafe promotion validation PATH entry/i],
+  ]) {
+    const invalid = planPromotions(state, { validationPath });
+    assert.equal(invalid.projects.length, 0);
+    assert.equal(invalid.planningFailures[0].code, "PROJECT_VALIDATION_INPUT_INVALID");
+    assert.match(invalid.planningFailures[0].reason, reason);
+  }
 
   candidate.promotionValidationRecoveryReceipt = {
     schemaVersion: "studioops.promotion-validation-recovery.v1",
@@ -1111,10 +1109,9 @@ test("promotion reconciliation binds declared validation policy without resolvin
       tasks: [{ id: "task_1", projectId: "project_1", title: "Task", status: "approved_for_main" }],
       candidates: [createCandidate],
     });
-    assert.throws(
-      () => planPromotions(createState),
-      /unsafe writable promotion validation executable/i,
-    );
+    const invalidCreate = planPromotions(createState);
+    assert.equal(invalidCreate.projects.length, 0);
+    assert.match(invalidCreate.planningFailures[0].reason, /unsafe writable promotion validation executable/i);
 
     const safeProject = { ...structuredClone(project), validationCommands: ["/bin/sh -c true"] };
     const retryCandidate = candidateFixture({
@@ -1174,12 +1171,123 @@ test("promotion reconciliation binds declared validation policy without resolvin
     delete retryCandidate.qaDecision.ownerQaPacketDigest;
     retryState.qaBundles = [];
     attachOwnerQaPackets(retryState);
-    assert.throws(
-      () => planPromotions(retryState),
-      /unsafe writable promotion validation executable/i,
-    );
+    const invalidRetry = planPromotions(retryState);
+    assert.equal(invalidRetry.projects.length, 0);
+    assert.match(invalidRetry.planningFailures[0].reason, /unsafe writable promotion validation executable/i);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion planning contains invalid project tooling after checking task eligibility", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-planning-containment-"));
+  try {
+    const unsafePython = path.join(root, "unsafe-python");
+    await writeFile(unsafePython, "#!/bin/sh\nexit 0\n", { mode: 0o775 });
+    await chmod(unsafePython, 0o775);
+    const coordinates = { baseSha: "a".repeat(40), sourceSha: "b".repeat(40), integrationSha: "b".repeat(40) };
+    const unsafe = candidateFixture({ ...coordinates, status: "qa_passed" });
+    const healthy = candidateFixture({
+      ...coordinates, status: "qa_passed", projectId: "project_2", taskId: "task_2", candidateId: "candidate_2", bundleId: "qa_bundle_2",
+    });
+    const reconciling = releaseCandidateFixture({
+      ...coordinates, taskId: "task_3", candidateId: "candidate_3", bundleId: "qa_bundle_3",
+      prUrl: "https://github.com/example/demo/pull/43",
+    });
+    const state = baseState({
+      projects: [
+        { id: "project_1", key: "unsafe", name: "Unsafe", repoPath: "/tmp/unsafe", repoUrl: GITHUB_REPO_URL, defaultBranch: "main", validationCommands: [`${unsafePython} -m pytest`] },
+        { id: "project_2", key: "healthy", name: "Healthy", repoPath: "/tmp/healthy", repoUrl: "https://github.com/example/healthy", defaultBranch: "main", validationCommands: ["/bin/sh -c true"] },
+      ],
+      tasks: [
+        { id: "task_1", projectId: "project_1", title: "Blocked", status: "blocked" },
+        { id: "task_2", projectId: "project_2", title: "Healthy", status: "approved_for_main" },
+        { id: "task_3", projectId: "project_1", title: "Reconcile", status: "user_review" },
+      ],
+      candidates: [unsafe, healthy, reconciling],
+    });
+    const blocked = planPromotions(state);
+    assert.deepEqual(blocked.planningFailures, []);
+    assert.deepEqual(blocked.projects.map((project) => [project.candidate.id, project.mode]), [
+      ["candidate_3", "reconcile"], ["candidate_2", "create"],
+    ]);
+
+    state.tasks[0].status = "approved_for_main";
+    const eligible = planPromotions(state);
+    assert.deepEqual(eligible.projects.map((project) => [project.candidate.id, project.mode]), [
+      ["candidate_3", "reconcile"], ["candidate_2", "create"],
+    ]);
+    assert.equal(eligible.planningFailures.length, 1);
+    assert.equal(eligible.planningFailures[0].candidateId, "candidate_1");
+    assert.equal(eligible.planningFailures[0].code, "PROJECT_VALIDATION_INPUT_INVALID");
+    assert.match(eligible.planningFailures[0].reason, /unsafe writable/i);
+    assert.equal(eligible.projects[0].validationToolchain.executableResolution, "disabled");
+    assert.ok(eligible.projects[1].validationToolchain.commandExecutables.length > 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion sweep health deduplicates failures and preserves the last failure after recovery", async () => {
+  const { writeWorkerHeartbeat, readWorkerHeartbeats } = await import("../src/worker-heartbeat.js");
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-promotion-health-"));
+  try {
+    const report = {
+      projects: [{ projectId: "project_2", status: "pr_ready" }],
+      planningFailures: [{ projectId: "project_1", projectKey: "unsafe", candidateId: "candidate_1", taskIds: ["task_1"], code: "PROJECT_VALIDATION_INPUT_INVALID", reason: "Unsafe executable", status: "planning_failed" }],
+    };
+    const first = promotionSweepHealthPatch({}, report, { nowMs: Date.parse("2026-09-06T00:00:00.000Z") });
+    await writeWorkerHeartbeat("promotion", first, { dataDir: root });
+    const persisted = (await readWorkerHeartbeats({ dataDir: root }))[0];
+    const second = promotionSweepHealthPatch(persisted, report, { nowMs: Date.parse("2026-09-06T00:05:00.000Z") });
+    assert.equal(second.status, "degraded");
+    assert.equal(second.lastFailure.fingerprint, first.lastFailure.fingerprint);
+    assert.equal(second.lastFailure.firstSeenAt, first.lastFailure.firstSeenAt);
+    assert.equal(second.lastFailure.observations, 2);
+    assert.equal(second.lastSuccessAt, "");
+    const recovered = promotionSweepHealthPatch(second, { projects: [] }, { nowMs: Date.parse("2026-09-06T00:10:00.000Z") });
+    assert.equal(recovered.status, "idle");
+    assert.equal(recovered.activeFailureCount, 0);
+    assert.equal(recovered.lastFailure.resolvedAt, "2026-09-06T00:10:00.000Z");
+    assert.equal(recovered.lastSuccessAt, recovered.lastSweepCompletedAt);
+    assert.equal(recovered.lastFailure.failures[0].candidateId, "candidate_1");
+    const failed = promotionSweepHealthPatch(recovered, {}, { error: new Error("Authorization: Bearer abc123secret") });
+    assert.equal(failed.status, "degraded");
+    assert.doesNotMatch(failed.lastError, /abc123secret/);
+    assert.equal(failed.lastSuccessAt, recovered.lastSuccessAt);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("promotion sweep health preserves recovery-only failures and clears only completed recoveries", () => {
+  const previous = { lastSuccessAt: "2026-09-06T00:00:00.000Z" };
+  const recovery = { projectId: "project_1", projectKey: "demo", candidateId: "candidate_1", taskIds: ["task_1"] };
+  for (const [field, status, code] of [
+    ["mergedAdmissionRecoveries", "unavailable", "merged_admission_unavailable"],
+    ["mergedAdmissionRecoveries", "invalid", "merged_admission_invalid"],
+    ["qaRevocations", "failed", "qa_revocation_failed"],
+    ["qaRevocations", "pending", "qa_revocation_pending"],
+  ]) {
+    const report = { projects: [], [field]: [{ ...recovery, status, reason: "token=private-secret remote unavailable" }] };
+    const failed = promotionSweepHealthPatch(previous, report);
+    assert.equal(failed.status, "degraded");
+    assert.equal(failed.activeFailureCount, 1);
+    assert.equal(failed.lastSuccessAt, previous.lastSuccessAt);
+    assert.equal(failed.lastFailure.failures[0].code, code);
+    assert.equal(failed.lastFailure.failures[0].projectId, recovery.projectId);
+    assert.deepEqual(failed.lastFailure.failures[0].taskIds, recovery.taskIds);
+    assert.doesNotMatch(JSON.stringify(failed), /private-secret/);
+    assert.equal(promotionSweepHealthPatch(failed, report).lastFailure.observations, 2);
+    const healthy = promotionSweepHealthPatch(failed, {
+      projects: [],
+      mergedAdmissionRecoveries: ["recovered", "already_safe"].map((status) => ({ ...recovery, status })),
+      qaRevocations: ["revoked", "already_invalidated", "merged", "completed"].map((status) => ({ ...recovery, status })),
+    });
+    assert.equal(healthy.status, "idle");
+    assert.equal(healthy.activeFailureCount, 0);
+    assert.ok(healthy.lastFailure.resolvedAt);
+    assert.equal(healthy.lastSuccessAt, healthy.lastSweepCompletedAt);
   }
 });
 
@@ -1294,7 +1402,9 @@ test("promotion circuit publication CAS preserves validation-policy and attempt-
           { cwd: root },
         );
         if (scenario.expectedImmediateFailure) {
-          await assert.rejects(invocation, scenario.expectedImmediateFailure);
+          const report = JSON.parse((await invocation).stdout.trim());
+          assert.equal(report.projects[0].status, "project_failed");
+          assert.match(report.projects[0].output, scenario.expectedImmediateFailure);
           const state = readPersistedState(root);
           assert.equal(state.tasks[0].status, "approved_for_main");
           assert.equal(state.tasks[0].promotionStatus, "queued");

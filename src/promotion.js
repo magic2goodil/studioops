@@ -1199,10 +1199,30 @@ function taskCanRetryPromotionValidation(task, candidate, source, policyDigest) 
 }
 
 function candidateTasksRemainPromotable(candidate, tasksById, policyDigest) {
+  if (!candidateTasksHaveEligibleStatusAndRole(candidate, tasksById)) return false;
   const reusableValidation = validPromotionRecoveryReceipt(candidate, policyDigest);
   return candidate.manifest.sources.every((source) => {
     const task = tasksById.get(source.taskId);
-    if (!task) return false;
+    const attempts = promotionValidationAttemptsForCandidate(task, candidate);
+    if (candidate.status === "qa_passed" && attempts > 0) {
+      if (taskCanRetryPromotionValidation(task, candidate, source, policyDigest)) return true;
+      if (!reusableValidation) return false;
+    }
+    if (
+      candidate.status === "qa_passed"
+      && task.status === "promotion_blocked"
+      && !AUTO_RECOVERABLE_PROMOTION_STATUSES.has(String(task.promotionStatus || ""))
+    ) return false;
+    return true;
+  });
+}
+
+// These checks need no executable or receipt policy. Run them before resolving
+// project tooling so a blocked/stale source cannot stop unrelated promotions.
+function candidateTasksHaveEligibleStatusAndRole(candidate, tasksById) {
+  return candidate.manifest.sources.every((source) => {
+    const task = tasksById.get(source.taskId);
+    if (!task || !PROMOTABLE_TASK_STATUSES.has(task.status)) return false;
     if (
       candidate.status === "qa_passed"
       && ["approved_for_main", "promotion_blocked"].includes(task.status)
@@ -1215,17 +1235,7 @@ function candidateTasksRemainPromotable(candidate, tasksById, policyDigest) {
         && !["owner", "promotion-worker"].includes(task.assignedAgentRole)
       ) return false;
     }
-    const attempts = promotionValidationAttemptsForCandidate(task, candidate);
-    if (candidate.status === "qa_passed" && attempts > 0) {
-      if (taskCanRetryPromotionValidation(task, candidate, source, policyDigest)) return true;
-      if (!reusableValidation) return false;
-    }
-    if (
-      candidate.status === "qa_passed"
-      && task.status === "promotion_blocked"
-      && !AUTO_RECOVERABLE_PROMOTION_STATUSES.has(String(task.promotionStatus || ""))
-    ) return false;
-    return PROMOTABLE_TASK_STATUSES.has(task.status);
+    return true;
   });
 }
 
@@ -1291,12 +1301,13 @@ function orderPromotionTasks(projectTasks, candidates) {
 }
 
 export function planPromotions(state, input = {}) {
+  const planningFailures = [];
   const projectPlans = (state.projects || [])
     .filter((project) => projectMatches(project, input))
     .flatMap((project) => {
       const candidateFilter = normalizeList(input.candidate || input.candidates || input.candidateId);
       const taskFilter = normalizeList(input.task || input.tasks || input.taskId);
-      const projectCandidates = (state.candidates || [])
+      let projectCandidates = (state.candidates || [])
         .filter((candidate) => candidate.projectId === project.id)
         .filter((candidate) => (
           candidateHasValidQaPass(candidate, state)
@@ -1310,6 +1321,21 @@ export function planPromotions(state, input = {}) {
           .filter((task) => task.projectId === project.id)
           .map((task) => [task.id, task]),
       );
+      projectCandidates = projectCandidates.filter((candidate) => (
+        candidateTasksHaveEligibleStatusAndRole(candidate, projectTasks)
+      ));
+      if (!projectCandidates.length) return [];
+      const recordPlanningFailure = (candidate, error) => {
+        planningFailures.push({
+          projectId: project.id,
+          projectKey: project.key,
+          candidateId: candidate.id,
+          taskIds: candidate.manifest.sources.map((source) => source.taskId),
+          status: "planning_failed",
+          code: String(error.code || "PROJECT_PROMOTION_POLICY_INVALID"),
+          reason: truncateOutput(redactPromotionValidationText(redactSecrets(error.message, input.secrets))),
+        });
+      };
       const taskPlans = (candidate) => candidate.manifest.sources.map((source) => {
         const task = projectTasks.get(source.taskId);
         const dependencyBindings = [...new Set(normalizeList(task?.dependsOnTaskIds))]
@@ -1349,7 +1375,11 @@ export function planPromotions(state, input = {}) {
       const validationPathSelection = selectedPromotionValidationPath(input);
       let resolvedExecutionToolchain = null;
       const validationToolchainForCandidate = (candidate) => {
-        if (candidate.status === "release_candidate_ready") {
+        if (
+          candidate.status === "release_candidate_ready"
+          || !promotionEnabled(project)
+          || promotionTargetBranch(project) !== candidate.manifest.base.branch
+        ) {
           return normalizedPromotionReconciliationValidationPolicy(validationCommands);
         }
         resolvedExecutionToolchain ||= normalizedPromotionValidationToolchain(validationPathSelection.value, {
@@ -1362,55 +1392,35 @@ export function planPromotions(state, input = {}) {
       try {
         projectPolicy = promotionProjectPolicyBinding(project);
       } catch (error) {
-        return projectCandidates.map((candidate) => {
-          const validationToolchain = validationToolchainForCandidate(candidate);
-          return {
-            projectId: project.id,
-            projectKey: project.key,
-            projectName: project.name,
-            repoPath: project.repoPath || "",
-            repoUrl: project.repoUrl || "",
-            defaultBranch: project.defaultBranch || "main",
-            targetBranch: candidate.manifest.base.branch,
-            enabled: false,
-            skipReason: `promotion project policy is invalid: ${error.message}`,
-            validationCommands,
-            validationTimeoutMs,
-            validationPath: validationToolchain.path,
-            validationPathSource: validationPathSelection.source,
-            validationToolchain,
-            validationPolicyDigest: "",
-            projectPolicy: null,
-            projectPolicyDigest: "",
-            mode: candidate.status === "release_candidate_ready" ? "reconcile" : "create",
-            candidate,
-            mergedCandidates: [],
-            tasks: taskPlans(candidate),
-            blockedTasks: [],
-          };
-        });
+        for (const candidate of projectCandidates) recordPlanningFailure(candidate, error);
+        return [];
       }
       const projectPolicyDigest = contentDigest(JSON.stringify(projectPolicy));
       return projectCandidates
-        .map((candidate) => {
-          const validationToolchain = validationToolchainForCandidate(candidate);
-          const plannedValidationPolicyDigest = promotionValidationPolicyDigest({
-            commands: validationCommands,
-            timeoutMs: validationTimeoutMs,
-            environmentPolicyVersion: promotionValidationEnvironmentPolicyVersion(validationToolchain),
-            projectPolicyDigest,
-            sandboxPolicyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
-            validationStrategy: "disposable_full_clone",
-            networkPolicy: "deny_all",
-          });
-          const receiptPolicyDigest = candidate.status === "release_candidate_ready"
-            ? String(candidate.promotionValidationRecoveryReceipt?.policyDigest || "")
-            : "";
-          const validationPolicyDigest = receiptPolicyDigest
-            && validPromotionRecoveryReceipt(candidate, receiptPolicyDigest)
-            ? receiptPolicyDigest
-            : plannedValidationPolicyDigest;
-          return { candidate, validationToolchain, validationPolicyDigest };
+        .flatMap((candidate) => {
+          try {
+            const validationToolchain = validationToolchainForCandidate(candidate);
+            const plannedValidationPolicyDigest = promotionValidationPolicyDigest({
+              commands: validationCommands,
+              timeoutMs: validationTimeoutMs,
+              environmentPolicyVersion: promotionValidationEnvironmentPolicyVersion(validationToolchain),
+              projectPolicyDigest,
+              sandboxPolicyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+              validationStrategy: "disposable_full_clone",
+              networkPolicy: "deny_all",
+            });
+            const receiptPolicyDigest = candidate.status === "release_candidate_ready"
+              ? String(candidate.promotionValidationRecoveryReceipt?.policyDigest || "")
+              : "";
+            const validationPolicyDigest = receiptPolicyDigest
+              && validPromotionRecoveryReceipt(candidate, receiptPolicyDigest)
+              ? receiptPolicyDigest
+              : plannedValidationPolicyDigest;
+            return [{ candidate, validationToolchain, validationPolicyDigest }];
+          } catch (error) {
+            recordPlanningFailure(candidate, error);
+            return [];
+          }
         })
         .filter(({ candidate, validationPolicyDigest }) => (
           candidateTasksRemainPromotable(candidate, projectTasks, validationPolicyDigest)
@@ -1512,6 +1522,7 @@ export function planPromotions(state, input = {}) {
     generatedAt: new Date().toISOString(),
     dryRun: Boolean(input.dryRun || input.plan),
     projects: projectPlans,
+    planningFailures,
     taskCount: projectPlans.reduce((count, project) => count + project.tasks.length + project.blockedTasks.length, 0),
   };
 }
@@ -3270,6 +3281,13 @@ export async function runPromotion(input = {}) {
     ? []
     : await reconcileMergedPromotionAdmissions(input);
   const state = await readState();
+  for (const observation of [...qaRevocations, ...mergedAdmissionRecoveries]) {
+    const candidate = (state.candidates || []).find((item) => item.id === observation.candidateId);
+    const project = (state.projects || []).find((item) => item.id === candidate?.projectId);
+    observation.projectId ||= candidate?.projectId || "";
+    observation.projectKey = project?.key || "";
+    observation.taskIds ||= candidate?.manifest?.sources?.map((source) => source.taskId) || [];
+  }
   const plan = planPromotions(state, input);
 
   if (input.dryRun || input.plan) {
@@ -3280,6 +3298,7 @@ export async function runPromotion(input = {}) {
   for (const plannedProject of plan.projects) {
     if (!plannedProject.tasks.length && !plannedProject.blockedTasks.length) continue;
     let projectPlan = plannedProject;
+    try {
     if (!projectPlan.enabled || projectPlan.dependencyBlocked) {
       results.push(await promoteProject(projectPlan, input));
       continue;
@@ -3454,6 +3473,19 @@ export async function runPromotion(input = {}) {
       await cleanupGitHubAppAuth(authContext);
     }
     results.push(result);
+    } catch (error) {
+      // Publication or cleanup may fail after external work. Preserve its
+      // fenced claim and report the failure; other candidates can still run.
+      const output = truncateOutput(redactPromotionValidationText(redactSecrets(error.message, input.secrets)));
+      results.push({
+        ...projectPlan,
+        status: "project_failed",
+        output,
+        tasks: allTaskResults(projectPlan.tasks, "project_failed", output),
+        validation: [],
+        validationEvidence: null,
+      });
+    }
   }
 
   return {
@@ -3462,7 +3494,71 @@ export async function runPromotion(input = {}) {
     qaRevocations,
     mergedAdmissionRecoveries,
     projects: results,
+    planningFailures: plan.planningFailures,
     taskCount: results.reduce((count, project) => count + (project.tasks || []).length, 0),
+  };
+}
+
+export function promotionSweepHealthPatch(previous = {}, report = {}, input = {}) {
+  const now = new Date(Number(input.nowMs || Date.now())).toISOString();
+  const waitingOrSuccessful = new Set([
+    "no_tasks", "skipped", "pending", "merged", "pr_ready", "pr_merged_detected",
+    "claim_busy", "claim_retry_deferred", "claim_terminal", "claim_stale", "stale_result_discarded",
+  ]);
+  const recoveryFailures = (stage, observations, completedStatuses) => (observations || [])
+    .filter((observation) => !completedStatuses.includes(observation.status))
+    .map((observation) => ({
+      projectId: observation.projectId || "",
+      projectKey: observation.projectKey || "",
+      candidateId: observation.candidateId || "",
+      taskIds: normalizeList(observation.taskIds),
+      status: observation.status || "unknown",
+      code: `${stage}_${observation.status || "unknown"}`,
+      reason: truncateOutput(redactPromotionValidationText(observation.reason || "Promotion recovery remains incomplete.")),
+    }));
+  const failures = [
+    ...(report.planningFailures || []),
+    ...recoveryFailures("qa_revocation", report.qaRevocations, ["revoked", "already_invalidated", "merged", "completed"]),
+    ...recoveryFailures("merged_admission", report.mergedAdmissionRecoveries, ["recovered", "already_safe"]),
+    ...(report.projects || []).filter((project) => !waitingOrSuccessful.has(project.status)).map((project) => ({
+      projectId: project.projectId,
+      projectKey: project.projectKey,
+      candidateId: project.candidate?.id || "",
+      taskIds: (project.tasks || []).map((task) => task.taskId || task.id),
+      status: project.status || "unknown",
+      code: project.status || "unknown",
+      reason: truncateOutput(redactPromotionValidationText(project.output || project.skipReason || "Promotion did not advance.")),
+    })),
+    ...(input.error ? [{
+      projectId: "", projectKey: "", candidateId: "", taskIds: [], status: "sweep_failed",
+      code: String(input.error.code || "PROMOTION_SWEEP_FAILED"),
+      reason: truncateOutput(redactPromotionValidationText(input.error.message || String(input.error))),
+    }] : []),
+  ].sort((a, b) => `${a.projectId}:${a.candidateId}:${a.code}`.localeCompare(`${b.projectId}:${b.candidateId}:${b.code}`));
+  const fingerprint = failures.length ? contentDigest(JSON.stringify(failures)) : "";
+  const unchanged = fingerprint && previous.failureFingerprint === fingerprint;
+  const lastFailure = failures.length ? {
+    fingerprint,
+    firstSeenAt: unchanged ? previous.lastFailure?.firstSeenAt || now : now,
+    lastSeenAt: now,
+    observations: unchanged ? Math.min(Number(previous.lastFailure?.observations || 0) + 1, Number.MAX_SAFE_INTEGER) : 1,
+    failureCount: failures.length,
+    failures: failures.slice(0, 50),
+    omittedCount: Math.max(0, failures.length - 50),
+  } : previous.lastFailure ? {
+    ...previous.lastFailure,
+    resolvedAt: previous.lastFailure.resolvedAt || now,
+  } : null;
+  return {
+    status: failures.length ? "degraded" : "idle",
+    lastError: failures.map((failure) => `${failure.projectKey || "sweep"}: ${failure.reason}`).join("; ").slice(0, MAX_OUTPUT_CHARS),
+    lastSweepCompletedAt: now,
+    lastSuccessAt: failures.length ? previous.lastSuccessAt || "" : now,
+    failureFingerprint: fingerprint,
+    activeFailureCount: failures.length,
+    lastFailure,
+    projectCount: (report.projects || []).length,
+    taskCount: Number(report.taskCount || 0),
   };
 }
 
@@ -3472,6 +3568,10 @@ export function formatPromotionReport(report) {
     `Projects: ${(report.projects || []).length}  Tasks: ${report.taskCount || 0}`,
     "",
   ];
+
+  for (const failure of report.planningFailures || []) {
+    lines.push(`[${failure.projectKey}] ${failure.candidateId}: ${failure.code}: ${failure.reason}`);
+  }
 
   if (!report.projects?.length) {
     lines.push("No projects matched.");

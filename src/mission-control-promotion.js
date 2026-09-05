@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { setTimeout as sleep } from "node:timers/promises";
 import { loadConfig } from "./config.js";
-import { formatPromotionReport, planPromotions, runPromotion } from "./promotion.js";
+import { formatPromotionReport, planPromotions, promotionSweepHealthPatch, runPromotion } from "./promotion.js";
 import { readState } from "./store.js";
+import { readWorkerHeartbeats, writeWorkerHeartbeat } from "./worker-heartbeat.js";
 
 const DEFAULT_INTERVAL_SECONDS = 300;
 
@@ -71,7 +72,32 @@ async function runOnce(args) {
     const state = await readState();
     report = planPromotions(state, options);
   } else {
-    report = await runPromotion(options);
+    const previous = (await readWorkerHeartbeats()).find((heartbeat) => heartbeat.worker === "promotion") || {};
+    await writeWorkerHeartbeat("promotion", {
+      status: "busy", intervalSeconds: options.intervalSeconds,
+      lastSweepStartedAt: new Date().toISOString(),
+    });
+    // Promotion may legitimately validate longer than its scheduled interval.
+    // Keep a separate liveness pulse without erasing the last completed result.
+    let pendingPulse = Promise.resolve();
+    const pulse = setInterval(() => {
+      pendingPulse = pendingPulse.then(() => writeWorkerHeartbeat("promotion", { status: "busy" })).catch((error) => (
+        console.error(`Promotion heartbeat failed: ${error.message}`)
+      ));
+    }, 30_000);
+    pulse.unref();
+    try {
+      report = await runPromotion(options);
+    } catch (error) {
+      clearInterval(pulse);
+      await pendingPulse;
+      await writeWorkerHeartbeat("promotion", promotionSweepHealthPatch(previous, {}, { error }));
+      throw error;
+    } finally {
+      clearInterval(pulse);
+      await pendingPulse;
+    }
+    await writeWorkerHeartbeat("promotion", promotionSweepHealthPatch(previous, report));
   }
   if (args.json) console.log(JSON.stringify(report, null, 2));
   else console.log(formatPromotionReport(report));
