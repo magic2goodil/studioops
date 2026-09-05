@@ -23,10 +23,14 @@ import {
 } from "./store.js";
 import { loadConfig } from "./config.js";
 import { buildOwnerInbox } from "./owner-inbox.js";
+import { boardStateForSnapshot } from "./board-state.js";
+import { readWorkerHeartbeats } from "./worker-heartbeat.js";
+import { promotionWorkerHealth } from "./watchdog.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
 import {
   databaseContentionHealth,
   databaseStorageHealth,
+  readDatabaseStateCached,
   readFailureIncidentPage,
   readFailureIncidentTotals,
 } from "./state-database.js";
@@ -71,7 +75,7 @@ function sendJson(res, status, body) {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
   });
-  res.end(JSON.stringify(body, null, 2));
+  res.end(JSON.stringify(body));
 }
 
 function sendText(res, status, body, contentType = "text/plain; charset=utf-8") {
@@ -265,12 +269,22 @@ async function handleApi(req, res, url) {
       status: "ok",
       ...storageHealth,
       databaseContention: await databaseContentionHealth(),
+      workers: { promotion: promotionWorkerHealth(await readWorkerHeartbeats()) },
     });
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/state") {
-    const state = await readState();
+    const state = await readDatabaseStateCached();
     const config = await loadConfig();
+    if (url.searchParams.get("view") === "board") {
+      sendJson(res, 200, {
+        ...boardStateForSnapshot(state),
+        workerHealth: { promotion: promotionWorkerHealth(await readWorkerHeartbeats()) },
+        configLoaded: !!config,
+        productAccess: localProductAccess(),
+      });
+      return;
+    }
     sendJson(res, 200, {
       meta: state.meta || {},
       projects: state.projects || [],
@@ -285,13 +299,13 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/inbox") {
-    sendJson(res, 200, buildOwnerInbox(await readState()));
+    sendJson(res, 200, buildOwnerInbox(await readDatabaseStateCached()));
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/api/automation/progress") {
     try {
-      const state = await readState();
+      const state = await readDatabaseStateCached();
       const window = normalizeProgressWindow(url.searchParams.get("window"));
       const project = resolveProgressProject(state, url.searchParams.get("project"));
       const taskIds = project ? [] : (state.tasks || []).map((task) => task.id);

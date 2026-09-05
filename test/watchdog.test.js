@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   assessPipelineLiveness,
   managedWorkerHealth,
+  promotionWorkerHealth,
   planWatchdogActions,
   restartWorker,
   runWatchdog,
@@ -378,6 +379,31 @@ test("managed worker health rejects stale, error, and wrong-root heartbeats", ()
     "heartbeat_stale",
     "",
   ]);
+});
+
+test("promotion health tracks scheduled failures without globally restarting or suppressing workers", () => {
+  const nowMs = Date.parse("2026-09-06T00:05:00.000Z");
+  const heartbeats = healthyHeartbeats(nowMs);
+  const promotion = {
+    worker: "promotion", status: "idle", intervalSeconds: 300, dataDir: "/tmp/studioops-data",
+    updatedAt: new Date(nowMs - 4 * 60_000).toISOString(), activeFailureCount: 0,
+  };
+  heartbeats.push(promotion);
+  assert.equal(promotionWorkerHealth(heartbeats, { nowMs, dataDir: "/tmp/studioops-data" }).ok, true);
+  promotion.status = "degraded";
+  promotion.activeFailureCount = 1;
+  promotion.lastFailure = {
+    failureCount: 1, failures: [{ projectId: "project_1", code: "PROJECT_VALIDATION_INPUT_INVALID", reason: "Unsafe executable: /Users/private/person/python3 token=secret" }],
+  };
+  const failure = promotionWorkerHealth(heartbeats, { nowMs, dataDir: "/tmp/studioops-data" });
+  assert.equal(failure.ok, false);
+  assert.equal(failure.reason, "promotion_sweep_failed");
+  assert.equal(failure.lastFailure.failures[0].projectId, "project_1");
+  assert.doesNotMatch(JSON.stringify(failure), /private|person|token=secret/);
+  assert.equal(managedWorkerHealth(heartbeats, { nowMs, dataDir: "/tmp/studioops-data" }).ok, true);
+  assert.ok(!planWatchdogActions({ meta: {}, tasks: [], runs: [] }, heartbeats, { nowMs }).some((action) => action.worker === "promotion"));
+  promotion.updatedAt = new Date(nowMs - 11 * 60_000).toISOString();
+  assert.equal(promotionWorkerHealth(heartbeats, { nowMs }).reason, "heartbeat_stale");
 });
 
 test("watchdog recovers once after cleanup, database, and worker checks while preserving owner pause", async () => {

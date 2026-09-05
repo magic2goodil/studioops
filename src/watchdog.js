@@ -233,6 +233,51 @@ export function managedWorkerHealth(heartbeats, input = {}) {
   };
 }
 
+// Scheduled promotion is observable separately from managed builder workers:
+// one project's invalid toolchain must not close the global automation gate.
+export function promotionWorkerHealth(heartbeats, input = {}) {
+  const heartbeat = (heartbeats || []).find((item) => item.worker === "promotion");
+  const nowMs = Number(input.nowMs || Date.now());
+  const intervalMs = Math.max(1_000, Number(heartbeat?.intervalSeconds || 300) * 1000);
+  const staleAfterMs = heartbeat?.status === "busy" ? 3 * 60_000 : Math.max(3 * 60_000, intervalMs * 2);
+  let reason = "";
+  if (!heartbeat) reason = "heartbeat_missing";
+  else if (heartbeat.invalid || !Number.isFinite(Date.parse(heartbeat.updatedAt || ""))) reason = "heartbeat_invalid";
+  else if (nowMs - Date.parse(heartbeat.updatedAt) > staleAfterMs) reason = "heartbeat_stale";
+  else if (Number(heartbeat.activeFailureCount || 0) > 0 || !["busy", "idle"].includes(heartbeat.status)) reason = "promotion_sweep_failed";
+  else if (path.resolve(String(heartbeat.dataDir || ".")) !== path.resolve(input.dataDir || missionControlDataDir())) reason = "worker_data_root_mismatch";
+  return {
+    worker: "promotion",
+    ok: !reason,
+    reason,
+    status: String(heartbeat?.status || "missing").slice(0, 40),
+    updatedAt: heartbeat?.updatedAt || "",
+    lastSweepCompletedAt: heartbeat?.lastSweepCompletedAt || "",
+    lastSuccessAt: heartbeat?.lastSuccessAt || "",
+    activeFailureCount: Number(heartbeat?.activeFailureCount || 0),
+    lastFailure: heartbeat?.lastFailure ? {
+      fingerprint: heartbeat.lastFailure.fingerprint,
+      firstSeenAt: heartbeat.lastFailure.firstSeenAt,
+      lastSeenAt: heartbeat.lastFailure.lastSeenAt,
+      observations: heartbeat.lastFailure.observations,
+      failureCount: heartbeat.lastFailure.failureCount,
+      omittedCount: heartbeat.lastFailure.omittedCount,
+      ...(heartbeat.lastFailure.resolvedAt ? { resolvedAt: heartbeat.lastFailure.resolvedAt } : {}),
+      failures: (heartbeat.lastFailure.failures || []).slice(0, 50).map((failure) => ({
+        projectId: failure.projectId,
+        projectKey: failure.projectKey,
+        candidateId: failure.candidateId,
+        taskIds: failure.taskIds,
+        status: failure.status,
+        code: failure.code,
+        reason: failure.code === "PROJECT_VALIDATION_INPUT_INVALID"
+          ? "Project validation toolchain is unavailable or unsafe."
+          : "Promotion could not complete; inspect the recorded local sweep failure.",
+      })),
+    } : null,
+  };
+}
+
 async function readDiskPair(input = {}) {
   if (input.readDiskPair) return input.readDiskPair(input);
   const readDisk = input.readDiskAvailability || readDiskAvailability;
@@ -319,6 +364,7 @@ export async function runWatchdog(input = {}) {
       }
     }
     const [state, heartbeats] = await Promise.all([stateReader(), (input.readWorkerHeartbeats || readWorkerHeartbeats)(input)]);
+    const promotionHealth = promotionWorkerHealth(heartbeats, input);
     const liveness = assessPipelineLiveness(state, input);
     const livenessNotification = await updatePipelineLiveness(state, liveness, input);
     const actions = planWatchdogActions(state, heartbeats, { ...input, disk: initial.data });
@@ -335,6 +381,7 @@ export async function runWatchdog(input = {}) {
       lastError: results.filter((item) => !item.ok).map((item) => item.output).join("; "),
       lastSweepCompletedAt: new Date().toISOString(),
       lastSuccessAt: results.every((item) => item.ok) ? new Date().toISOString() : "",
+      promotionHealth,
     }, { ...input, disk: initial.data }).catch((error) => console.error(`[watchdog] heartbeat failed: ${error.message}`));
     return {
       generatedAt: new Date().toISOString(),
@@ -343,6 +390,7 @@ export async function runWatchdog(input = {}) {
       reconciliation,
       liveness,
       livenessNotification,
+      promotionHealth,
       actions: results,
     };
   }

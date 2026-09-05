@@ -147,7 +147,7 @@ export const LIFECYCLE_ACTION_MATRIX = Object.freeze({
 
 export const LIFECYCLE_EVIDENCE_FIELDS = Object.freeze([
   "assignedAgentRole", "assignedThreadId", "reviewerThreadId", "workflowLease",
-  "reviewCycle", "reviewSubjectSha", "reviewSubjectCycle", "impactEvidence", "candidateIdentity", "candidateId",
+  "reviewCycle", "reviewSubjectSha", "reviewSubjectCycle", "impactEvidence", "impactScopePlan", "candidateIdentity", "candidateId",
   "qaBundleId", "qaDecision", "integrationStatus", "promotionStatus", "promotionEvidence",
   "evidenceInvalidations", "architectureStatus", "architectureSummary", "architectureDecisionTaskIds",
   "architectureCompletedAt", "architectureCompletedBy",

@@ -8,7 +8,10 @@ import {
   loadProjectComponentImpactMapAtCommit,
   normalizeRepositoryIdentity,
   projectRepositoryIdentity,
+  pathMatchesImpactScope,
 } from "./component-impact-map.js";
+
+export { pathMatchesImpactScope } from "./component-impact-map.js";
 
 const FULL_REGRESSION_WORDS = [
   "authorization", "identity", "consent", "privacy", "entitlement", "safety",
@@ -19,22 +22,6 @@ const FULL_REGRESSION_WORDS = [
 function list(value) {
   if (Array.isArray(value)) return [...new Set(value.map((item) => String(item || "").trim()).filter(Boolean))];
   return [];
-}
-
-function escapeRegex(value) {
-  return value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-}
-
-export function pathMatchesImpactScope(file, scope) {
-  const candidate = String(file || "").replaceAll("\\", "/").replace(/^\.\//, "");
-  const pattern = String(scope || "").replaceAll("\\", "/").replace(/^\.\//, "");
-  if (!candidate || !pattern) return false;
-  if (!pattern.includes("*")) return candidate === pattern || candidate.startsWith(`${pattern.replace(/\/$/, "")}/`);
-  const regex = escapeRegex(pattern)
-    .replaceAll("**", "\u0000")
-    .replaceAll("*", "[^/]*")
-    .replaceAll("\u0000", ".*");
-  return new RegExp(`^${regex}$`).test(candidate);
 }
 
 function taskSearchText(task) {
@@ -129,10 +116,10 @@ export function exactCandidateChangedFiles(project = {}, candidate = {}, options
       trustedGit(repoRoot, ["cat-file", "-e", `${baseSha}^{commit}`]);
       trustedGit(repoRoot, ["cat-file", "-e", `${commitSha}^{commit}`]);
       const output = trustedGit(repoRoot, [
-        "--no-pager", "diff", "--no-ext-diff", "--no-renames", "--name-only", "--diff-filter=ACMR", "-z",
+        "--no-pager", "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z",
         `${baseSha}...${commitSha}`, "--",
       ]);
-      return [...new Set(output.split("\0").map((item) => item.trim()).filter(Boolean))].sort();
+      return [...new Set(output.split("\0").filter(Boolean))].sort();
     } catch (error) {
       lastError = error;
     }
@@ -269,6 +256,7 @@ export function resolveProjectImpactPlan(input = {}) {
   if (immutableCandidate && !immutableChangedFiles.length) reasonCodes.push("immutable_diff_evidence_missing");
   if (sensitiveKeywords.length || sensitivePaths.length) reasonCodes.push("release_sensitive_impact");
   if (loaded.status === "legacy") reasonCodes.push("legacy_manifest_compatibility");
+  if (loaded.coverage?.checked && !loaded.coverage.complete) reasonCodes.push("component_map_coverage_drift");
   const fullRegression = reasonCodes.length > 0;
   const allowedFileScope = [...new Set([
     ...selectedPaths,
@@ -276,6 +264,32 @@ export function resolveProjectImpactPlan(input = {}) {
       pathMatchesImpactScope(area, scope) || pathMatchesImpactScope(scope, area)
     ))),
   ])].sort();
+  // Read supporting contracts without granting edit authority to dependencies.
+  const selectedIds = new Set(selected.map((component) => component.id));
+  const supportingIds = new Set();
+  const visitDependencies = (id) => {
+    for (const dependency of loaded.manifest.components[id].dependsOn) {
+      if (supportingIds.has(dependency) || selectedIds.has(dependency)) continue;
+      supportingIds.add(dependency);
+      visitDependencies(dependency);
+    }
+  };
+  for (const id of selectedIds) visitDependencies(id);
+  const supporting = [...supportingIds].sort().map((id) => loaded.manifest.components[id]);
+  // Dependents own contract/composition checks affected by a changed provider.
+  const testIds = new Set(selectedIds);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const component of Object.values(loaded.manifest.components)) {
+      if (!testIds.has(component.id) && component.dependsOn.some((id) => testIds.has(id))) {
+        testIds.add(component.id);
+        added = true;
+      }
+    }
+  }
+  const dependentTests = [...testIds].filter((id) => !selectedIds.has(id))
+    .flatMap((id) => loaded.manifest.components[id].tests.map((entry) => entry.command));
   return {
     schemaVersion: 1,
     status: selected.length ? "mapped" : "unclassified",
@@ -302,18 +316,25 @@ export function resolveProjectImpactPlan(input = {}) {
       digest: sha256Digest(component),
     })),
     allowedFileScope,
+    supportingContext: supporting.map((component) => ({
+      id: component.id, owner: component.owner, paths: component.paths,
+      publicContracts: component.publicContracts, digest: sha256Digest(component),
+    })),
+    supportingFileScope: [...new Set(supporting.flatMap((component) => component.paths))].sort(),
+    dependentTests: [...new Set(dependentTests)],
     targetedTests: [...new Set(selected.flatMap((component) => component.tests.map((entry) => entry.command)))],
     requiredReviewLanes: [...new Set(selected.flatMap((component) => component.reviewOwners))],
     fullRegression,
     aggregateCommand: loaded.manifest.aggregateCommand,
+    coverage: loaded.coverage || null,
     reasonCodes: fullRegression ? reasonCodes : ["single_component_mapped"],
     discovery: {
-      required: !selected.length || unmappedDeclaredPaths.length > 0 || unmappedImpactPaths.length > 0,
+      required: !selected.length || unmappedDeclaredPaths.length > 0 || unmappedImpactPaths.length > 0 || Boolean(loaded.coverage?.checked && !loaded.coverage.complete),
       reasonCode: !selected.length
         ? "unclassified_impact"
         : unmappedImpactPaths.length
           ? "immutable_diff_path_unmapped"
-          : unmappedDeclaredPaths.length ? "declared_path_unmapped" : "",
+          : unmappedDeclaredPaths.length ? "declared_path_unmapped" : loaded.coverage?.checked && !loaded.coverage.complete ? "component_map_coverage_drift" : "",
     },
   };
 }
@@ -333,9 +354,40 @@ export function assertImpactPlanProjectBinding(plan = {}, project = {}) {
   return true;
 }
 
+export function impactScopeDigest(plan = {}) {
+  return sha256Digest({ project: plan.project, manifest: plan.manifest, allowedFileScope: list(plan.allowedFileScope).sort() });
+}
+
+/** Deliberate, compare-and-swap remapping is separate from builder submission. */
+export function remapTaskImpactScope(project, task, remap = {}, options = {}) {
+  const previous = task.impactScopePlan || task.impactPlan;
+  if (!previous) throw new Error("A dispatched impact scope is required before recording a remap.");
+  assertImpactPlanProjectBinding(previous, project);
+  if (remap.expectedPlanDigest !== impactScopeDigest(previous)) throw new Error("Impact remap scope digest is stale; read the current scope before remapping.");
+  const reason = String(remap.reason || "").trim();
+  const workAreas = list(remap.workAreas);
+  if (reason.length < 20 || !workAreas.length) throw new Error("Impact remap requires explicit work areas and a substantive reason (at least 20 characters).");
+  const commitSha = remap.commitSha ? exactSha(remap.commitSha) : "";
+  if (remap.commitSha && !commitSha) throw new Error("Impact remap commit must be a full Git SHA.");
+  const plan = resolveProjectImpactPlan({
+    project, task: { ...task, workAreas, candidateIdentity: commitSha ? { commitSha } : {}, impactEvidence: {} },
+    repoRoot: options.repoRoot || project.sourceRepoPath || project.repoPath,
+    sourceCommit: commitSha,
+    ...(options.loadedMap ? { loadedMap: options.loadedMap } : {}),
+  });
+  assertImpactPlanProjectBinding(plan, project);
+  if (plan.status !== "mapped" || plan.discovery.required) throw new Error("Impact remap requires complete, unambiguous component ownership; update the repository map first.");
+  return {
+    plan, workAreas,
+    record: { reason, previousDigest: impactScopeDigest(previous), nextDigest: impactScopeDigest(plan),
+      previousScope: list(previous.allowedFileScope), nextScope: list(plan.allowedFileScope),
+      manifestDigest: plan.manifest.digest, sourceCommit: plan.sourceCommit },
+  };
+}
+
 export function assertChangedFilesWithinImpactPlan(plan = {}, changedFiles = []) {
   const files = list(changedFiles);
-  if (!files.length || !["mapped", "unclassified"].includes(plan.status)) return true;
+  if (!files.length) return true;
   const scope = list(plan.allowedFileScope);
   const outside = files.filter((file) => !scope.some((pattern) => pathMatchesImpactScope(file, pattern)));
   if (outside.length) {
@@ -345,6 +397,17 @@ export function assertChangedFilesWithinImpactPlan(plan = {}, changedFiles = [])
     throw error;
   }
   return true;
+}
+
+/** Only a trusted base/config allowlist can authorize candidate-selected commands. */
+export function selectImpactValidationCommands({ plan = {}, aggregateCommands = [], approvedTargetedCommands = [], expectedCommitSha = "" } = {}) {
+  const fallback = (reason) => ({ commands: list(aggregateCommands), mode: "aggregate", reason });
+  if (!exactSha(expectedCommitSha) || plan.candidateBinding?.commitSha !== expectedCommitSha) return fallback("candidate_binding_unverified");
+  if (plan.status !== "mapped" || plan.fullRegression || plan.discovery?.required || plan.selectedComponents?.length !== 1) return fallback("full_regression_required");
+  const commands = list([...(plan.targetedTests || []), ...(plan.dependentTests || [])]);
+  const approved = new Set(list(approvedTargetedCommands));
+  if (!commands.length || commands.some((command) => !approved.has(command))) return fallback("targeted_commands_not_approved");
+  return { commands, mode: "scoped", reason: "verified_single_component" };
 }
 
 export function formatImpactPlanForPrompt(plan = {}) {
@@ -358,13 +421,18 @@ export function formatImpactPlanForPrompt(plan = {}) {
 - Manifest digest contract: SHA-256 of canonical JSON after schema validation and normalization; this is intentionally not the raw file-byte hash.
 - Selected components: ${components.join(", ") || "(unclassified)"}
 - Allowed file scope: ${scope.join(", ") || "(none; remap before editing)"}
+- Scope digest for an explicit remap: ${plan.editScopeDigest || impactScopeDigest(plan)}
+- Supporting read-only paths: ${list(plan.supportingFileScope).join(", ") || "(none)"}
+- Supporting contracts: ${(plan.supportingContext || []).map((item) => `${item.id}: ${list(item.publicContracts).join("; ")}`).join(" | ") || "(none)"}
 - Targeted implementation tests: ${tests.join(" && ") || "(none; use final aggregate only)"}
+- Dependent contract/composition tests: ${list(plan.dependentTests).join(" && ") || "(none)"}
 - Final aggregate required: ${plan.aggregateCommand || "npm run check"}
 - Full regression at integration: ${plan.fullRegression ? "yes" : "no"}
 - Reason codes: ${list(plan.reasonCodes).join(", ") || "(none)"}
 
 Context rules:
 - Start with the named component paths and tests. Do not list or broadly search the repository for mapped work.
+- Read supporting paths only as needed to understand the named contracts; supporting paths do not grant edit permission.
 - Do not edit outside the allowed file scope. If it is incomplete or stale, stop and request a bounded remap.
 - Keep broader discovery exceptional, redacted, artifact-backed, and out of the model transcript.`;
 }
