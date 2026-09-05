@@ -119,6 +119,7 @@ export const DATABASE_FILE = path.join(DATA_DIR, "mission-control.sqlite3");
 export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
 
 let database = null;
+let databaseReadyPromise = null;
 let integrityMigrated = false;
 let integrityMigrationPromise = null;
 
@@ -860,6 +861,12 @@ function readStateFromOpenDatabase(db) {
       .map((row) => parsePayload(row.payload, {}));
   }
   return state;
+}
+
+function stateDatabaseInitialized(db) {
+  return Boolean(
+    db.prepare("SELECT 1 AS initialized FROM state_meta WHERE singleton_id = 1").get()?.initialized,
+  );
 }
 
 function upsertEntity(db, table, item, sequence) {
@@ -2288,12 +2295,12 @@ async function initialState() {
   };
 }
 
-export async function ensureStateDatabase() {
+async function initializeStateDatabase() {
   assertIsolatedTestEnvironment();
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   await secureStoragePaths();
   const db = openDatabase();
-  if (!readStateFromOpenDatabase(db)) {
+  if (!stateDatabaseInitialized(db)) {
     const state = await initialState();
     state.meta = {
       ...(state.meta || {}),
@@ -2303,7 +2310,7 @@ export async function ensureStateDatabase() {
     };
     db.exec("BEGIN IMMEDIATE");
     try {
-      if (!readStateFromOpenDatabase(db)) {
+      if (!stateDatabaseInitialized(db)) {
         writeStateToOpenDatabase(db, state, {
           testFixtureLegacyAuthorityCapability:
             TEST_FIXTURE_LEGACY_AUTHORITY_BOOTSTRAP?.databaseCapability || null,
@@ -2318,6 +2325,16 @@ export async function ensureStateDatabase() {
   await migrateStateIntegrity(db);
   await secureStoragePaths();
   return db;
+}
+
+export async function ensureStateDatabase() {
+  if (!databaseReadyPromise) {
+    databaseReadyPromise = initializeStateDatabase().catch((error) => {
+      databaseReadyPromise = null;
+      throw error;
+    });
+  }
+  return databaseReadyPromise;
 }
 
 export async function readDatabaseState() {
@@ -2403,6 +2420,25 @@ export async function writeDatabaseState(state) {
   }
 }
 
+async function prepareDatabaseMutation(state, mutator, options) {
+  assertMaintenanceWriteAllowed(state);
+  const snapshot = mutationSnapshot(state);
+  reconcileStateIntegrity(state);
+
+  // Mutators must only transform the supplied snapshot or perform retry-safe
+  // reads. External writes belong in the fenced operation-intent workflow.
+  const result = await mutator(state);
+  assertProposedQaAuthorityPreserved(state, snapshot, options);
+  reconcileStateIntegrity(state);
+  state.meta = state.meta || {};
+  const archived = compactOperationalHistory(state);
+  const now = new Date().toISOString();
+  if (archivedItemCount(archived)) recordOperationalArchiveMetadata(state, archived, now);
+  state.meta.updatedAt = now;
+  state.meta.storageBackend = "sqlite";
+  return { state, snapshot, result, archived, now };
+}
+
 export async function mutateDatabaseState(mutator, options = {}) {
   const db = await ensureStateDatabase();
   const operationName = boundedOperationName(options.operationName);
@@ -2410,44 +2446,49 @@ export async function mutateDatabaseState(mutator, options = {}) {
   const startedAt = Date.now();
   let retryCount = 0;
   let lockWaitMs = 0;
+  let serializedReplay = false;
 
   while (true) {
-    const { state, version: expectedVersion } = readStateSnapshot(db);
-    assertMaintenanceWriteAllowed(state);
-    const snapshot = mutationSnapshot(state);
-    reconcileStateIntegrity(state);
-
-    // Mutators run before the write transaction. They must only transform the
-    // supplied snapshot or perform retry-safe reads; external writes belong in
-    // the fenced operation-intent workflow.
-    const result = await mutator(state);
-    assertProposedQaAuthorityPreserved(state, snapshot, options);
-    reconcileStateIntegrity(state);
-    state.meta = state.meta || {};
-    const archived = compactOperationalHistory(state);
-    const now = new Date().toISOString();
-    if (archivedItemCount(archived)) recordOperationalArchiveMetadata(state, archived, now);
-    state.meta.updatedAt = now;
-    state.meta.storageBackend = "sqlite";
-
     let transactionStarted = false;
     try {
-      const lockAttemptStartedAt = Date.now();
-      try {
-        db.exec("BEGIN IMMEDIATE");
-      } finally {
-        lockWaitMs += Date.now() - lockAttemptStartedAt;
+      let expectedVersion = 0;
+      let prepared;
+      if (serializedReplay) {
+        const lockAttemptStartedAt = Date.now();
+        try {
+          db.exec("BEGIN IMMEDIATE");
+        } finally {
+          lockWaitMs += Date.now() - lockAttemptStartedAt;
+        }
+        transactionStarted = true;
+        prepared = await prepareDatabaseMutation(readStateFromOpenDatabase(db), mutator, options);
+      } else {
+        const snapshot = readStateSnapshot(db);
+        expectedVersion = snapshot.version;
+        prepared = await prepareDatabaseMutation(snapshot.state, mutator, options);
       }
-      transactionStarted = true;
-      const currentVersion = Number(
-        db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
-      );
-      if (currentVersion !== expectedVersion) {
-        const conflict = new Error(
-          `StudioOps state changed during ${operationName}; expected version ${expectedVersion}, observed ${currentVersion}.`,
+
+      const { state, snapshot, result, archived, now } = prepared;
+      const lockAttemptStartedAt = Date.now();
+      if (!transactionStarted) {
+        try {
+          db.exec("BEGIN IMMEDIATE");
+        } finally {
+          lockWaitMs += Date.now() - lockAttemptStartedAt;
+        }
+        transactionStarted = true;
+      }
+      if (!serializedReplay) {
+        const currentVersion = Number(
+          db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
         );
-        conflict.code = "STUDIOOPS_STATE_CONFLICT";
-        throw conflict;
+        if (currentVersion !== expectedVersion) {
+          const conflict = new Error(
+            `StudioOps state changed during ${operationName}; expected version ${expectedVersion}, observed ${currentVersion}.`,
+          );
+          conflict.code = "STUDIOOPS_STATE_CONFLICT";
+          throw conflict;
+        }
       }
       const currentMeta = parsePayload(
         db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload,
@@ -2458,7 +2499,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
       writeMutationToOpenDatabase(db, state, snapshot, options);
       recordContentionEvent(db, {
         operationName,
-        outcome: "committed",
+        outcome: serializedReplay ? "serialized_replay" : "committed",
         waitMs: lockWaitMs,
         durationMs: Date.now() - startedAt,
         retryCount,
@@ -2476,6 +2517,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
         throw error;
       }
       retryCount += 1;
+      serializedReplay = true;
       await sleep(retryDelayMs(retryCount));
     }
   }
@@ -3259,6 +3301,20 @@ export async function databaseContentionHealth(input = {}) {
       retries: Number(event.retry_count || 0),
       createdAt: event.created_at,
     })),
+  };
+}
+
+export async function databaseStorageHealth() {
+  const db = await ensureStateDatabase();
+  const row = db.prepare(`
+    SELECT updated_at
+    FROM state_meta
+    WHERE singleton_id = 1
+  `).get();
+  if (!row) throw new Error("StudioOps state database is not initialized.");
+  return {
+    storage: "sqlite",
+    updatedAt: row.updated_at || "",
   };
 }
 
