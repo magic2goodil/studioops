@@ -69,11 +69,43 @@ function safeRelativePath(value, label) {
     || path.posix.isAbsolute(normalized)
     || normalized === ".."
     || normalized.startsWith("../")
-    || normalized.includes("/../")
+    || normalized.split("/").includes("..")
+    || normalized.includes("\0")
   ) {
     throw new Error(`${label} must be a repository-relative path: ${value || "(missing)"}`);
   }
   return normalized;
+}
+
+export function pathMatchesImpactScope(file, scope) {
+  const candidate = String(file || "").replaceAll("\\", "/").replace(/^\.\//, "");
+  const pattern = String(scope || "").replaceAll("\\", "/").replace(/^\.\//, "");
+  if (!candidate || !pattern) return false;
+  if (!pattern.includes("*")) return candidate === pattern || candidate.startsWith(`${pattern.replace(/\/$/, "")}/`);
+  const regex = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&")
+    .replaceAll("**", "\u0000").replaceAll("*", "[^/]*").replaceAll("\u0000", ".*");
+  return new RegExp(`^${regex}$`).test(candidate);
+}
+
+/** Compare tracked source inventory with ownership, never source contents. */
+export function inspectComponentMapCoverage(manifest, files = []) {
+  const roots = manifest.coverageRoots || [];
+  const relevant = list(files).filter((file) => roots.some((root) => pathMatchesImpactScope(file, root)));
+  const uncoveredFiles = [];
+  const conflictingFiles = [];
+  for (const file of relevant) {
+    const owners = Object.values(manifest.components).filter((component) => component.paths.some((scope) => pathMatchesImpactScope(file, scope)));
+    if (!owners.length) uncoveredFiles.push(file);
+    if (owners.length > 1) conflictingFiles.push({ path: file, owners: owners.map((owner) => owner.id).sort() });
+  }
+  return {
+    checked: roots.length > 0,
+    fileCount: relevant.length,
+    mappedFileCount: relevant.length - uncoveredFiles.length - conflictingFiles.length,
+    uncoveredFiles: uncoveredFiles.sort(),
+    conflictingFiles,
+    complete: !uncoveredFiles.length && !conflictingFiles.length,
+  };
 }
 
 function normalizeTest(test, componentId) {
@@ -219,6 +251,7 @@ export function validateComponentImpactMap(input, expected = {}) {
     schemaVersion: COMPONENT_IMPACT_SCHEMA_VERSION,
     project: { key: projectKey, repository },
     aggregateCommand: String(input.aggregateCommand || "npm run check").trim(),
+    ...(list(input.coverageRoots).length ? { coverageRoots: list(input.coverageRoots).map((item) => safeRelativePath(item, "Coverage root")) } : {}),
     fullRegressionTriggers: list(input.fullRegressionTriggers),
     fullRegressionKeywords: list(input.fullRegressionKeywords),
     releaseSensitivePaths,
@@ -306,12 +339,16 @@ export function loadProjectComponentImpactMap(project = {}, options = {}) {
     repository: projectRepositoryIdentity(project),
     compatibility: source === "legacy",
   });
+  const coverage = manifest.coverageRoots?.length
+    ? inspectComponentMapCoverage(manifest, trustedGit(repoRoot, ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ...manifest.coverageRoots]).split("\0").filter(Boolean))
+    : inspectComponentMapCoverage(manifest);
   return {
-    status: source === "primary" ? "mapped" : "legacy",
+    status: !coverage.complete ? "drifted" : source === "primary" ? "mapped" : "legacy",
     reason: source === "primary" ? "component_map_loaded" : "legacy_component_maps_loaded",
     manifest,
     digest: sha256Digest(manifest),
     path: source === "primary" ? relativeManifestPath : "docs/architecture/*.components.json",
+    coverage,
   };
 }
 
@@ -382,12 +419,16 @@ export function loadProjectComponentImpactMapAtCommit(project = {}, commitSha, o
     projectKey: String(project.key || project.id || "").trim(),
     repository: expectedRepository,
   });
+  const coverage = manifest.coverageRoots?.length
+    ? inspectComponentMapCoverage(manifest, trustedGit(repoRoot, ["ls-tree", "-r", "--name-only", "-z", sha, "--", ...manifest.coverageRoots]).split("\0").filter(Boolean))
+    : inspectComponentMapCoverage(manifest);
   return {
-    status: "mapped",
+    status: coverage.complete ? "mapped" : "drifted",
     reason: "candidate_component_map_loaded",
     manifest,
     digest: sha256Digest(manifest),
     path: relativeManifestPath,
     sourceCommit: sha,
+    coverage,
   };
 }

@@ -68,6 +68,7 @@ import {
   assertChangedFilesWithinImpactPlan,
   assertImpactPlanProjectBinding,
   exactCandidateChangedFiles,
+  remapTaskImpactScope,
   resolveProjectImpactPlan,
 } from "./impact-planner.js";
 import {
@@ -2663,6 +2664,23 @@ export async function updateTask(taskId, patch) {
     if (Object.prototype.hasOwnProperty.call(patch, "workAreas")) {
       task.workAreas = normalizeList(patch.workAreas);
     }
+    if (Object.prototype.hasOwnProperty.call(patch, "impactRemap")) {
+      if (!["ready", "queued", "in_progress", "needs_changes", "blocked"].includes(previousStatus)
+        || ["status", "subjectSha", "candidateIdentity", "impactEvidence"].some((key) => Object.prototype.hasOwnProperty.call(patch, key))) {
+        throw new Error("Record a scope remap while preparing builder work, separately from status or candidate submission.");
+      }
+      const remapped = remapTaskImpactScope(project, aggregateBeforePatch, patch.impactRemap);
+      const recordedAt = new Date().toISOString();
+      task.impactScopePlan = structuredClone(remapped.plan);
+      task.impactPlan = structuredClone(remapped.plan);
+      task.workAreas = remapped.workAreas;
+      state.events.push({ id: nextId(state.events, "event"), type: "task_impact_scope_remapped", projectId: task.projectId,
+        taskId: task.id, message: `Component scope remapped: ${remapped.record.reason}`, createdAt: recordedAt,
+        impactRemap: remapped.record });
+      state.comments.push({ id: nextId(state.comments, "comment"), taskId: task.id, author: "StudioOps Scope Remap",
+        body: `Explicit component remap: ${remapped.record.reason}\nPrevious scope digest: ${remapped.record.previousDigest}\nNew scope digest: ${remapped.record.nextDigest}\nEditable paths: ${remapped.record.nextScope.join(", ")}`,
+        createdAt: recordedAt });
+    }
     validateTaskRelationships(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
     if (Object.prototype.hasOwnProperty.call(patch, "attachments")) {
       task.attachments = normalizeAttachments(patch.attachments);
@@ -2757,7 +2775,9 @@ export async function updateTask(taskId, patch) {
       ...task,
       reviewSubjectSha: patchedSubjectSha,
     });
-    if (requestedStatus === "builder_review" && task.impactPlan?.status === "mapped") {
+    const approvedImpactScope = aggregateBeforePatch.impactScopePlan || aggregateBeforePatch.impactPlan;
+    if (requestedStatus === "builder_review" && approvedImpactScope
+      && (["mapped", "unclassified"].includes(approvedImpactScope.status) || approvedImpactScope.allowedFileScope?.length)) {
       const impactEvidence = Object.prototype.hasOwnProperty.call(patch, "impactEvidence")
         ? normalizedImpactEvidence(patch.impactEvidence || {})
         : normalizedImpactEvidence(task.impactEvidence || {});
@@ -2768,6 +2788,8 @@ export async function updateTask(taskId, patch) {
         cwd: process.cwd(),
       });
       assertChangedFileEvidenceMatches(actualChangedFiles, impactEvidence.changedFiles);
+      assertImpactPlanProjectBinding(approvedImpactScope, project);
+      assertChangedFilesWithinImpactPlan(approvedImpactScope, actualChangedFiles);
       const candidateImpactPlan = resolveProjectImpactPlan({
         project,
         task: {
@@ -2783,10 +2805,9 @@ export async function updateTask(taskId, patch) {
         changedFiles: actualChangedFiles,
       });
       assertImpactPlanProjectBinding(candidateImpactPlan, project);
-      if (candidateImpactPlan.status === "mapped") {
-        assertChangedFilesWithinImpactPlan(candidateImpactPlan, actualChangedFiles);
-      }
+      // Classification controls testing, never grants new edit authority.
       task.impactPlan = candidateImpactPlan;
+      task.impactScopePlan ||= structuredClone(approvedImpactScope);
     }
     const unchangedCandidateTree = Object.prototype.hasOwnProperty.call(patch, "candidateIdentity")
       && Object.prototype.hasOwnProperty.call(patch, "subjectSha")

@@ -48,6 +48,7 @@ import {
   verifyProjectValidationSandbox,
 } from "./project-validation-sandbox.js";
 import { redactPromotionValidationText } from "./promotion-validation-evidence.js";
+import { selectQaImpactValidation } from "./qa-impact-validation.js";
 import {
   assertCurrentIsolatedTestAuthority,
   consumeIsolatedTestAuthority,
@@ -1966,6 +1967,7 @@ function qaProjectPolicyBinding(project = {}) {
     qaIntegration: jsonValue(project.qaIntegration, {}),
     localQaPreview: jsonValue(project.localQaPreview, null),
     validationCommands: normalizeList(project.validationCommands),
+    componentImpactMapPath: String(project.componentImpactMapPath || ""),
   };
 }
 
@@ -2211,6 +2213,7 @@ export function planQaIntegrations(state, input = {}) {
         integrationBranch,
         integrationBranchUrl: branchWebUrl(project, integrationBranch),
         validationCommands: normalizeList(project.validationCommands),
+        componentImpactMapPath: String(project.componentImpactMapPath || ""),
         deferredTaskCount: candidateReady ? 0 : includedTasks.length,
         assembly,
         tasks: tasks.map((task) => {
@@ -2624,6 +2627,7 @@ async function integrateProject(projectPlan, options = {}) {
     repoUrl: candidatePlan.repoUrl,
     defaultBranch: candidatePlan.defaultBranch,
     integrationBranch: candidatePlan.integrationBranch,
+    componentImpactMapPath: candidatePlan.componentImpactMapPath,
   };
   const repoPath = String(project.repoPath || "").trim();
   const result = {
@@ -2834,7 +2838,7 @@ async function integrateProject(projectPlan, options = {}) {
       return result;
     }
 
-    const validationCommands = normalizeList(candidatePlan.validationCommands);
+    let validationCommands = normalizeList(candidatePlan.validationCommands);
     if (!validationCommands.length) {
       result.status = "validation_missing";
       result.output = "No project validationCommands are configured. The QA integration branch was not pushed or marked ready.";
@@ -2844,6 +2848,13 @@ async function integrateProject(projectPlan, options = {}) {
 
     const candidateCommit = await git(executionRepoPath, ["rev-parse", "--verify", "HEAD"], gitOptions);
     result.commit = candidateCommit.stdout.trim();
+    const candidateDiff = await git(executionRepoPath, ["diff", "--name-only", "--no-renames", "-z", result.baseSha, result.commit, "--"], gitOptions);
+    result.validationSelection = selectQaImpactValidation({
+      project, repoRoot: executionRepoPath, baseSha: result.baseSha, commitSha: result.commit,
+      changedFiles: candidateDiff.stdout.split("\0").filter(Boolean),
+      aggregateCommands: validationCommands,
+    });
+    validationCommands = result.validationSelection.commands;
     const validationWorkspaceRoot = resolveWorkspaceRoot(
       options.projectValidationWorkspaceRoot
         || options.validationWorkspaceRoot
@@ -3028,6 +3039,7 @@ async function integrateProject(projectPlan, options = {}) {
         command: item.command,
         ok: item.ok,
         output: stableQaOutput(item.output, result.workspacePath),
+        selection: result.validationSelection,
       })).digest("hex")}`,
     }));
     const candidate = createCandidateEnvelope({
@@ -3366,6 +3378,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
       status: projectResult.status,
       commands: projectResult.validation || [],
       sandbox: projectResult.validationSandbox || null,
+      selection: projectResult.validationSelection || null,
     },
     assignedAgentRole,
     reviewerThreadId: "",

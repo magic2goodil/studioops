@@ -905,6 +905,151 @@ test("conflicting idempotent mutations finish through serialized replay", async 
   }
 });
 
+test("same-process asynchronous mutations retain every update through serialized replay", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-shared-connection-"));
+  try {
+    await writeLegacyState(root);
+    const { stdout } = await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { databaseContentionHealth } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      await Promise.all(Array.from({ length: 4 }, (_, index) => mutateState(async (state) => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        state.meta.workers = state.meta.workers || [];
+        if (!state.meta.workers.includes(index)) state.meta.workers.push(index);
+      }, { operationName: "test.same_process_" + index })));
+      assert.deepEqual([...(await readState()).meta.workers].sort(), [0, 1, 2, 3]);
+      process.stdout.write(JSON.stringify(await databaseContentionHealth()));
+    `);
+    const health = JSON.parse(stdout);
+    assert.equal(health.successfulOperationCount, 4);
+    assert.equal(health.failedOperationCount, 0);
+    assert.ok(health.recent.some((event) => event.outcome === "serialized_replay"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("async replay permits committed reads and queues unrelated coordination and state writers", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-replay-consumers-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { readDatabaseStateCached, databaseStorageHealth, withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      import { claimResourceLease, listDueExternalOperations } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/coordination.js")).href)};
+      await readState();
+      let started, resumeFirst, replayStarted, resumeReplay;
+      const first = new Promise((resolve) => { started = resolve; });
+      const firstPause = new Promise((resolve) => { resumeFirst = resolve; });
+      const replay = new Promise((resolve) => { replayStarted = resolve; });
+      const replayPause = new Promise((resolve) => { resumeReplay = resolve; });
+      let attempts = 0;
+      const slow = mutateState(async (state) => {
+        attempts += 1;
+        if (attempts === 1) { started(); await firstPause; }
+        else { replayStarted(); await replayPause; }
+        state.meta.slow = true;
+      }, { operationName: "test.replay_consumer" });
+      await first;
+      await mutateState((state) => { state.meta.fast = true; });
+      const before = await readDatabaseStateCached();
+      resumeFirst();
+      await replay;
+      assert.equal(await readDatabaseStateCached(), before);
+      assert.equal((await readState()).meta.slow, undefined);
+      assert.equal((await databaseStorageHealth()).storage, "sqlite");
+      assert.deepEqual(await listDueExternalOperations(), []);
+      let leaseFinished = false;
+      const lease = claimResourceLease({ resourceKey: "test:consumer", aggregateType: "task", aggregateId: "task_1", ownerProcessIdentity: "test:worker", expectedStateVersion: before.tasks[0].stateVersion, leaseTtlMs: 10000 }).then((result) => { leaseFinished = true; return result; });
+      const write = mutateState((state) => { state.meta.other = true; });
+      await assert.rejects(withStateDatabaseConnection(() => {}, { deadlineAt: Date.now() + 25 }), { code: "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT" });
+      assert.equal(leaseFinished, false);
+      resumeReplay();
+      await Promise.all([slow, lease, write]);
+      const after = await readState();
+      assert.equal(after.meta.slow, true);
+      assert.equal(after.meta.other, true);
+      assert.equal(leaseFinished, true);
+    `);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cached display snapshots are immutable and follow committed versions across connections", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-cached-read-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { DatabaseSync } from "node:sqlite";
+      import { DATABASE_FILE, readDatabaseStateCached, withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      const first = await readDatabaseStateCached();
+      assert.equal(first, await readDatabaseStateCached());
+      assert.ok(Object.isFrozen(first) && Object.isFrozen(first.tasks) && Object.isFrozen(first.tasks[0]));
+      assert.throws(() => { first.tasks[0].title = "must not mutate"; }, TypeError);
+      let entered, resume;
+      const enteredGate = new Promise((resolve) => { entered = resolve; });
+      const pause = new Promise((resolve) => { resume = resolve; });
+      const owner = withStateDatabaseConnection(async (db) => {
+        db.exec("BEGIN IMMEDIATE");
+        db.prepare("UPDATE state_meta SET payload = ?, version = version + 1 WHERE singleton_id = 1").run(JSON.stringify({ ...first.meta, marker: "committed" }));
+        entered();
+        await pause;
+        db.exec("COMMIT");
+      });
+      await enteredGate;
+      assert.equal(await readDatabaseStateCached(), first);
+      assert.equal((await readDatabaseStateCached()).meta.marker, undefined);
+      resume();
+      await owner;
+      const second = await readDatabaseStateCached();
+      assert.notEqual(second, first);
+      assert.equal(second.meta.marker, "committed");
+      const external = new DatabaseSync(DATABASE_FILE);
+      external.prepare("UPDATE state_meta SET payload = ?, version = version + 1 WHERE singleton_id = 1").run(JSON.stringify({ ...second.meta, marker: "external" }));
+      external.close();
+      const third = await readDatabaseStateCached();
+      assert.notEqual(third, second);
+      assert.equal(third.meta.marker, "external");
+    `);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("connection ownership cannot grant an expired waiter after a stalled event loop", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-owner-deadline-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      let entered, resume;
+      const ready = new Promise((resolve) => { entered = resolve; });
+      const pause = new Promise((resolve) => { resume = resolve; });
+      const owner = withStateDatabaseConnection(async () => {
+        entered();
+        await pause;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60);
+      });
+      await ready;
+      let called = false;
+      const rejected = assert.rejects(withStateDatabaseConnection(() => { called = true; }, { deadlineAt: Date.now() + 25 }), { code: "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT" });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      resume();
+      await Promise.all([owner, rejected]);
+      assert.equal(called, false);
+      await withStateDatabaseConnection(() => {});
+    `);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("slow mutation preparation does not hold the SQLite write lock", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-short-lock-"));
   try {
@@ -991,6 +1136,93 @@ test("database contention health is bounded and omits mutation payload data", as
     assert.equal(Array.isArray(health.recent), true);
     assert.equal(JSON.stringify(health).includes("private comment body"), false);
     assert.equal(health.recent.length <= 20, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed mutation telemetry survives a locked workflow database and the writer process exiting", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-failed-telemetry-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { DatabaseSync } from "node:sqlite";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { DATABASE_FILE, databaseContentionHealth } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      const blocker = new DatabaseSync(DATABASE_FILE);
+      blocker.exec("BEGIN IMMEDIATE");
+      try {
+        await assert.rejects(mutateState((state) => {
+          state.meta.privateMarker = "must-not-be-in-health";
+        }, { operationName: "test.locked_failure", maxBusyRetries: 0 }), /locked/);
+        const health = await databaseContentionHealth();
+        assert.equal(health.failedOperationCount, 1);
+        assert.equal(health.failureTelemetryAvailable, true);
+        assert.equal(health.recent[0].failureCode, "SQLITE_BUSY");
+      } finally {
+        blocker.exec("ROLLBACK");
+        blocker.close();
+      }
+      await assert.rejects(mutateState(() => {
+        throw new Error("private-error-must-not-be-in-health");
+      }, { operationName: "test.callback_failure" }));
+    `);
+    const { stdout } = await runStoreScript(root, `
+      import { databaseContentionHealth } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      process.stdout.write(JSON.stringify(await databaseContentionHealth()));
+    `);
+    const health = JSON.parse(stdout);
+    assert.equal(health.failedOperationCount, 2);
+    assert.equal(health.operationCount, health.successfulOperationCount + 2);
+    assert.equal(health.recent.every((event) => event.outcome === "failed"), true);
+    assert.equal(stdout.includes("must-not-be-in-health"), false);
+    assert.equal(stdout.includes("private-error"), false);
+    const files = await readdir(path.join(root, "data", "database-contention-failures"));
+    assert.equal(files.length, 2);
+    assert.ok(files.every((name) => name.endsWith(".json")));
+    for (const name of files) {
+      assert.equal((await stat(path.join(root, "data", "database-contention-failures", name))).mode & 0o777, 0o600);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failure telemetry retention is capped and unreadable evidence is reported unavailable", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-telemetry-retention-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { randomUUID } from "node:crypto";
+      import { mkdir, readdir, writeFile } from "node:fs/promises";
+      import path from "node:path";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { DATABASE_FILE, databaseContentionHealth } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      const directory = path.join(path.dirname(DATABASE_FILE), "database-contention-failures");
+      await mkdir(directory, { mode: 0o700 });
+      const now = Date.now();
+      const event = { operation_name: "test.retention", outcome: "failed", failure_code: "MUTATION_FAILED", wait_ms: 0, duration_ms: 1, retry_count: 0, created_at: new Date(now).toISOString() };
+      for (let index = 0; index < 1001; index += 32) {
+        await Promise.all(Array.from({ length: Math.min(32, 1001 - index) }, (_, offset) => writeFile(path.join(directory, (now - index - offset) + "-" + randomUUID() + ".json"), JSON.stringify(event), { mode: 0o600 })));
+      }
+      const expired = (now - 2 * 86400000) + "-" + randomUUID() + ".tmp";
+      await writeFile(path.join(directory, expired), "{}", { mode: 0o600 });
+      await assert.rejects(mutateState(() => { throw new Error("retention probe"); }));
+      const files = await readdir(directory);
+      assert.equal(files.length, 1000);
+      assert.equal(files.includes(expired), false);
+      const health = await databaseContentionHealth();
+      assert.equal(health.failedOperationCount, 1000);
+      assert.equal(health.failureTelemetryAvailable, true);
+      await writeFile(path.join(directory, Date.now() + "-" + randomUUID() + ".json"), "x".repeat(3000), { mode: 0o600 });
+      await assert.rejects(mutateState(() => { throw new Error("retention probe"); }));
+      assert.equal((await readdir(directory)).length, 1000);
+      assert.equal((await databaseContentionHealth()).failureTelemetryAvailable, false);
+    `);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

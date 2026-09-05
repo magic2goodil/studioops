@@ -64,6 +64,7 @@ import {
 import {
   assertImpactPlanProjectBinding,
   formatImpactPlanForPrompt,
+  impactScopeDigest,
   resolveProjectImpactPlan,
   writeBoundedDiscoveryArtifact,
 } from "./impact-planner.js";
@@ -1606,6 +1607,11 @@ function withExecutionImpactPlan(run) {
     sourceCommit: run.reviewSubjectSha || run.preflightBaseCommit || "",
   });
   assertImpactPlanProjectBinding(impactPlan, run.project);
+  if (run.task?.impactScopePlan) {
+    assertImpactPlanProjectBinding(run.task.impactScopePlan, run.project);
+    impactPlan.allowedFileScope = [...run.task.impactScopePlan.allowedFileScope];
+    impactPlan.editScopeDigest = impactScopeDigest(run.task.impactScopePlan);
+  }
   return {
     ...run,
     impactPlan,

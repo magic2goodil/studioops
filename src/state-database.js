@@ -1,6 +1,7 @@
 import { backup, DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, stat } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { assertCandidateEnvelope, canonicalJson } from "./candidate-manifest.js";
 import {
@@ -70,6 +71,8 @@ const MAX_MUTATION_RETRIES = 8;
 const SERIALIZED_REPLAY_LOCK_DEADLINE_MS = 10_000;
 const CONTENTION_EVENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_CONTENTION_EVENTS = 1_000;
+const FAILURE_TELEMETRY_DIR = path.join(missionControlDataDir(), "database-contention-failures");
+const FAILURE_TELEMETRY_FILE = /^(\d{13})-[a-f0-9-]{36}\.(json|tmp)$/;
 const QA_REVOCATION_SETTLEMENT_WRITE = Symbol("studioops.qa-revocation-settlement-write");
 const QA_REVOCATION_INTENT_WRITE = Symbol("studioops.qa-revocation-intent-write");
 const CANDIDATE_QA_DECISION_WRITE = Symbol("studioops.candidate-qa-decision-write");
@@ -121,6 +124,13 @@ export const LEGACY_DATA_FILE = path.join(DATA_DIR, "mission-control.json");
 
 let database = null;
 let databaseReadyPromise = null;
+let readerDatabase = null;
+let cachedReadSnapshot = null;
+let connectionLeased = false;
+const connectionWaiters = [];
+const connectionLeaseContext = new AsyncLocalStorage();
+let failureTelemetryCache = null;
+let failureTelemetryWriteErrors = 0;
 let integrityMigrated = false;
 let integrityMigrationPromise = null;
 
@@ -358,6 +368,92 @@ function recordContentionEvent(db, input = {}) {
       LIMIT -1 OFFSET ?
     )
   `).run(MAX_CONTENTION_EVENTS);
+}
+
+async function pruneFailureTelemetry() {
+  const cutoff = Date.now() - CONTENTION_EVENT_RETENTION_MS;
+  const names = (await readdir(FAILURE_TELEMETRY_DIR)).filter((name) => FAILURE_TELEMETRY_FILE.test(name)).sort().reverse();
+  const obsolete = names.filter((name, index) => index >= MAX_CONTENTION_EVENTS || Number(name.slice(0, 13)) < cutoff);
+  for (let index = 0; index < obsolete.length; index += 32) {
+    await Promise.all(obsolete.slice(index, index + 32).map((name) => unlink(path.join(FAILURE_TELEMETRY_DIR, name)).catch(() => {})));
+  }
+}
+
+function safeMutationFailureCode(error) {
+  if (isSqliteBusy(error)) return "SQLITE_BUSY";
+  return new Set([
+    "STUDIOOPS_STATE_CONFLICT", "STUDIOOPS_SERIALIZED_REPLAY_TIMEOUT",
+    "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT", "STUDIOOPS_DATABASE_TRANSACTION_REENTRY",
+    "STUDIOOPS_MAINTENANCE",
+  ]).has(error?.code) ? error.code : "MUTATION_FAILED";
+}
+
+// The failure path cannot rely on obtaining the SQLite lock that just failed.
+// Atomically publish bounded, payload-free events so a CLI exit cannot hide a failure.
+async function recordFailedContentionEvent(input, error) {
+  const now = Date.now();
+  const basename = `${now}-${randomUUID()}`;
+  const temporaryPath = path.join(FAILURE_TELEMETRY_DIR, `${basename}.tmp`);
+  const event = {
+    operation_name: boundedOperationName(input.operationName),
+    outcome: "failed",
+    failure_code: safeMutationFailureCode(error),
+    wait_ms: Math.max(0, Math.round(input.waitMs)),
+    duration_ms: Math.max(0, Math.round(input.durationMs)),
+    retry_count: Math.max(0, Math.floor(input.retryCount)),
+    created_at: new Date(now).toISOString(),
+  };
+  try {
+    await mkdir(FAILURE_TELEMETRY_DIR, { recursive: true, mode: 0o700 });
+    await writeFile(temporaryPath, JSON.stringify(event), { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await rename(temporaryPath, path.join(FAILURE_TELEMETRY_DIR, `${basename}.json`));
+    await pruneFailureTelemetry();
+    failureTelemetryCache = null;
+  } catch {
+    failureTelemetryWriteErrors += 1;
+    await unlink(temporaryPath).catch(() => {});
+  }
+}
+
+async function readFailedContentionEvents() {
+  try {
+    const directory = await stat(FAILURE_TELEMETRY_DIR, { bigint: true });
+    const signature = `${directory.mtimeNs}:${directory.ctimeNs}`;
+    if (failureTelemetryCache?.signature === signature) return failureTelemetryCache;
+    const names = (await readdir(FAILURE_TELEMETRY_DIR))
+      .filter((name) => FAILURE_TELEMETRY_FILE.test(name) && name.endsWith(".json"))
+      .sort().reverse().slice(0, MAX_CONTENTION_EVENTS);
+    const events = [];
+    let available = true;
+    for (let index = 0; index < names.length; index += 32) {
+      const batch = await Promise.all(names.slice(index, index + 32).map(async (name) => {
+        try {
+          const filename = path.join(FAILURE_TELEMETRY_DIR, name);
+          if ((await stat(filename)).size > 2_048) {
+            available = false;
+            return null;
+          }
+          const event = JSON.parse(await readFile(filename, "utf8"));
+          if (
+            event.outcome !== "failed" || !Number.isFinite(Date.parse(event.created_at))
+            || ![event.wait_ms, event.duration_ms, event.retry_count].every((value) => Number.isFinite(value) && value >= 0)
+          ) {
+            available = false;
+            return null;
+          }
+          return { ...event, operation_name: boundedOperationName(event.operation_name), failure_code: safeMutationFailureCode({ code: event.failure_code }) };
+        } catch (error) {
+          if (error.code !== "ENOENT") available = false;
+          return null;
+        }
+      }));
+      events.push(...batch.filter(Boolean));
+    }
+    failureTelemetryCache = { signature, events, available };
+    return failureTelemetryCache;
+  } catch (error) {
+    return { events: [], available: error.code === "ENOENT" };
+  }
 }
 
 function readStateSnapshot(db) {
@@ -1699,15 +1795,18 @@ function assertTaskQaDecisionTransitions(state, snapshot, options = {}) {
     );
     if (previousWasMirror) {
       const candidate = currentCandidates.get(previousCandidate.id);
-      const exactInvalidation = Boolean(
+      // Siblings may submit in separate transactions after the first source
+      // invalidates their shared candidate. Detach only the task mirror; the
+      // candidate decision and durable invalidation remain append-only above.
+      const detachesInvalidatedCandidate = Boolean(
         candidate?.invalidation
-        && !previousCandidate.invalidation
         && candidate.status === "invalidated"
+        && canonicalJson(candidate.qaDecision) === canonicalJson(previousCandidate.qaDecision)
         && task.qaDecision === null
         && !task.candidateId
         && !task.qaBundleId,
       );
-      if (exactInvalidation) continue;
+      if (detachesInvalidatedCandidate) continue;
       throw new Error(`Task ${taskId} qaDecision authority mirror is append-only while its candidate remains linked.`);
     }
     if (task.qaDecision) {
@@ -2360,9 +2459,109 @@ export async function ensureStateDatabase() {
   return databaseReadyPromise;
 }
 
-export async function readDatabaseState() {
+function connectionWaitError(operationName) {
+  const error = new Error(`StudioOps database connection wait deadline exceeded during ${operationName}.`);
+  error.code = "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT";
+  return error;
+}
+
+function releaseDatabaseConnection() {
+  let waiter;
+  while ((waiter = connectionWaiters.shift())) {
+    clearTimeout(waiter.timer);
+    if (Date.now() >= waiter.deadlineAt) {
+      waiter.reject(connectionWaitError(waiter.operationName));
+      continue;
+    }
+    waiter.resolve(releaseDatabaseConnection);
+    return;
+  }
+  connectionLeased = false;
+}
+
+function acquireDatabaseConnection(operationName, deadlineAt) {
+  if (connectionLeaseContext.getStore()) {
+    const error = new Error("State mutators must not start another database write while holding a transaction.");
+    error.code = "STUDIOOPS_DATABASE_TRANSACTION_REENTRY";
+    throw error;
+  }
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) throw connectionWaitError(operationName);
+  if (!connectionLeased) {
+    connectionLeased = true;
+    return Promise.resolve(releaseDatabaseConnection);
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, operationName, deadlineAt, timer: null };
+    waiter.timer = setTimeout(() => {
+      const index = connectionWaiters.indexOf(waiter);
+      if (index >= 0) connectionWaiters.splice(index, 1);
+      reject(connectionWaitError(operationName));
+    }, remainingMs);
+    connectionWaiters.push(waiter);
+  });
+}
+
+/** Own the process-wide write connection until the callback has settled. */
+export async function withStateDatabaseConnection(callback, input = {}) {
   const db = await ensureStateDatabase();
-  return readStateFromOpenDatabase(db);
+  const release = await acquireDatabaseConnection(
+    boundedOperationName(input.operationName),
+    input.deadlineAt || Date.now() + SERIALIZED_REPLAY_LOCK_DEADLINE_MS,
+  );
+  try {
+    return await connectionLeaseContext.run(true, () => callback(db));
+  } finally {
+    release();
+  }
+}
+
+async function ensureReadOnlyStateDatabase() {
+  await ensureStateDatabase();
+  assertIsolatedTestEnvironment();
+  if (!readerDatabase) {
+    readerDatabase = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+    readerDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+  }
+  return readerDatabase;
+}
+
+/** Read callbacks are synchronous and use a connection that cannot see uncommitted writes. */
+export async function withStateDatabaseRead(callback) {
+  const result = callback(await ensureReadOnlyStateDatabase());
+  if (result && typeof result.then === "function") {
+    throw new Error("Database read callbacks must be synchronous.");
+  }
+  return result;
+}
+
+function freezeReadSnapshot(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) freezeReadSnapshot(child);
+  return Object.freeze(value);
+}
+
+/** A display-only snapshot, reused only while the committed database version is unchanged. */
+export async function readDatabaseStateCached() {
+  return withStateDatabaseRead((db) => {
+    db.exec("BEGIN");
+    try {
+      const version = Number(db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version);
+      if (!Number.isFinite(version)) throw new Error("StudioOps state database is not initialized.");
+      if (!cachedReadSnapshot || cachedReadSnapshot.version !== version) {
+        cachedReadSnapshot = { version, state: freezeReadSnapshot(readStateFromOpenDatabase(db)) };
+      }
+      db.exec("COMMIT");
+      return cachedReadSnapshot.state;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  });
+}
+
+export async function readDatabaseState() {
+  return withStateDatabaseRead((db) => readStateSnapshot(db).state);
 }
 
 export async function readDatabaseStateReadOnly() {
@@ -2386,7 +2585,7 @@ export async function readDatabaseStateReadOnly() {
     },
   );
   try {
-    const state = readStateFromOpenDatabase(db);
+    const state = readStateSnapshot(db).state;
     if (!state) throw new Error("StudioOps state database is not initialized; read-only inspection cannot initialize it.");
     return state;
   } finally {
@@ -2417,30 +2616,31 @@ function assertMaintenanceWriteAllowed(state) {
 }
 
 export async function writeDatabaseState(state) {
-  const db = await ensureStateDatabase();
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const previousState = readStateFromOpenDatabase(db);
-    assertMaintenanceWriteAllowed(previousState);
-    const snapshot = mutationSnapshot(previousState);
-    assertProposedQaAuthorityPreserved(state, snapshot);
-    reconcileStateIntegrity(state);
-    normalizeTaskStateVersions(state, snapshot);
-    assertValidTaskStatuses(state);
-    const archived = compactOperationalHistory(state);
-    if (archivedItemCount(archived)) {
-      const now = new Date().toISOString();
-      archiveOperationalHistory(db, archived, now);
-      state.meta = state.meta || {};
-      recordOperationalArchiveMetadata(state, archived, now);
+  await withStateDatabaseConnection((db) => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const previousState = readStateFromOpenDatabase(db);
+      assertMaintenanceWriteAllowed(previousState);
+      const snapshot = mutationSnapshot(previousState);
+      assertProposedQaAuthorityPreserved(state, snapshot);
+      reconcileStateIntegrity(state);
+      normalizeTaskStateVersions(state, snapshot);
+      assertValidTaskStatuses(state);
+      const archived = compactOperationalHistory(state);
+      if (archivedItemCount(archived)) {
+        const now = new Date().toISOString();
+        archiveOperationalHistory(db, archived, now);
+        state.meta = state.meta || {};
+        recordOperationalArchiveMetadata(state, archived, now);
+      }
+      writeStateToOpenDatabase(db, state);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
     }
-    writeStateToOpenDatabase(db, state);
-    db.exec("COMMIT");
-    await secureStoragePaths();
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  }, { operationName: "state.replace" });
+  await secureStoragePaths();
 }
 
 async function prepareDatabaseMutation(state, mutator, options) {
@@ -2463,7 +2663,7 @@ async function prepareDatabaseMutation(state, mutator, options) {
 }
 
 export async function mutateDatabaseState(mutator, options = {}) {
-  const db = await ensureStateDatabase();
+  await ensureStateDatabase();
   const operationName = boundedOperationName(options.operationName);
   const retryPolicy = mutationRetryPolicy(options);
   const startedAt = Date.now();
@@ -2473,72 +2673,73 @@ export async function mutateDatabaseState(mutator, options = {}) {
   let serializedReplayDeadlineAt = 0;
 
   while (true) {
-    let transactionStarted = false;
     try {
       let expectedVersion = 0;
       let prepared;
-      if (serializedReplay) {
-        const lockAttemptStartedAt = Date.now();
-        try {
-          beginSerializedReplayTransaction(
-            db,
-            operationName,
-            serializedReplayDeadlineAt,
-            retryCount,
-          );
-        } finally {
-          lockWaitMs += Date.now() - lockAttemptStartedAt;
-        }
-        transactionStarted = true;
-        prepared = await prepareDatabaseMutation(readStateFromOpenDatabase(db), mutator, options);
-      } else {
-        const snapshot = readStateSnapshot(db);
+      if (!serializedReplay) {
+        const snapshot = await withStateDatabaseRead(readStateSnapshot);
         expectedVersion = snapshot.version;
         prepared = await prepareDatabaseMutation(snapshot.state, mutator, options);
       }
-
-      const { state, snapshot, result, archived, now } = prepared;
       const lockAttemptStartedAt = Date.now();
-      if (!transactionStarted) {
+      let acquired = false;
+      const result = await withStateDatabaseConnection(async (db) => {
+        let transactionStarted = false;
         try {
-          db.exec("BEGIN IMMEDIATE");
-        } finally {
+          if (serializedReplay) {
+            beginSerializedReplayTransaction(db, operationName, serializedReplayDeadlineAt, retryCount);
+          } else {
+            db.exec("BEGIN IMMEDIATE");
+          }
+          transactionStarted = true;
           lockWaitMs += Date.now() - lockAttemptStartedAt;
-        }
-        transactionStarted = true;
-      }
-      if (!serializedReplay) {
-        const currentVersion = Number(
-          db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
-        );
-        if (currentVersion !== expectedVersion) {
-          const conflict = new Error(
-            `StudioOps state changed during ${operationName}; expected version ${expectedVersion}, observed ${currentVersion}.`,
+          acquired = true;
+          if (serializedReplay) {
+            prepared = await prepareDatabaseMutation(readStateFromOpenDatabase(db), mutator, options);
+          }
+          const { state, snapshot, result: mutationResult, archived, now } = prepared;
+          if (!serializedReplay) {
+            const currentVersion = Number(
+              db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
+            );
+            if (currentVersion !== expectedVersion) {
+              const conflict = new Error(
+                `StudioOps state changed during ${operationName}; expected version ${expectedVersion}, observed ${currentVersion}.`,
+              );
+              conflict.code = "STUDIOOPS_STATE_CONFLICT";
+              throw conflict;
+            }
+          }
+          const currentMeta = parsePayload(
+            db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload,
+            {},
           );
-          conflict.code = "STUDIOOPS_STATE_CONFLICT";
-          throw conflict;
+          assertMaintenanceWriteAllowed({ meta: currentMeta });
+          if (archivedItemCount(archived)) archiveOperationalHistory(db, archived, now);
+          writeMutationToOpenDatabase(db, state, snapshot, options);
+          recordContentionEvent(db, {
+            operationName,
+            outcome: serializedReplay ? "serialized_replay" : "committed",
+            waitMs: lockWaitMs,
+            durationMs: Date.now() - startedAt,
+            retryCount,
+          });
+          db.exec("COMMIT");
+          transactionStarted = false;
+          return mutationResult;
+        } catch (error) {
+          if (transactionStarted) db.exec("ROLLBACK");
+          throw error;
         }
-      }
-      const currentMeta = parsePayload(
-        db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload,
-        {},
-      );
-      assertMaintenanceWriteAllowed({ meta: currentMeta });
-      if (archivedItemCount(archived)) archiveOperationalHistory(db, archived, now);
-      writeMutationToOpenDatabase(db, state, snapshot, options);
-      recordContentionEvent(db, {
+      }, {
         operationName,
-        outcome: serializedReplay ? "serialized_replay" : "committed",
-        waitMs: lockWaitMs,
-        durationMs: Date.now() - startedAt,
-        retryCount,
+        ...(serializedReplay ? { deadlineAt: serializedReplayDeadlineAt } : {}),
+      }).finally(() => {
+        if (!acquired) lockWaitMs += Date.now() - lockAttemptStartedAt;
       });
-      db.exec("COMMIT");
-      transactionStarted = false;
       await secureStoragePaths();
       return result;
     } catch (error) {
-      if (transactionStarted) db.exec("ROLLBACK");
       const retryableConflict = error.code === "STUDIOOPS_STATE_CONFLICT" || isSqliteBusy(error);
       const serializedLockCanWait = serializedReplay
         && isSqliteBusy(error)
@@ -2550,6 +2751,9 @@ export async function mutateDatabaseState(mutator, options = {}) {
       ) {
         error.operationName = operationName;
         error.retryCount = retryCount;
+        await recordFailedContentionEvent({
+          operationName, waitMs: lockWaitMs, durationMs: Date.now() - startedAt, retryCount,
+        }, error);
         throw error;
       }
       retryCount += 1;
@@ -3117,63 +3321,65 @@ function failureClaimAuthority(input = {}) {
  * SDK, CLI, dispatcher, and watchdog callers share this single table and cap.
  */
 export async function claimFailureContainmentPaidAttempt(input = {}) {
-  const db = await ensureStateDatabase();
   const authority = failureClaimAuthority(input);
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
-    assertMaintenanceWriteAllowed({ meta });
-    const previous = failureIncidentFromRow(latestFailureIncidentRow(
-      db,
-      authority.fingerprint.value.taskId,
-      authority.fingerprint.digest,
-    ));
-    const initial = previous || createFailureIncident({
-      fingerprint: authority.fingerprint,
-      evidence: authority.evidence,
-      now: input.now,
-    });
-    const result = claimPaidFailureAttempt(initial, {
-      ...input,
-      evidence: authority.evidence,
-    });
-    supersedePriorFailureGeneration(db, previous, result.incident);
-    upsertFailureIncidentRow(db, result.incident);
-    db.exec("COMMIT");
-    return result;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  return withStateDatabaseConnection((db) => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+      assertMaintenanceWriteAllowed({ meta });
+      const previous = failureIncidentFromRow(latestFailureIncidentRow(
+        db,
+        authority.fingerprint.value.taskId,
+        authority.fingerprint.digest,
+      ));
+      const initial = previous || createFailureIncident({
+        fingerprint: authority.fingerprint,
+        evidence: authority.evidence,
+        now: input.now,
+      });
+      const result = claimPaidFailureAttempt(initial, {
+        ...input,
+        evidence: authority.evidence,
+      });
+      supersedePriorFailureGeneration(db, previous, result.incident);
+      upsertFailureIncidentRow(db, result.incident);
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }, { operationName: "failure_containment.claim_paid_attempt" });
 }
 
 async function mutateFailureIncident(input, transition, options = {}) {
-  const db = await ensureStateDatabase();
   const authority = failureClaimAuthority(input);
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
-    assertMaintenanceWriteAllowed({ meta });
-    const previous = failureIncidentFromRow(latestFailureIncidentRow(
-      db,
-      authority.fingerprint.value.taskId,
-      authority.fingerprint.digest,
-    ));
-    const initial = previous || (options.createIfMissing ? createFailureIncident({
-      fingerprint: authority.fingerprint,
-      evidence: authority.evidence,
-      now: input.now,
-    }) : null);
-    if (!initial) throw new Error("Failure incident does not exist.");
-    const current = transition(initial, authority.evidence);
-    supersedePriorFailureGeneration(db, previous, current);
-    upsertFailureIncidentRow(db, current);
-    db.exec("COMMIT");
-    return current;
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  return withStateDatabaseConnection((db) => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+      assertMaintenanceWriteAllowed({ meta });
+      const previous = failureIncidentFromRow(latestFailureIncidentRow(
+        db,
+        authority.fingerprint.value.taskId,
+        authority.fingerprint.digest,
+      ));
+      const initial = previous || (options.createIfMissing ? createFailureIncident({
+        fingerprint: authority.fingerprint,
+        evidence: authority.evidence,
+        now: input.now,
+      }) : null);
+      if (!initial) throw new Error("Failure incident does not exist.");
+      const current = transition(initial, authority.evidence);
+      supersedePriorFailureGeneration(db, previous, current);
+      upsertFailureIncidentRow(db, current);
+      db.exec("COMMIT");
+      return current;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }, { operationName: "failure_containment.transition" });
 }
 
 export async function recordFailureContainmentActivity(input = {}) {
@@ -3199,7 +3405,7 @@ export async function openFailureContainmentCircuit(input = {}) {
 
 /** Indexed operational query; never scans run payloads. */
 export async function readFailureIncidents(input = {}) {
-  const db = await ensureStateDatabase();
+  const db = await ensureReadOnlyStateDatabase();
   const where = [];
   const parameters = [];
   if (input.taskId) {
@@ -3227,7 +3433,7 @@ export async function readFailureIncidents(input = {}) {
 
 /** Cursor-paginated failure rows for the bounded owner progress read model. */
 export async function readFailureIncidentPage(input = {}) {
-  const db = await ensureStateDatabase();
+  const db = await ensureReadOnlyStateDatabase();
   const where = [];
   const parameters = [];
   const taskIds = [...new Set((input.taskIds || []).map(String).filter(Boolean))].slice(0, 500);
@@ -3270,7 +3476,7 @@ export async function readFailureIncidentPage(input = {}) {
 
 /** Aggregate counters are independent of the incident detail page size. */
 export async function readFailureIncidentTotals(input = {}) {
-  const db = await ensureStateDatabase();
+  const db = await ensureReadOnlyStateDatabase();
   const where = [];
   const parameters = [];
   const taskIds = [...new Set((input.taskIds || []).map(String).filter(Boolean))].slice(0, 500);
@@ -3305,17 +3511,21 @@ export async function readFailureIncidentTotals(input = {}) {
 }
 
 export async function databaseContentionHealth(input = {}) {
-  const db = await ensureStateDatabase();
+  const db = await ensureReadOnlyStateDatabase();
   const windowMinutes = Math.min(1_440, Math.max(1, Number(input.windowMinutes) || 15));
   const cutoff = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+  const failureTelemetry = await readFailedContentionEvents();
+  const failed = failureTelemetry.events.filter((event) => event.created_at >= cutoff);
   const aggregate = db.prepare(`
     SELECT
       count(*) AS operation_count,
       coalesce(sum(retry_count), 0) AS retry_count,
       coalesce(max(wait_ms), 0) AS max_wait_ms,
       coalesce(round(avg(wait_ms)), 0) AS average_wait_ms,
+      coalesce(sum(wait_ms), 0) AS total_wait_ms,
       coalesce(max(duration_ms), 0) AS max_duration_ms,
       coalesce(round(avg(duration_ms)), 0) AS average_duration_ms,
+      coalesce(sum(duration_ms), 0) AS total_duration_ms,
       max(created_at) AS last_operation_at
     FROM database_contention_events
     WHERE created_at >= ?
@@ -3327,18 +3537,25 @@ export async function databaseContentionHealth(input = {}) {
     ORDER BY created_at DESC
     LIMIT 20
   `).all(cutoff, SQLITE_BUSY_TIMEOUT_MS);
+  const operationCount = Number(aggregate.operation_count || 0) + failed.length;
+  const combinedRecent = [...recent, ...failed].sort((left, right) => right.created_at.localeCompare(left.created_at)).slice(0, 20);
   return {
+    scope: "state_mutations",
     windowMinutes,
-    operationCount: Number(aggregate.operation_count || 0),
-    retryCount: Number(aggregate.retry_count || 0),
-    maxWaitMs: Number(aggregate.max_wait_ms || 0),
-    averageWaitMs: Number(aggregate.average_wait_ms || 0),
-    maxDurationMs: Number(aggregate.max_duration_ms || 0),
-    averageDurationMs: Number(aggregate.average_duration_ms || 0),
-    lastOperationAt: aggregate.last_operation_at || "",
-    recent: recent.map((event) => ({
+    operationCount,
+    successfulOperationCount: Number(aggregate.operation_count || 0),
+    failedOperationCount: failed.length,
+    failureTelemetryAvailable: failureTelemetry.available && failureTelemetryWriteErrors === 0,
+    retryCount: Number(aggregate.retry_count || 0) + failed.reduce((sum, event) => sum + event.retry_count, 0),
+    maxWaitMs: Math.max(Number(aggregate.max_wait_ms || 0), ...failed.map((event) => event.wait_ms)),
+    averageWaitMs: operationCount ? Math.round((Number(aggregate.total_wait_ms || 0) + failed.reduce((sum, event) => sum + event.wait_ms, 0)) / operationCount) : 0,
+    maxDurationMs: Math.max(Number(aggregate.max_duration_ms || 0), ...failed.map((event) => event.duration_ms)),
+    averageDurationMs: operationCount ? Math.round((Number(aggregate.total_duration_ms || 0) + failed.reduce((sum, event) => sum + event.duration_ms, 0)) / operationCount) : 0,
+    lastOperationAt: [aggregate.last_operation_at || "", ...failed.map((event) => event.created_at)].sort().at(-1),
+    recent: combinedRecent.map((event) => ({
       operation: event.operation_name,
       outcome: event.outcome,
+      ...(event.failure_code ? { failureCode: event.failure_code } : {}),
       waitMs: Number(event.wait_ms || 0),
       durationMs: Number(event.duration_ms || 0),
       retries: Number(event.retry_count || 0),
@@ -3348,7 +3565,7 @@ export async function databaseContentionHealth(input = {}) {
 }
 
 export async function databaseStorageHealth() {
-  const db = await ensureStateDatabase();
+  const db = await ensureReadOnlyStateDatabase();
   const row = db.prepare(`
     SELECT updated_at
     FROM state_meta
@@ -3362,12 +3579,11 @@ export async function databaseStorageHealth() {
 }
 
 export async function backupStateDatabase(destination = "") {
-  const db = await ensureStateDatabase();
   const backupDir = path.join(DATA_DIR, "backups");
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outputPath = path.resolve(destination || path.join(backupDir, `mission-control-${timestamp}.sqlite3`));
   await mkdir(path.dirname(outputPath), { recursive: true, mode: 0o700 });
-  await backup(db, outputPath);
+  await withStateDatabaseConnection((db) => backup(db, outputPath), { operationName: "state.backup" });
   await chmod(outputPath, 0o600);
   return outputPath;
 }

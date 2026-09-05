@@ -2,6 +2,7 @@ const state = {
   projects: [],
   tasks: [],
   qaBundles: [],
+  workerHealth: {},
   qaDecisionCoordinates: { tasks: {}, bundles: {} },
   ownerInbox: {
     count: 0,
@@ -385,7 +386,7 @@ function attachmentList(attachments) {
 
 async function loadState() {
   renderInboxLoading();
-  const data = await api("/api/state");
+  const data = await api("/api/state?view=board");
   state.projects = data.projects || [];
   state.tasks = data.tasks || [];
   state.qaBundles = data.qaBundles || [];
@@ -399,6 +400,7 @@ async function loadState() {
     operatorPause: null,
   };
   state.productAccess = data.productAccess || null;
+  state.workerHealth = data.workerHealth || {};
   if (productPlan && state.productAccess) {
     productPlan.textContent = `${state.productAccess.planName} · ${state.productAccess.connectedToCloud ? "cloud" : "local"}`;
   }
@@ -560,10 +562,15 @@ function formatAge(ageMs) {
   return `${Math.floor(ageMs / (7 * 24 * 60 * 60_000))}w old`;
 }
 
+function inboxAgeMs(item) {
+  const timestamp = Date.parse(String(item.updatedAt || ""));
+  return Number.isFinite(timestamp) ? Math.max(0, Date.now() - timestamp)
+    : item.ageMs === null || item.ageMs === undefined ? Number.NaN : Number(item.ageMs);
+}
+
 function inboxAge(item) {
   const updatedAt = String(item.updatedAt || "");
-  const ageMs = item.ageMs === null || item.ageMs === undefined ? Number.NaN : Number(item.ageMs);
-  const label = formatAge(ageMs);
+  const label = formatAge(inboxAgeMs(item));
   return updatedAt
     ? `<time datetime="${escapeHtml(updatedAt)}" title="${escapeHtml(new Date(updatedAt).toLocaleString())}">${escapeHtml(label)}</time>`
     : `<span>${escapeHtml(label)}</span>`;
@@ -596,18 +603,32 @@ function inboxChecklist(item) {
 
 function renderSystemStatus() {
   const pause = state.ownerInbox?.operatorPause;
-  systemStatus.hidden = !pause;
-  if (!pause) {
+  const promotion = state.workerHealth?.promotion;
+  const promotionProblem = promotion && !promotion.ok;
+  const promotionMessage = {
+    heartbeat_missing: "The promotion worker has not reported its health yet.",
+    heartbeat_invalid: "The promotion worker health record could not be verified.",
+    heartbeat_stale: "The promotion worker has not reported recently.",
+    promotion_sweep_failed: "One or more promotion checks need attention.",
+    worker_data_root_mismatch: "The promotion worker is connected to the wrong data directory.",
+  }[promotion?.reason] || "Promotion health is unavailable.";
+  systemStatus.hidden = !pause && !promotionProblem;
+  if (systemStatus.hidden) {
     systemStatus.innerHTML = "";
     return;
   }
-  systemStatus.innerHTML = `
+  systemStatus.innerHTML = `${pause ? `
     <div>
       <strong>Automation is paused</strong>
       <span>${escapeHtml(pause.reason || "StudioOps is not starting new builder or reviewer runs.")}</span>
     </div>
     <button type="button" data-resume-automation>Resume after verification</button>
-  `;
+  ` : ""}${promotionProblem ? `
+    <div role="status">
+      <strong>Promotion needs attention</strong>
+      <span>${escapeHtml(promotionMessage)}${promotion.activeFailureCount ? ` (${Number(promotion.activeFailureCount)} affected candidates)` : ""} This warning does not pause other workers.</span>
+    </div>
+  ` : ""}`;
 }
 
 function inboxTaskLinks(item) {
@@ -726,7 +747,7 @@ function inboxGroupMarkup(group) {
   const items = Array.isArray(group.items) ? group.items : [];
   const count = Number(group.count ?? items.length);
   const ages = items
-    .map((item) => (item.ageMs === null || item.ageMs === undefined ? Number.NaN : Number(item.ageMs)))
+    .map(inboxAgeMs)
     .filter(Number.isFinite);
   const oldestAge = ages.length
     ? formatAge(Math.max(...ages))
@@ -985,7 +1006,7 @@ function renderTasks() {
           <h3>${escapeHtml(task.title)}</h3>
           <p>${escapeHtml(task.description || "No description yet.")}</p>
           <span class="workflow-owner">${escapeHtml(workflowGate(task))}${task.reviewCycle ? ` · cycle ${escapeHtml(task.reviewCycle)}` : ""}</span>
-          <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${parent ? ` · parent ${escapeHtml(parent.id)} ${escapeHtml(parent.title)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencies.length ? ` · depends on ${dependencies.map((item) => `${item.id} ${item.title}`).join(", ")}` : ""}${task.attachments?.length ? ` · ${task.attachments.length} attachment${task.attachments.length === 1 ? "" : "s"}` : ""}</small>
+          <small>${escapeHtml(project?.key || "unknown")} · ${escapeHtml(task.priority || "medium")}${parent ? ` · parent ${escapeHtml(parent.id)} ${escapeHtml(parent.title)}` : ""}${childCount ? ` · ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}${dependencies.length ? ` · depends on ${dependencies.map((item) => `${item.id} ${item.title}`).join(", ")}` : ""}${task.attachmentCount ? ` · ${task.attachmentCount} attachment${task.attachmentCount === 1 ? "" : "s"}` : ""}</small>
         </button>
         ${qaMeta}
       </article>

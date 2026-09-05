@@ -930,6 +930,12 @@ Automation:
     if (Object.prototype.hasOwnProperty.call(args, "label")) patch.labels = args.label;
     if (Object.prototype.hasOwnProperty.call(args, "work-area")) patch.workAreas = args["work-area"];
     if (Object.prototype.hasOwnProperty.call(args, "work-areas")) patch.workAreas = args["work-areas"];
+    if (["remap-reason", "remap-work-areas", "remap-plan-digest", "remap-sha"].some((key) => Object.prototype.hasOwnProperty.call(args, key))) {
+      patch.impactRemap = {
+        reason: args["remap-reason"], workAreas: normalizeList(args["remap-work-areas"]),
+        expectedPlanDigest: args["remap-plan-digest"], commitSha: args["remap-sha"],
+      };
+    }
     if (Object.prototype.hasOwnProperty.call(args, "priority")) patch.priority = args.priority;
     if (Object.prototype.hasOwnProperty.call(args, "parent")) patch.parentTaskId = args.parent;
     if (Object.prototype.hasOwnProperty.call(args, "parent-task-id")) patch.parentTaskId = args["parent-task-id"];
