@@ -121,7 +121,7 @@
       "publicContracts": ["repository-bound component manifest", "content-addressed context packet", "out-of-scope handoff rejection"],
       "workflows": ["dispatch planning", "builder handoff", "exact-SHA QA validation"],
       "tests": [
-        { "command": "node --test test/component-impact-map.test.js", "layer": "unit-contract" }
+        { "command": "node scripts/run-tests.js --test-file test/component-impact-map.test.js", "layer": "unit-contract" }
       ],
       "reviewOwners": ["backend-reviewer", "lead-reviewer"],
       "fullRegressionPaths": ["src/component-impact-map.js","src/impact-planner.js","docs/architecture/components.json"],
@@ -155,7 +155,7 @@
       ],
       "data": ["projects", "tasks", "runs", "reviews", "events", "candidates"],
       "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle"],
-      "tests": [{ "command": "node --test test/state-database.test.js", "layer": "persistence" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/accessibility-review.test.js --test-file test/architecture.test.js --test-file test/coordination.test.js --test-file test/delivery-policy-enforcement.test.js --test-file test/lifecycle-policy.test.js --test-file test/local-state-migration.test.js --test-file test/prototype-fast-lane.test.js --test-file test/regression-review-status.test.js --test-file test/resilience.test.js --test-file test/review-handoff.test.js --test-file test/review-identity.test.js --test-file test/state-database.test.js --test-file test/task-status-integrity.test.js", "layer": "persistence" }],
       "reviewOwners": ["backend-reviewer"],
       "fullRegressionPaths": ["src/store.js","src/state-database.js","src/lifecycle-policy.js","src/coordination.js","src/local-state-migration.js"],
       "policyAuthorities": ["task lifecycle state"],
@@ -190,7 +190,7 @@
       "services": ["supervisor planner", "dispatcher admission"],
       "publicContracts": ["dispatch admission decision", "lane-safe immutable run snapshot"],
       "workflows": ["architecture builder reviewer and owner dispatch"],
-      "tests": [{ "command": "node --test test/dispatcher.test.js", "layer": "unit-contract" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js", "layer": "unit-contract" }],
       "reviewOwners": ["backend-reviewer"],
       "fullRegressionPaths": [
         "src/dispatcher.js",
@@ -236,7 +236,7 @@
       "publicContracts": ["repository-confined worker launch", "atomic pre-provider failure-attempt claim", "bounded redacted validation evidence"],
       "workflows": ["builder execution", "review execution"],
       "deploySurfaces": ["local LaunchAgent runner"],
-      "tests": [{ "command": "node --test test/runner.test.js", "layer": "adapter" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/git-lock.test.js --test-file test/github-app-auth.test.js --test-file test/launch-agent-environment.test.js --test-file test/local-builder-review.test.js --test-file test/local-workspace-handoff.test.js --test-file test/project-validation-sandbox.test.js --test-file test/run-output-evidence.test.js --test-file test/runner.test.js --test-file test/runtime-paths.test.js", "layer": "adapter" }],
       "reviewOwners": ["backend-reviewer", "lead-reviewer"],
       "fullRegressionPaths": [
         "src/runner.js",
@@ -271,7 +271,7 @@
       "services": ["watchdog", "bounded TechOps repair", "remediation handoff"],
       "publicContracts": ["bounded failure recovery", "durable remediation handoff"],
       "workflows": ["failure recovery", "stale branch remediation"],
-      "tests": [{ "command": "node --test test/watchdog.test.js test/techops.test.js", "layer": "recovery" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/failure-containment.test.js --test-file test/techops.test.js --test-file test/watchdog.test.js", "layer": "recovery" }],
       "reviewOwners": ["backend-reviewer", "lead-reviewer"],
       "fullRegressionPaths": ["src/failure-containment.js","src/watchdog.js","src/techops.js","src/remediation-handoff.js","src/mission-control-techops.js","src/mission-control-watchdog.js"],
       "policyAuthorities": ["failure recovery routing"],
@@ -318,7 +318,7 @@
       "publicContracts": ["exact-SHA QA evidence", "owner-gated release candidate", "bounded preview startup identity polling"],
       "workflows": ["QA integration", "owner approval", "production promotion"],
       "deploySurfaces": ["protected production branch"],
-      "tests": [{ "command": "node --test test/qa-integration.test.js test/promotion.test.js", "layer": "integration-release" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/candidate-manifest.test.js --test-file test/promotion-ancestry-observation.test.js --test-file test/promotion-attempt-claim.test.js --test-file test/promotion-remote-observation.test.js --test-file test/promotion-validation-evidence.test.js --test-file test/promotion.test.js --test-file test/qa-approval-revocation.test.js --test-file test/qa-bundle-cli.test.js --test-file test/qa-decision-auth.test.js --test-file test/qa-impact-validation.test.js --test-file test/qa-integration-options.test.js --test-file test/qa-integration.test.js --test-file test/qa-review-discoverability.test.js", "layer": "integration-release" }],
       "reviewOwners": ["lead-reviewer"],
       "fullRegressionPaths": [
         "src/qa-integration.js",
@@ -353,7 +353,7 @@
       "publicContracts": ["clean fast-forward source update", "verified immutable runtime provenance", "bounded active QA and promotion claim diagnostics"],
       "workflows": ["StudioOps self-update", "runtime-only repair"],
       "deploySurfaces": ["local immutable runtime", "managed LaunchAgents"],
-      "tests": [{ "command": "node --test test/self-update.test.js test/runtime-install.test.js", "layer": "runtime-release" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/identity-verification.test.js --test-file test/runtime-install.test.js --test-file test/self-update.test.js", "layer": "runtime-release" }],
       "reviewOwners": ["backend-reviewer", "lead-reviewer"],
       "fullRegressionPaths": ["src/self-update.js","src/self-update-lease.js","src/runtime-install.js","src/mission-control-self-update.js"],
       "policyAuthorities": ["StudioOps runtime publication"],
@@ -370,7 +370,7 @@
       "publicContracts": ["file-backed shell-safe intake", "public plugin manifest"],
       "workflows": ["Codex-to-StudioOps intake", "plugin packaging"],
       "deploySurfaces": ["local Codex plugin cache"],
-      "tests": [{ "command": "node --test test/plugin-submission.test.js test/studioops-plugin-client.test.js", "layer": "plugin-contract" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/plugin-submission.test.js --test-file test/studioops-plugin-client.test.js", "layer": "plugin-contract" }],
       "reviewOwners": ["backend-reviewer", "lead-reviewer"],
       "dependsOn": ["owner-console"],
       "rollback": "Retain the prior packaged plugin and use the loopback API or board for intake."
@@ -401,7 +401,7 @@
       "ui": ["owner inbox", "task detail", "project status", "progress metrics", "containment diagnostics"],
       "services": ["local notifier"],
       "publicContracts": ["loopback owner read model", "bounded project progress report", "deduplicated local notification"],
-      "tests": [{ "command": "node --test test/owner-inbox-ui.test.js test/notifier.test.js", "layer": "browser-notification" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/board-state.test.js --test-file test/notifier.test.js --test-file test/owner-inbox-ui.test.js --test-file test/owner-inbox.test.js --test-file test/progress-observability-ui.test.js --test-file test/progress-report.test.js --test-file test/server-request-security.test.js --test-file test/visual/owner-first/design-contract.test.js", "layer": "browser-notification" }],
       "reviewOwners": ["frontend-reviewer", "lead-reviewer"],
       "fullRegressionPaths": ["src/progress-report.js","src/server.js","src/board-state.js"],
       "dependsOn": ["workflow-state"],

@@ -61,7 +61,11 @@ Scoped execution requires identical normalized map digests, an exact candidate
 binding, one known component, complete declared coverage, no sensitive/shared/
 unknown impact, and commands present in the protected base map. The executor
 runs the selected component tests plus declared dependent tests in the existing
-validation sandbox. Candidate map commands alone are not execution authority.
+validation sandbox. StudioOps component commands invoke `scripts/run-tests.js`
+with every owned `*.test.js`, including nested test files, so the required
+temporary control plane is established before tests access state. A regression
+check rejects missing owned tests or commands that bypass this bootstrap.
+Candidate map commands alone are not execution authority.
 Any failed condition uses configured aggregate commands. Changing a map or
 release-sensitive surface therefore requires the broader path. This selection
 and its Git/map/diff bindings accompany validation evidence. Supporting or

@@ -1112,6 +1112,67 @@ test("dependency definition edits invalidate frozen and passed packets but fence
   }
 });
 
+test("failed multi-task QA permits sequential sibling submissions without rewriting its authority audit", async () => {
+  const initial = await installFixtureState({ taskCount: 2 });
+  const candidate = initial.candidates[0];
+  const [firstTaskId, secondTaskId] = candidate.manifest.sources.map((source) => source.taskId);
+  await recordQaBundleDecision(
+    candidate.qaBundleId,
+    bundleDecisionInput(initial, candidate, "failed"),
+    successfulVerificationDependencies(),
+  );
+  const failed = await readState();
+  const originalDecision = structuredClone(failed.candidates.find((item) => item.id === candidate.id).qaDecision);
+  const originalTaskMirror = structuredClone(failed.tasks.find((task) => task.id === secondTaskId).qaDecision);
+  assert.equal(originalDecision.outcome, "failed");
+
+  await updateTask(firstTaskId, { status: "builder_review", subjectSha: "e".repeat(40) });
+  const firstSubmitted = await readState();
+  const invalidated = firstSubmitted.candidates.find((item) => item.id === candidate.id);
+  assert.equal(invalidated.status, "invalidated");
+  const originalInvalidation = structuredClone(invalidated.invalidation);
+  const secondBefore = firstSubmitted.tasks.find((task) => task.id === secondTaskId);
+  assert.equal(secondBefore.candidateId, candidate.id);
+  assert.deepEqual(secondBefore.qaDecision, originalTaskMirror);
+
+  await updateTask(secondTaskId, { status: "builder_review", subjectSha: "f".repeat(40) });
+  const submitted = await readState();
+  const storedCandidate = submitted.candidates.find((item) => item.id === candidate.id);
+  assert.deepEqual(storedCandidate.qaDecision, originalDecision);
+  assert.deepEqual(storedCandidate.invalidation, originalInvalidation);
+  assert.deepEqual(submitted.qaBundles.find((item) => item.id === candidate.qaBundleId).qaDecision, originalDecision);
+  for (const taskId of [firstTaskId, secondTaskId]) {
+    const task = submitted.tasks.find((item) => item.id === taskId);
+    assert.equal(task.status, "builder_review");
+    assert.equal(task.candidateId, "");
+    assert.equal(task.qaBundleId, "");
+    assert.equal(task.qaDecision, null);
+  }
+  await assert.rejects(mutateState((state) => {
+    state.candidates.find((item) => item.id === candidate.id).qaDecision.notes = "rewrite after invalidation";
+  }), /qaDecision record is append-only/i);
+});
+
+test("a live approved candidate still forbids clearing or rewriting its task QA mirror", async () => {
+  const initial = await installFixtureState({ candidateStatus: "qa_passed" });
+  const candidate = initial.candidates[0];
+  const taskId = candidate.manifest.sources[0].taskId;
+  for (const rewrite of ["decision", "detach"]) {
+    await assert.rejects(mutateState((state) => {
+      const task = state.tasks.find((item) => item.id === taskId);
+      if (rewrite === "decision") task.qaDecision.notes = "unauthorized rewrite";
+      else {
+        task.qaDecision = null;
+        task.candidateId = "";
+        task.qaBundleId = "";
+      }
+    }), /qaDecision authority mirror is append-only/i);
+  }
+  const current = await readState();
+  assert.equal(current.candidates.find((item) => item.id === candidate.id).status, "qa_passed");
+  assert.equal(current.tasks.find((item) => item.id === taskId).candidateId, candidate.id);
+});
+
 test("multi-task QA revocation is atomic and preserves the original signed approval audit", async () => {
   const initial = await installFixtureState({ candidateStatus: "qa_passed", taskCount: 2 });
   const candidate = initial.candidates[0];
