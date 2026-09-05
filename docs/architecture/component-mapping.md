@@ -74,3 +74,48 @@ dependent context never relaxes repository identity or release approval checks.
 Worker context packets prioritize named paths. Their search guidance does not
 intercept every shell command or guarantee a hard token budget; the runner's
 separate output and failure containment controls still apply.
+
+## Derived code context
+
+The runner also attaches an advisory structural retrieval packet after resolving
+its execution scope. `repository-context-index.js` reads immutable Git blobs;
+`repository-context-extractor.js` uses the bundled Tree-sitter WASM grammars for
+JavaScript, TypeScript/TSX, Python and PHP. Named declarations and static import
+hints are derived from syntax. Dynamic imports and unsupported languages are
+reported as unresolved or path-only; this is not a complete compiler call graph.
+
+The authored map remains the authority for component ownership, allowed edits,
+declared dependencies, review and validation. Derived imports describe observed
+code relationships and do not replace architectural dependency policy. Retrieval
+results are suggestions for reading, including related locations outside edit
+scope. They do not grant remapping, test-skipping, merge or release authority.
+
+The local disposable cache is partitioned by project/repository and immutable
+source version, and binds the extractor, map and exclusion policy. It stores
+paths, identifiers, line numbers and blob IDs, not source bodies or task text.
+Secret, dependency, generated and user-data paths are excluded; additional
+exclusions can be committed in `.studioops-contextignore`. Partial coverage,
+unsupported syntax, limits and unavailable indexes remain visible. A stale,
+invalid or unavailable index leaves the existing map and QA behavior intact.
+
+`task-context-retrieval.js` ranks exact paths and identifiers, identifier-token
+overlap and bounded static relationships. `repository-context-packet.js` verifies
+the repository, commit and map bindings before formatting at most 10,000 UTF-8
+bytes of advice. This is an output byte bound, not a claim about tokenizer size
+or the total worker prompt. The existing authority packet is preserved.
+
+Run the same read-only retrieval directly:
+
+```sh
+npm run context -- --repo /path/to/repo --project studioops \
+  --repository https://github.com/magic2goodil/studioops \
+  --commit FULL_40_CHARACTER_SHA --query 'retry queued worker'
+```
+
+Omit `--commit` to resolve the local HEAD once. The selected commit must contain
+a valid map for this command's policy-bound packet. `--work-area` supplies a
+specific task path. The command changes no task, source file or Git reference.
+Set `STUDIOOPS_CONTEXT_RETRIEVAL=0` to disable worker attachment for rollback;
+normal component mapping and validation remain active. No embedding provider is
+enabled by default. The reproducible experiment and limits are documented in
+`repository-context-evaluation.md`.

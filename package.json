@@ -23,7 +23,8 @@
     "mission-control-qa-integration": "./src/mission-control-qa-integration.js",
     "mission-control-promotion": "./src/mission-control-promotion.js",
     "mission-control-self-update": "./src/mission-control-self-update.js",
-    "mission-control-watchdog": "./src/mission-control-watchdog.js"
+    "mission-control-watchdog": "./src/mission-control-watchdog.js",
+    "studioops-context": "./src/mission-control-context.js"
   },
   "scripts": {
     "setup": "node src/mission-control-cli.js setup",
@@ -53,12 +54,15 @@
     "uninstall-agents": "node scripts/install-launchagents.js uninstall",
     "status-agents": "node scripts/install-launchagents.js status",
     "setup-github-app": "node scripts/setup-github-apps.js single --open",
-    "setup-github-role-apps": "node scripts/setup-github-apps.js roles --open"
+    "setup-github-role-apps": "node scripts/setup-github-apps.js roles --open",
+    "context": "node src/mission-control-context.js",
+    "context:evaluate": "node scripts/evaluate-repository-context.js"
   },
   "engines": {
     "node": ">=22.5"
   },
   "dependencies": {
-    "@openai/codex-sdk": "^0.144.5"
+    "@openai/codex-sdk": "^0.144.5",
+    "@vscode/tree-sitter-wasm": "0.3.1"
   }
 }
