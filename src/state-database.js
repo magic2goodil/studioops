@@ -1795,15 +1795,18 @@ function assertTaskQaDecisionTransitions(state, snapshot, options = {}) {
     );
     if (previousWasMirror) {
       const candidate = currentCandidates.get(previousCandidate.id);
-      const exactInvalidation = Boolean(
+      // Siblings may submit in separate transactions after the first source
+      // invalidates their shared candidate. Detach only the task mirror; the
+      // candidate decision and durable invalidation remain append-only above.
+      const detachesInvalidatedCandidate = Boolean(
         candidate?.invalidation
-        && !previousCandidate.invalidation
         && candidate.status === "invalidated"
+        && canonicalJson(candidate.qaDecision) === canonicalJson(previousCandidate.qaDecision)
         && task.qaDecision === null
         && !task.candidateId
         && !task.qaBundleId,
       );
-      if (exactInvalidation) continue;
+      if (detachesInvalidatedCandidate) continue;
       throw new Error(`Task ${taskId} qaDecision authority mirror is append-only while its candidate remains linked.`);
     }
     if (task.qaDecision) {
