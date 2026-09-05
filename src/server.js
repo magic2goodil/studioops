@@ -24,7 +24,12 @@ import {
 import { loadConfig } from "./config.js";
 import { buildOwnerInbox } from "./owner-inbox.js";
 import { localProductAccess, productCatalog } from "./product-tiers.js";
-import { databaseContentionHealth, readFailureIncidentPage, readFailureIncidentTotals } from "./state-database.js";
+import {
+  databaseContentionHealth,
+  databaseStorageHealth,
+  readFailureIncidentPage,
+  readFailureIncidentTotals,
+} from "./state-database.js";
 import { currentRemediationHandoff } from "./remediation-handoff.js";
 import { buildQaReviewList } from "./qa-review-list.js";
 import {
@@ -255,11 +260,10 @@ async function serveLocalImage(res, url) {
 
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/health") {
-    const state = await readState();
+    const storageHealth = await databaseStorageHealth();
     sendJson(res, 200, {
       status: "ok",
-      storage: state.meta?.storageBackend || "unknown",
-      updatedAt: state.meta?.updatedAt || "",
+      ...storageHealth,
       databaseContention: await databaseContentionHealth(),
     });
     return;

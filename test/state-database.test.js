@@ -862,6 +862,49 @@ test("concurrent worker processes serialize updates without dropping comments", 
   }
 });
 
+test("conflicting idempotent mutations finish through serialized replay", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-serialized-replay-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    await Promise.all(Array.from({ length: 4 }, (_, index) => runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState(async (state) => {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        state.meta.serializedReplayWorkers = state.meta.serializedReplayWorkers || [];
+        if (!state.meta.serializedReplayWorkers.includes(${index})) {
+          state.meta.serializedReplayWorkers.push(${index});
+        }
+      }, { operationName: "test.serialized_replay_${index}", idempotent: true });
+    `)));
+
+    const state = readPersistedState(root);
+    assert.deepEqual([...state.meta.serializedReplayWorkers].sort(), [0, 1, 2, 3]);
+    const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
+    try {
+      const timings = db.prepare(`
+        SELECT outcome, retry_count
+        FROM database_contention_events
+        WHERE operation_name LIKE 'test.serialized_replay_%'
+      `).all();
+      assert.equal(timings.length, 4);
+      assert.equal(timings.some((timing) => timing.outcome === "serialized_replay"), true);
+      assert.equal(
+        timings.every((timing) => timing.outcome !== "serialized_replay" || Number(timing.retry_count) >= 1),
+        true,
+      );
+      assert.equal(
+        timings.every((timing) => timing.outcome !== "committed" || Number(timing.retry_count) === 0),
+        true,
+      );
+    } finally {
+      db.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("slow mutation preparation does not hold the SQLite write lock", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-short-lock-"));
   try {
@@ -948,6 +991,45 @@ test("database contention health is bounded and omits mutation payload data", as
     assert.equal(Array.isArray(health.recent), true);
     assert.equal(JSON.stringify(health).includes("private comment body"), false);
     assert.equal(health.recent.length <= 20, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("database storage health reads bounded metadata from a large state", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-storage-health-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+    const databasePath = path.join(root, "data", "mission-control.sqlite3");
+    const db = new DatabaseSync(databasePath);
+    try {
+      db.prepare(`
+        INSERT INTO comments(id, sequence, task_id, created_at, payload)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        "comment_large_private",
+        10_000,
+        "task_1",
+        new Date().toISOString(),
+        JSON.stringify({ body: `private-health-marker-${"x".repeat(16 * 1024 * 1024)}` }),
+      );
+    } finally {
+      db.close();
+    }
+
+    const { stdout } = await runStoreScript(root, `
+      import { performance } from "node:perf_hooks";
+      import { databaseStorageHealth } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      const startedAt = performance.now();
+      const health = await databaseStorageHealth();
+      process.stdout.write(JSON.stringify({ health, durationMs: performance.now() - startedAt }));
+    `);
+    const result = JSON.parse(stdout);
+    assert.equal(result.health.storage, "sqlite");
+    assert.ok(result.health.updatedAt);
+    assert.ok(result.durationMs < 1_000, `storage health took ${result.durationMs}ms`);
+    assert.equal(stdout.includes("private-health-marker"), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
