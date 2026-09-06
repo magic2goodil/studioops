@@ -18,6 +18,7 @@ import {
   completeRun,
   completeRunAfterExecution,
   observeRunOutput,
+  automationPauseReason,
   performGitHubRemoteRecoveryProbe,
   planRunnableRuns,
   prePushValidationScript,
@@ -41,7 +42,7 @@ import { eligibleRunWorkspaceSnapshotsInState, resumeBudgetPauseInState } from "
 
 const execFileAsync = promisify(execFile);
 
-test("worker output guard warns and bounds one oversized command but stops cumulative dumps", () => {
+test("worker output guard stops one oversized command and cumulative dumps", () => {
   const event = (size) => ({
     type: "item.completed",
     item: { type: "command_execution", aggregated_output: "x".repeat(size) },
@@ -50,8 +51,8 @@ test("worker output guard warns and bounds one oversized command but stops cumul
     maxCommandOutputChars: 10,
     maxCumulativeCommandOutputChars: 30,
   });
-  assert.equal(oversized.violation, null);
-  assert.equal(oversized.warning.code, "command_output_budget_warning");
+  assert.equal(oversized.violation.code, "command_output_budget_exceeded");
+  assert.equal(oversized.warning, null);
   const bounded = boundedRunOutputEvent(event(30), 20);
   assert.ok(bounded.item.aggregated_output.length <= 20);
   assert.match(bounded.item.aggregated_output, /StudioOps bounded/);
@@ -65,6 +66,17 @@ test("worker output guard warns and bounds one oversized command but stops cumul
     maxCommandOutputChars: 10,
     maxCumulativeCommandOutputChars: 15,
   }).violation.code, "cumulative_command_output_budget_exceeded");
+});
+
+test("output guard failures remain recoverable and do not become owner configuration blocks", () => {
+  assert.equal(automationPauseReason(
+    "command_output_budget_exceeded",
+    "A worker command exceeded the bounded output limit.",
+  ), "");
+  assert.equal(automationPauseReason(
+    "sdk_error",
+    "github_app_not_installed_on_repository",
+  ), "github_app_not_installed_on_repository");
 });
 
 test("runner normalizes provider failures to bounded reason codes", () => {

@@ -1547,6 +1547,7 @@ function candidateIdentityPrompt(task) {
 
 function contextEfficiencyContract() {
   return [
+    "- Treat listed context, standards, and safety files as references, not instructions to read every file in full. Locate only the headings, symbols, and bounded excerpts needed for the current decision.",
     "- Keep command output entering the model context bounded: prefer targeted rg/find queries and narrow line ranges; do not dump whole files, logs, state snapshots, or test suites.",
     "- Redirect noisy validation output to a temporary log and return only the exit status plus a short failure excerpt or final summary. Preserve the full local log for debugging without replaying it into the model.",
     "- Cap ordinary inspection output at roughly 200 lines or 12 KB per command. If more evidence is needed, read the next targeted slice instead of repeating prior output.",
@@ -6049,11 +6050,11 @@ Review cycle: ${currentReviewCycle(task)}
 Parent epic/task: ${parent ? `${parent.id}: ${parent.title}` : "(none)"}
 
 Before editing:
-- Read project context:
+- Use these project-context references selectively. Do not read whole files; locate relevant headings or symbols and read bounded excerpts (normally no more than 80 lines or 8 KB per command):
 ${context}
-- Read project standards:
+- Use these project-standard references selectively under the same bounded-read rule:
 ${standards}
-- Follow project safety rules:
+- Apply these project safety rules without rereading unchanged material already supplied in this prompt:
 ${safety}
 
 Review loop policy:
