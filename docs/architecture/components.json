@@ -287,6 +287,10 @@
       "owner": "release-management",
       "aliases": ["QA", "candidate", "promotion", "release"],
       "paths": [
+        "src/hosted-rc-evidence.js",
+        "src/release-qualification.js",
+        "test/hosted-rc-evidence.test.js",
+        "test/release-qualification.test.js",
         "src/qa-integration.js",
         "src/promotion.js",
         "src/candidate-manifest.js",
