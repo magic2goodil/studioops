@@ -120,6 +120,35 @@ export function hostedRcSigningBytes(kind, payload) {
   rcId(kind);
   return Buffer.from(`studioops.hosted-rc.signature.v1\n${kind}\n${hostedRcCanonicalJson(payload)}`);
 }
+/** Canonical key identity: PEM wrapping, labels and role-map aliases cannot
+ * manufacture independent Ed25519 authorities. No private material is returned. */
+export function hostedRcPublicKeyFingerprint(configured, code = "untrusted_observation") {
+  try {
+    const key = createPublicKey(configured);
+    if (key.asymmetricKeyType !== "ed25519") rcFail(code);
+    return `sha256:${createHash("sha256").update(key.export({ type: "spki", format: "der" })).digest("hex")}`;
+  } catch { rcFail(code); }
+}
+
+export function assertHostedRcKeyIndependence({ producerKeys, observerKeys, actorKeys = {}, policyKeys = {} }) {
+  const fingerprints = (keys, code, required) => {
+    if (!keys || typeof keys !== "object" || Array.isArray(keys)) rcFail(code);
+    const entries = Object.entries(keys);
+    if (entries.length > 32 || (required && !entries.length)) rcFail(code);
+    return new Set(entries.map(([id, key]) => { rcId(id); return hostedRcPublicKeyFingerprint(key, code); }));
+  };
+  const producer = fingerprints(producerKeys, "untrusted_producer", true);
+  const observer = fingerprints(observerKeys, "untrusted_observation", true);
+  const owner = fingerprints(actorKeys, "untrusted_decision", false);
+  const policy = fingerprints(policyKeys, "untrusted_policy", false);
+  if ([...producer].some((key) => observer.has(key))) rcFail("untrusted_observation");
+  if ([...owner].some((key) => producer.has(key) || observer.has(key))) rcFail("untrusted_decision");
+  if ([...policy].some((key) => producer.has(key) || observer.has(key))) rcFail("untrusted_policy");
+  // Policy signing may share an operator/owner channel. It does not substitute
+  // for the independently keyed producer, observer and final owner decision.
+  return true;
+}
+
 /** trustedKeys is deployment-owned configuration, NEVER taken from an evidence request. */
 export function verifyHostedRcProof(kind, payload, proof, trustedKeys, code = "untrusted_observation") {
   try {

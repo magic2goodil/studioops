@@ -514,7 +514,8 @@ export function buildHostedOwnerQaPacket(candidate, inputs, readiness, evidence)
   const diagnosticPacketDigest = candidate.qaPacket?.packetDigest;
   if (!diagnosticPacketDigest) throw new Error("owner_decision_missing");
   const base = {
-    schemaVersion: "studioops.hosted-owner-qa-packet.v1",
+    schemaVersion: inputs.schemaVersion === "studioops.release-qualification-inputs.v2"
+      ? "studioops.hosted-owner-qa-packet.v2" : "studioops.hosted-owner-qa-packet.v1",
     candidateId: candidate.id, manifestDigest: candidate.manifestDigest,
     diagnosticPacketDigest, inputs, inputsDigest: hostedRcDigest(inputs),
     readinessDigest: hostedRcDigest(readiness), origin: evidence.environment.origin,

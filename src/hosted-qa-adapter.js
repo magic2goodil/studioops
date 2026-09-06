@@ -1,12 +1,12 @@
 import { constants, openSync, fstatSync, readSync, closeSync, realpathSync } from "node:fs";
 import path from "node:path";
 import {
-  hostedRcCanonicalJson, hostedRcDigest, normalizeHostedRcBinding, rcDigest, rcEnum,
+  hostedRcCanonicalJson, hostedRcDigest, normalizeHostedRcBinding, rcDigest, rcEnum, assertHostedRcKeyIndependence,
   rcFail, rcId, rcObject, rcOrigin, rcRepository, rcSha, rcTime, verifyHostedRcProof,
 } from "./hosted-rc-evidence.js";
 import {
   assertHostedRcEvidence, createReleaseQualificationAuthority, normalizeReleaseDecisionObservation,
-  normalizeReleaseQaPolicy, releaseQualificationInputs,
+  normalizeReleaseQaPolicy, releaseQualificationInputs, normalizeReleaseReviewStages, RELEASE_QA_POLICY_V2,
 } from "./release-qualification.js";
 import { observeHostedRc } from "./hosted-rc-transport.js";
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
@@ -15,6 +15,7 @@ import { missionControlConfigRoot } from "./runtime-paths.js";
 import {
   appendHostedRcEvidence, getReleaseQaPolicy, invalidateReleaseQualification,
   readHostedQaCoordinates, recordHostedRcOwnerPacket, recordReleaseQaPolicy, recordReleaseQualification,
+  reviewStagesForTask, reviewStagesForProject, currentReviewCandidateCycle, latestCurrentReviewForStage, reviewMatchesCurrentCandidate,
 } from "./store.js";
 
 export const HOSTED_QA_TRUST_FILE = "hosted-qa-trust.json";
@@ -67,6 +68,7 @@ function loadTrust(projectId, candidateId) {
   const trust = config.projects?.[projectId];
   const deployment = trust?.deployments?.[candidateId];
   if (!trust || !deployment) rcFail("authority_required");
+  assertHostedRcKeyIndependence(trust);
   // No keys, policy, expected identities, network allowlists or callbacks are
   // accepted from imported evidence or CLI options.
   return { filename, digest: hostedRcDigest(config), trust, deployment };
@@ -80,6 +82,40 @@ function currentReviews(coordinates, trust) {
       subjectSha: row.subjectSha, outcome: row.invalidatedAt || row.invalidation ? "revoked" : row.outcome,
       evidenceDigest: hostedRcDigest(row) };
   });
+}
+
+function currentStageContract(coordinates) {
+  const {project, candidate, tasks, currentReviews: live} = coordinates;
+  const sources = candidate.manifest.sources;
+  if (!Array.isArray(tasks) || !Array.isArray(live) || tasks.length !== sources.length
+    || new Set(tasks.map(t => t.id)).size !== tasks.length || live.length > 128
+    || new Set(live.map(r => r.id)).size !== live.length) rcFail("review_changed");
+  const known = reviewStagesForProject(project);
+  if (known.length > 32 || new Set(known.map(s => s.key)).size !== known.length) rcFail("review_changed");
+  const mapped = sources.map(source => {
+    const task = tasks.find(t => t.id === source.taskId);
+    if (!task || task.projectId !== project.id || task.reviewSubjectSha !== source.headSha
+      || currentReviewCandidateCycle(task) !== source.candidateCycle || task.candidateId !== candidate.id) rcFail("review_changed");
+    const required = reviewStagesForTask(project, task).filter(s => s.required !== false);
+    const rows = coordinates.reviews.filter(r => r.taskId === task.id);
+    const keys = [...new Set([...required.map(s => s.key), ...rows.map(r => r.stageKey)])];
+    return {taskId:task.id, stages:keys.map(key => {
+      const stage = known.find(s => s.key === key);
+      if (!stage) rcFail("review_changed");
+      const row = rows.find(r => r.stageKey === key);
+      const latest = latestCurrentReviewForStage({reviews:live}, task, stage);
+      if (!row || !latest || latest.id !== row.id || hostedRcDigest(latest) !== hostedRcDigest(row)
+        || rows.filter(r => r.stageKey === key).length !== 1) rcFail("review_changed");
+      // Equal-time replacements have no authoritative ordering in the public
+      // workflow selector. Fail closed rather than choosing the old manifest ID.
+      if (live.some(r => r.id !== row.id && r.stageKey === key && r.createdAt === row.createdAt
+        && r.taskId === task.id && reviewMatchesCurrentCandidate(task,r))) rcFail("review_changed");
+      if (!required.some(s => s.key === key) && row.outcome !== "skipped") rcFail("review_changed");
+      return {stageId:key, workflowRequired:required.some(s => s.key === key), disposition:row.outcome === "skipped" ? "not_applicable" : "required",
+        dispositionDigest:row.outcome === "skipped" ? hostedRcDigest(row) : null};
+    })};
+  });
+  return normalizeReleaseReviewStages({schemaVersion:"studioops.release-review-stages.v1",tasks:mapped});
 }
 
 function contextFor(prepared, coordinates, decisionOverride = null) {
@@ -123,6 +159,7 @@ function contextFor(prepared, coordinates, decisionOverride = null) {
     revoked: Boolean(candidate.invalidation || candidate.qaRevocationIntent || candidate.qaRevocationSettlement),
     reviewSubjects: candidate.manifest.sources.map((s) => ({ taskId: s.taskId, subjectSha: s.headSha, cycle: s.candidateCycle })),
     currentReviews: currentReviews(coordinates, trust),
+    currentReviewStages: currentStageContract(coordinates),
   };
 }
 
@@ -134,7 +171,8 @@ function makeAuthority(prepared, decisionOverride = null) {
       const context = resolve(coordinates);
       const verified = assertHostedRcEvidence(input, context);
       const inputs = releaseQualificationInputs({ binding: context.binding, evidenceDigest: verified.evidenceDigest,
-        policyDigest: verified.policyDigest, revocationGeneration: context.revocationGeneration, reviews: context.currentReviews });
+        policyDigest: verified.policyDigest, revocationGeneration: context.revocationGeneration, reviews: context.currentReviews,
+        ...(context.policy.schemaVersion === RELEASE_QA_POLICY_V2 ? {reviewStages:context.policy.reviewStages} : {}) });
       return buildHostedOwnerQaPacket(coordinates.candidate, inputs, context.readiness, verified.evidence);
     },
     decisionObservation(coordinates) { return structuredClone(resolve(coordinates).decision); },
@@ -192,6 +230,9 @@ export function hostedQaCoordinatesFromState(state, candidateId) {
   if (!candidate) rcFail("candidate_mismatch");
   const ids = new Set(candidate.manifest.sources.flatMap((s) => s.reviews.map((r) => r.id)));
   return { candidate, project: state.projects.find((p) => p.id === candidate.projectId),
+    tasks: state.tasks.filter((t) => candidate.manifest.sources.some((s) => s.taskId === t.id)),
+    currentReviews: state.reviews.filter((r) => candidate.manifest.sources.some((s) => s.taskId === r.taskId
+      && s.headSha === r.subjectSha && s.candidateCycle === r.candidateCycle)),
     reviews: state.reviews.filter((r) => ids.has(r.id)), record: candidate.hostedRc || null };
 }
 
@@ -199,7 +240,7 @@ export function hostedQaCoordinatesFromState(state, candidateId) {
 export async function runHostedQaCommand({ action, projectId, candidateId, file }) {
   if (action === "status") {
     const coordinates = await readHostedQaCoordinates(projectId, candidateId);
-    return hostedQaStatus(coordinates);
+    return hostedQaStatus({...coordinates,includeReviewStages:true});
   }
   const imported = file ? readPrivateJson(file) : null;
   if (action === "policy") {
@@ -240,10 +281,18 @@ export async function runHostedQaCommand({ action, projectId, candidateId, file 
 }
 
 /** Bounded display only. A fresh prepareHostedQaAdmission remains mandatory. */
-export function hostedQaStatus({ project, candidate, reviews = [] }, nowMs = Date.now()) {
+export function hostedQaStatus({ project, candidate, reviews = [], tasks = [], currentReviews = reviews, includeReviewStages = false }, nowMs = Date.now()) {
   const record = candidate?.hostedRc;
   const evidence = record?.evidence.at(-1)?.evidence;
   const receipt = record?.qualifications.at(-1)?.qualification;
+  let currentStages = null;
+  try {
+    const sources = candidate.manifest.sources;
+    const ids = new Set(sources.flatMap(s => s.reviews.map(r => r.id)));
+    currentStages = currentStageContract({project,candidate,tasks:tasks.filter(t => sources.some(s => s.taskId === t.id)),
+      reviews:reviews.filter(r => ids.has(r.id)),currentReviews:currentReviews.filter(r => sources.some(s =>
+        s.taskId === r.taskId && s.headSha === r.subjectSha && s.candidateCycle === r.candidateCycle))});
+  } catch { /* Diagnostic absence never supplies authority. */ }
   let status = "collecting", reason = "owner_decision_missing";
   if (!project?.hostedRc?.activePolicyDigest || !evidence) { status = "setup_missing"; reason = "evidence_missing"; }
   else if (candidate.invalidation || candidate.qaRevocationIntent || candidate.qaRevocationSettlement
@@ -253,14 +302,16 @@ export function hostedQaStatus({ project, candidate, reviews = [] }, nowMs = Dat
     || (receipt && Date.parse(receipt.expiresAt) <= nowMs)) { status = "stale"; reason = "evidence_stale"; }
   else if (receipt) {
     const signed = record.qualifications.at(-1).decisionObservation?.payload;
-    const changed = !signed || !candidate.qaDecision || (signed.reviews || []).some((r) => {
+    let changed = !signed || !candidate.qaDecision || (signed.reviews || []).some((r) => {
       const row = reviews.find((v) => v.id === r.id);
       return !row || hostedRcDigest(row) !== r.evidenceDigest;
     }) || signed.decisionDigest !== hostedRcDigest(candidate.qaDecision)
       || signed.ownerPacketDigest !== record.packets?.at(-1)?.packet.packetDigest;
+    const priorStages = record.packets?.at(-1)?.packet.inputs.reviewStages;
+    if (!currentStages || (priorStages && hostedRcDigest(priorStages) !== hostedRcDigest(currentStages))) changed = true;
     status = changed ? "stale" : "qualified"; reason = changed ? "review_changed" : "qualified";
   }
-  return { status, reason, origin: evidence?.environment.origin || "", distributionId: evidence?.native?.distributionId || "",
+  return { status, reason, ...(includeReviewStages ? {reviewStages:currentStages} : {}), origin: evidence?.environment.origin || "", distributionId: evidence?.native?.distributionId || "",
     evidenceDigest: record?.evidence.at(-1)?.digest || "", inputsDigest: record?.packets?.at(-1)?.packet.inputsDigest || "",
     ownerPacketDigest: record?.packets?.at(-1)?.packet.packetDigest || "", authority: "display_only",
     recovery: status === "setup_missing" ? "Configure the approved hosted deployment and collect signed evidence."

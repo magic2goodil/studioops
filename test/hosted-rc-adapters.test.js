@@ -100,7 +100,7 @@ export async function cleanupHostedPromotionFixtures() {
 
 /** Hermetic real TLS producer/observer fixture; never production QA evidence.
  * Importing this factory does not register tests. No product test-hook exists. */
-export async function createHostedAdapterFixture({ configRoot, candidate = null, project = null, reviews = [], productionTarget = null } = {}) {
+export async function createHostedAdapterFixture({ configRoot, candidate = null, project = null, reviews = [], productionTarget = null, reviewStages = null } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "hrc-"));
   const binding = hostedFixtureNetwork();
   const ip = binding.address;
@@ -166,6 +166,14 @@ export async function createHostedAdapterFixture({ configRoot, candidate = null,
   f.input.evidence.snapshot.retentionExpiresAt = at(3600000);
   f.context.now = at(0);
   const reviewActors = Object.fromEntries(reviews.map((r) => [r.actorId || r.author, `actor-${r.id}`]));
+  if (reviewStages) {
+    f.context.policy.schemaVersion = "studioops.release-qa-policy.v2";
+    delete f.context.policy.requiredReviewRoles;
+    f.context.policy.reviewStages = reviewStages;
+    f.context.currentReviewStages = reviewStages;
+    f.context.currentReviews = reviews.map(row => ({id:row.id, taskId:row.taskId, actorId:reviewActors[row.actorId || row.author],
+      role:row.stageKey, cycle:row.candidateCycle, subjectSha:row.subjectSha, outcome:row.outcome, evidenceDigest:hostedRcDigest(row)}));
+  }
   f.seal();
   f.context.binding = structuredClone(f.input.evidence.binding);
   const trust = { schemaVersion: "studioops.hosted-qa-trust.v1", projects: {
@@ -229,13 +237,34 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const { prepareHostedQaAdmission } = await import("../src/hosted-qa-adapter.js");
     const { normalizeReleaseDecisionObservation } = await import("../src/release-qualification.js");
     const initial = hostedRcFixture();
-    const reviews = initial.context.currentReviews.map((r) => ({ id: r.id, taskId: "task_1", projectId: "project_1",
-      stageKey: r.role, role: `${r.role}-reviewer`, candidateCycle: 1, subjectSha: r.subjectSha,
-      outcome: "approved", author: r.actorId, createdAt: "2026-09-06T01:00:00.000Z" }));
+    const stageCase = process.env.STUDIOOPS_TEST_HOSTED_STAGE_CASE || "legacy";
+    const v2 = stageCase !== "legacy";
+    const skipped = ["skipped", "prototype"].includes(stageCase);
+    const stageKeys = v2 ? ["backend", "frontend", "accessibility", ...(stageCase === "custom" ? ["regression-release"] : []), "lead"] : ["backend", "lead"];
+    const project = {id:"project_1",key:"fixture",repoUrl:"https://github.com/example/project",
+      reviewPipeline: v2 ? [] : stageKeys.map(key => ({key,role:`${key}-reviewer`,status:`${key}_review`,required:true}))};
+    if (stageCase === "custom") project.reviewPipeline = store.normalizeReviewPipeline([
+      ...store.DEFAULT_REVIEW_PIPELINE.slice(0,-1), {key:"regression-release",role:"regression-reviewer",status:"regression_review",required:true}, store.DEFAULT_REVIEW_PIPELINE.at(-1)]);
+    if (stageCase === "prototype") project.deliveryPolicy = {profile:"prototype-fast-lane"};
+    const task = {id:"task_1",projectId:project.id,candidateId:"candidate_1",reviewSubjectSha:"b".repeat(40),reviewSubjectCycle:1,reviewCycle:1,
+      impactEvidence:{changedFiles:["src/store.js"]}};
+    const reviews = stageKeys.map(role => ({id:`review_${role}`,taskId:task.id,projectId:project.id,stageKey:role,role:`${role}-reviewer`,
+      candidateCycle:1,cycle:1,subjectSha:task.reviewSubjectSha,outcome:skipped && ["frontend","accessibility"].includes(role) ? "skipped" : "approved",
+      author:`reviewer_${role}`,createdAt:"2026-09-06T01:00:00.000Z"}));
+    // A retained source skip may have been issued by the full workflow before
+    // current prototype routing excludes it. Both public policies are exercised.
+    const assemblyProject = {...project, deliveryPolicy:undefined};
+    const workflow = store.candidateReviewEvidenceForTask({projects:[assemblyProject],reviews},task);
+    assert.equal(workflow.ok,true,workflow.error);
+    const required = new Set(store.reviewStagesForTask(project,task).filter(s => s.required !== false).map(s => s.key));
+    if (stageCase === "prototype") assert.deepEqual([...required],["backend","lead"]);
+    const reviewStages = v2 ? {schemaVersion:"studioops.release-review-stages.v1",tasks:[{taskId:task.id,stages:reviews.map(row => ({
+      stageId:row.stageKey,workflowRequired:required.has(row.stageKey),disposition:row.outcome === "skipped" ? "not_applicable" : "required",
+      dispositionDigest:row.outcome === "skipped" ? hostedRcDigest(row) : null}))}]} : null;
     const candidate = createCandidateEnvelope({ qaBundleId: "qa_bundle_1", manifest: {
       candidateId: "candidate_1", projectId: "project_1", base: { branch: "main", sha: "a".repeat(40) },
       sources: [{ taskId: "task_1", sourceRef: "refs/heads/codex/fixture", headSha: "b".repeat(40), candidateCycle: 1,
-        reviews: reviews.map((r) => ({ ...r, reviewedAt: r.createdAt })) }],
+        reviews: workflow.reviews }],
       integration: { branch: "qa/fixture", sha: "c".repeat(40) },
       checks: [{ id: "check_1", kind: "local-validation", name: "fixture", outcome: "passed", subjectSha: "c".repeat(40), evidenceDigest: initial.digest("check") }],
       preview: { url: "http://127.0.0.1:4174/", status: "healthy", commitSha: "c".repeat(40), verifiedAt: "2026-09-06T01:30:00.000Z",
@@ -245,16 +274,16 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     // Explicit imported historical diagnostic fixture, not a product write path.
     candidate.qaPacket = { packetDigest: initial.digest("diagnostic-packet") };
     candidate.qaDecision = { outcome: "passed", candidateId: candidate.id, ownerQaPacketDigest: candidate.qaPacket.packetDigest };
-    const project = { id: "project_1", key: "fixture", repoUrl: "https://github.com/example/project" };
     await store.readState();
     const db = new DatabaseSync(DATABASE_FILE);
+    db.prepare("INSERT INTO tasks(id,sequence,project_id,status,payload) VALUES (?,?,?,?,?)").run(task.id,1,project.id,"qa_passed",JSON.stringify(task));
     db.prepare("INSERT OR REPLACE INTO projects(id,sequence,key,payload) VALUES (?,?,?,?)").run(project.id, 1, project.key, JSON.stringify(project));
     db.prepare("INSERT INTO candidates(id,sequence,project_id,status,manifest_digest,payload) VALUES (?,?,?,?,?,?)")
       .run(candidate.id, 1, project.id, candidate.status, candidate.manifestDigest, JSON.stringify(candidate));
     for (const [i, r] of reviews.entries()) db.prepare("INSERT INTO reviews(id,sequence,task_id,outcome,payload) VALUES (?,?,?,?,?)")
       .run(r.id, i, r.taskId, r.outcome, JSON.stringify(r));
     db.close();
-    const f = await createHostedAdapterFixture({ configRoot: missionControlConfigRoot(), candidate, project, reviews });
+    const f = await createHostedAdapterFixture({ configRoot: missionControlConfigRoot(), candidate, project, reviews, reviewStages });
     const files = await mkdtemp(path.join(tmpdir(), "hc-cli-"));
     const cli = async (action, value) => {
       const args = ["src/mission-control-cli.js", "hosted-qa", action, "--project", project.id, "--candidate", candidate.id];
@@ -278,7 +307,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       assert.equal(duplicate.packet.packetDigest, collected.packet.packetDigest);
       await assert.rejects(prepareHostedQaAdmission({ projectId: project.id, candidateId: candidate.id }));
       const packet = collected.packet;
-      const decision = normalizeReleaseDecisionObservation({ schemaVersion: "studioops.release-decision-observation.v1",
+      assert.equal(packet.schemaVersion,v2 ? "studioops.hosted-owner-qa-packet.v2" : "studioops.hosted-owner-qa-packet.v1");
+      const decision = normalizeReleaseDecisionObservation({ schemaVersion: v2 ? "studioops.release-decision-observation.v2" : "studioops.release-decision-observation.v1",
         binding: f.input.evidence.binding, inputsDigest: packet.inputsDigest,
         evidenceDigest: hostedRcDigest(f.input.evidence), policyDigest: f.input.evidence.policyDigest,
         ownerPacketDigest: packet.packetDigest, decisionDigest: hostedRcDigest(candidate.qaDecision),
@@ -297,6 +327,61 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       const coordinates = await store.readHostedQaCoordinates(project.id, candidate.id);
       assert.deepEqual(coordinates.candidate.manifest, candidate.manifest);
       assert.deepEqual(coordinates.candidate.qaPacket, candidate.qaPacket);
+      const raceDb = new DatabaseSync(DATABASE_FILE);
+      const originalReview = raceDb.prepare("SELECT * FROM reviews WHERE id=?").get("review_backend");
+      const originalTask = raceDb.prepare("SELECT * FROM tasks WHERE id=?").get(task.id);
+      const originalProject = raceDb.prepare("SELECT * FROM projects WHERE id=?").get(project.id);
+      const snapshot = () => ["tasks","projects","candidates","reviews","events","comments","state_meta"].map(table =>
+        raceDb.prepare(`SELECT * FROM ${table} ORDER BY ${table === "state_meta" ? "singleton_id" : "id"}`).all());
+      const rejectWithoutWrites = async () => {
+        const before = snapshot();
+        await assert.rejects(cli("collect",f.input));
+        await assert.rejects(cli("verify"));
+        assert.equal((await cli("status")).status,"stale");
+        assert.deepEqual(snapshot(),before);
+      };
+      try {
+        for (const tie of [false,true]) {
+          const replacement = {...JSON.parse(originalReview.payload),id:"a-review-replacement",createdAt:tie ? reviews[0].createdAt : new Date().toISOString()};
+          raceDb.prepare("INSERT INTO reviews(id,sequence,task_id,outcome,created_at,payload) VALUES (?,?,?,?,?,?)")
+            .run(replacement.id,99,task.id,replacement.outcome,tie ? originalReview.created_at : replacement.createdAt,JSON.stringify(replacement));
+          await rejectWithoutWrites();
+          raceDb.prepare("DELETE FROM reviews WHERE id=?").run(replacement.id);
+        }
+        raceDb.prepare("DELETE FROM reviews WHERE id=?").run(originalReview.id);
+        await rejectWithoutWrites();
+        raceDb.prepare("INSERT INTO reviews(id,sequence,task_id,outcome,created_at,payload) VALUES (?,?,?,?,?,?)")
+          .run(...["id","sequence","task_id","outcome","created_at","payload"].map(k=>originalReview[k]));
+        raceDb.prepare("UPDATE reviews SET payload=? WHERE id=?").run(JSON.stringify({...JSON.parse(originalReview.payload),invalidatedAt:new Date().toISOString()}),originalReview.id);
+        await rejectWithoutWrites();
+        raceDb.prepare("UPDATE reviews SET payload=? WHERE id=?").run(originalReview.payload,originalReview.id);
+        for (const patch of [{reviewSubjectSha:"d".repeat(40)},{reviewSubjectCycle:2},{projectId:"wrong-project"}]) {
+          raceDb.prepare("UPDATE tasks SET payload=? WHERE id=?").run(JSON.stringify({...task,...patch}),task.id);
+          await rejectWithoutWrites();
+        }
+        raceDb.prepare("UPDATE tasks SET payload=? WHERE id=?").run(originalTask.payload,task.id);
+        raceDb.prepare("DELETE FROM tasks WHERE id=?").run(task.id);
+        await rejectWithoutWrites();
+        raceDb.prepare("INSERT INTO tasks(id,sequence,project_id,status,payload) VALUES (?,?,?,?,?)")
+          .run(originalTask.id,originalTask.sequence,originalTask.project_id,originalTask.status,originalTask.payload);
+        const changedProject = JSON.parse(originalProject.payload);
+        changedProject.reviewPipeline = [...store.reviewStagesForProject(changedProject),{key:"regression-new",role:"regression-reviewer",required:true}];
+        raceDb.prepare("UPDATE projects SET payload=? WHERE id=?").run(JSON.stringify(changedProject),project.id);
+        await rejectWithoutWrites();
+        raceDb.prepare("UPDATE projects SET payload=? WHERE id=?").run(originalProject.payload,project.id);
+        if (skipped) {
+          const saved = raceDb.prepare("SELECT payload FROM reviews WHERE id='review_frontend'").get().payload;
+          raceDb.prepare("UPDATE reviews SET payload=? WHERE id='review_frontend'").run(JSON.stringify({...JSON.parse(saved),outcome:"approved"}));
+          await rejectWithoutWrites();
+          raceDb.prepare("UPDATE reviews SET payload=? WHERE id='review_frontend'").run(saved);
+        }
+        if (stageCase === "prototype") {
+          const changed = JSON.parse(originalProject.payload);delete changed.deliveryPolicy;
+          raceDb.prepare("UPDATE projects SET payload=? WHERE id=?").run(JSON.stringify(changed),project.id);
+          await rejectWithoutWrites();
+          raceDb.prepare("UPDATE projects SET payload=? WHERE id=?").run(originalProject.payload,project.id);
+        }
+      } finally { raceDb.close(); }
       const changedReviews = structuredClone(coordinates);
       changedReviews.reviews[0].outcome = "revoked";
       assert.throws(() => admission.assertCurrent(changedReviews));
@@ -304,6 +389,19 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       await chmod(trustPath, 0o644);
       await assert.rejects(cli("verify"));
       await chmod(trustPath, 0o600);
+      const trustedConfig = await readFile(trustPath, "utf8");
+      for (const [source, target] of [["producerKeys", "observerKeys"], ["producerKeys", "actorKeys"], ["observerKeys", "actorKeys"], ["producerKeys", "policyKeys"], ["observerKeys", "policyKeys"]]) {
+        const substituted = JSON.parse(trustedConfig);
+        substituted.projects[project.id][target].aliased = Object.values(substituted.projects[project.id][source])[0];
+        await writeFile(trustPath, JSON.stringify(substituted), {mode:0o600});
+        assert.throws(() => admission.assertCurrent(coordinates));
+        await assert.rejects(cli("verify"));
+      }
+      const removed = JSON.parse(trustedConfig);
+      removed.projects[project.id].observerKeys = {};
+      await writeFile(trustPath,JSON.stringify(removed),{mode:0o600});
+      await assert.rejects(cli("verify"));
+      await writeFile(trustPath,trustedConfig,{mode:0o600});
       const originalExpiry = f.readiness.backup.expiresAt;
       f.readiness.backup.expiresAt = "2000-01-01T00:00:00.000Z";
       await f.writeTrust();
@@ -329,4 +427,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       await assert.rejects(cli("verify"));
     } finally { await f.cleanup(); await rm(files, { recursive: true, force: true }); await environment.cleanup(); }
   });
+  test("v2 default accessibility, custom regression and signed applicability survive CLI restart", async () => {
+    for (const stageCase of ["default", "custom", "skipped", "prototype"]) {
+      const childEnv = {...process.env,STUDIOOPS_TEST_HOSTED_STAGE_CASE:stageCase};
+      delete childEnv.NODE_TEST_CONTEXT;
+      const result = await exec(process.execPath,["--test","--test-name-pattern=^CLI collection",fileURLToPath(import.meta.url)],
+        {env:childEnv,maxBuffer:65536});
+      assert.match(result.stdout,/pass 1/);
+    }
+  });
+
 }

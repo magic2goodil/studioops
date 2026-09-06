@@ -53,7 +53,7 @@ export function buildQaReviewList(state, options = {}) {
     const actionable = Boolean(coordinates && bundleMatches);
     return {
       task,
-      hostedQa: hostedQaStatus({ candidate, project: state.projects.find((p) => p.id === task.projectId), reviews: state.reviews }),
+      hostedQa: hostedQaStatus({ candidate, project: state.projects.find((p) => p.id === task.projectId), reviews: state.reviews, tasks: state.tasks }),
       actionable,
       qaBundleId: actionable ? bundle.id : "",
       candidateId: actionable ? coordinates.candidateId : "",
@@ -78,7 +78,7 @@ export function buildQaReviewList(state, options = {}) {
       if (!coordinates || candidate.qaBundleId !== bundle.id) return null;
       return {
         bundle,
-        hostedQa: hostedQaStatus({ candidate, project: state.projects.find((p) => p.id === bundle.projectId), reviews: state.reviews }),
+        hostedQa: hostedQaStatus({ candidate, project: state.projects.find((p) => p.id === bundle.projectId), reviews: state.reviews, tasks: state.tasks }),
         actionable: true,
         candidateId: coordinates.candidateId,
         manifestDigest: coordinates.manifestDigest,

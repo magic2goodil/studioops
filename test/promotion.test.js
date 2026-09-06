@@ -377,6 +377,10 @@ function baseState(overrides = {}) {
 }
 
 function attachOwnerQaPackets(state) {
+  // These historical backend-only seeds explicitly opt into the two-stage
+  // workflow; omitted default UI/accessibility reviews must never qualify.
+  for (const project of state.projects || []) project.reviewPipeline ??= ["backend", "lead"].map(key =>
+    ({key,role:`${key}-reviewer`,status:`${key}_review`,required:true}));
   state.qaBundles ||= [];
   state.reviews ||= [];
   for (const candidate of state.candidates || []) {
@@ -386,6 +390,12 @@ function attachOwnerQaPackets(state) {
       }
       const task = (state.tasks || []).find((item) => item.id === source.taskId);
       if (!task) continue;
+      task.reviewSubjectSha ??= source.headSha;
+      task.reviewSubjectCycle ??= source.candidateCycle;
+      for (const row of state.reviews.filter(r => source.reviews.some(ref => ref.id === r.id))) {
+        row.cycle ??= task.reviewCycle || 0;
+        row.createdAt ??= row.reviewedAt;
+      }
       task.candidateId ??= candidate.id;
       task.qaBundleId ??= candidate.qaBundleId;
       task.candidateManifestDigest ??= candidate.manifestDigest;

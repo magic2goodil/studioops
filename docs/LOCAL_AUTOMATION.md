@@ -944,3 +944,85 @@ The same complete aggregate, executable restrictions, capture limits, deadline,
 filesystem checks and final source attestation still apply. Fixture capability
 does not supply hosted qualification: production origin allowlisting, DNS
 pinning, CA verification and independent signed nonce responses are unchanged.
+
+Hosted authority independence is checked against canonical Ed25519 public-key
+fingerprints (SPKI DER), not key IDs, actor labels or PEM wrapping. Every
+configured producer key must differ from every observer key. Every final owner
+key must differ from both sets; aliases, including unused aliases in a role
+map, reject configuration and qualification. Each producer, observer, owner and policy key map is bounded to 32
+keys. Policy/operator keys must also differ from producer and observer keys. Policy
+signing may share the owner's operator channel; it never replaces
+the independent producer, observer or final owner decision. Existing aliased
+v1 evidence fails closed after this security correction. Replace the offending
+trust configuration and obtain newly authenticated evidence and decisions;
+never rewrite or re-sign stored historical receipts automatically. Config is
+revalidated during collection and at every final admission fence.
+
+
+Hosted review stages use an explicit version transition. Existing valid
+`studioops.release-qa-policy.v1`, decision v1, qualification inputs v1 and
+qualification v1 keep their canonical bytes and 32-review limit. They remain
+eligible only when all current required stages are representable and complete.
+Default accessibility, custom regression or explicit applicability dispositions
+use policy/decision/inputs/qualification v2 and hosted owner packet v2. Evidence
+and observation remain v1 envelopes binding the new policy digest; their signed
+payload versions and normalizations are unchanged. Mixed policy/decision
+versions, unsupported versions and stale v1 receipts cannot authorize v2.
+
+Policy v2 replaces `requiredReviewRoles` with `reviewStages`:
+
+```json
+{
+  "schemaVersion": "studioops.release-review-stages.v1",
+  "tasks": [{
+    "taskId": "task_1",
+    "stages": [{
+      "stageId": "backend",
+      "workflowRequired": true,
+      "disposition": "required",
+      "dispositionDigest": null
+    }, {
+      "stageId": "lead",
+      "workflowRequired": true,
+      "disposition": "required",
+      "dispositionDigest": null
+    }]
+  }]
+}
+```
+
+The complete map includes every current required stage and every stage retained
+in immutable source review evidence. IDs match the configured workflow keys
+(lowercase ASCII letter followed by at most 63 lowercase letters, digits,
+underscores or hyphens). Task and stage IDs are unique and ordered by ASCII
+value. Limits are 32 tasks, 32 stages per task and 128 total stages/review rows;
+64 KiB encoded transport/config/input limits still apply and can reject a
+maximum-count payload with long fields. Overflow is never truncated.
+
+An accepted workflow skip is represented as `not_applicable`, with
+`dispositionDigest` equal to the exact current skipped review-row digest.
+The policy signer and final owner explicitly sign those coordinates. It never
+counts as an independent approval. Backend and lead remain workflow-required,
+approved and independently reviewed. A routing-excluded source skip remains
+visible with `workflowRequired: false` only while its configured stage is known
+and excluded by current public workflow policy. Custom non-lead applicability
+requires the same explicit signed disposition, not an inferred exemption.
+
+`hosted-qa status` includes an unsigned, bounded current `reviewStages` proposal
+(or null when current evidence is incomplete); it is diagnostic only. An
+authorized operator can inspect it when preparing a new signed v2 policy. Then
+collect newly authenticated evidence for that policy, issue a new hosted packet
+and obtain a new exact signed owner decision. Never rewrite, automatically
+re-sign or reinterpret historical manifests, packets or receipts during this
+transition. List summaries omit the full proposal to keep page payloads bounded.
+
+Every admission reads exact current task/project rows and up to 128 current
+same-subject/candidate-cycle review rows, in addition to manifest references.
+Public workflow selection establishes the latest accepted stage review. Missing,
+wrong-project, stale, replaced or revoked rows and equal-time replacement
+ambiguity fail closed; changing requirements or skip dispositions also requires
+new authority. The fence adds two bounded reads through existing indexed task
+and review access paths. A normal evidence write reports six logical reads and
+a qualification lookup five, versus four and three before this change. The
+runtime consumer must provide these same fresh task/current-review coordinates
+inside its own final fence; copied manifest review IDs alone are insufficient.
