@@ -2057,6 +2057,48 @@ function qaAttemptClaims(state) {
   return state.meta.qaIntegrationAttemptClaims;
 }
 
+function qaAttemptClaimHistory(state) {
+  state.meta = state.meta || {};
+  state.meta.qaIntegrationAttemptClaimHistory = Array.isArray(state.meta.qaIntegrationAttemptClaimHistory)
+    ? state.meta.qaIntegrationAttemptClaimHistory
+    : [];
+  return state.meta.qaIntegrationAttemptClaimHistory;
+}
+
+function qaClaimOwner(input = {}) {
+  const ownerPid = Number(input.qaOwnerPid ?? process.pid);
+  const ownerHost = String(input.qaOwnerHost ?? os.hostname()).trim().toLowerCase();
+  if (!Number.isSafeInteger(ownerPid) || ownerPid < 1 || !ownerHost || ownerHost.length > 255) {
+    throw new Error("QA integration requires a bounded local process owner identity.");
+  }
+  return { ownerPid, ownerHost };
+}
+
+export function qaClaimOwnerState(claim, input = {}) {
+  const currentHost = String(input.qaOwnerHost ?? os.hostname()).trim().toLowerCase();
+  const ownerHost = String(claim?.ownerHost || "").trim().toLowerCase();
+  const ownerPid = Number(claim?.ownerPid);
+  if (!ownerHost || ownerHost !== currentHost || !Number.isSafeInteger(ownerPid) || ownerPid < 1) {
+    return "unknown";
+  }
+  const processAlive = typeof input.qaProcessAlive === "function"
+    ? input.qaProcessAlive
+    : (pid) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error) {
+          if (error?.code === "ESRCH") return false;
+          return true;
+        }
+      };
+  try {
+    return processAlive(ownerPid) === false ? "dead" : "alive";
+  } catch {
+    return "unknown";
+  }
+}
+
 function assertQaAuthorityInState(state, projectPlan) {
   const observedDigest = qaAuthorityDigest(state, projectPlan);
   if (!projectPlan.qaAuthorityDigest || observedDigest !== projectPlan.qaAuthorityDigest) {
@@ -2078,13 +2120,29 @@ async function claimQaAttempt(projectPlan, input = {}) {
       && Number.isFinite(Date.parse(previous.expiresAt || ""))
       && Date.parse(previous.expiresAt) > nowMs
     ) {
-      return {
-        acquired: false,
-        claim: jsonValue(previous, null),
-        reason: `QA project ${projectPlan.projectId} already has an active fenced attempt.`,
-      };
+      if (qaClaimOwnerState(previous, input) !== "dead") {
+        return {
+          acquired: false,
+          claim: jsonValue(previous, null),
+          reason: `QA project ${projectPlan.projectId} already has an active fenced attempt.`,
+        };
+      }
+      const history = qaAttemptClaimHistory(state);
+      history.push({
+        schemaVersion: QA_ATTEMPT_CLAIM_SCHEMA_VERSION,
+        claimId: previous.claimId,
+        projectId: projectPlan.projectId,
+        fence: Number(previous.fence || 0),
+        status: "abandoned",
+        ownerPid: previous.ownerPid,
+        ownerHost: previous.ownerHost,
+        terminalAt: now,
+        outcome: "owner_process_absent",
+      });
+      state.meta.qaIntegrationAttemptClaimHistory = history.slice(-100);
     }
     const ttlMs = Math.max(1_000, Math.min(24 * 60 * 60_000, Number(input.qaAttemptTtlMs || QA_ATTEMPT_TTL_MS)));
+    const owner = qaClaimOwner(input);
     const claim = {
       schemaVersion: QA_ATTEMPT_CLAIM_SCHEMA_VERSION,
       claimId: typeof input.qaClaimIdFactory === "function" ? input.qaClaimIdFactory() : randomUUID(),
@@ -2092,6 +2150,7 @@ async function claimQaAttempt(projectPlan, input = {}) {
       fence: Math.max(0, Number(previous?.fence || 0)) + 1,
       status: "active",
       authorityDigest,
+      ...owner,
       acquiredAt: now,
       renewedAt: now,
       expiresAt: new Date(nowMs + ttlMs).toISOString(),
