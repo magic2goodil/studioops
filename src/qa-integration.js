@@ -582,6 +582,14 @@ function githubRepositorySlug(value) {
   return raw === canonical ? `${segments[0]}/${segments[1]}` : "";
 }
 
+export function canonicalGitHubSshTransport(repoUrl) {
+  const repository = githubRepositorySlug(repoUrl);
+  if (!repository) {
+    throw qaRemotePolicyError("QA local SSH fallback requires a configured canonical GitHub repository URL.");
+  }
+  return `git@github.com:${repository}.git`;
+}
+
 function qaIntegrationAuthEnabled(projectPlan, input = {}) {
   return booleanOption(
     input.githubAppAuth ?? process.env.MISSION_CONTROL_QA_GITHUB_APP_AUTH,
@@ -785,6 +793,10 @@ function qaGitOptions(options = {}, overrides = {}) {
   };
 }
 
+function qaRemoteTarget(options = {}) {
+  return String(options.remoteTransportUrl || "origin");
+}
+
 function qaRemotePolicyError(message) {
   const error = new Error(message);
   error.code = "QA_REMOTE_POLICY";
@@ -873,7 +885,9 @@ async function qaRemotePolicy(repoPath, projectPlan, options = {}) {
   }
   return {
     repository: expectedRepository,
-    transportUrl: configuredUrl,
+    transportUrl: options.preferLocalSshTransport
+      ? canonicalGitHubSshTransport(configuredUrl)
+      : configuredUrl,
   };
 }
 
@@ -1266,7 +1280,7 @@ async function remoteBranchExists(repoPath, branchName, options = {}) {
 }
 
 async function remoteRefHead(repoPath, ref, options = {}) {
-  const result = await git(repoPath, ["ls-remote", "origin", ref], { ...options, allowFailure: true });
+  const result = await git(repoPath, ["ls-remote", qaRemoteTarget(options), ref], { ...options, allowFailure: true });
   if (!result.ok) return { ok: false, head: "", output: truncateOutput(result.output) };
   const line = String(result.stdout || "").split("\n").find(Boolean) || "";
   return {
@@ -2447,7 +2461,7 @@ async function verifyMergedIntegrationTarget(repoPath, projectPlan, pr, options 
   const targetBranch = normalizeBranchName(projectPlan.integrationBranch);
   const fetch = await git(
     repoPath,
-    ["fetch", "origin", `refs/heads/${targetBranch}:refs/remotes/origin/${targetBranch}`],
+    ["fetch", qaRemoteTarget(options), `refs/heads/${targetBranch}:refs/remotes/origin/${targetBranch}`],
     { ...options, allowFailure: true },
   );
   if (!fetch.ok) {
@@ -2482,12 +2496,17 @@ async function verifyMergedIntegrationTarget(repoPath, projectPlan, pr, options 
   };
 }
 
+export function isGitAuthenticationFailure(output) {
+  return /could not read username|permission denied \(publickey\)|authentication failed|repository not found/i
+    .test(String(output || ""));
+}
+
 async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, options = {}) {
   for (const task of projectPlan.tasks) {
     const source = await remoteTaskHead(repoPath, task, options);
     if (!source.ok) {
       return {
-        status: "candidate_drift",
+        status: isGitAuthenticationFailure(source.output) ? "authentication_failed" : "candidate_drift",
         blocker: `Could not verify the reviewed source for ${task.id}: ${source.output}`,
       };
     }
@@ -2585,7 +2604,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
     let cleanup = { ok: true, output: "" };
     if (remoteCandidate.head) {
       await guardQaExternalMutation(repoPath, projectPlan, options, "delete_superseded_candidate_branch");
-      cleanup = await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+      cleanup = await git(repoPath, ["push", qaRemoteTarget(options), `:refs/heads/${handoff.branch}`], {
         ...options,
         allowFailure: true,
       });
@@ -2643,7 +2662,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
   let cleanup = { ok: true, output: "" };
   if (remoteCandidate.head) {
     await guardQaExternalMutation(repoPath, projectPlan, options, "delete_merged_candidate_branch");
-    cleanup = await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+    cleanup = await git(repoPath, ["push", qaRemoteTarget(options), `:refs/heads/${handoff.branch}`], {
       ...options,
       allowFailure: true,
     });
@@ -2754,8 +2773,9 @@ async function integrateProject(projectPlan, options = {}) {
 
   let mergedHandoff = null;
   if (pendingHandoff) {
-    await qaRemotePolicy(repoPath, candidatePlan, options);
-    const inspected = await inspectPendingProtectedHandoff(repoPath, candidatePlan, pendingHandoff, options);
+    const remotePolicy = await qaRemotePolicy(repoPath, candidatePlan, options);
+    const inspectionOptions = { ...options, remoteTransportUrl: remotePolicy.transportUrl };
+    const inspected = await inspectPendingProtectedHandoff(repoPath, candidatePlan, pendingHandoff, inspectionOptions);
     if (inspected.status === "superseded") {
       candidatePlan.tasks = requestedTasks;
       candidatePlan.assembly = requestedAssembly;
@@ -3142,7 +3162,12 @@ async function integrateProject(projectPlan, options = {}) {
     });
     if (options.renewQaClaim) await options.renewQaClaim();
     if (options.assertQaClaim) await options.assertQaClaim();
-    const candidateVerification = await verifyCandidateRepositoryState(project, candidate, gitOptions);
+    const candidateVerification = await verifyCandidateRepositoryState(project, candidate, {
+      ...gitOptions,
+      ...(options.preferLocalSshTransport
+        ? { remoteTransportUrl: canonicalGitHubSshTransport(project.repoUrl) }
+        : {}),
+    });
     if (!candidateVerification.ok) {
       result.status = candidateVerification.status === "drift"
         ? "candidate_drift"
@@ -3321,7 +3346,7 @@ function commentForTask(projectResult, taskResult) {
     return `Protected QA branch handoff for ${taskResult.source}: ${projectResult.integrationCandidateCommit} is published on ${projectResult.integrationCandidateBranch}.${projectResult.integrationPr?.url ? `\n\nPR: ${projectResult.integrationPr.url}` : ""}${branchLine}${checks}\n\n${projectResult.integrationBlocker || projectResult.output}${supersededLine}`;
   }
 
-  if (["candidate_drift", "candidate_publish_failed", "candidate_supersession_failed"].includes(taskResult.status)) {
+  if (["candidate_drift", "candidate_publish_failed", "candidate_supersession_failed", "authentication_failed"].includes(taskResult.status)) {
     return `Protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
   }
 
@@ -3411,7 +3436,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
   );
   const assignedAgentRole = taskResult.status === "ready"
     ? "owner"
-    : ["pr_waiting", "pr_merged", "validation_sandbox_unavailable"].includes(taskResult.status)
+    : ["pr_waiting", "pr_merged", "validation_sandbox_unavailable", "authentication_failed"].includes(taskResult.status)
       ? "qa-integration-worker"
       : taskResult.status === "pr_closed"
         ? "owner"
@@ -3752,6 +3777,7 @@ export async function runQaIntegration(input = {}) {
           result = localFallbackResultNote(await integrateProject(projectPlan, {
             ...input,
             githubAppAuth: false,
+            preferLocalSshTransport: true,
             env: { ...(input.env || {}) },
             gitAuthEnv: {},
             secrets: normalizeSecrets(input.secrets),
