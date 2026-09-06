@@ -1,3 +1,4 @@
+import { hostedRcDigest } from "./hosted-rc-evidence.js";
 import { createHash } from "node:crypto";
 import {
   assertCandidateEnvelope,
@@ -505,4 +506,23 @@ export function assertReconciliationOwnerQaPacket(state, candidate, bundle = nul
     }
   }
   return packet;
+}
+
+/** Separate hosted inputs leave the originally issued diagnostic packet intact.
+ * The final signed decision/receipt is deliberately excluded from this digest. */
+export function buildHostedOwnerQaPacket(candidate, inputs, readiness, evidence) {
+  const diagnosticPacketDigest = candidate.qaPacket?.packetDigest;
+  if (!diagnosticPacketDigest) throw new Error("owner_decision_missing");
+  const base = {
+    schemaVersion: inputs.schemaVersion === "studioops.release-qualification-inputs.v2"
+      ? "studioops.hosted-owner-qa-packet.v2" : "studioops.hosted-owner-qa-packet.v1",
+    candidateId: candidate.id, manifestDigest: candidate.manifestDigest,
+    diagnosticPacketDigest, inputs, inputsDigest: hostedRcDigest(inputs),
+    readinessDigest: hostedRcDigest(readiness), origin: evidence.environment.origin,
+    deploymentId: evidence.environment.deploymentId,
+    distribution: evidence.native, devices: evidence.scenarios.map(({ id, deviceId, deviceKind, authentication, result }) => (
+      { id, deviceId, deviceKind, authentication, result }
+    )), dataTransferMode: "none",
+  };
+  return { ...base, packetDigest: hostedRcDigest(base) };
 }

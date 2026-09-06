@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { prepareHostedQaAdmission, hostedQaCoordinatesFromState } from "./hosted-qa-adapter.js";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -1581,79 +1582,96 @@ function promotionClaimInput(projectPlan, input = {}, overrides = {}, state = nu
   };
 }
 
+// Network observation happens outside the write lock. Only the trusted adapter
+// creates this executable authority; callers cannot supply it in promotion input.
+async function preparePromotionStateAdmission(projectPlan) {
+  try {
+    return await prepareHostedQaAdmission({ projectId: projectPlan.projectId, candidateId: projectPlan.candidate.id });
+  } catch (error) { error.code = "PROMOTION_ATTEMPT_STALE"; throw error; }
+}
+
+function assertHostedPromotionState(admission, state, candidateId) {
+  try { return admission.assertCurrent(hostedQaCoordinatesFromState(state, candidateId)); }
+  catch (error) { error.code = "PROMOTION_ATTEMPT_STALE"; throw error; }
+}
+
 async function claimProjectPromotionAttempt(projectPlan, input = {}) {
-  return mutatePromotionAttemptClaimState(projectPlan.candidate.id, (state) => claimPromotionAttemptInState(
-    state,
-    promotionClaimInput(projectPlan, input, {}, state),
-  ), { operationName: "promotion.claim_attempt" });
+  const admission = await preparePromotionStateAdmission(projectPlan);
+  return mutatePromotionAttemptClaimState(projectPlan.candidate.id, (state) => {
+    assertHostedPromotionState(admission, state, projectPlan.candidate.id);
+    return claimPromotionAttemptInState(state, promotionClaimInput(projectPlan, input, {}, state));
+  }, { operationName: "promotion.claim_attempt" });
 }
 
 async function renewProjectPromotionAttempt(projectPlan, claim, input = {}) {
-  return mutatePromotionAttemptClaimState(projectPlan.candidate.id, (state) => renewPromotionAttemptClaimInState(
-    state,
-    claim,
-    promotionClaimInput(projectPlan, input, {}, state),
-  ), { operationName: "promotion.renew_attempt" });
+  const admission = await preparePromotionStateAdmission(projectPlan);
+  return mutatePromotionAttemptClaimState(projectPlan.candidate.id, (state) => {
+    assertHostedPromotionState(admission, state, projectPlan.candidate.id);
+    return renewPromotionAttemptClaimInState(state, claim, promotionClaimInput(projectPlan, input, {}, state));
+  }, { operationName: "promotion.renew_attempt" });
 }
 
 async function assertProjectPromotionAttempt(projectPlan, claim, input = {}) {
+  const admission = await preparePromotionStateAdmission(projectPlan);
   const state = await readState();
+  assertHostedPromotionState(admission, state, projectPlan.candidate.id);
   try {
-    return assertPromotionAttemptClaimInState(
-      state,
-      claim,
-      promotionClaimInput(projectPlan, input, {}, state),
-    );
-  } catch (error) {
-    error.code = "PROMOTION_ATTEMPT_STALE";
-    throw error;
-  }
+    return assertPromotionAttemptClaimInState(state, claim, promotionClaimInput(projectPlan, input, {}, state));
+  } catch (error) { error.code = "PROMOTION_ATTEMPT_STALE"; throw error; }
 }
 
 async function recordProjectPromotionRecoveryReceipt(projectPlan, claim, validationResults, validationEvidence, input = {}) {
-  return mutateCandidatePromotionState(projectPlan.candidate.id, claim, (state) => recordPromotionRecoveryReceiptInState(
-    state,
-    claim,
-    {
-      ...promotionClaimInput(projectPlan, input, {}, state),
-      validationResults,
-      validationEvidence,
-      advanceTaskVersion: ({ task, source, candidate, previousVersion, now }) => {
-        applyPromotionLifecycleTransitionInState(state, {
-          action: "record_promotion_validation_evidence",
-          taskId: task.id,
-          expectedStateVersion: previousVersion,
-          actorContext: {
-            actorId: "studioops-promotion-worker",
-            actorType: "system",
-            role: "promotion-worker",
-            trusted: true,
-          },
-          evidence: {
-            targetStatus: task.status,
-            candidateCycle: source.candidateCycle,
-            subjectSha: source.headSha,
-            candidateId: candidate.id,
-            manifestDigest: candidate.manifestDigest,
-            promotionClaimId: claim.claimId,
-            promotionClaimFence: claim.fence,
-            validationEvidenceDigest: validationEvidence?.digest || "",
-          },
-        }, { now });
+  const admission = await preparePromotionStateAdmission(projectPlan);
+  return mutateCandidatePromotionState(projectPlan.candidate.id, claim, (state) => {
+    assertHostedPromotionState(admission, state, projectPlan.candidate.id);
+    return recordPromotionRecoveryReceiptInState(
+      state,
+      claim,
+      {
+        ...promotionClaimInput(projectPlan, input, {}, state),
+        validationResults,
+        validationEvidence,
+        advanceTaskVersion: ({ task, source, candidate, previousVersion, now }) => {
+          applyPromotionLifecycleTransitionInState(state, {
+            action: "record_promotion_validation_evidence",
+            taskId: task.id,
+            expectedStateVersion: previousVersion,
+            actorContext: {
+              actorId: "studioops-promotion-worker",
+              actorType: "system",
+              role: "promotion-worker",
+              trusted: true,
+            },
+            evidence: {
+              targetStatus: task.status,
+              candidateCycle: source.candidateCycle,
+              subjectSha: source.headSha,
+              candidateId: candidate.id,
+              manifestDigest: candidate.manifestDigest,
+              promotionClaimId: claim.claimId,
+              promotionClaimFence: claim.fence,
+              validationEvidenceDigest: validationEvidence?.digest || "",
+            },
+          }, { now });
+        },
       },
-    },
-  ), { operationName: "promotion.record_recovery_receipt" });
+    );
+  }, { operationName: "promotion.record_recovery_receipt" });
 }
 
 async function bindProjectPromotionReconciliationReplacement(projectPlan, claim, replacement, input = {}) {
-  return mutatePromotionAttemptClaimState(projectPlan.candidate.id, (state) => bindPromotionReconciliationReplacementInState(
-    state,
-    claim,
-    {
-      ...promotionClaimInput(projectPlan, input, {}, state),
-      replacement,
-    },
-  ), { operationName: "promotion.bind_reconciliation_replacement" });
+  const admission = await preparePromotionStateAdmission(projectPlan);
+  return mutatePromotionAttemptClaimState(projectPlan.candidate.id, (state) => {
+    assertHostedPromotionState(admission, state, projectPlan.candidate.id);
+    return bindPromotionReconciliationReplacementInState(
+      state,
+      claim,
+      {
+        ...promotionClaimInput(projectPlan, input, {}, state),
+        replacement,
+      },
+    );
+  }, { operationName: "promotion.bind_reconciliation_replacement" });
 }
 
 function allTaskResults(tasks, status, output) {
@@ -2739,13 +2757,15 @@ function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) 
 }
 
 async function recordProjectResult(projectResult) {
+  const hostedAdmission = await preparePromotionStateAdmission(projectResult);
   if (projectResult.status === "merged") {
     // GitHub may omit fractional seconds. Canonicalize once before binding the
     // terminal claim and writing each durable merge mirror so they cannot
     // disagree solely because equivalent ISO timestamps use different forms.
     projectResult.mergedAt = new Date(projectResult.mergedAt).toISOString();
   }
-  return mutateCandidatePromotionState(projectResult.candidate?.id, projectResult.promotionClaim, async (state) => {
+  return mutateCandidatePromotionState(projectResult.candidate?.id, projectResult.promotionClaim, (state) => {
+    const hostedQualification = assertHostedPromotionState(hostedAdmission, state, projectResult.candidate.id);
     const now = new Date().toISOString();
     state.comments = state.comments || [];
     state.events = state.events || [];
@@ -2981,6 +3001,8 @@ async function recordProjectResult(projectResult) {
         commitSha: projectResult.commit || "",
         manifestDigest: candidate.manifestDigest,
         readyAt: now,
+        ...(hostedQualification ? { hostedQa: { qualification: hostedQualification,
+          observation: hostedAdmission.authority.hostedObservation(), dataTransferMode: "none" } } : {}),
       };
       candidate.updatedAt = now;
       state.events.push({
@@ -3032,9 +3054,11 @@ async function recordProjectResult(projectResult) {
 }
 
 async function recordPromotionClaimCircuit(projectPlan, claimResult) {
+  const admission = await preparePromotionStateAdmission(projectPlan);
   const observedClaim = claimResult?.claim;
   const circuit = claimResult?.circuit;
   return mutatePromotionAttemptClaimState(projectPlan.candidate.id, (state) => {
+    assertHostedPromotionState(admission, state, projectPlan.candidate.id);
     const now = new Date().toISOString();
     const project = (state.projects || []).find((item) => item.id === projectPlan.projectId);
     if (!project) return { published: false, reason: "project_missing" };

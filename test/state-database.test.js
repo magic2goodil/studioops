@@ -2812,7 +2812,7 @@ test("hosted RC persistence fences writes, preserves legacy history, survives re
       assert.equal(policyAgain.idempotent,true); assert.equal(policyAgain.version,1);
       const append={projectId:'project_1',candidateId:'candidate_1',expectedVersion:0,...f.input};
       const admitted=await store.appendHostedRcEvidence(append,authority);
-      assert.equal(admitted.queryCount,4); assert.equal(admitted.version,1);
+      assert.equal(admitted.queryCount,6); assert.equal(admitted.version,1);
       await assert.rejects(store.appendHostedRcEvidence(append,authority),{code:'state_conflict'});
       const duplicate=await store.appendHostedRcEvidence({...append,expectedVersion:1},authority);
       assert.equal(duplicate.idempotent,true); assert.equal(duplicate.version,1);
@@ -2827,7 +2827,7 @@ test("hosted RC persistence fences writes, preserves legacy history, survives re
       const readStart=performance.now();
       const view=await store.getCurrentReleaseQualification('project_1','candidate_1',{nowMs:Date.parse(f.context.now)});
       const qualificationReadMs=performance.now()-readStart;
-      assert.equal(view.reason,'qualified'); assert.equal(view.queryCount,3);
+      assert.equal(view.reason,'qualified'); assert.equal(view.queryCount,5);
       const list=await store.listHostedRcEvidence('project_1','candidate_1',{limit:1});
       assert.equal(list.items.length,1); assert.equal(list.items[0].evidence,undefined); assert.equal(list.nextOffset,null);
       await assert.rejects(store.listHostedRcEvidence('project_1','candidate_1',{limit:51}),{code:'evidence_malformed'});
@@ -2847,7 +2847,7 @@ test("hosted RC persistence fences writes, preserves legacy history, survives re
       assert.ok(page.items.every(item=>!('evidence' in item)));
       console.log(JSON.stringify({envelopeBytes:Buffer.byteLength(JSON.stringify(f.input.evidence)),writeQueryCount:q.queryCount,readQueryCount:view.queryCount,qualificationWriteMs,qualificationReadMs,summaryPageMs,summaryCount:page.items.length}));
     `);
-    assert.match(stdout, /"writeQueryCount":4/);
+    assert.match(stdout, /"writeQueryCount":6/);
     t.diagnostic(stdout.trim());
     const restarted = await runStoreScript(root, `${common}
       const current=await store.getCurrentReleaseQualification('project_1','candidate_1',{nowMs:Date.parse(f.context.now)});

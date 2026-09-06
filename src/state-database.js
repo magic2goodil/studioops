@@ -3611,6 +3611,24 @@ function assertHostedRcProtectedState(state, snapshot) {
   }
 }
 
+function hostedRcSourceTasks(db, candidate, projectId) {
+  const ids = (candidate?.manifest?.sources || []).map((source) => source.taskId);
+  if (ids.length > 32 || new Set(ids).size !== ids.length) throw hostedRcStorageError("history_limit");
+  return ids.length ? db.prepare(`SELECT payload FROM tasks WHERE project_id = ? AND id IN (${ids.map(() => "?").join(",")}) ORDER BY id`)
+    .all(projectId, ...ids).map((row) => parsePayload(row.payload, null)) : [];
+}
+
+function hostedRcCurrentReviews(db, candidate, projectId) {
+  const sources = candidate?.manifest?.sources || [];
+  if (!sources.length) return [];
+  const rows = db.prepare(`SELECT r.payload FROM reviews r JOIN tasks t ON t.id = r.task_id WHERE t.project_id = ? AND (${sources.map(() =>
+    "(r.task_id = ? AND json_extract(r.payload, '$.subjectSha') = ? AND json_extract(r.payload, '$.candidateCycle') = ?)"
+  ).join(" OR ")}) ORDER BY r.created_at DESC, r.id DESC LIMIT 129`)
+    .all(projectId, ...sources.flatMap((source) => [source.taskId, source.headSha, source.candidateCycle]));
+  if (rows.length > 128) throw hostedRcStorageError("history_limit");
+  return rows.map((row) => parsePayload(row.payload, null));
+}
+
 /** Internal persistence port; only workflow-state's hosted RC adapter supplies mutator. No network IO in a transaction. */
 export async function mutateHostedRcAggregate(input, mutator) {
   if (!input || typeof input.projectId !== "string" || !Number.isSafeInteger(input.expectedVersion)
@@ -3633,8 +3651,9 @@ export async function mutateHostedRcAggregate(input, mutator) {
       if (reviewIds.length > 128) throw hostedRcStorageError("history_limit");
       const reviews = reviewIds.length ? db.prepare(`SELECT payload FROM reviews WHERE id IN (${reviewIds.map(() => "?").join(",")}) ORDER BY id`)
         .all(...reviewIds).map((r) => parsePayload(r.payload, null)) : [];
+      const tasks = hostedRcSourceTasks(db, candidate, input.projectId);
       const result = mutator({ project: structuredClone(project), candidate: structuredClone(candidate),
-        reviews, record: structuredClone(previous) });
+        reviews, tasks, currentReviews: hostedRcCurrentReviews(db, candidate, input.projectId), record: structuredClone(previous) });
       if (!result || typeof result.then === "function") throw hostedRcStorageError("authority_required");
       if (JSON.stringify(result.record) !== JSON.stringify(previous)) {
         if (!result.record || result.record.version !== input.expectedVersion + 1
@@ -3646,7 +3665,7 @@ export async function mutateHostedRcAggregate(input, mutator) {
       }
       db.exec("COMMIT");
       return { ...result.value, version: result.record?.version || 0,
-        queryCount: (candidate ? 3 : 2) + (reviewIds.length ? 1 : 0) };
+        queryCount: (candidate ? 3 : 2) + (reviewIds.length ? 1 : 0) + (candidate?.manifest?.sources?.length ? 2 : 0) };
     } catch (error) { db.exec("ROLLBACK"); throw error; }
   }, { operationName: "hosted_rc.fenced_aggregate" });
 }
@@ -3663,6 +3682,9 @@ export async function readHostedRcAggregate(projectId, candidateId = "", include
     if (reviewIds.length > 128) throw hostedRcStorageError("history_limit");
     const reviews = reviewIds.length ? db.prepare(`SELECT payload FROM reviews WHERE id IN (${reviewIds.map(() => "?").join(",")}) ORDER BY id`)
       .all(...reviewIds).map((r) => parsePayload(r.payload, null)) : [];
-    return { project, candidate, reviews, queryCount: (candidateId ? 2 : 1) + (reviewIds.length ? 1 : 0) };
+    const tasks = includeReviews ? hostedRcSourceTasks(db, candidate, projectId) : [];
+    const currentReviews = includeReviews ? hostedRcCurrentReviews(db, candidate, projectId) : [];
+    return { project, candidate, reviews, tasks, currentReviews, queryCount: (candidateId ? 2 : 1) + (reviewIds.length ? 1 : 0)
+      + (includeReviews && candidate?.manifest?.sources?.length ? 2 : 0) };
   });
 }

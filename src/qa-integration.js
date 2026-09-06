@@ -45,6 +45,9 @@ import {
   installPreparedProjectValidationDependencies,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
   normalizeProjectValidationNetworkPolicy,
+  normalizeProjectValidationFixtureNetwork,
+  PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE,
+  PROJECT_VALIDATION_FIXTURE_NETWORK_ENV,
   runProjectValidationCommand,
   verifyProjectValidationSandbox,
 } from "./project-validation-sandbox.js";
@@ -916,6 +919,9 @@ function validationSandboxAdapter(options = {}) {
 }
 
 function outerValidationEnvironment(homePath, validationPath) {
+  const networkPolicy = normalizeProjectValidationNetworkPolicy(process.env.STUDIOOPS_PROJECT_VALIDATION_NETWORK_POLICY);
+  const fixtureNetwork = networkPolicy === PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE
+    ? normalizeProjectValidationFixtureNetwork(JSON.parse(process.env[PROJECT_VALIDATION_FIXTURE_NETWORK_ENV] || "null")) : null;
   return {
     PATH: validationPath,
     HOME: homePath,
@@ -936,6 +942,8 @@ function outerValidationEnvironment(homePath, validationPath) {
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_TERMINAL_PROMPT: "0",
     STUDIOOPS_PROJECT_VALIDATION_SANDBOX: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+    STUDIOOPS_PROJECT_VALIDATION_NETWORK_POLICY: networkPolicy,
+    ...(fixtureNetwork ? { [PROJECT_VALIDATION_FIXTURE_NETWORK_ENV]: JSON.stringify(fixtureNetwork) } : {}),
   };
 }
 
@@ -1085,7 +1093,7 @@ export function createQaOuterSandboxTestAdapter() {
           ),
           policyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
           strategy: "outer_verified_sandbox_disposable_full_clone",
-          networkPolicy: "deny_all",
+          networkPolicy: normalizeProjectValidationNetworkPolicy(process.env.STUDIOOPS_PROJECT_VALIDATION_NETWORK_POLICY),
           processPolicy: "outer_sandbox_inherited",
           expectedHeadSha,
           testGitRunner: input.testGitRunner,
