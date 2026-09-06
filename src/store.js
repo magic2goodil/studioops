@@ -3916,7 +3916,14 @@ async function settleQaRevocationPromotion(snapshot, dependencies) {
     const result = await dependencies.settleReleaseCandidatePullRequestForRevocation(
       snapshot.project,
       snapshot.candidate,
-      { githubToken: auth.token },
+      {
+        githubToken: auth.token,
+        gitAuthEnv: {
+          GIT_ASKPASS: auth.askpassPath,
+          MISSION_CONTROL_GITHUB_TOKEN: auth.token,
+          MISSION_CONTROL_GIT_USERNAME: "x-access-token",
+        },
+      },
     );
     if (["absent", "closed", "merged"].includes(result?.status)) return result;
     return redactQaVerification(result, githubAppAuthSecrets(auth));

@@ -488,3 +488,104 @@ export async function verifyCandidateRepositoryState(project, candidate, input =
     observations,
   }, observationTestAuthority);
 }
+
+function safeTemporaryRefSegment(value) {
+  return String(value || "candidate").replace(/[^A-Za-z0-9._-]/g, "-");
+}
+
+/**
+ * Verify the narrow legacy case where a closed promotion branch advanced past
+ * the recorded integration commit without changing the candidate tree.
+ */
+export async function verifyClosedPromotionHeadContainsCandidate(project, candidate, input = {}) {
+  assertCandidateEnvelope(candidate);
+  const observedHead = normalizeGitSha(input.observedHead, "observed promotion head SHA");
+  const promotionBranch = String(input.promotionBranch || "").trim();
+  const integrationBranch = String(candidate.manifest.integration.branch || "").trim();
+  const integrationSha = candidate.manifest.integration.sha;
+  const repoPath = requiredRepositoryPath(project);
+  const suffix = `${safeTemporaryRefSegment(candidate.id)}-${process.pid}-${Date.now()}`;
+  const promotionRef = `refs/studioops/qa-revocation/${suffix}/promotion`;
+  const integrationRef = `refs/studioops/qa-revocation/${suffix}/integration`;
+  const localInspectionInput = { ...input, gitAuthEnv: undefined };
+
+  try {
+    const remotePolicy = await candidateRemotePolicy(project, input);
+    await trustedGit(repoPath, ["check-ref-format", "--branch", promotionBranch], localInspectionInput);
+    await trustedGit(repoPath, ["check-ref-format", "--branch", integrationBranch], localInspectionInput);
+    await trustedGit(repoPath, [
+      "fetch",
+      "--force",
+      "--no-tags",
+      "--no-recurse-submodules",
+      "--no-write-fetch-head",
+      "--",
+      remotePolicy.transportUrl,
+      `+refs/heads/${promotionBranch}:${promotionRef}`,
+      `+refs/heads/${integrationBranch}:${integrationRef}`,
+    ], input);
+
+    const fetchedPromotion = normalizeGitSha(
+      (await trustedGit(repoPath, ["rev-parse", "--verify", `${promotionRef}^{commit}`], localInspectionInput)).stdout.trim(),
+      "fetched promotion head SHA",
+    );
+    const fetchedIntegration = normalizeGitSha(
+      (await trustedGit(repoPath, ["rev-parse", "--verify", `${integrationRef}^{commit}`], localInspectionInput)).stdout.trim(),
+      "fetched integration SHA",
+    );
+    if (fetchedPromotion !== observedHead || fetchedIntegration !== integrationSha) {
+      return {
+        ok: false,
+        status: "drift",
+        reason: "Promotion or integration ref changed during legacy revocation verification.",
+      };
+    }
+
+    try {
+      await trustedGit(repoPath, ["merge-base", "--is-ancestor", integrationSha, observedHead], localInspectionInput);
+    } catch (error) {
+      if (Number(error?.code) === 1) {
+        return {
+          ok: false,
+          status: "invalid",
+          reason: "The closed promotion head does not contain the immutable integration commit.",
+        };
+      }
+      throw error;
+    }
+
+    const integrationTree = normalizeGitSha(
+      (await trustedGit(repoPath, ["rev-parse", "--verify", `${integrationSha}^{tree}`], localInspectionInput)).stdout.trim(),
+      "immutable integration tree SHA",
+    );
+    const promotionTree = normalizeGitSha(
+      (await trustedGit(repoPath, ["rev-parse", "--verify", `${observedHead}^{tree}`], localInspectionInput)).stdout.trim(),
+      "closed promotion tree SHA",
+    );
+    if (integrationTree !== promotionTree) {
+      return {
+        ok: false,
+        status: "invalid",
+        reason: "The closed promotion head changed the immutable candidate tree.",
+      };
+    }
+
+    return {
+      ok: true,
+      status: "verified",
+      observedHead,
+      integrationSha,
+      treeSha: integrationTree,
+      verifiedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: "unavailable",
+      reason: `Closed promotion ancestry could not be verified: ${String(error.stderr || error.message || "git verification failed").trim()}`,
+    };
+  } finally {
+    await trustedGit(repoPath, ["update-ref", "-d", promotionRef], localInspectionInput).catch(() => {});
+    await trustedGit(repoPath, ["update-ref", "-d", integrationRef], localInspectionInput).catch(() => {});
+  }
+}
