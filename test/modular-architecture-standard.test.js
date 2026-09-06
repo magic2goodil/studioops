@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   MODULAR_ARCHITECTURE_STANDARD,
+  HOSTED_RC_STANDARD,
   projectFromConfig,
   withDefaultProjectStandards,
 } from "../src/config.js";
@@ -92,6 +93,7 @@ test("new config projects receive the required standard while preserving explici
 
   assert.deepEqual(project.standards, [
     MODULAR_ARCHITECTURE_STANDARD,
+    HOSTED_RC_STANDARD,
     "docs/PROJECT_POLICY.md",
   ]);
   assert.deepEqual(project.safetyRules, ["Never skip device-stop validation."]);
@@ -101,11 +103,12 @@ test("new config projects receive the required standard while preserving explici
   });
   assert.deepEqual(inherited.standards, [
     MODULAR_ARCHITECTURE_STANDARD,
+    HOSTED_RC_STANDARD,
     "standards/engineering.md",
   ]);
   assert.deepEqual(
     withDefaultProjectStandards([MODULAR_ARCHITECTURE_STANDARD, MODULAR_ARCHITECTURE_STANDARD]),
-    [MODULAR_ARCHITECTURE_STANDARD],
+    [MODULAR_ARCHITECTURE_STANDARD, HOSTED_RC_STANDARD],
   );
 });
 
@@ -123,9 +126,10 @@ test("existing project adoption is idempotent and preserves standards and safety
   });
 
   assert.equal(first.changed, true);
-  assert.deepEqual(first.added, [MODULAR_ARCHITECTURE_STANDARD]);
+  assert.deepEqual(first.added, [MODULAR_ARCHITECTURE_STANDARD, HOSTED_RC_STANDARD]);
   assert.deepEqual(state.projects[0].standards, [
     MODULAR_ARCHITECTURE_STANDARD,
+    HOSTED_RC_STANDARD,
     "docs/PROJECT_POLICY.md",
   ]);
   assert.deepEqual(state.projects[0].safetyRules, safetyRules);

@@ -19,8 +19,20 @@ import {
   writeConfig,
 } from "../src/config.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+import { HOSTED_RC_STANDARD, MODULAR_ARCHITECTURE_STANDARD, resolveStandardReference } from "../src/config.js";
 
 const execFileAsync = promisify(execFile);
+
+test("required hosted standard survives new-project and config defaults without replacing custom references", () => {
+  const custom = ["/private/custom/standard.md", "docs/PROJECT_POLICY.md", "https://example.invalid/policy"];
+  const config = normalizeConfig({ defaults: { standards: custom } });
+  assert.deepEqual(config.defaults.standards, [MODULAR_ARCHITECTURE_STANDARD, HOSTED_RC_STANDARD, ...custom]);
+  assert.deepEqual(normalizeConfig(config), config);
+  const project = projectFromConfig({ key: "example", standards: custom }, config.defaults);
+  assert.deepEqual(project.standards, config.defaults.standards);
+  assert.equal(resolveStandardReference(custom[0]), custom[0]);
+  assert.equal(resolveStandardReference(custom[2]), custom[2]);
+});
 
 test("runner output guard defaults are finite and configurable", () => {
   assert.deepEqual(normalizeRunOutputGuard(), {

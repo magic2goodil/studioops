@@ -24,6 +24,7 @@ const RUNTIME_ITEMS = [
   "public",
   "scripts",
   "deploy",
+  "standards",
   "package.json",
   "package-lock.json",
   "plugins/studioops/.codex-plugin/plugin.json",

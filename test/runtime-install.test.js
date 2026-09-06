@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { promisify } from "node:util";
 import {
@@ -32,9 +33,12 @@ async function runtimeFixture(input = {}) {
     mkdir(path.join(sourceRoot, "public"), { recursive: true }),
     mkdir(path.join(sourceRoot, "scripts"), { recursive: true }),
     mkdir(path.join(sourceRoot, "deploy"), { recursive: true }),
+    mkdir(path.join(sourceRoot, "standards"), { recursive: true }),
     mkdir(pluginRoot, { recursive: true }),
   ]);
   const fixtureWrites = [
+    copyFile("standards/hosted-release-candidate-qa.md", path.join(sourceRoot, "standards/hosted-release-candidate-qa.md")),
+    copyFile("standards/modular-architecture-and-scoped-validation.md", path.join(sourceRoot, "standards/modular-architecture-and-scoped-validation.md")),
     writeFile(path.join(sourceRoot, "src", "server.js"), "export {};\n"),
     writeFile(path.join(sourceRoot, "package.json"), `${JSON.stringify({
       name: input.packageName || "studioops",
@@ -185,6 +189,9 @@ test("clean canonical sources stage a versioned provenance manifest and matching
     assert.equal(payload.fileCount, payload.files.length);
     assert.ok(payload.totalBytes > 0);
     assert.ok(payload.files.some((item) => item.path === "src/server.js" && /^[0-9a-f]{64}$/.test(item.sha256)));
+    assert.ok(payload.files.some((item) => item.path === "standards/hosted-release-candidate-qa.md" && /^[0-9a-f]{64}$/.test(item.sha256)));
+    assert.equal(await readFile(path.join(runtime.releasePath, "standards/hosted-release-candidate-qa.md"), "utf8"),
+      await readFile("standards/hosted-release-candidate-qa.md", "utf8"));
     assert.deepEqual(
       JSON.parse(await readFile(path.join(runtime.releasePath, "plugins", "studioops", ".codex-plugin", "plugin.json"))),
       manifest.plugin,
@@ -192,6 +199,35 @@ test("clean canonical sources stage a versioned provenance manifest and matching
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("installed built-in standards resolve independently of cwd and tampering breaks provenance", async () => {
+  const fixture = await runtimeFixture();
+  try {
+    // Stage the real config module and its dependency closure so resolution is
+    // exercised from the installed immutable payload, not a mocked root option.
+    for (const name of ["config.js", "runtime-paths.js", "integration-policy.js", "credit-policy.js"]) {
+      await copyFile(path.join("src", name), path.join(fixture.sourceRoot, "src", name));
+    }
+    await git(fixture.sourceRoot, ["add", "."]);
+    await git(fixture.sourceRoot, ["-c", "user.name=StudioOps Fixture", "-c", "user.email=fixture", "commit", "-m", "installed config"]);
+    const runtime = await deployRuntime({ ...fixture, activate: false });
+    const moduleUrl = pathToFileURL(path.join(runtime.releasePath, "src/config.js")).href;
+    const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "-e", `
+      import {resolveStandardReference,HOSTED_RC_STANDARD,MODULAR_ARCHITECTURE_STANDARD} from ${JSON.stringify(moduleUrl)};
+      console.log(JSON.stringify([HOSTED_RC_STANDARD,MODULAR_ARCHITECTURE_STANDARD,'/private/custom.md','docs/PROJECT_POLICY.md',
+        './standards/hosted-release-candidate-qa.md','https://example.invalid/custom.md'].map(resolveStandardReference)));
+    `], { cwd: fixture.root });
+    assert.deepEqual(JSON.parse(stdout), [
+      path.join(runtime.releasePath, "standards/hosted-release-candidate-qa.md"),
+      path.join(runtime.releasePath, "standards/modular-architecture-and-scoped-validation.md"),
+      "/private/custom.md", path.join(fixture.root, "docs/PROJECT_POLICY.md"),
+      path.join(fixture.root, "standards/hosted-release-candidate-qa.md"), "https://example.invalid/custom.md",
+    ]);
+    await writeFile(path.join(runtime.releasePath, "standards/hosted-release-candidate-qa.md"), "tampered standard");
+    await assert.rejects(deployRuntime({ ...fixture, activate: false }), /runtime payload content contradicts its provenance/);
+    await assert.rejects(readlink(path.join(fixture.runtimeRoot, "current")), { code: "ENOENT" });
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
 test("runtime staging rejects dirty, unrelated, and non-StudioOps sources before activation", async (t) => {

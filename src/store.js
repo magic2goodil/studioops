@@ -33,6 +33,7 @@ import {
   normalizeTechOpsPolicy,
   normalizeWorkspaceRetention,
   withDefaultProjectStandards,
+  resolveStandardReference,
 } from "./config.js";
 import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
@@ -1572,10 +1573,7 @@ function currentStageEvidencePrompt(state, task, role) {
 }
 
 function standardReference(item) {
-  const value = String(item || "").trim();
-  if (!value) return "";
-  if (path.isAbsolute(value) || /^[a-z]+:\/\//i.test(value)) return value;
-  return path.join(process.cwd(), value);
+  return resolveStandardReference(item);
 }
 
 export function normalizeReviewPipeline(value) {
@@ -2061,7 +2059,6 @@ export async function updateProject(projectId, patch = {}) {
 export function adoptDefaultProjectStandardsInState(state, projectId, input = {}) {
   const project = findProject(state, projectId);
   if (!project) throw new Error(`Unknown project: ${projectId}`);
-  const projectBeforePatch = structuredClone(project);
   const previous = normalizeList(project.standards);
   const standards = withDefaultProjectStandards(previous);
   const added = standards.filter((standard) => !previous.includes(standard));
@@ -2069,12 +2066,15 @@ export function adoptDefaultProjectStandardsInState(state, projectId, input = {}
 
   const now = input.now || new Date().toISOString();
   project.standards = standards;
-  invalidateChangedProjectQaAuthorityInState(state, projectBeforePatch, project, now);
+  // Adoption adds requirements for future releases. Frozen packets still fail
+  // current-definition checks, but their manifests, reviews and task history
+  // remain historical evidence; adoption is never a trigger for builder work.
   project.updatedAt = now;
   state.events = state.events || [];
   state.events.push({
     id: nextId(state.events, "event"),
     type: "project_default_standards_adopted",
+    scope: "future_releases",
     projectId: project.id,
     message: `Required StudioOps standards adopted: ${added.join(", ")}`,
     createdAt: now,
@@ -2083,7 +2083,14 @@ export function adoptDefaultProjectStandardsInState(state, projectId, input = {}
 }
 
 export async function adoptDefaultProjectStandards(projectId, input = {}) {
-  return mutateState(async (state) => adoptDefaultProjectStandardsInState(state, projectId, input), {
+  const snapshot = await readStateReadOnly();
+  const project = findProject(snapshot, projectId);
+  if (!project) throw new Error(`Unknown project: ${projectId}`);
+  const preview = adoptDefaultProjectStandardsInState({ projects: [structuredClone(project)], events: [] }, projectId, input);
+  if (!preview.changed) return preview;
+  // The storage boundary also recognizes a raced, byte-identical no-op without
+  // committing metadata or reporting a normal concurrent adopter as a failure.
+  return mutateState((state) => adoptDefaultProjectStandardsInState(state, projectId, input), {
     operationName: "project.adopt_standards",
   });
 }

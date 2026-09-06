@@ -66,6 +66,43 @@ Default installed source checkout:
 
 Persistent control-plane state, worker workspaces, runtime releases, logs, and credentials also live below `~/.codex/studioops`. Do not place StudioOps operational state in Documents, Desktop, or another cloud-synchronized directory.
 
+## Hosted RC defaults and preserving adoption
+
+The installed runtime includes `standards/hosted-release-candidate-qa.md` and
+binds bundled standards in its immutable payload provenance. Canonical built-in
+references such as `standards/hosted-release-candidate-qa.md` resolve beside the
+installed module, independently of the shell's current directory. Absolute paths,
+URLs, and explicitly project-relative references (for example
+`./standards/hosted-release-candidate-qa.md` or `docs/PROJECT_POLICY.md`) retain
+their existing meaning. User-owned standard files are never overwritten.
+
+New projects/config imports receive the required standard. Preview existing
+projects before an authorized adoption using
+`studioops adopt-default-standards --all --plan --json --limit 50`.
+Continue with the returned `--after PROJECT_ID` cursor. Apply reviewed adoption
+per project with `studioops adopt-default-standards PROJECT`; bounded `--all`
+batches use the same limit and cursor. Repeated unchanged adoption is a no-op.
+
+Adoption preserves custom configuration, signed hosted policy, frozen manifests,
+reviews, approval audit and completed/frozen task history. It adds requirements
+for future releases without reopening work, dispatching builders or creating
+candidates. A historical owner packet cannot authorize a new decision after its
+project requirements change. Current signed ReleaseQaPolicy and hosted
+ReleaseQualification remain required through their shared authority; adoption
+does not create or approve either one.
+
+Inventory statuses are setup requirements, not proof that an environment is live.
+`setup_missing` requires authorized isolated hosting/data setup;
+`policy_invalid` requires repairing the signed project policy;
+`applicability_review_required` requires an explicit verified applicability
+decision; `evidence_required` requires fresh candidate-bound observations and QA.
+No environment, snapshot, deployment, restart or external send occurs during
+adoption. Normal authenticated device acceptance, migration rehearsal, production
+backup/rollback and project-specific identity/media rules remain mandatory.
+
+Runtime packaging/adoption do not activate StudioOps. Activation and the final
+fresh hosted qualification gate belong to the governed runtime release workflow.
+
 ## What The User Can Say
 
 Create a task only:

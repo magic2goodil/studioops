@@ -35,7 +35,7 @@ import {
   assertCurrentIsolatedTestAuthority,
   consumeIsolatedTestAuthority,
 } from "./test-authority-realm.js";
-import { fileExists } from "./config.js";
+import { fileExists, withDefaultProjectStandards } from "./config.js";
 import {
   assertFailureIncident,
   claimPaidFailureAttempt,
@@ -1080,11 +1080,11 @@ function upsertEntity(db, table, item, sequence) {
     .run(item.id, sequence, item.projectId || "", item.status || "", item.integrationCommit || "", item.updatedAt || "", payload);
 }
 
-function writeStateToOpenDatabase(db, state, options = {}) {
+function writeStateToOpenDatabase(db, state, options = {}, snapshot = null) {
   assertFullCandidateHistoryPreserved(db, state.candidates || [], options);
   assertFullReviewHistoryPreserved(db, state.reviews || []);
   assertFullQaAuthorityPreserved(db, state, options);
-  assertOwnerQaPacketMirrors(state);
+  assertOwnerQaPacketMirrors(state, {}, snapshot);
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -1516,7 +1516,42 @@ function exactIntegrityMigrationPreservation(state, candidate, bundle, options =
   ));
 }
 
-function assertOwnerQaPacketMirrors(state, options = {}) {
+function exactDefaultStandardsHistory(state, candidate, bundle, snapshot) {
+  if (!snapshot) return false;
+  const unchanged = (table, item) => item && snapshot.tables[table].get(item.id)?.payload === JSON.stringify(item);
+  if (!unchanged("candidates", candidate) || !unchanged("qaBundles", bundle)) return false;
+  const project = state.projects.find((item) => item.id === candidate.projectId);
+  const priorProject = parsePayload(snapshot.tables.projects.get(candidate.projectId)?.payload, null);
+  const previousStandards = candidate.qaPacket.project?.definition?.standards;
+  if (!project || !priorProject || !Array.isArray(previousStandards)) return false;
+  const requiredStandards = withDefaultProjectStandards(previousStandards);
+  if (canonicalJson(requiredStandards) === canonicalJson(previousStandards)
+    || canonicalJson(project.standards) !== canonicalJson(requiredStandards)) return false;
+  if (![previousStandards, requiredStandards].some((standards) =>
+    canonicalJson(priorProject.standards) === canonicalJson(standards))) return false;
+  const { standards: ignoredCurrentStandards, updatedAt: ignoredCurrentTime, ...currentDefinition } = project;
+  const { standards: ignoredPriorStandards, updatedAt: ignoredPriorTime, ...priorDefinition } = priorProject;
+  if (canonicalJson(currentDefinition) !== canonicalJson(priorDefinition)) return false;
+  for (const source of candidate.manifest.sources) {
+    if (!unchanged("tasks", state.tasks.find((item) => item.id === source.taskId))) return false;
+    for (const review of source.reviews) {
+      if (!unchanged("reviews", state.reviews.find((item) => item.id === review.id))) return false;
+    }
+  }
+  const priorMeta = parsePayload(snapshot.meta, {});
+  if (canonicalJson(state.meta?.promotionAttemptClaims?.[candidate.id] ?? null)
+    !== canonicalJson(priorMeta.promotionAttemptClaims?.[candidate.id] ?? null)) return false;
+  // Only storage of the exact old records is permitted. This historical view
+  // never reaches owner decisions, promotion claims or release qualification.
+  // Recompute every other packet-bound project/task definition normally.
+  try {
+    assertCurrentOwnerQaPacket({ ...state, projects: state.projects.map((item) => item.id === project.id
+      ? { ...item, standards: previousStandards } : item) }, candidate, bundle);
+    return true;
+  } catch { return false; }
+}
+
+function assertOwnerQaPacketMirrors(state, options = {}, snapshot = null) {
   const candidatesById = new Map((state.candidates || []).map((candidate) => [candidate.id, candidate]));
   const bundlesById = new Map((state.qaBundles || []).map((bundle) => [bundle.id, bundle]));
   for (const candidate of state.candidates || []) {
@@ -1550,7 +1585,8 @@ function assertOwnerQaPacketMirrors(state, options = {}) {
     ) {
       const legacyPacket = packet.schemaVersion === LEGACY_OWNER_QA_PACKET_SCHEMA_VERSION;
       if (!legacyPacket) {
-        assertCurrentOwnerQaPacket(state, candidate, bundle);
+        try { assertCurrentOwnerQaPacket(state, candidate, bundle); }
+        catch (error) { if (!exactDefaultStandardsHistory(state, candidate, bundle, snapshot)) throw error; }
       } else if (candidate.status === "release_candidate_ready") {
         const exactRecoveryWriter = options.mergedPromotionRecoveryCapability === MERGED_PROMOTION_RECOVERY_WRITE
           && options.mergedPromotionRecoveryCandidateId === candidate.id;
@@ -2036,7 +2072,7 @@ function assertProposedQaAuthorityPreserved(state, snapshot, options = {}) {
   assertPromotionClaimChanges(state, snapshot, options);
   assertMergedPromotionRecoveryTransitions(state, snapshot, options);
   assertActiveCandidatesDoNotUseInvalidatedReviews(state);
-  assertOwnerQaPacketMirrors(state, options);
+  assertOwnerQaPacketMirrors(state, options, snapshot);
 }
 
 function assertValidTaskStatuses(state) {
@@ -2076,7 +2112,7 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
       assertValidTaskStatuses(state);
     }
   }
-  assertOwnerQaPacketMirrors(state, options);
+  assertOwnerQaPacketMirrors(state, options, snapshot);
   const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
   const version = Number(previous?.version || 0) + 1;
   const updatedAt = state.meta?.updatedAt || new Date().toISOString();
@@ -2634,7 +2670,7 @@ export async function writeDatabaseState(state) {
         state.meta = state.meta || {};
         recordOperationalArchiveMetadata(state, archived, now);
       }
-      writeStateToOpenDatabase(db, state);
+      writeStateToOpenDatabase(db, state, {}, snapshot);
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
@@ -2646,12 +2682,18 @@ export async function writeDatabaseState(state) {
 
 async function prepareDatabaseMutation(state, mutator, options) {
   assertMaintenanceWriteAllowed(state);
+  const adoptionBefore = options.operationName === "project.adopt_standards" ? JSON.stringify(state) : null;
   const snapshot = mutationSnapshot(state);
   reconcileStateIntegrity(state);
 
   // Mutators must only transform the supplied snapshot or perform retry-safe
   // reads. External writes belong in the fenced operation-intent workflow.
   const result = await mutator(state);
+  // A concurrent standards adopter may have already finished. This grants no
+  // write authority: only an exactly unchanged full snapshot can return early.
+  if (adoptionBefore !== null && result?.changed === false && JSON.stringify(state) === adoptionBefore) {
+    return { noMutation: true, result };
+  }
   assertProposedQaAuthorityPreserved(state, snapshot, options);
   reconcileStateIntegrity(state);
   state.meta = state.meta || {};
@@ -2681,6 +2723,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
         const snapshot = await withStateDatabaseRead(readStateSnapshot);
         expectedVersion = snapshot.version;
         prepared = await prepareDatabaseMutation(snapshot.state, mutator, options);
+        if (prepared.noMutation) return prepared.result;
       }
       const lockAttemptStartedAt = Date.now();
       let acquired = false;
@@ -2697,6 +2740,11 @@ export async function mutateDatabaseState(mutator, options = {}) {
           acquired = true;
           if (serializedReplay) {
             prepared = await prepareDatabaseMutation(readStateFromOpenDatabase(db), mutator, options);
+            if (prepared.noMutation) {
+              db.exec("ROLLBACK");
+              transactionStarted = false;
+              return prepared.result;
+            }
           }
           const { state, snapshot, result: mutationResult, archived, now } = prepared;
           if (!serializedReplay) {

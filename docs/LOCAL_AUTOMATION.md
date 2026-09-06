@@ -823,3 +823,26 @@ not delete incident rows, clear circuits because time passed, or bypass the
 repository-bound project filter during recovery. Pause worker admission before
 database repair and resume only after the loopback API, exact project boundary,
 notification deduplication, and durable restart checks pass.
+
+## Hosted RC standards rollout
+
+Use `studioops adopt-default-standards --all --plan --limit 50 --json` for a
+read-only inventory. A returned `nextAfter` is the stable project ID cursor for
+the next page (`--after PROJECT_ID`). No candidate or task scan is needed to
+classify project setup. The inventory reports required policy version, missing
+standard references and the next setup/evidence action; it never certifies a
+running environment or release readiness.
+
+Apply only reviewed, authorized adoption with
+`studioops adopt-default-standards PROJECT`. `--all` applies at most the selected
+page and can resume with the same cursor. Each project is adopted independently;
+custom settings and signed policies survive, and unchanged adoption performs no
+state write or duplicate audit event. The existing owner dispatch pause is not
+changed. Completed/frozen work and approval history are not requeued or rebuilt.
+
+Policy adoption does not provision hosting, copy production data, collect hosted
+evidence, restart services or authorize outbound effects. Follow the bundled
+Hosted Release Candidate QA standard for an authorized isolated snapshot,
+migration rehearsal, physical/native acceptance, same-artifact promotion and
+production backup/rollback. The shared hosted policy and qualification authority
+must validate any new release, independently of historical QA or greenlights.
