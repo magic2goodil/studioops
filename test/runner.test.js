@@ -26,6 +26,7 @@ import {
   remediateStaleLinkedPrInState,
   preflightRun,
   prepareRunWorkspace,
+  withExecutionImpactPlan,
   resolveProjectWorkflowMode,
   runGitHubRemoteRecoveryProbes,
   runWorkspaceCleanup,
@@ -389,6 +390,30 @@ async function createRepository(root, options = {}) {
   }
   return repoPath;
 }
+
+test("GitHub execution context binds the prepared checkout even when preflight has no base SHA", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-execution-binding-"));
+  t.after(() => rm(root, {recursive:true,force:true}));
+  const repoPath = await createRepository(root);
+  const sha = await git(repoPath, ["rev-parse", "HEAD"]);
+  const run = {group:"builder",workflowMode:"github",preflightBaseCommit:"",project:{key:"demo",repoPath},task:{title:"Read the code map"},fileScope:["README.md"]};
+  const result = await withExecutionImpactPlan(run);
+  assert.equal(result.executionCommitSha, sha);
+  assert.equal(result.impactPlan.sourceCommit, sha);
+  assert.equal(result.preflightBaseCommit, "", "advisory snapshot does not invent preflight authority");
+  await assert.rejects(withExecutionImpactPlan({...run, group:"reviewer",reviewSubjectSha:"f".repeat(40)}), /does not match the review candidate/);
+});
+
+test("run completion retains sanitized repository context and excludes source packets", async () => {
+  const state = fixtureState();
+  const run = state.runs[0];
+  const executionRun = {...run, executionCommitSha:"a".repeat(40),repositoryContext:{status:"partial",commitSha:"a".repeat(40),cacheHit:true,resultCount:12,bytes:8000,packet:"PRIVATE_SOURCE",reason:"PRIVATE_REASON"}};
+  const completed = await completeRunAfterExecution(run, {state,status:"failed",exitCode:"test_failure"}, executionRun);
+  assert.equal(completed.repositoryContext.status,"partial");
+  assert.equal(completed.repositoryContext.cacheHit,true);
+  assert.equal(completed.executionCommitSha,"a".repeat(40));
+  assert.doesNotMatch(JSON.stringify(completed.repositoryContext), /PRIVATE/);
+});
 
 function fixtureState(taskPatch = {}, runPatch = {}) {
   return {

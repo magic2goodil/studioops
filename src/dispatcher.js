@@ -28,6 +28,7 @@ import {
   failureActionIdentity,
   failureFingerprint,
   normalizeFailureProvider,
+  selectFailureIncident,
 } from "./failure-containment.js";
 import { readFailureIncidents } from "./state-database.js";
 
@@ -273,24 +274,15 @@ function durableFailureAdmissionReason(task, action, options, nowMs) {
   const actionIdentity = failureActionIdentity(action);
   const provider = failureProviderFor(task, options);
   const candidateIdentity = failureCandidateIdentity(task);
-  const matching = (options.failureIncidents || []).find((incident) => {
-    if (!incident || incident.taskId !== task.id || incident.action !== actionIdentity || incident.provider !== provider) {
-      return false;
-    }
-    try {
-      return failureFingerprint({
-        taskId: task.id,
-        action: actionIdentity,
-        candidateIdentity,
-        provider,
-        reasonCode: incident.reasonCode,
-      }).digest === incident.fingerprintDigest;
-    } catch {
-      return false;
-    }
-  });
-  if (!matching) return null;
-  if (matching.state === "open") {
+  const matches = [...new Set((options.failureIncidents || []).filter((incident) => incident.taskId === task.id).map((incident) => incident.reasonCode))]
+    .map((reasonCode) => selectFailureIncident(options.failureIncidents, {
+      taskId: task.id, action: actionIdentity, candidateIdentity, provider, reasonCode,
+    })).filter(Boolean);
+  const blocking = matches.find(({ incident, paidAttempts }) => incident.state === "open" || paidAttempts >= 2)
+    || matches.find(({ incident }) => incident.state === "backoff" && Date.parse(incident.backoffUntil || "") > nowMs);
+  if (!blocking) return null;
+  const matching = blocking.incident;
+  if (matching.state === "open" || blocking.paidAttempts >= 2) {
     return { reason: "failure_circuit_open", incident: matching, actionIdentity, provider };
   }
   if (matching.state === "backoff" && Date.parse(matching.backoffUntil || "") > nowMs) {
