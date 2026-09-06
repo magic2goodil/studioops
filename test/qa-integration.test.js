@@ -30,6 +30,7 @@ import {
   isGitHubAppPermissionError,
   planQaIntegrations,
   projectPlanHasWork,
+  qaClaimOwnerState,
   qaResultFingerprint,
 } from "../src/qa-integration.js";
 import { readPersistedState } from "./state-database-helper.js";
@@ -42,6 +43,17 @@ const OUTER_VALIDATION_SANDBOX = Boolean(process.env.STUDIOOPS_PROJECT_VALIDATIO
 const localhostPreviewTest = OUTER_VALIDATION_SANDBOX
   ? { skip: "The verified outer release sandbox intentionally denies localhost preview listeners." }
   : {};
+
+test("QA claim owner liveness fails closed except for a verified absent same-host PID", () => {
+  const ownerHost = "studioops-test-host";
+  const claim = { ownerHost, ownerPid: 41001 };
+  assert.equal(qaClaimOwnerState(claim, { qaOwnerHost: ownerHost, qaProcessAlive: () => true }), "alive");
+  assert.equal(qaClaimOwnerState(claim, { qaOwnerHost: ownerHost, qaProcessAlive: () => false }), "dead");
+  assert.equal(qaClaimOwnerState({ ...claim, ownerHost: "another-host" }, { qaOwnerHost: ownerHost, qaProcessAlive: () => false }), "unknown");
+  assert.equal(qaClaimOwnerState({ ownerHost, ownerPid: 0 }, { qaOwnerHost: ownerHost, qaProcessAlive: () => false }), "unknown");
+  assert.equal(qaClaimOwnerState({}, { qaOwnerHost: ownerHost, qaProcessAlive: () => false }), "unknown");
+  assert.equal(qaClaimOwnerState(claim, { qaOwnerHost: ownerHost, qaProcessAlive: () => { throw new Error("permission denied"); } }), "unknown");
+});
 
 test("candidate auth preflight accepts only the verifier's exact canonical GitHub authority", () => {
   assert.deepEqual(
