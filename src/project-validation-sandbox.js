@@ -5,7 +5,9 @@ import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rm,
 import os from "node:os";
 import path from "node:path";
 
-export const PROJECT_VALIDATION_SANDBOX_POLICY_ID = "darwin-seatbelt-v3-disposable-clone-data-egress-exec-confined";
+export const PROJECT_VALIDATION_SANDBOX_POLICY_ID = "darwin-seatbelt-v4-disposable-clone-attested-network";
+export const PROJECT_VALIDATION_NETWORK_POLICY_DENY_ALL = "deny_all";
+export const PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK = "loopback_only";
 export const PROJECT_VALIDATION_SANDBOX_ISOLATION = Object.freeze({
   filesystem: "kernel_enforced_allowlist",
   network: "kernel_enforced_deny_all",
@@ -209,7 +211,18 @@ async function canonicalVerifierExecutable() {
   return resolved;
 }
 
-function validationEnvironment(homePath, validationPath) {
+export function normalizeProjectValidationNetworkPolicy(value) {
+  const policy = String(value || PROJECT_VALIDATION_NETWORK_POLICY_DENY_ALL).trim().toLowerCase();
+  if (![PROJECT_VALIDATION_NETWORK_POLICY_DENY_ALL, PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK].includes(policy)) {
+    throw sandboxError(
+      `Unsupported project validation network policy: ${policy || "(empty)"}.`,
+      "PROJECT_VALIDATION_INPUT_INVALID",
+    );
+  }
+  return policy;
+}
+
+function validationEnvironment(homePath, validationPath, networkPolicy) {
   return {
     PATH: validationPath,
     HOME: homePath,
@@ -230,10 +243,11 @@ function validationEnvironment(homePath, validationPath) {
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_TERMINAL_PROMPT: "0",
     STUDIOOPS_PROJECT_VALIDATION_SANDBOX: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+    STUDIOOPS_PROJECT_VALIDATION_NETWORK_POLICY: networkPolicy,
   };
 }
 
-function seatbeltProfile(rootPath, readableToolRoots, verifierExecutable) {
+function seatbeltProfile(rootPath, readableToolRoots, verifierExecutable, networkPolicy) {
   const explicitRoots = unique([rootPath, ...readableToolRoots, ...SYSTEM_RUNTIME_READ_ROOTS]);
   const explicitReadRoots = explicitRoots
     .map((entry) => `(subpath ${seatbeltLiteral(entry)})`)
@@ -259,6 +273,13 @@ function seatbeltProfile(rootPath, readableToolRoots, verifierExecutable) {
   const safeSysctls = SAFE_SYSCTL_READ_NAMES
     .map((entry) => `(sysctl-name ${seatbeltLiteral(entry)})`)
     .join(" ");
+  const networkRules = networkPolicy === PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK
+    ? [
+        "(allow network-bind (local tcp \"localhost:*\"))",
+        "(allow network-inbound (local tcp \"localhost:*\"))",
+        "(allow network-outbound (remote tcp \"localhost:*\"))",
+      ]
+    : [];
   return [
     "(version 1)",
     "(deny default)",
@@ -271,6 +292,7 @@ function seatbeltProfile(rootPath, readableToolRoots, verifierExecutable) {
     `(allow file-write* (subpath ${seatbeltLiteral(rootPath)}))`,
     "(allow file-write-data (literal \"/dev/null\") (literal \"/dev/dtracehelper\"))",
     "(allow file-ioctl (literal \"/dev/dtracehelper\"))",
+    ...networkRules,
   ].join("\n");
 }
 
@@ -514,6 +536,7 @@ async function validateSeatbeltExecutable(executable) {
 }
 
 export async function prepareProjectValidationSandbox(input = {}) {
+  const networkPolicy = normalizeProjectValidationNetworkPolicy(input.networkPolicy);
   const requestedSourceRepoPath = String(input.sourceRepoPath || "");
   const requestedWorkspaceRoot = String(input.workspaceRoot || "");
   const expectedHeadSha = String(input.expectedHeadSha || "").trim().toLowerCase();
@@ -552,7 +575,7 @@ export async function prepareProjectValidationSandbox(input = {}) {
       writeFile(path.join(homePath, ".npm-globalrc"), "", { mode: 0o600 }),
     ]);
     const gitExecutable = await validateTrustedGitExecutable();
-    const gitEnvironment = validationEnvironment(homePath, DEFAULT_PROJECT_VALIDATION_PATH);
+    const gitEnvironment = validationEnvironment(homePath, DEFAULT_PROJECT_VALIDATION_PATH, networkPolicy);
     await trustedGit("", [
       "clone",
       "--no-local",
@@ -595,8 +618,14 @@ export async function prepareProjectValidationSandbox(input = {}) {
     const resolvedHomePath = await realpath(homePath);
     const verifierExecutable = await canonicalVerifierExecutable();
     const expectedWorkspaceManifest = await snapshotWorkspaceManifest(resolvedRepoPath);
-    const profile = seatbeltProfile(resolvedRoot, pathRoots, verifierExecutable);
-    const environment = validationEnvironment(resolvedHomePath, validationPath);
+    const profile = seatbeltProfile(resolvedRoot, pathRoots, verifierExecutable, networkPolicy);
+    const environment = validationEnvironment(resolvedHomePath, validationPath, networkPolicy);
+    const processPolicy = Object.freeze({
+      ...PROJECT_VALIDATION_SANDBOX_ISOLATION,
+      network: networkPolicy === PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK
+        ? "kernel_enforced_tcp_loopback_only"
+        : PROJECT_VALIDATION_SANDBOX_ISOLATION.network,
+    });
     const sandbox = {
       rootPath: resolvedRoot,
       repoPath: resolvedRepoPath,
@@ -606,8 +635,8 @@ export async function prepareProjectValidationSandbox(input = {}) {
       environment,
       policyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
       strategy: "disposable_full_clone",
-      networkPolicy: "deny_all",
-      processPolicy: PROJECT_VALIDATION_SANDBOX_ISOLATION,
+      networkPolicy,
+      processPolicy,
       validationPath,
       verifierExecutable,
       expectedHeadSha,
@@ -657,6 +686,8 @@ export async function prepareProjectValidationSandbox(input = {}) {
       profile,
       environment,
       verifierExecutable,
+      networkPolicy,
+      processPolicy,
       expectedHeadSha,
       expectedWorkspaceManifest: structuredClone(expectedWorkspaceManifest),
       dependencyCachePrepared: false,
@@ -861,8 +892,8 @@ export async function verifyProjectValidationSandbox(sandbox) {
     head: capability.expectedHeadSha,
     policyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
     strategy: "disposable_full_clone",
-    networkPolicy: "deny_all",
-    processPolicy: PROJECT_VALIDATION_SANDBOX_ISOLATION,
+    networkPolicy: capability.networkPolicy,
+    processPolicy: capability.processPolicy,
   };
 }
 

@@ -138,11 +138,11 @@ export function observeRunOutput(event, state = {}, policy = {}) {
   if (commandOutputChars > guard.maxCommandOutputChars) {
     return {
       state: nextState,
-      violation: null,
-      warning: {
-        code: "command_output_budget_warning",
-        message: `A worker command returned ${commandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCommandOutputChars.toLocaleString()}-character per-command guidance. StudioOps kept the run alive, bounded the stored event, and expects subsequent reads to use targeted excerpts or local log files.`,
+      violation: {
+        code: "command_output_budget_exceeded",
+        message: `A worker command returned ${commandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCommandOutputChars.toLocaleString()}-character per-command limit. StudioOps preserved the output as a local discovery artifact and stopped this attempt so recovery can continue with targeted excerpts.`,
       },
+      warning: null,
     };
   }
   return { state: nextState, violation: null, warning: null };
@@ -2323,6 +2323,10 @@ function nonRetryableWorkspaceFailureReason(notes) {
   return "";
 }
 
+export function automationPauseReason(errorCode, notes) {
+  return nonRetryableWorkspaceFailureReason(notes);
+}
+
 async function pauseTaskForAutomationConfig(run, reason, notes) {
   const now = new Date().toISOString();
   await mutateState(async (state) => {
@@ -2980,6 +2984,21 @@ async function runClaimedRunWithSdk(run, input = {}) {
 
     for await (const event of events) {
       const observation = observeRunOutput(event, outputGuardState, outputGuard);
+      if (observation.warning || observation.violation) {
+        const reasonCode = observation.violation?.code || "oversized_command_output";
+        const commandOutput = String(event.item?.aggregated_output || "");
+        if (commandOutput) {
+          const artifact = await writeBoundedDiscoveryArtifact({
+            artifactRoot: path.join(RUN_OUTPUT_DIR, "context-artifacts"),
+            projectKey: executionRun.project?.key || run.projectId,
+            runId: run.id,
+            reasonCode,
+            output: redactSecrets(commandOutput, githubAppAuthSecrets(authContext)),
+          });
+          discoveryArtifacts.push(artifact);
+          log.write(`StudioOps discovery artifact: ${artifact.path} (${artifact.digest})\n`);
+        }
+      }
       if (observation.violation) {
         const error = new Error(observation.violation.message);
         error.code = observation.violation.code;
@@ -2989,18 +3008,6 @@ async function runClaimedRunWithSdk(run, input = {}) {
       }
       if (observation.warning) {
         log.write(`\nStudioOps output guidance: ${observation.warning.message}\n`);
-        const commandOutput = String(event.item?.aggregated_output || "");
-        if (commandOutput) {
-          const artifact = await writeBoundedDiscoveryArtifact({
-            artifactRoot: path.join(RUN_OUTPUT_DIR, "context-artifacts"),
-            projectKey: executionRun.project?.key || run.projectId,
-            runId: run.id,
-            reasonCode: "oversized_command_output",
-            output: redactSecrets(commandOutput, githubAppAuthSecrets(authContext)),
-          });
-          discoveryArtifacts.push(artifact);
-          log.write(`StudioOps discovery artifact: ${artifact.path} (${artifact.digest})\n`);
-        }
       }
       const loggedEvent = observation.warning
         ? boundedRunOutputEvent(event, outputGuard.maxCommandOutputChars)
@@ -3025,13 +3032,12 @@ async function runClaimedRunWithSdk(run, input = {}) {
   } catch (error) {
     status = "failed";
     notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
-    pauseReason = [
+    const outputGuardCode = [
       "command_output_budget_exceeded",
       "cumulative_command_output_budget_exceeded",
-    ].includes(error?.code)
-      ? error.code
-      : nonRetryableWorkspaceFailureReason(notes);
-    exitCode = pauseReason || (error?.name === "AbortError" ? "timeout" : "sdk_error");
+    ].includes(error?.code) ? error.code : "";
+    pauseReason = automationPauseReason(error?.code, notes);
+    exitCode = outputGuardCode || pauseReason || (error?.name === "AbortError" ? "timeout" : "sdk_error");
     log.write(`\nCodex SDK runner error: ${notes}\n`);
     try {
       await writeFile(lastMessagePath, notes, "utf8");
@@ -3261,13 +3267,6 @@ async function runClaimedRunWithCli(run, input = {}) {
         contextEvidence: { validationAttestation },
         workspaceRoot: input.workspaceRoot,
       }, executionRun);
-      if (outputBudgetViolation) {
-        await pauseTaskForAutomationConfig(
-          run,
-          outputBudgetViolation,
-          `CLI output exceeded ${outputGuard.maxCumulativeCommandOutputChars.toLocaleString()} characters.`,
-        );
-      }
       resolve(completed);
     });
     child.stdin.end(prompt);
