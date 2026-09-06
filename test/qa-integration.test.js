@@ -588,6 +588,7 @@ if (args[0] === "pr" && args[1] === "list") {
   }
   const line = execFileSync("/usr/bin/git", ["--git-dir", process.env.FAKE_GIT_REMOTE, "show-ref", "refs/heads/" + head], { encoding: "utf8", env: gitEnv }).trim();
   const oid = line.split(/\\s+/)[0] || "";
+  const recordIsMerged = String(record.number) === process.env.FAKE_GH_MERGED_PR_NUMBER;
   const checkMode = String(record.number) === process.env.FAKE_GH_FAILED_PR_NUMBER
     ? "failed"
     : process.env.FAKE_GH_CHECK_STATE || "pending";
@@ -599,15 +600,15 @@ if (args[0] === "pr" && args[1] === "list") {
   console.log(JSON.stringify([{
     number: record.number,
     url: record.url,
-    state: process.env.FAKE_GH_PR_STATE || record.state,
+    state: recordIsMerged ? "MERGED" : process.env.FAKE_GH_PR_STATE || record.state,
     headRefName: head,
     headRefOid: oid,
     headRepository: { nameWithOwner: "example/demo" },
     baseRefName: base,
-    mergeStateStatus: process.env.FAKE_GH_MERGE_STATE || "BLOCKED",
-    reviewDecision: process.env.FAKE_GH_REVIEW_DECISION || "REVIEW_REQUIRED",
+    mergeStateStatus: recordIsMerged ? "CLEAN" : process.env.FAKE_GH_MERGE_STATE || "BLOCKED",
+    reviewDecision: recordIsMerged ? "APPROVED" : process.env.FAKE_GH_REVIEW_DECISION || "REVIEW_REQUIRED",
     statusCheckRollup: checks,
-    mergeCommit: process.env.FAKE_GH_MERGE_COMMIT
+    mergeCommit: process.env.FAKE_GH_MERGE_COMMIT && (recordIsMerged || !process.env.FAKE_GH_MERGED_PR_NUMBER)
       ? { oid: process.env.FAKE_GH_MERGE_COMMIT }
       : null
   }]));
@@ -2616,6 +2617,110 @@ test("merged protected QA handoff validates a squash result without repushing so
       await git(fixture.remotePath, ["for-each-ref", "--format=%(refname)", `refs/heads/${project.integrationCandidateBranch}`]),
       "",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("merged protected QA handoff is superseded when a reviewed source changes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-merged-stale-source-"));
+
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    const previous = pending.projects[0];
+
+    await git(fixture.repoPath, [
+      "fetch",
+      "origin",
+      `refs/heads/${previous.integrationCandidateBranch}`,
+    ]);
+    await git(fixture.repoPath, [
+      "checkout",
+      "-B",
+      "merged-stale-source",
+      "refs/remotes/origin/qa/integration",
+    ]);
+    await git(fixture.repoPath, ["merge", "--no-ff", "--no-edit", "FETCH_HEAD"]);
+    const oldMergeCommit = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await chmod(fixture.hookPath, 0o644);
+    await git(fixture.repoPath, ["push", "origin", "HEAD:refs/heads/qa/integration"]);
+    await chmod(fixture.hookPath, 0o755);
+
+    await git(fixture.repoPath, ["checkout", "feature/task"]);
+    await writeFile(path.join(fixture.repoPath, "feature.txt"), "corrected after protected merge\n", "utf8");
+    await git(fixture.repoPath, ["commit", "-am", "correct source after protected merge"]);
+    const correctedHead = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "feature/task"]);
+    await advanceReviewedQaTask(root, "task_1", correctedHead);
+
+    const replacement = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: {
+        ...fixture.env,
+        FAKE_GH_MERGED_PR_NUMBER: "42",
+        FAKE_GH_MERGE_COMMIT: oldMergeCommit,
+        FAKE_GH_CHECK_STATE: "passed",
+      },
+    });
+    const project = replacement.projects[0];
+
+    assert.equal(project.status, "pr_waiting", JSON.stringify(project, null, 2));
+    assert.equal(project.integrationPr.url, "https://github.com/example/demo/pull/43");
+    assert.notEqual(project.integrationCandidateCommit, previous.integrationCandidateCommit);
+    assert.match(project.output, /Superseded protected QA handoff/);
+    assert.equal(
+      await git(fixture.remotePath, ["show", `refs/heads/${project.integrationCandidateBranch}:feature.txt`]),
+      "corrected after protected merge",
+    );
+
+    const persisted = readPersistedState(root);
+    const task = persisted.tasks[0];
+    assert.equal(task.integrationSourceHeadSha, correctedHead);
+    assert.equal(task.integrationSourceCandidateCycle, 2);
+    assert.equal(task.integrationHandoffHistory.length, 1);
+    assert.equal(task.integrationHandoffHistory[0].reasonCode, "stale_integration_authority");
+    assert.equal(task.integrationHandoffHistory[0].candidateCommit, previous.integrationCandidateCommit);
+    assert.equal(task.integrationHandoffHistory[0].workflowStatus, "merged");
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("protected QA handoff without source snapshots cannot create QA authority", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-missing-source-snapshot-"));
+
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    const project = pending.projects[0];
+    const script = `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        const task = state.tasks.find((item) => item.id === "task_1");
+        delete task.integrationSourceHeadSha;
+        delete task.integrationSourceCandidateCycle;
+      });
+    `;
+    await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+
+    const blocked = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: fixture.env,
+    });
+
+    assert.equal(blocked.projects[0].status, "stale_integration_authority");
+    assert.match(blocked.projects[0].integrationBlocker, /lacks immutable source snapshots/);
+    assert.equal(blocked.projects[0].candidate, null);
+    assert.equal(blocked.projects[0].localQaPreview, null);
+    assert.equal(blocked.projects[0].integrationCandidateCommit, project.integrationCandidateCommit);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.qaBundles.length, 0);
+    assert.equal(persisted.tasks[0].integrationStatus, "blocked");
+    assert.equal(persisted.tasks[0].integrationValidation.status, "stale_integration_authority");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -2579,19 +2579,20 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
     && task.integrationSourceHeadSha !== task.expectedHeadSha
   ));
   const missingSourceSnapshots = projectPlan.tasks.filter((task) => !task.integrationSourceHeadSha);
-  if (inspectedPr.workflowStatus !== "merged" && changedSources.length) {
-    if (missingSourceSnapshots.length) {
-      return {
-        status: "candidate_drift",
-        blocker: `Newly reviewed source evidence is available, but the previous handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not replace the open PR without auditable evidence.`,
-        pr: inspectedPr,
-      };
-    }
+  if (missingSourceSnapshots.length) {
+    return {
+      status: "stale_integration_authority",
+      blocker: `The protected QA handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not reuse it or create owner QA authority.`,
+      pr: inspectedPr,
+    };
+  }
+  if (changedSources.length) {
     const changedSummary = changedSources
       .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
       .join(", ");
-    const reason = `StudioOps is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
-    const closed = String(inspectedPr.state || "").toUpperCase() === "CLOSED"
+    const reason = `StudioOps detected stale integration authority and is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
+    const prIsTerminal = ["CLOSED", "MERGED"].includes(String(inspectedPr.state || "").toUpperCase());
+    const closed = prIsTerminal
       ? { ok: true, pr: inspectedPr, output: "" }
       : await closeIntegrationPr(repoPath, projectPlan, inspectedPr, reason, options);
     if (!closed.ok) {
@@ -2617,6 +2618,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
         state: "CLOSED",
       },
       supersededHandoff: {
+        reasonCode: "stale_integration_authority",
         candidateBranch: handoff.branch,
         candidateCommit: handoff.commit,
         prUrl: handoff.prUrl,
@@ -3422,6 +3424,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
     "candidate_drift",
     "candidate_publish_failed",
     "candidate_supersession_failed",
+    "stale_integration_authority",
   ]);
   const integrationStatus = remediationStatuses.has(taskResult.status)
     ? "blocked"
