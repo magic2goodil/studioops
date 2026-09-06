@@ -2579,14 +2579,14 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
     && task.integrationSourceHeadSha !== task.expectedHeadSha
   ));
   const missingSourceSnapshots = projectPlan.tasks.filter((task) => !task.integrationSourceHeadSha);
+  if (missingSourceSnapshots.length) {
+    return {
+      status: "stale_integration_authority",
+      blocker: `The protected QA handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not reuse it or create owner QA authority.`,
+      pr: inspectedPr,
+    };
+  }
   if (changedSources.length) {
-    if (missingSourceSnapshots.length) {
-      return {
-        status: "candidate_drift",
-        blocker: `Newly reviewed source evidence is available, but the previous handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not replace the protected QA handoff without auditable evidence.`,
-        pr: inspectedPr,
-      };
-    }
     const changedSummary = changedSources
       .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
       .join(", ");
@@ -3424,6 +3424,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
     "candidate_drift",
     "candidate_publish_failed",
     "candidate_supersession_failed",
+    "stale_integration_authority",
   ]);
   const integrationStatus = remediationStatuses.has(taskResult.status)
     ? "blocked"

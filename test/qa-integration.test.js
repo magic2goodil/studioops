@@ -2688,6 +2688,44 @@ test("merged protected QA handoff is superseded when a reviewed source changes",
   }
 });
 
+test("protected QA handoff without source snapshots cannot create QA authority", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-missing-source-snapshot-"));
+
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    const project = pending.projects[0];
+    const script = `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        const task = state.tasks.find((item) => item.id === "task_1");
+        delete task.integrationSourceHeadSha;
+        delete task.integrationSourceCandidateCycle;
+      });
+    `;
+    await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+
+    const blocked = await runQaIntegrationFixture(root, {
+      input: { force: true },
+      env: fixture.env,
+    });
+
+    assert.equal(blocked.projects[0].status, "stale_integration_authority");
+    assert.match(blocked.projects[0].integrationBlocker, /lacks immutable source snapshots/);
+    assert.equal(blocked.projects[0].candidate, null);
+    assert.equal(blocked.projects[0].localQaPreview, null);
+    assert.equal(blocked.projects[0].integrationCandidateCommit, project.integrationCandidateCommit);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.qaBundles.length, 0);
+    assert.equal(persisted.tasks[0].integrationStatus, "blocked");
+    assert.equal(persisted.tasks[0].integrationValidation.status, "stale_integration_authority");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("new QA tasks wait behind an existing protected integration handoff", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-protected-serialized-"));
 
