@@ -601,3 +601,24 @@ test("dispatcher persists one repository-bound context packet on both run and ta
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("hosted RC authority has one owner, pure imports and an acyclic runtime public edge", async () => {
+  const loaded = loadProjectComponentImpactMap(studioOpsProject);
+  const components = loaded.manifest.components;
+  for (const file of ["src/hosted-rc-evidence.js", "src/release-qualification.js", "test/hosted-rc-evidence.test.js", "test/release-qualification.test.js", "test/hosted-rc-adapters.test.js"]) {
+    assert.deepEqual(Object.entries(components).filter(([, c]) => c.paths.includes(file)).map(([id]) => id), ["qa-release"]);
+  }
+  assert.ok(components["runtime-self-update"].paths.includes("scripts/install-launchagents.js"));
+  assert.ok(components["scheduling-dispatch"].paths.includes("standards/hosted-release-candidate-qa.md"));
+  assert.ok(components["runtime-self-update"].dependsOn.includes("qa-release"));
+  assert.doesNotThrow(() => validateComponentImpactMap(loaded.manifest));
+  for (const name of ["hosted-rc-evidence", "release-qualification"]) {
+    const source = await readFile(path.join(repositoryRoot, "src", `${name}.js`), "utf8");
+    const imports = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((m) => m[1]);
+    assert.ok(imports.every((specifier) => ["node:crypto", "./hosted-rc-evidence.js"].includes(specifier)), JSON.stringify(imports));
+  }
+  for (const changedFiles of [["src/hosted-rc-evidence.js"], ["src/state-database.js"], ["docs/architecture/components.json"], ["src/new-unmapped-contract.js"]]) {
+    const plan = resolveProjectImpactPlan({ project: studioOpsProject, task: { workAreas: changedFiles }, changedFiles, loadedMap: loaded });
+    assert.equal(plan.fullRegression, true);
+  }
+});

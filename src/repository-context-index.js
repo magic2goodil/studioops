@@ -206,7 +206,32 @@ async function buildSnapshot(context) {
 export async function buildRepositoryContextIndex(input) { return buildSnapshot(await snapshot(input)); }
 
 async function secureDirectory(directory) {
-  const absolute = path.resolve(directory);
+  const requested = path.resolve(directory);
+  let absolute;
+  try {
+    const requestedStat = await lstat(requested);
+    if (!requestedStat.isDirectory() || requestedStat.isSymbolicLink()) throw failure("cache_path_unsafe");
+    absolute = await realpath(requested);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const missing = [path.basename(requested)];
+    let ancestor = path.dirname(requested);
+    while (true) {
+      try {
+        const ancestorStat = await lstat(ancestor);
+        if (!ancestorStat.isDirectory() && !ancestorStat.isSymbolicLink()) throw failure("cache_path_unsafe");
+        ancestor = await realpath(ancestor);
+        break;
+      } catch (ancestorError) {
+        if (ancestorError.code !== "ENOENT") throw ancestorError;
+        const parent = path.dirname(ancestor);
+        if (parent === ancestor) throw failure("cache_path_unsafe");
+        missing.push(path.basename(ancestor));
+        ancestor = parent;
+      }
+    }
+    absolute = path.join(ancestor, ...missing.reverse());
+  }
   let current = path.parse(absolute).root;
   for (const part of absolute.slice(current.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, part);
