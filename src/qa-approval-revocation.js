@@ -1,5 +1,8 @@
 import { assertCandidateEnvelope } from "./candidate-manifest.js";
-import { assertCanonicalCandidateRepositoryAuthority } from "./candidate-repository.js";
+import {
+  assertCanonicalCandidateRepositoryAuthority,
+  verifyClosedPromotionHeadContainsCandidate,
+} from "./candidate-repository.js";
 import {
   assertCurrentIsolatedTestAuthority,
   consumeIsolatedTestAuthority,
@@ -195,6 +198,19 @@ function exactPullRequest(payload, expected) {
   );
 }
 
+function exactPullRequestEnvelope(payload, expected) {
+  return Boolean(
+    payload
+    && Number(payload.number) === expected.number
+    && payload.html_url === expected.prUrl
+    && payload.base?.ref === expected.baseBranch
+    && String(payload.base?.repo?.full_name || "").toLowerCase() === expected.repository.toLowerCase()
+    && payload.head?.ref === expected.branch
+    && String(payload.head?.repo?.full_name || "").toLowerCase() === expected.repository.toLowerCase()
+    && String(payload.body || "").includes(expected.marker)
+  );
+}
+
 function observedState(payload) {
   if (payload?.merged_at) return "merged";
   return String(payload?.state || "").toLowerCase();
@@ -367,15 +383,35 @@ async function githubRequest(pathname, options = {}) {
   };
 }
 
-async function inspect(expected, options) {
+async function inspect(project, candidate, expected, options) {
   const [owner, repository] = expected.repository.split("/");
   const response = await githubRequest(
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/pulls/${expected.number}`,
     options,
   );
   if (!response.ok) return { status: "unavailable", reason: response.reason };
-  if (!exactPullRequest(response.payload, expected)) {
+  if (exactPullRequest(response.payload, expected)) {
+    return inspectedPullRequest(response.payload, expected);
+  }
+  const observedHead = String(response.payload?.head?.sha || "").toLowerCase();
+  if (
+    observedState(response.payload) !== "closed"
+    || response.payload?.merged_at
+    || !exactPullRequestEnvelope(response.payload, expected)
+    || !/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(observedHead)
+  ) {
     return { status: "invalid", reason: "The release pull request no longer matches the immutable candidate identity." };
+  }
+  const ancestry = await verifyClosedPromotionHeadContainsCandidate(project, candidate, {
+    ...options,
+    observedHead,
+    promotionBranch: expected.branch,
+  });
+  if (!ancestry.ok) {
+    return {
+      status: ancestry.status === "unavailable" ? "unavailable" : "invalid",
+      reason: ancestry.reason || "The closed promotion ancestry could not be verified.",
+    };
   }
   return inspectedPullRequest(response.payload, expected);
 }
@@ -449,7 +485,7 @@ export async function settleReleaseCandidatePullRequestForRevocation(project, ca
     }
     expected = discovery.expected;
   }
-  const first = await inspect(expected, options);
+  const first = await inspect(project, candidate, expected, options);
   if (first.status !== "open") {
     return attestRemoteObservation(candidate, first, observationTestAuthority);
   }
@@ -459,7 +495,7 @@ export async function settleReleaseCandidatePullRequestForRevocation(project, ca
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/pulls/${expected.number}`,
     { ...options, method: "PATCH", body: { state: "closed" } },
   );
-  const final = await inspect(expected, options);
+  const final = await inspect(project, candidate, expected, options);
   if (final.status === "closed" || final.status === "merged") {
     return attestRemoteObservation(candidate, final, observationTestAuthority);
   }

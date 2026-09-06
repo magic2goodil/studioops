@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
@@ -11,6 +15,11 @@ const {
   createQaRevocationTestTransport,
   settleReleaseCandidatePullRequestForRevocation,
 } = await import(`../src/qa-approval-revocation.js?test=${Date.now()}`);
+const {
+  createCandidateRepositoryTestGitRunner,
+} = await import("../src/candidate-repository.js");
+
+const execFileAsync = promisify(execFile);
 
 const BASE_SHA = "a".repeat(40);
 const HEAD_SHA = "b".repeat(40);
@@ -23,43 +32,45 @@ const PROJECT = {
   defaultBranch: "main",
 };
 
-function candidateFixture() {
+function candidateFixture(options = {}) {
+  const baseSha = options.baseSha || BASE_SHA;
+  const headSha = options.headSha || HEAD_SHA;
   const candidate = createCandidateEnvelope({
     qaBundleId: "qa_bundle_1",
     manifest: {
       candidateId: "candidate_1",
       projectId: "project_1",
-      base: { branch: "main", sha: BASE_SHA },
+      base: { branch: "main", sha: baseSha },
       sources: [{
         taskId: "task_1",
         sourceRef: "refs/heads/feature/task",
-        headSha: HEAD_SHA,
+        headSha,
         candidateCycle: 1,
         reviews: [{
           id: "review_1",
           stageKey: "lead",
           role: "lead-reviewer",
           outcome: "approved",
-          subjectSha: HEAD_SHA,
+          subjectSha: headSha,
           candidateCycle: 1,
           reviewedAt: "2026-09-03T12:00:00.000Z",
         }],
       }],
-      integration: { branch: "qa/demo", sha: HEAD_SHA },
+      integration: { branch: "qa/demo", sha: headSha },
       checks: [{
         id: "check_1",
         kind: "local-validation",
         name: "npm test",
         outcome: "passed",
-        subjectSha: HEAD_SHA,
+        subjectSha: headSha,
         evidenceDigest: DIGEST,
       }],
       preview: {
         url: "http://127.0.0.1:4393/",
         status: "healthy",
-        commitSha: HEAD_SHA,
+        commitSha: headSha,
         verifiedAt: "2026-09-03T12:05:00.000Z",
-        attestation: { kind: "json", key: "commitSha", observedSha: HEAD_SHA },
+        attestation: { kind: "json", key: "commitSha", observedSha: headSha },
       },
       assembly: {
         mode: "atomic",
@@ -73,10 +84,73 @@ function candidateFixture() {
   candidate.promotion = {
     branch: "qa/promotion-demo",
     prUrl: "https://github.com/example/demo/pull/42",
-    commitSha: HEAD_SHA,
+    commitSha: headSha,
     manifestDigest: candidate.manifestDigest,
   };
   return candidate;
+}
+
+async function git(cwd, args, env = {}) {
+  return execFileAsync("/usr/bin/git", args, {
+    cwd,
+    env: { ...process.env, ...env },
+    maxBuffer: 2 * 1024 * 1024,
+  });
+}
+
+async function legacyPromotionRepository(options = {}) {
+  const root = await mkdtemp(path.join(process.env.STUDIOOPS_TEST_ROOT, "qa-revocation-ancestry-"));
+  const remotePath = path.join(root, "remote.git");
+  const seedPath = path.join(root, "seed");
+  const repoPath = path.join(root, "repo");
+  await mkdir(seedPath);
+  await git(root, ["init", "--bare", "--quiet", remotePath]);
+  await git(seedPath, ["init", "--quiet", "--initial-branch=main"]);
+  await git(seedPath, ["config", "user.name", "StudioOps Test"]);
+  await git(seedPath, ["config", "user.email", "studioops-test@example.invalid"]);
+  await writeFile(path.join(seedPath, "base.txt"), "base\n", "utf8");
+  await git(seedPath, ["add", "base.txt"]);
+  await git(seedPath, ["commit", "--quiet", "-m", "base"]);
+  const baseSha = (await git(seedPath, ["rev-parse", "HEAD"])).stdout.trim();
+  await git(seedPath, ["switch", "--quiet", "-c", "qa/demo"]);
+  await writeFile(path.join(seedPath, "candidate.txt"), "candidate\n", "utf8");
+  await git(seedPath, ["add", "candidate.txt"]);
+  await git(seedPath, ["commit", "--quiet", "-m", "candidate"]);
+  const integrationSha = (await git(seedPath, ["rev-parse", "HEAD"])).stdout.trim();
+  const integrationTree = (await git(seedPath, ["rev-parse", "HEAD^{tree}"])).stdout.trim();
+  await git(seedPath, ["switch", "--quiet", "main"]);
+  await writeFile(path.join(seedPath, "main.txt"), "main advanced\n", "utf8");
+  await git(seedPath, ["add", "main.txt"]);
+  await git(seedPath, ["commit", "--quiet", "-m", "advance main"]);
+  const mainSha = (await git(seedPath, ["rev-parse", "HEAD"])).stdout.trim();
+  let promotionTree = integrationTree;
+  if (options.changedTree) {
+    await git(seedPath, ["switch", "--quiet", "qa/demo"]);
+    await writeFile(path.join(seedPath, "candidate.txt"), "changed after QA\n", "utf8");
+    await git(seedPath, ["add", "candidate.txt"]);
+    promotionTree = (await git(seedPath, ["write-tree"])).stdout.trim();
+  }
+  const promotionSha = (await git(seedPath, [
+    "commit-tree",
+    promotionTree,
+    "-p",
+    options.unrelated ? baseSha : integrationSha,
+    "-p",
+    mainSha,
+    "-m",
+    "legacy promotion merge",
+  ], {
+    GIT_AUTHOR_NAME: "StudioOps Test",
+    GIT_AUTHOR_EMAIL: "studioops-test@example.invalid",
+    GIT_COMMITTER_NAME: "StudioOps Test",
+    GIT_COMMITTER_EMAIL: "studioops-test@example.invalid",
+  })).stdout.trim();
+  await git(seedPath, ["update-ref", "refs/heads/qa/promotion-demo", promotionSha]);
+  await git(seedPath, ["remote", "add", "origin", remotePath]);
+  await git(seedPath, ["push", "--quiet", "origin", "main", "qa/demo", "qa/promotion-demo"]);
+  await git(root, ["clone", "--quiet", remotePath, repoPath]);
+  await git(repoPath, ["remote", "set-url", "origin", "https://github.com/example/demo"]);
+  return { remotePath, repoPath, baseSha, integrationSha, promotionSha };
 }
 
 function qaPassedCandidateFixture() {
@@ -249,6 +323,88 @@ test("release-candidate revocation detects a merge before changing local authori
   });
   assert.equal(result.status, "merged");
   assert.equal(result.mergedAt, mergedAt);
+});
+
+test("a merged pull request never uses the legacy descendant revocation path", async () => {
+  const candidate = candidateFixture();
+  const transport = createQaRevocationTestTransport(async () => ({
+    ok: true,
+    status: 200,
+    payload: pullPayload(candidate, {
+      state: "closed",
+      merged_at: "2026-09-03T12:30:00.000Z",
+      merge_commit_sha: "d".repeat(40),
+      head: {
+        ref: candidate.promotion.branch,
+        sha: BASE_SHA,
+        repo: { full_name: "example/demo" },
+      },
+    }),
+  }));
+  const result = await settleReleaseCandidatePullRequestForRevocation(PROJECT, candidate, {
+    githubToken: "ghs_test_token",
+    testTransport: transport,
+  });
+  assert.equal(result.status, "invalid");
+});
+
+test("closed legacy promotion revocation verifies an unchanged-tree descendant with real Git", async () => {
+  const fixture = await legacyPromotionRepository();
+  const candidate = candidateFixture({ baseSha: fixture.baseSha, headSha: fixture.integrationSha });
+  const transport = createQaRevocationTestTransport(async () => ({
+    ok: true,
+    status: 200,
+    payload: pullPayload(candidate, {
+      state: "closed",
+      head: {
+        ref: candidate.promotion.branch,
+        sha: fixture.promotionSha,
+        repo: { full_name: "example/demo" },
+      },
+    }),
+  }));
+  const result = await settleReleaseCandidatePullRequestForRevocation({
+    ...PROJECT,
+    repoPath: fixture.repoPath,
+  }, candidate, {
+    githubToken: "ghs_test_token",
+    testTransport: transport,
+    testGitRunner: createCandidateRepositoryTestGitRunner(fixture.remotePath),
+  });
+  assert.equal(result.status, "closed");
+});
+
+test("closed legacy promotion revocation rejects unrelated or changed-tree heads", async (t) => {
+  for (const variant of [
+    ["unrelated", { unrelated: true }],
+    ["changed tree", { changedTree: true }],
+  ]) {
+    await t.test(variant[0], async () => {
+      const fixture = await legacyPromotionRepository(variant[1]);
+      const candidate = candidateFixture({ baseSha: fixture.baseSha, headSha: fixture.integrationSha });
+      const transport = createQaRevocationTestTransport(async () => ({
+        ok: true,
+        status: 200,
+        payload: pullPayload(candidate, {
+          state: "closed",
+          head: {
+            ref: candidate.promotion.branch,
+            sha: fixture.promotionSha,
+            repo: { full_name: "example/demo" },
+          },
+        }),
+      }));
+      const result = await settleReleaseCandidatePullRequestForRevocation({
+        ...PROJECT,
+        repoPath: fixture.repoPath,
+      }, candidate, {
+        githubToken: "ghs_test_token",
+        testTransport: transport,
+        testGitRunner: createCandidateRepositoryTestGitRunner(fixture.remotePath),
+      });
+      assert.equal(result.status, "invalid");
+    });
+  }
 });
 
 test("release-candidate revocation rejects every mismatched pull-request identity field", async (t) => {
