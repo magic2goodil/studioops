@@ -793,6 +793,10 @@ function qaGitOptions(options = {}, overrides = {}) {
   };
 }
 
+function qaRemoteTarget(options = {}) {
+  return String(options.remoteTransportUrl || "origin");
+}
+
 function qaRemotePolicyError(message) {
   const error = new Error(message);
   error.code = "QA_REMOTE_POLICY";
@@ -1276,7 +1280,7 @@ async function remoteBranchExists(repoPath, branchName, options = {}) {
 }
 
 async function remoteRefHead(repoPath, ref, options = {}) {
-  const result = await git(repoPath, ["ls-remote", "origin", ref], { ...options, allowFailure: true });
+  const result = await git(repoPath, ["ls-remote", qaRemoteTarget(options), ref], { ...options, allowFailure: true });
   if (!result.ok) return { ok: false, head: "", output: truncateOutput(result.output) };
   const line = String(result.stdout || "").split("\n").find(Boolean) || "";
   return {
@@ -2457,7 +2461,7 @@ async function verifyMergedIntegrationTarget(repoPath, projectPlan, pr, options 
   const targetBranch = normalizeBranchName(projectPlan.integrationBranch);
   const fetch = await git(
     repoPath,
-    ["fetch", "origin", `refs/heads/${targetBranch}:refs/remotes/origin/${targetBranch}`],
+    ["fetch", qaRemoteTarget(options), `refs/heads/${targetBranch}:refs/remotes/origin/${targetBranch}`],
     { ...options, allowFailure: true },
   );
   if (!fetch.ok) {
@@ -2600,7 +2604,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
     let cleanup = { ok: true, output: "" };
     if (remoteCandidate.head) {
       await guardQaExternalMutation(repoPath, projectPlan, options, "delete_superseded_candidate_branch");
-      cleanup = await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+      cleanup = await git(repoPath, ["push", qaRemoteTarget(options), `:refs/heads/${handoff.branch}`], {
         ...options,
         allowFailure: true,
       });
@@ -2658,7 +2662,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
   let cleanup = { ok: true, output: "" };
   if (remoteCandidate.head) {
     await guardQaExternalMutation(repoPath, projectPlan, options, "delete_merged_candidate_branch");
-    cleanup = await git(repoPath, ["push", "origin", `:refs/heads/${handoff.branch}`], {
+    cleanup = await git(repoPath, ["push", qaRemoteTarget(options), `:refs/heads/${handoff.branch}`], {
       ...options,
       allowFailure: true,
     });
@@ -2769,8 +2773,9 @@ async function integrateProject(projectPlan, options = {}) {
 
   let mergedHandoff = null;
   if (pendingHandoff) {
-    await qaRemotePolicy(repoPath, candidatePlan, options);
-    const inspected = await inspectPendingProtectedHandoff(repoPath, candidatePlan, pendingHandoff, options);
+    const remotePolicy = await qaRemotePolicy(repoPath, candidatePlan, options);
+    const inspectionOptions = { ...options, remoteTransportUrl: remotePolicy.transportUrl };
+    const inspected = await inspectPendingProtectedHandoff(repoPath, candidatePlan, pendingHandoff, inspectionOptions);
     if (inspected.status === "superseded") {
       candidatePlan.tasks = requestedTasks;
       candidatePlan.assembly = requestedAssembly;
