@@ -44,6 +44,7 @@ import {
   prepareProjectValidationDependencies,
   installPreparedProjectValidationDependencies,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+  normalizeProjectValidationNetworkPolicy,
   runProjectValidationCommand,
   verifyProjectValidationSandbox,
 } from "./project-validation-sandbox.js";
@@ -1954,6 +1955,9 @@ function jsonValue(value, fallback) {
 }
 
 function qaProjectPolicyBinding(project = {}) {
+  const validationNetworkPolicy = normalizeProjectValidationNetworkPolicy(
+    project.qaIntegration?.validationNetworkPolicy,
+  );
   return {
     id: String(project.id || ""),
     repoPath: String(project.repoPath || ""),
@@ -1967,6 +1971,7 @@ function qaProjectPolicyBinding(project = {}) {
     qaIntegration: jsonValue(project.qaIntegration, {}),
     localQaPreview: jsonValue(project.localQaPreview, null),
     validationCommands: normalizeList(project.validationCommands),
+    validationNetworkPolicy,
     componentImpactMapPath: String(project.componentImpactMapPath || ""),
   };
 }
@@ -2213,6 +2218,9 @@ export function planQaIntegrations(state, input = {}) {
         integrationBranch,
         integrationBranchUrl: branchWebUrl(project, integrationBranch),
         validationCommands: normalizeList(project.validationCommands),
+        validationNetworkPolicy: normalizeProjectValidationNetworkPolicy(
+          project.qaIntegration?.validationNetworkPolicy,
+        ),
         componentImpactMapPath: String(project.componentImpactMapPath || ""),
         deferredTaskCount: candidateReady ? 0 : includedTasks.length,
         assembly,
@@ -2869,6 +2877,7 @@ async function integrateProject(projectPlan, options = {}) {
         || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH
         || DEFAULT_PROJECT_VALIDATION_PATH,
       sandboxExecutable: options.projectValidationSandboxExecutable,
+      networkPolicy: projectPlan.validationNetworkPolicy,
       cloneTimeoutMs: options.validationCloneTimeoutMs,
       testGitRunner: options.testGitRunner,
       gitAuthEnv: options.gitAuthEnv,
