@@ -258,7 +258,11 @@ export function createCandidateRepositoryTestGitRunner(
   ) {
     throw new Error("The candidate-verification test transport requires an isolated test, an absolute remote path, and a canonical GitHub URL.");
   }
-  const rewrite = `url.file://${resolvedRemotePath}.insteadOf=${repositoryUrl}`;
+  const repository = githubRepositorySlug(repositoryUrl);
+  const rewrites = [
+    `url.file://${resolvedRemotePath}.insteadOf=${repositoryUrl}`,
+    `url.file://${resolvedRemotePath}.insteadOf=git@github.com:${repository}.git`,
+  ];
   return registerIsolatedTestAdapter(
     testAuthority,
     "candidate-repository-git",
@@ -269,7 +273,9 @@ export function createCandidateRepositoryTestGitRunner(
         "-c",
         "protocol.file.allow=always",
         "-c",
-        rewrite,
+        rewrites[0],
+        "-c",
+        rewrites[1],
         ...payload.args,
       ]);
       assertCurrentIsolatedTestAuthority(testAuthority);
@@ -396,7 +402,11 @@ async function candidateRemotePolicy(project, input = {}) {
       );
     }
   }
-  return authority;
+  const transportUrl = String(input.remoteTransportUrl || authority.transportUrl).trim();
+  if (equivalentGitHubOriginSlug(transportUrl) !== authority.repository) {
+    throw new Error(`Candidate verification transport does not match configured repository ${authority.repository}.`);
+  }
+  return { ...authority, transportUrl };
 }
 
 function expectedRefs(candidate) {

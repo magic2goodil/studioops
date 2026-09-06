@@ -3162,7 +3162,12 @@ async function integrateProject(projectPlan, options = {}) {
     });
     if (options.renewQaClaim) await options.renewQaClaim();
     if (options.assertQaClaim) await options.assertQaClaim();
-    const candidateVerification = await verifyCandidateRepositoryState(project, candidate, gitOptions);
+    const candidateVerification = await verifyCandidateRepositoryState(project, candidate, {
+      ...gitOptions,
+      ...(options.preferLocalSshTransport
+        ? { remoteTransportUrl: canonicalGitHubSshTransport(project.repoUrl) }
+        : {}),
+    });
     if (!candidateVerification.ok) {
       result.status = candidateVerification.status === "drift"
         ? "candidate_drift"
