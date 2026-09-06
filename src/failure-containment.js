@@ -160,6 +160,53 @@ export function failureFingerprint(input = {}) {
   return { value, canonical: canonicalJson(value), digest: sha256(value) };
 }
 
+// Keep stored v1 fingerprints intact. Admission compares the work they describe,
+// so old incidents cannot be bypassed by a new transport, action alias or label.
+function failureWorkIdentity(input) {
+  const value = failureFingerprint(input).value;
+  const infrastructure = new Set([
+    "configuration_invalid", "credential_unavailable", "dependency_unavailable",
+    "output_guard_exceeded", "provider_auth_failed", "provider_rate_limited",
+    "provider_unavailable", "repository_unavailable", "service_unhealthy",
+  ]).has(value.reasonCode);
+  const builder = new Set(["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]);
+  const action = infrastructure ? "execution"
+    : builder.has(value.action) ? "builder"
+      : ["start_review", "continue_review"].includes(value.action) ? "reviewer" : value.action;
+  const candidate = value.candidate || {};
+  return {
+    taskId: value.taskId, provider: value.provider, reasonCode: value.reasonCode, action,
+    // Candidate IDs, cycles and manifests describe bookkeeping, not changed code.
+    source: infrastructure ? "" : candidate.treeSha || candidate.commitSha || candidate.baseSha || "",
+  };
+}
+
+export function selectFailureIncident(incidents = [], input = {}) {
+  const wanted = canonicalJson(failureWorkIdentity(input));
+  const latest = new Map();
+  for (const raw of incidents) {
+    const incident = normalizedIncident(raw);
+    if (canonicalJson(failureWorkIdentity(incident.fingerprint)) !== wanted) continue;
+    const prior = latest.get(incident.fingerprintDigest);
+    if (!prior || incident.generation > prior.generation) latest.set(incident.fingerprintDigest, incident);
+  }
+  let matching = [...latest.values()].filter((incident) => !["superseded", "closed"].includes(incident.state));
+  // A verified repair starts a fresh generation; older alias rows must not
+  // resurrect the repaired failure. Ordinary status updates cannot do this.
+  const repairedAt = Math.max(0, ...matching.flatMap((incident) => incident.history
+    .filter((event) => event.type === "evidence_verified")
+    .map((event) => Date.parse(event.recordedAt) || 0)));
+  if (repairedAt) matching = matching.filter((incident) => Date.parse(incident.createdAt) >= repairedAt);
+  matching.sort((a, b) => Number(b.state === "open") - Number(a.state === "open")
+    || (Date.parse(b.backoffUntil) || 0) - (Date.parse(a.backoffUntil) || 0)
+    || Date.parse(b.updatedAt) - Date.parse(a.updatedAt)
+    || a.incidentId.localeCompare(b.incidentId));
+  return matching.length ? {
+    incident: matching[0],
+    paidAttempts: matching.reduce((total, incident) => total + incident.paidAttempts, 0),
+  } : null;
+}
+
 function normalizedRepositoryEvidence(value = {}) {
   const repository = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const prUrl = String(repository.prUrl || "").trim();

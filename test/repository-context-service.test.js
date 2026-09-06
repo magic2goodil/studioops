@@ -64,3 +64,12 @@ test("read-only context command handles help and rejects incomplete or mutable c
   await assert.rejects(runContextCommand(["--query", "retry"], () => {}), /required/);
   await assert.rejects(runContextCommand(["--repo", "/unused", "--project", "fixture", "--repository", "https://github.com/example/fixture", "--query", "retry", "--commit", "main"], () => {}), /immutable/);
 });
+
+test("prepared execution snapshot supplies retrieval when GitHub preflight base is absent", async () => {
+  const run = {...fixture(),preflightBaseCommit:"",executionCommitSha:sha};
+  const result = await withRepositoryContext(run, {loadIndex:async input => {
+    assert.equal(input.commitSha,sha);return index();
+  }});
+  assert.equal(result.repositoryContext.status,"available");
+  assert.match(result.repositoryContextPacket,/retryDelivery/);
+});

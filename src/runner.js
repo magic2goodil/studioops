@@ -68,8 +68,8 @@ import {
   resolveProjectImpactPlan,
   writeBoundedDiscoveryArtifact,
 } from "./impact-planner.js";
-import { sha256Digest } from "./component-impact-map.js";
-import { withRepositoryContext } from "./repository-context-service.js";
+import { sha256Digest, loadProjectComponentImpactMapAtCommit } from "./component-impact-map.js";
+import { withRepositoryContext, repositoryContextEvidence } from "./repository-context-service.js";
 import { MAX_VALIDATION_ARTIFACT_BYTES } from "./run-output-evidence.js";
 import { createRemediationHandoff } from "./remediation-handoff.js";
 import {
@@ -83,6 +83,7 @@ import {
   failureFingerprint,
   failureIncidentCompatibilityCircuit,
   normalizeFailureProvider,
+  selectFailureIncident,
 } from "./failure-containment.js";
 
 const execFileAsync = promisify(execFile);
@@ -1600,12 +1601,18 @@ function withExecutionWorkspace(run, workspace) {
   };
 }
 
-function withExecutionImpactPlan(run) {
+export async function withExecutionImpactPlan(run) {
+  const executionCommitSha = (await gitOutput(["rev-parse", "HEAD"], { cwd: run.project.repoPath })).trim();
+  if (!/^[a-f0-9]{40}$/.test(executionCommitSha)) throw new Error("Prepared workspace commit is unavailable.");
+  const sourceCommit = run.group === "reviewer"
+    ? run.reviewSubjectSha || run.candidateIdentity?.commitSha || executionCommitSha : executionCommitSha;
+  if (sourceCommit !== executionCommitSha) throw new Error("Prepared workspace does not match the review candidate.");
   const impactPlan = resolveProjectImpactPlan({
     project: run.project,
     task: run.task || {},
     repoRoot: run.project.repoPath,
-    sourceCommit: run.reviewSubjectSha || run.preflightBaseCommit || "",
+    sourceCommit,
+    loadedMap: loadProjectComponentImpactMapAtCommit(run.project, sourceCommit, { repoRoot: run.project.repoPath }),
   });
   assertImpactPlanProjectBinding(impactPlan, run.project);
   if (run.task?.impactScopePlan) {
@@ -1615,6 +1622,7 @@ function withExecutionImpactPlan(run) {
   }
   return {
     ...run,
+    executionCommitSha,
     impactPlan,
     fileScope: impactPlan.allowedFileScope.length ? impactPlan.allowedFileScope : run.fileScope,
     fileScopeExplicit: impactPlan.allowedFileScope.length > 0 || run.fileScopeExplicit,
@@ -2004,7 +2012,7 @@ function failureCandidateForRun(run = {}) {
   const identity = run.candidateIdentity || {};
   return {
     candidateId: canonicalCandidateId(run.candidateId),
-    commitSha: fullGitSha(identity.commitSha || run.reviewSubjectSha),
+    commitSha: fullGitSha(identity.commitSha || run.reviewSubjectSha || run.executionCommitSha),
     treeSha: fullGitSha(identity.treeSha),
     baseSha: fullGitSha(identity.baseSha || run.preflightBaseCommit),
     manifestDigest: /^sha256:[a-f0-9]{64}$/.test(String(run.candidateManifestDigest || ""))
@@ -2119,13 +2127,13 @@ async function denyPaidFailureAttempt(run, claim) {
 export async function claimCurrentFailureAttempt(run, input = {}) {
   const state = input.state || await (input.readState || readState)();
   const incidents = input.failureIncidents || await (input.readFailureIncidents || readFailureIncidents)({ taskId: run.taskId });
-  const match = incidents.find((incident) => {
-    if (incident.action !== run.actionType || incident.provider !== normalizeFailureProvider(run.provider || "codex")) return false;
-    const authority = failureAuthorityForRun(run, incident.reasonCode, state, incident.evidence);
-    return failureFingerprint(authority).digest === incident.fingerprintDigest;
-  });
+  const matches = [...new Set(incidents.map((incident) => incident.reasonCode))]
+    .map((reasonCode) => selectFailureIncident(incidents, failureAuthorityForRun(run, reasonCode, state))).filter(Boolean);
+  const selected = matches.find(({incident, paidAttempts}) => incident.state === "open" || paidAttempts >= 2)
+    || matches.find(({incident}) => incident.state === "backoff" && Date.parse(incident.backoffUntil) > Date.now()) || matches[0];
+  const match = selected?.incident;
   if (!match) return { admitted: true, reason: "no_active_failure_generation", incident: null };
-  const authority = failureAuthorityForRun(run, match.reasonCode, state, match.evidence);
+  const authority = { ...match.fingerprint, evidence: match.evidence };
   const claim = await (input.claimFailureAttempt || claimFailureContainmentPaidAttempt)({
     ...authority,
     initiator: "runner",
@@ -2599,6 +2607,8 @@ export async function completeRun(runId, input = {}) {
     run.notes = String(input.notes || run.notes || "").trim();
     if (input.impactPlan) run.impactPlan = structuredClone(input.impactPlan);
     if (input.contextEvidence) run.contextEvidence = structuredClone(input.contextEvidence);
+    if (input.repositoryContext) run.repositoryContext = repositoryContextEvidence(input.repositoryContext);
+    if (/^[a-f0-9]{40}$/.test(input.executionCommitSha || "")) run.executionCommitSha = input.executionCommitSha;
     const budget = recordRunUsage(run, input.usage, now);
     const task = findTask(state, run.taskId);
     let handoffFailure = "";
@@ -2764,6 +2774,11 @@ export async function completeRun(runId, input = {}) {
 }
 
 export async function completeRunAfterExecution(run, input, executionRun = run) {
+  input = {
+    ...input,
+    repositoryContext: executionRun.repositoryContext,
+    executionCommitSha: executionRun.executionCommitSha,
+  };
   let preserveBuilderReviewCycle = false;
   if (input.status === "completed" && run.workflowMode === "local" && run.group === "builder") {
     try {
@@ -2950,10 +2965,10 @@ async function runClaimedRunWithSdk(run, input = {}) {
     authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
-    executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
+    executionRun = await withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
     executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
     log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
-    const failureClaim = await claimCurrentFailureAttempt(run, input);
+    const failureClaim = await claimCurrentFailureAttempt(executionRun, input);
     if (!failureClaim.admitted) {
       status = "cancelled";
       exitCode = failureClaim.reason === "backoff" ? "failure_backoff" : "failure_circuit_open";
@@ -3095,10 +3110,10 @@ async function runClaimedRunWithCli(run, input = {}) {
     authContext = run.group === "architect" ? null : await prepareRunAuth(run, input);
     log.write(githubWorkflowAuthForLog(run, authContext));
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
-    executionRun = withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
+    executionRun = await withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
     executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
     log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
-    const failureClaim = await claimCurrentFailureAttempt(run, input);
+    const failureClaim = await claimCurrentFailureAttempt(executionRun, input);
     if (!failureClaim.admitted) {
       log.write(`StudioOps skipped provider launch because ${failureClaim.reason} is active for ${failureClaim.incident.incidentId}.\n`);
       log.end();

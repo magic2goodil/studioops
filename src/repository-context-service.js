@@ -5,6 +5,19 @@ import { projectRepositoryIdentity } from "./component-impact-map.js";
 
 const FALLBACK = "ADVISORY REPOSITORY CONTEXT\nStructural retrieval is unavailable. Use the existing component map and bounded source discovery. Edit scope, required validation, and release authority remain unchanged.";
 
+export function repositoryContextEvidence(value = {}) {
+  const evidence = {};
+  if (["available", "partial", "no_matches", "unavailable", "disabled"].includes(value.status)) evidence.status = value.status;
+  if (["snapshot_binding_missing", "packet_unavailable", "index_or_binding_unavailable"].includes(value.reason)) evidence.reason = value.reason;
+  if (/^[a-f0-9]{40}$/.test(value.commitSha || "")) evidence.commitSha = value.commitSha;
+  if (/^sha256:[a-f0-9]{64}$/.test(value.indexDigest || "")) evidence.indexDigest = value.indexDigest;
+  for (const field of ["bytes", "resultCount"]) {
+    if (Number.isSafeInteger(value[field]) && value[field] >= 0 && value[field] <= 1000000) evidence[field] = value[field];
+  }
+  for (const field of ["cacheHit", "partial"]) if (typeof value[field] === "boolean") evidence[field] = value[field];
+  return evidence;
+}
+
 function unavailable(run, reason) {
   return {
     ...run,
@@ -19,7 +32,7 @@ export async function withRepositoryContext(run, options = {}) {
     return { ...run, repositoryContext: { status: "disabled", resultCount: 0, bytes: 0 }, repositoryContextPacket: "" };
   }
   const plan = run.impactPlan;
-  const commitSha = run.reviewSubjectSha || run.preflightBaseCommit || plan?.sourceCommit || "";
+  const commitSha = run.executionCommitSha || run.reviewSubjectSha || plan?.sourceCommit || run.preflightBaseCommit || "";
   if (!plan?.manifest?.digest || !/^[a-f0-9]{40}$/.test(commitSha)) return unavailable(run, "snapshot_binding_missing");
   const expected = {
     project: { key: run.project?.key || run.project?.id || "", repository: projectRepositoryIdentity(run.project) },
