@@ -135,6 +135,7 @@ const DEPENDENCY_COMPLETE_STATUSES = new Set([
 
 const ACTIVE_RUN_STATUSES = new Set(["queued", "running"]);
 const WORKSPACE_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TASK_TERMINAL_STATUSES = new Set(["merged", "deployed", "done"]);
 const DEFAULT_ORPHANED_TASK_GRACE_MS = 15 * 60 * 1000;
 const DEFAULT_TRANSIENT_RECOVERY_MS = 2 * 60 * 1000;
 const MAX_TRANSIENT_RECOVERY_MS = 15 * 60 * 1000;
@@ -3266,7 +3267,8 @@ function invalidateCandidateQaAuthorityInState(state, candidate, tasks, input, s
     mergeCommit: String(input.promotionSettlement.mergeCommit || ""),
     mergedAt: String(input.promotionSettlement.mergedAt || ""),
   } : null;
-  const planned = tasks.map((task) => {
+  const terminalTasks = tasks.filter((task) => TASK_TERMINAL_STATUSES.has(task.status));
+  const planned = tasks.filter((task) => !TASK_TERMINAL_STATUSES.has(task.status)).map((task) => {
     const evidence = lifecycleEvidenceForTask(state, task, "needs_changes", {
       candidateId: subject.candidateId,
       manifestDigest: subject.manifestDigest,
@@ -3319,6 +3321,37 @@ function invalidateCandidateQaAuthorityInState(state, candidate, tasks, input, s
     return task;
   });
   const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+  if (!candidate.invalidation) {
+    invalidateCandidate(candidate, {
+      reason: `QA authority was revoked after the exact release candidate settled as ${promotionSettlement?.status || "not promoted"}.`,
+      expected: candidate.manifestDigest,
+      observed: outcome,
+      invalidatedAt: now,
+    });
+  }
+  if (bundle) {
+    bundle.status = "invalidated";
+    bundle.updatedAt = now;
+  }
+  for (const task of terminalTasks) {
+    addAutomationComment(
+      state,
+      task,
+      `Local QA authority was revoked for obsolete candidate ${candidate.id}. The terminal task and its merge evidence were preserved.${notes ? `\n\n${notes}` : ""}`,
+      now,
+      author,
+    );
+    state.events.push({
+      id: nextId(state.events, "event"),
+      type: options.taskEventType || "qa_approval_revoked",
+      projectId: task.projectId,
+      taskId: task.id,
+      message: `${task.title}: obsolete QA authority for ${candidate.id} was revoked without reopening the terminal task.`,
+      ...(promotionSettlement ? { promotionSettlement } : {}),
+      createdAt: now,
+    });
+  }
+  applied.push(...terminalTasks);
   state.events.push({
     id: nextId(state.events, "event"),
     type: options.candidateEventType || "candidate_qa_approval_revoked",
@@ -3579,12 +3612,15 @@ export function qaDecisionCoordinatesForState(state) {
         || !["frozen", "qa_passed", "release_candidate_ready"].includes(candidate.status)
       ) continue;
       const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
+      const linkageOptions = {
+        allowTerminalRevocation: candidate.status === "release_candidate_ready",
+      };
       if (candidate.manifest.sources.length === 1) {
         const taskId = candidate.manifest.sources[0].taskId;
-        assertQaDecisionLinkage(state, candidate, { kind: "task", id: taskId });
+        assertQaDecisionLinkage(state, candidate, { kind: "task", id: taskId }, linkageOptions);
       }
       if (candidate.qaBundleId) {
-        assertQaDecisionLinkage(state, candidate, { kind: "bundle", id: candidate.qaBundleId });
+        assertQaDecisionLinkage(state, candidate, { kind: "bundle", id: candidate.qaBundleId }, linkageOptions);
       }
       const packet = assertCurrentOwnerQaPacket(state, candidate, bundle);
       if (candidate.manifest.sources.length === 1) {
@@ -3598,7 +3634,7 @@ export function qaDecisionCoordinatesForState(state) {
   return coordinates;
 }
 
-function assertQaDecisionLinkage(state, candidate, selector) {
+function assertQaDecisionLinkage(state, candidate, selector, options = {}) {
   const sourceTaskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
   const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
   if (!bundle) throw new Error("QA candidate has no exact bundle linkage.");
@@ -3645,6 +3681,19 @@ function assertQaDecisionLinkage(state, candidate, selector) {
   }
   for (const taskId of sourceTaskIds) {
     const task = state.tasks.find((item) => item.id === taskId);
+    const source = candidate.manifest.sources.find((item) => item.taskId === taskId);
+    const exactTerminalRevocation = Boolean(
+      options.allowTerminalRevocation
+      && TASK_TERMINAL_STATUSES.has(task?.status)
+      && task?.projectId === candidate.projectId
+      && task?.candidateId === candidate.id
+      && task?.qaBundleId === bundle.id
+      && task?.candidateManifestDigest === candidate.manifestDigest
+      && task?.integrationCommit === candidate.manifest.integration.sha
+      && task?.reviewSubjectSha === source?.headSha
+      && Number(task?.reviewSubjectCycle || task?.reviewCycle || 0) === Number(source?.candidateCycle || 0)
+    );
+    if (exactTerminalRevocation) continue;
     if (
       !task
       || task.projectId !== candidate.projectId
@@ -3683,7 +3732,9 @@ function qaDecisionSnapshot(state, selector, input) {
   const outcome = String(boundInput.outcome || boundInput.decision || "").trim().toLowerCase();
   if (!["passed", "failed"].includes(outcome)) throw new Error("QA decision outcome must be passed or failed.");
   qaDecisionSubject(candidate, boundInput);
-  assertQaDecisionLinkage(state, candidate, selector);
+  assertQaDecisionLinkage(state, candidate, selector, {
+    allowTerminalRevocation: outcome === "failed" && candidate.status === "release_candidate_ready",
+  });
   const project = findProject(state, candidate.projectId);
   if (!project) throw new Error(`Candidate has missing project: ${candidate.projectId}`);
   const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
@@ -3712,7 +3763,10 @@ function assertQaDecisionSnapshotCurrent(state, snapshot) {
     throw new Error("QA candidate authority changed during repository verification; refresh and retry.");
   }
   qaDecisionSubject(candidate, snapshot.boundInput);
-  assertQaDecisionLinkage(state, candidate, snapshot.selector);
+  const outcome = String(snapshot.boundInput.outcome || snapshot.boundInput.decision || "").trim().toLowerCase();
+  assertQaDecisionLinkage(state, candidate, snapshot.selector, {
+    allowTerminalRevocation: outcome === "failed" && candidate.status === "release_candidate_ready",
+  });
   const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
   const packet = assertCurrentOwnerQaPacket(state, candidate, bundle);
   if (packet.packetDigest !== snapshot.ownerQaPacketDigest) {
@@ -3756,7 +3810,9 @@ async function finalizeQaRevocationSettlement(candidateId, settlement, input = {
     }
     const intent = assertQaRevocationIntent(candidate, candidate.qaRevocationIntent);
     const bundle = (state.qaBundles || []).find((item) => item.id === candidate.qaBundleId);
-    assertQaDecisionLinkage(state, candidate, { kind: "bundle", id: candidate.qaBundleId });
+    assertQaDecisionLinkage(state, candidate, { kind: "bundle", id: candidate.qaBundleId }, {
+      allowTerminalRevocation: true,
+    });
     const packet = assertCurrentOwnerQaPacket(state, candidate, bundle);
     if (packet.packetDigest !== intent.ownerQaPacketDigest) {
       throw new Error("QA revocation owner packet authority changed before local settlement.");
