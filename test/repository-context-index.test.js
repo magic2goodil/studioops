@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, mkdir, writeFile, readFile, readdir, stat, symlink, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -21,6 +22,123 @@ async function fixture(t, files = {}) {
   const commitSha = commit();
   return { root, repoRoot, cacheRoot, project: { key: "context-fixture", repoPath: repoRoot }, commitSha, put, commit, git };
 }
+
+function interceptGit(t, intercept) {
+  const actual = execFileSync;
+  const mock = t.mock.method(childProcess, "execFileSync", (command, args, options) => {
+    if (command !== "/usr/bin/git") return actual(command, args, options);
+    return intercept(args.slice(2), options, () => actual(command, args, options));
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mock.mock.restore(); syncBuiltinESMExports(); });
+}
+
+test("confirmed Git subprocess timeouts retain safe diagnostics at every snapshot stage", async (t) => {
+  const cases = [
+    ["rev-parse --show-toplevel", "resolve_root"],
+    ["remote get-url", "resolve_remote"],
+    ["cat-file -e", "verify_commit"],
+    ["ls-tree -r", "list_tree"],
+    ["cat-file blob", "read_blob", "docs/architecture/components.json"],
+    ["cat-file blob", "read_blob", ".studioops-contextignore"],
+    ["cat-file --batch", "read_blob_batch"],
+  ];
+  for (const [prefix, operation, extraPath] of cases) await t.test(`${operation} ${extraPath || ""}`, async (t) => {
+    const input = await fixture(t, { "src/main.js": "export function retainedSymbol() {}", ...(extraPath ? { [extraPath]: "{}" } : {}) });
+    if (operation === "resolve_remote") input.project.repoUrl = "https://example.invalid/context-fixture";
+    let allottedMs;
+    interceptGit(t, (args, options, run) => {
+      assert.ok(options.timeout > 0 && options.timeout <= 15000, "every Git read shares the hard budget");
+      assert.equal(options.env.GIT_NO_REPLACE_OBJECTS, "1");
+      if (args.slice(0, 2).join(" ") !== prefix) return run();
+      allottedMs = options.timeout;
+      throw Object.assign(new Error("PRIVATE_SENTINEL /private/repo https://token@private.invalid"), {
+        code: "ETIMEDOUT", status: null, signal: "SIGTERM", stderr: Buffer.from("PRIVATE_SENTINEL"),
+        stdout: Buffer.from("PRIVATE_SOURCE"), path: "/private/repo", spawnargs: ["PRIVATE_ARGS"],
+      });
+    });
+    await assert.rejects(buildRepositoryContextIndex({ ...input, limits: { maxDurationMs: 999999 } }), (error) => {
+      assert.equal(error.code, "duration_limit");
+      const diagnostic = error.gitDiagnostic;
+      assert.deepEqual(Object.keys(diagnostic).sort(), ["allottedMs", "code", "elapsedMs", "operation", "signal", "status"]);
+      assert.deepEqual({ ...diagnostic, elapsedMs: 0 }, { operation, code: "ETIMEDOUT", status: null, signal: "SIGTERM", allottedMs, elapsedMs: 0 });
+      assert.ok(Number.isSafeInteger(diagnostic.elapsedMs) && diagnostic.elapsedMs >= 0);
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE_|private|token|spawnargs|stderr|stdout/);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+  });
+});
+
+test("Git exits, overflow and signals alone do not establish deadline exhaustion", async (t) => {
+  const cases = [
+    { code: undefined, status: 128, signal: null },
+    { code: "ENOBUFS", status: null, signal: "SIGTERM" },
+    { code: undefined, status: null, signal: "SIGTERM" },
+    { code: undefined, status: null, signal: "SIGKILL" },
+    { code: "PRIVATE_SENTINEL".repeat(1000), status: "PRIVATE_STATUS", signal: "PRIVATE_SIGNAL" },
+    { code: undefined, status: -1, signal: null },
+  ];
+  for (const [index, metadata] of cases.entries()) await t.test(`failure ${index + 1}`, async (t) => {
+    const input = await fixture(t, { "src/main.js": "export function safeSymbol() {}" });
+    interceptGit(t, (args, options, run) => {
+      if (args[1] !== "--batch") return run();
+      throw Object.assign(new Error("PRIVATE_MESSAGE"), metadata);
+    });
+    await assert.rejects(buildRepositoryContextIndex(input), (error) => {
+      assert.equal(error.code, "git_snapshot_unavailable");
+      assert.equal(error.gitDiagnostic.operation, "read_blob_batch");
+      assert.equal(error.gitDiagnostic.code, metadata.code === "ENOBUFS" ? "ENOBUFS" : null);
+      assert.equal(error.gitDiagnostic.status, metadata.status === 128 ? 128 : null);
+      assert.equal(error.gitDiagnostic.signal, ["SIGTERM", "SIGKILL"].includes(metadata.signal) ? metadata.signal : null);
+      assert.ok(JSON.stringify(error).length < 300);
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE/);
+      return true;
+    });
+  });
+});
+
+test("a failed Git batch leaves no cache entry and the next call retries the immutable snapshot", async (t) => {
+  const input = await fixture(t, { "src/main.js": "export function committedSymbol() {}" });
+  await input.put("src/main.js", "export function dirtySymbol() {}");
+  let batches = 0;
+  interceptGit(t, (args, options, run) => {
+    if (args[1] === "--batch" && ++batches === 1) throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT", status: null, signal: "SIGTERM" });
+    return run();
+  });
+  await assert.rejects(loadOrBuildRepositoryContextIndex(input), { code: "duration_limit" });
+  const partitions = await readdir(input.cacheRoot);
+  assert.equal(partitions.length, 1);
+  assert.deepEqual(await readdir(path.join(input.cacheRoot, partitions[0])), []);
+  const recovered = await loadOrBuildRepositoryContextIndex(input);
+  assert.equal(batches, 2);
+  assert.equal(recovered.cacheHit, false);
+  assert.equal(recovered.coverage.complete, true);
+  assert.deepEqual(recovered.files[0].symbols.map((symbol) => symbol.name), ["committedSymbol"]);
+  assert.equal((await loadOrBuildRepositoryContextIndex(input)).cacheHit, true);
+  assert.equal(batches, 2);
+});
+
+test("real Git exit metadata stays distinct from a successfully read invalid component map", async (t) => {
+  const input = await fixture(t, { "docs/architecture/components.json": "PRIVATE_INVALID_JSON" });
+  await assert.rejects(buildRepositoryContextIndex({ ...input, commitSha: "f".repeat(40) }), (error) => {
+    assert.equal(error.code, "git_snapshot_unavailable");
+    assert.equal(error.gitDiagnostic.operation, "verify_commit");
+    assert.equal(error.gitDiagnostic.code, null);
+    assert.equal(error.gitDiagnostic.status, 128);
+    assert.equal(error.gitDiagnostic.signal, null);
+    assert.ok(error.gitDiagnostic.allottedMs > 0 && error.gitDiagnostic.allottedMs <= 15000);
+    assert.ok(Number.isSafeInteger(error.gitDiagnostic.elapsedMs) && error.gitDiagnostic.elapsedMs >= 0);
+    assert.doesNotMatch(JSON.stringify(error), /PRIVATE_|fatal|stderr|spawnargs/);
+    return true;
+  });
+  await assert.rejects(buildRepositoryContextIndex(input), (error) => {
+    assert.equal(error.code, "component_map_invalid");
+    assert.equal(error.gitDiagnostic, undefined);
+    assert.doesNotMatch(JSON.stringify(error), /PRIVATE_INVALID_JSON/);
+    return true;
+  });
+});
 
 test("WASM syntax extraction covers JS, TSX, Python and PHP without parsing comments or copying literals", async () => {
   const cases = [
