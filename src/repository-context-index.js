@@ -3,6 +3,8 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { constants as osConstants } from "node:os";
+import { performance } from "node:perf_hooks";
 import { studioOpsHome } from "./runtime-paths.js";
 import { sha256Digest, projectRepositoryIdentity, normalizeRepositoryIdentity,
   validateComponentImpactMap, pathMatchesImpactScope } from "./component-impact-map.js";
@@ -19,6 +21,13 @@ const MAX_CACHE_BYTES = 16 * 1024 * 1024;
 const DIAGNOSTIC_REASONS = new Set(["unsupported_language", "parse_timeout", "parse_error", "parser_unavailable", "extraction_limit",
   "symbol_limit", "import_limit", "file_limit", "total_byte_limit", "duration_limit", "file_too_large", "binary_file"]);
 const TRANSIENT_REASONS = new Set(["duration_limit", "parse_timeout", "parser_unavailable", "extraction_limit"]);
+const GIT_OPERATIONS = new Map([
+  ["rev-parse --show-toplevel", "resolve_root"], ["remote get-url", "resolve_remote"],
+  ["cat-file -e", "verify_commit"], ["ls-tree -r", "list_tree"],
+  ["cat-file blob", "read_blob"], ["cat-file --batch", "read_blob_batch"],
+]);
+const GIT_ERROR_CODES = new Set(Object.keys(osConstants.errno));
+const GIT_SIGNALS = new Set(Object.keys(osConstants.signals));
 
 function transientIncomplete(index) {
   return [...TRANSIENT_REASONS].some((reason) => index.coverage?.excluded?.[reason] > 0)
@@ -34,11 +43,25 @@ function limitsFor(input = {}) {
   }));
 }
 function git(root, args, maxBuffer = 8 * 1024 * 1024, input, timeoutMs = 10000) {
+  const started = performance.now();
   try {
     return execFileSync("/usr/bin/git", ["-C", root, ...args], { encoding: null, maxBuffer, input, timeout: timeoutMs,
       stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LANG: "C", LC_ALL: "C",
         GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat" } });
-  } catch { throw failure("git_snapshot_unavailable"); }
+  } catch (cause) {
+    // A signal or a slow operation alone does not establish timeout. Never retain
+    // the raw subprocess error: its message, output and arguments can be private.
+    const error = failure(cause?.code === "ETIMEDOUT" ? "duration_limit" : "git_snapshot_unavailable");
+    error.gitDiagnostic = {
+      operation: GIT_OPERATIONS.get(args.slice(0, 2).join(" ")) || "unknown",
+      code: GIT_ERROR_CODES.has(cause?.code) ? cause.code : null,
+      status: Number.isInteger(cause?.status) && cause.status >= 0 && cause.status <= 255 ? cause.status : null,
+      signal: GIT_SIGNALS.has(cause?.signal) ? cause.signal : null,
+      allottedMs: timeoutMs,
+      elapsedMs: Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(performance.now() - started))),
+    };
+    throw error;
+  }
 }
 export function safeRepositoryContextPath(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 500 && /^[\p{L}\p{N}\p{M} _./@+()\[\],=\-]+$/u.test(value)
@@ -98,7 +121,8 @@ async function snapshot(input) {
   let manifest = null;
   if (mapEntry) {
     if (!["100644", "100755"].includes(mapEntry.mode) || mapEntry.size > 1024 * 1024) throw failure("component_map_invalid");
-    try { manifest = validateComponentImpactMap(JSON.parse(runGit(["cat-file", "blob", mapEntry.blobSha], 1024 * 1024 + 1).toString("utf8")), { projectKey: project.key, repository: project.repository }); }
+    const mapBytes = runGit(["cat-file", "blob", mapEntry.blobSha], 1024 * 1024 + 1);
+    try { manifest = validateComponentImpactMap(JSON.parse(mapBytes.toString("utf8")), { projectKey: project.key, repository: project.repository }); }
     catch { throw failure("component_map_invalid"); }
   }
   if (input.manifest) {
