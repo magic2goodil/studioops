@@ -1,5 +1,6 @@
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import os from "node:os";
 import { integrationBranchName, trustLeadApprovalsEnabled } from "./integration-policy.js";
@@ -11,6 +12,7 @@ export const LEGACY_CONFIG_FILE = "mission-control.config.md";
 export const CONFIG_EXAMPLE_FILE = "studioops.config.example.md";
 export const PROJECT_WORKFLOW_MODES = new Set(["auto", "local", "github"]);
 export const MODULAR_ARCHITECTURE_STANDARD = "standards/modular-architecture-and-scoped-validation.md";
+export const HOSTED_RC_STANDARD = "standards/hosted-release-candidate-qa.md";
 export const INSTALLED_AUTOMATION_CAPACITY = Object.freeze({
   builderConcurrency: 3,
   reviewerConcurrency: 3,
@@ -400,6 +402,7 @@ export function normalizeConfig(config = {}) {
     ...(hasTopLevelCreditPolicy ? { creditPolicy: normalizedTopLevelCreditPolicy } : {}),
     defaults: {
       ...defaults,
+      standards: withDefaultProjectStandards(defaults.standards),
       ...(hasDefaultCreditPolicy ? { creditPolicy: normalizedDefaultCreditPolicy } : {}),
       dispatcher: {
         ...dispatcher,
@@ -438,8 +441,21 @@ export function withDefaultProjectStandards(value) {
     : String(value || "").split(/\n|,/);
   return [...new Set([
     MODULAR_ARCHITECTURE_STANDARD,
+    HOSTED_RC_STANDARD,
     ...standards.map((item) => String(item).trim()).filter(Boolean),
   ])];
+}
+
+/** Canonical bundled references follow this installed module, never the caller's cwd.
+ * Absolute, URL and explicitly project-relative references retain their meaning. */
+export function resolveStandardReference(item) {
+  const value = String(item || "").trim();
+  if (!value || path.isAbsolute(value) || /^[a-z]+:\/\//i.test(value)) return value;
+  if (/^standards\/[a-z0-9-]+\.md$/.test(value)) {
+    const bundled = fileURLToPath(new URL(`../${value}`, import.meta.url));
+    if ([MODULAR_ARCHITECTURE_STANDARD, HOSTED_RC_STANDARD].includes(value) || existsSync(bundled)) return bundled;
+  }
+  return path.join(process.cwd(), value);
 }
 
 export function normalizeProjectWorkflowMode(value, fallback = "auto") {

@@ -35,10 +35,12 @@ async function verificationFixture(input = {}) {
   const sourceRoot = path.join(root, "source");
   const runtimeRoot = path.join(root, "runtime");
   const pluginRoot = path.join(sourceRoot, "plugins", "studioops", ".codex-plugin");
-  for (const directory of ["src", "public", "scripts", "deploy", "data", "logs", "credentials", "node_modules"]) {
+  for (const directory of ["src", "public", "scripts", "deploy", "standards", "data", "logs", "credentials", "node_modules"]) {
     await mkdir(path.join(sourceRoot, directory), { recursive: true });
   }
   await mkdir(pluginRoot, { recursive: true });
+  await writeFile(path.join(sourceRoot, "standards/hosted-release-candidate-qa.md"),
+    await readFile("standards/hosted-release-candidate-qa.md"));
   const packageJson = { name: "studioops", version: "2.0.0" };
   const pluginJson = {
     name: "studioops",

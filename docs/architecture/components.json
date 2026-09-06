@@ -163,7 +163,7 @@
         "test/prototype-fast-lane.test.js"
       ],
       "data": ["projects", "tasks", "runs", "reviews", "events", "candidates", "projects.hostedRc additive policy history", "candidates.hostedRc fenced evidence qualification revocation history"],
-      "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle", "hosted RC policy/evidence/qualification append-read-revoke v1; expectedVersion CAS; <=50 summaries", "trusted executable qualification persistence port supplied by qa-release adapters"],
+      "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle", "exact additive required-default adoption preserves immutable historical QA records; new authority still requires current packet and policy", "hosted RC policy/evidence/qualification append-read-revoke v1; expectedVersion CAS; <=50 summaries", "trusted executable qualification persistence port supplied by qa-release adapters"],
       "events": ["release_qa_policy_recorded.v1", "hosted_rc_evidence_appended.v1", "release_qualification_recorded.v1", "release_qualification_revoked.v1"],
       "tests": [{ "command": "node scripts/run-tests.js --test-file test/accessibility-review.test.js --test-file test/architecture.test.js --test-file test/coordination.test.js --test-file test/delivery-policy-enforcement.test.js --test-file test/lifecycle-policy.test.js --test-file test/local-state-migration.test.js --test-file test/prototype-fast-lane.test.js --test-file test/regression-review-status.test.js --test-file test/resilience.test.js --test-file test/review-handoff.test.js --test-file test/review-identity.test.js --test-file test/state-database.test.js --test-file test/task-status-integrity.test.js", "layer": "persistence" }],
       "reviewOwners": ["backend-reviewer"],
@@ -178,6 +178,7 @@
       "aliases": ["dispatcher", "supervisor", "admission", "work lanes"],
       "paths": [
         "standards/hosted-release-candidate-qa.md",
+        "src/hosted-rc-adoption.js",
         "test/hosted-rc-adoption.test.js",
         "src/dispatcher.js",
         "src/mission-control-dispatcher.js",
@@ -187,6 +188,7 @@
         "src/config.js",
         "src/mission-control-cli.js",
         "studioops.config.example.md",
+        "docs/HANDOFF.md",
         "docs/LOCAL_AUTOMATION.md",
         "test/dispatcher.test.js",
         "test/config.test.js",
@@ -202,7 +204,10 @@
       "services": ["supervisor planner", "dispatcher admission"],
       "publicContracts": ["bundled hosted RC default policy reference and CLI setup/collect/status presentation; policy semantics delegated to qa-release","dispatch admission decision", "lane-safe immutable run snapshot"],
       "workflows": ["architecture builder reviewer and owner dispatch"],
-      "tests": [{ "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js", "layer": "unit-contract" }],
+      "tests": [
+        { "command": "node scripts/run-tests.js --test-file test/hosted-rc-adoption.test.js", "layer": "unit-contract" },
+        { "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js", "layer": "unit-contract" }
+      ],
       "reviewOwners": ["backend-reviewer"],
       "fullRegressionPaths": [
         "standards/hosted-release-candidate-qa.md",
@@ -217,7 +222,7 @@
         "src/mission-control-supervisor.js"
       ],
       "policyAuthorities": ["worker admission"],
-      "dependsOn": ["workflow-state", "component-impact-planning"],
+      "dependsOn": ["workflow-state", "component-impact-planning", "qa-release"],
       "rollback": "Disable scoped admission and route all eligible work through the prior full-regression dispatcher path."
     },
     "worker-execution": {

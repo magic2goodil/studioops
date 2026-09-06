@@ -269,6 +269,7 @@ The app reads the first fenced `json studioops-config` block in this file.
       }
     ],
     "standards": [
+      "standards/hosted-release-candidate-qa.md",
       "standards/engineering.md",
       "standards/design-system.md",
       "standards/frontend.md",
@@ -340,6 +341,7 @@ The app reads the first fenced `json studioops-config` block in this file.
         "AGENTS.md"
       ],
       "standards": [
+        "standards/hosted-release-candidate-qa.md",
         "standards/engineering.md",
         "standards/design-system.md",
         "standards/frontend.md",

@@ -44,6 +44,7 @@ import {
   INSTALLED_AUTOMATION_CAPACITY,
   loadConfig,
   MODULAR_ARCHITECTURE_STANDARD,
+  HOSTED_RC_STANDARD,
   projectFromConfig,
   writeConfig,
 } from "./config.js";
@@ -55,6 +56,7 @@ import {
   defaultStudioOpsWorkspaceRoot,
 } from "./runtime-paths.js";
 import { buildQaReviewList } from "./qa-review-list.js";
+import { planHostedRcAdoption, formatHostedRcAdoptionPlan } from "./hosted-rc-adoption.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -294,6 +296,7 @@ async function setup() {
         integrationBranch: "",
         standards: [
           MODULAR_ARCHITECTURE_STANDARD,
+          HOSTED_RC_STANDARD,
           "standards/engineering.md",
           "standards/design-system.md",
           "standards/frontend.md",
@@ -436,7 +439,8 @@ Commands:
   add-project --key --name      Add a project
   update-project PROJECT        Update project settings and Trust Leads policy
   adopt-default-standards PROJECT|--all
-                                Idempotently add required StudioOps standards
+                                Add required standards without replaying historical work
+                                --plan [--json] is read-only; --limit 1..50 --after PROJECT_ID resumes
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Mutate task status (builder_review also requires --subject-sha FULL_SHA)
@@ -839,24 +843,24 @@ Automation:
 
   if (command === "adopt-default-standards") {
     const state = await readStateReadOnly();
-    const projects = args.all
-      ? state.projects
-      : [state.projects.find((project) => (
-          project.id === (args._[1] || args.project)
-          || project.key === (args._[1] || args.project)
-        ))].filter(Boolean);
-    if (!projects.length) {
-      throw new Error(args.all
-        ? "No projects are registered."
-        : `Unknown project: ${args._[1] || args.project || "(missing)"}`);
+    const target = args._[1] || args.project;
+    if (!args.all && !state.projects.some((project) => [project.id, project.key].includes(target))) {
+      throw new Error(`Unknown project: ${target || "(missing)"}`);
     }
-    let changed = 0;
-    for (const project of projects) {
-      const result = await adoptDefaultProjectStandards(project.id);
-      if (result.changed) changed += 1;
-      console.log(`${result.changed ? "Updated" : "Already current"} ${project.key}: ${result.project.standards.join(", ")}`);
+    const plan = planHostedRcAdoption(state.projects, {
+      project: args.all ? "" : target, limit: args.limit === undefined ? 50 : Number(args.limit), after: args.after || "",
+    });
+    if (args.plan) {
+      console.log(args.json ? JSON.stringify(plan, null, 2) : formatHostedRcAdoptionPlan(plan));
+      return;
     }
-    console.log(`Adopted required standards for ${changed} project(s); ${projects.length - changed} already current.`);
+    const results = [];
+    for (const item of plan.items) {
+      const result = await adoptDefaultProjectStandards(item.projectId);
+      results.push({ projectId: item.projectId, changed: result.changed, added: result.added });
+    }
+    console.log(args.json ? JSON.stringify({ results, nextAfter: plan.nextAfter }, null, 2)
+      : `${formatHostedRcAdoptionPlan(plan)}\nAdopted standards for ${results.filter((item) => item.changed).length} project(s); historical work preserved.`);
     return;
   }
 
