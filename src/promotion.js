@@ -63,6 +63,7 @@ import {
   installPreparedProjectValidationDependencies,
   PROJECT_VALIDATION_SANDBOX_ISOLATION,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+  normalizeProjectValidationNetworkPolicy,
   runProjectValidationCommand,
   verifyProjectValidationSandbox,
 } from "./project-validation-sandbox.js";
@@ -929,6 +930,13 @@ function promotionValidationCommands(project = {}) {
   return normalizeList(promotionConfig(project).validationCommands || project.validationCommands);
 }
 
+function promotionValidationNetworkPolicy(project = {}) {
+  return normalizeProjectValidationNetworkPolicy(
+    promotionConfig(project).validationNetworkPolicy
+      || project.qaIntegration?.validationNetworkPolicy,
+  );
+}
+
 function selectedPromotionValidationPath(input = {}) {
   if (Object.hasOwn(input, "validationPath")) return { value: input.validationPath, source: "validationPath" };
   if (input.env && Object.hasOwn(input.env, "PATH")) return { value: input.env.PATH, source: "env.PATH" };
@@ -1407,7 +1415,7 @@ export function planPromotions(state, input = {}) {
               projectPolicyDigest,
               sandboxPolicyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
               validationStrategy: "disposable_full_clone",
-              networkPolicy: "deny_all",
+              networkPolicy: promotionValidationNetworkPolicy(project),
             });
             const receiptPolicyDigest = candidate.status === "release_candidate_ready"
               ? String(candidate.promotionValidationRecoveryReceipt?.policyDigest || "")
@@ -1455,6 +1463,7 @@ export function planPromotions(state, input = {}) {
           validationPathSource: validationPathSelection.source,
           validationToolchain,
           validationPolicyDigest,
+          validationNetworkPolicy: promotionValidationNetworkPolicy(project),
           projectPolicy,
           projectPolicyDigest,
           mode: candidate.status === "release_candidate_ready"
@@ -1548,7 +1557,7 @@ function authoritativePromotionPolicyDigest(state, projectPlan) {
     projectPolicyDigest,
     sandboxPolicyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
     validationStrategy: "disposable_full_clone",
-    networkPolicy: "deny_all",
+    networkPolicy: promotionValidationNetworkPolicy(project),
   });
 }
 
@@ -2088,7 +2097,7 @@ async function promoteProject(projectPlan, options = {}) {
     workspaceStrategy: "",
     validationSandboxPolicy: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
     validationWorkspaceStrategy: "disposable_full_clone",
-    validationNetworkPolicy: "deny_all",
+    validationNetworkPolicy: projectPlan.validationNetworkPolicy,
     validationProcessPolicy: PROJECT_VALIDATION_SANDBOX_ISOLATION,
   };
 
@@ -2170,6 +2179,7 @@ async function promoteProject(projectPlan, options = {}) {
         expectedHeadSha: projectPlan.candidate.manifest.integration.sha,
         validationPath: projectPlan.validationPath,
         sandboxExecutable: options.validationSandboxExecutable,
+        networkPolicy: projectPlan.validationNetworkPolicy,
         cloneTimeoutMs: WORKSPACE_COMMAND_TIMEOUT_MS,
       });
       result.validationDependencyCache = await prepareProjectValidationDependencies(validationSandbox, {
