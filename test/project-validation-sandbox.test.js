@@ -13,14 +13,25 @@ import {
   installPreparedProjectValidationDependencies,
   prepareProjectValidationSandbox,
   prepareProjectValidationDependencies,
+  PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK,
   PROJECT_VALIDATION_SANDBOX_ISOLATION,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+  normalizeProjectValidationNetworkPolicy,
   runProjectValidationCommand,
   verifyProjectValidationSandbox,
 } from "../src/project-validation-sandbox.js";
 
 const execFileAsync = promisify(execFile);
 const NESTED_PROJECT_SANDBOX = Boolean(process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX);
+
+test("validation network policy accepts only explicit supported values", () => {
+  assert.equal(normalizeProjectValidationNetworkPolicy(), "deny_all");
+  assert.equal(normalizeProjectValidationNetworkPolicy("loopback_only"), "loopback_only");
+  assert.throws(
+    () => normalizeProjectValidationNetworkPolicy("internet"),
+    (error) => error.code === "PROJECT_VALIDATION_INPUT_INVALID",
+  );
+});
 
 test("the release suite observes the active outer data-and-egress boundary", {
   skip: !NESTED_PROJECT_SANDBOX,
@@ -317,6 +328,53 @@ test("project validation uses a disposable no-network sandbox and cannot reach s
         if (error?.code !== "ESRCH") throw error;
       }
     }
+    if (sandbox) await cleanupProjectValidationSandbox(sandbox);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit loopback validation permits local HTTP while denying external and Unix-socket egress", {
+  skip: process.platform !== "darwin" || NESTED_PROJECT_SANDBOX,
+  timeout: 60_000,
+}, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-loopback-validation-"));
+  const { repoPath, head } = await repositoryFixture(root);
+  let sandbox;
+  try {
+    sandbox = await prepareProjectValidationSandbox({
+      sourceRepoPath: repoPath,
+      workspaceRoot: path.join(root, "validation-workspaces"),
+      expectedHeadSha: head,
+      networkPolicy: PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK,
+    });
+    const loopbackScript = [
+      "const http=require('node:http')",
+      "const server=http.createServer((_request,response)=>response.end('loopback-ok'))",
+      "server.listen(0,'127.0.0.1',()=>http.get({host:'127.0.0.1',port:server.address().port},response=>{let body='';response.on('data',chunk=>body+=chunk);response.on('end',()=>{console.log(body);server.close()})}).on('error',error=>{console.error(error);process.exit(2)}))",
+      "setTimeout(()=>process.exit(3),3000).unref()",
+    ].join(";");
+    const local = await runProjectValidationCommand(
+      sandbox,
+      `${JSON.stringify(process.execPath)} -e ${JSON.stringify(loopbackScript)}`,
+    );
+    assert.equal(local.ok, true, local.output);
+    assert.match(local.output, /loopback-ok/);
+
+    const deniedScript = [
+      "const net=require('node:net')",
+      "const targets=[{host:'1.1.1.1',port:443},{path:'/private/var/run/mDNSResponder'}]",
+      "Promise.all(targets.map(target=>new Promise((resolve,reject)=>{const socket=net.connect(target);socket.once('connect',()=>reject(new Error('unexpected connection')));socket.once('error',error=>['EPERM','EACCES'].includes(error.code)?resolve(error.code):reject(error));setTimeout(()=>reject(new Error('timeout')),2000).unref()}))).then(results=>console.log(results.join(','))).catch(error=>{console.error(error);process.exit(4)})",
+    ].join(";");
+    const denied = await runProjectValidationCommand(
+      sandbox,
+      `${JSON.stringify(process.execPath)} -e ${JSON.stringify(deniedScript)}`,
+    );
+    assert.equal(denied.ok, true, denied.output);
+    assert.match(denied.output, /(?:EPERM|EACCES),(?:EPERM|EACCES)/);
+    const attestation = await verifyProjectValidationSandbox(sandbox);
+    assert.equal(attestation.networkPolicy, PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK);
+    assert.equal(attestation.processPolicy.network, "kernel_enforced_tcp_loopback_only");
+  } finally {
     if (sandbox) await cleanupProjectValidationSandbox(sandbox);
     await rm(root, { recursive: true, force: true });
   }
