@@ -418,14 +418,23 @@ async function installFixtureState(options = {}) {
     });
     for (const taskId of taskIds) {
       const task = next.tasks.find((item) => item.id === taskId);
+      const terminalStatus = options.terminalTaskStatus || "";
       Object.assign(task, {
-        status: "user_review",
+        status: terminalStatus || "user_review",
         assignedAgentRole: "owner",
         promotionStatus: "pr_ready",
         promotionPrUrl: promotion.prUrl,
         promotionBranch: promotion.branch,
         promotionCommit: promotion.commitSha,
         updatedAt: promotion.readyAt,
+        ...(terminalStatus ? {
+          mergeEvidence: {
+            id: `independent-merge:${taskId}`,
+            subjectSha: task.reviewSubjectSha,
+            mergeCommit: "e".repeat(40),
+            recordedAt: promotion.readyAt,
+          },
+        } : {}),
       });
     }
     return terminalClaim;
@@ -1245,6 +1254,47 @@ test("release revocation uses promotion-worker auth, closes the PR, and persists
     mergedAt: "",
   });
   assert.equal(state.candidates.find((item) => item.id === candidate.id).status, "invalidated");
+});
+
+test("release revocation preserves an independently reconciled terminal task while clearing stale candidate authority", async () => {
+  const initial = await installFixtureState({
+    candidateStatus: "release_candidate_ready",
+    terminalTaskStatus: "merged",
+  });
+  const candidate = initial.candidates[0];
+  const originalTask = initial.tasks.find((item) => item.id === candidate.manifest.sources[0].taskId);
+  const coordinates = qaDecisionCoordinatesForState(initial);
+  assert.equal(coordinates.bundles[candidate.qaBundleId], candidate.qaPacket.packetDigest);
+
+  const result = await recordQaBundleDecision(
+    candidate.qaBundleId,
+    bundleDecisionInput(initial, candidate),
+    releaseRevocationDependencies(async () => ({
+      status: "closed",
+      prUrl: candidate.promotion.prUrl,
+      observedAt: "2026-09-03T12:31:30.000Z",
+      mergeCommit: "",
+      mergedAt: "",
+    })),
+  );
+
+  assert.equal(result.outcome, "revoked");
+  let state = await readState();
+  const task = state.tasks.find((item) => item.id === originalTask.id);
+  assert.equal(state.candidates.find((item) => item.id === candidate.id).status, "invalidated");
+  assert.equal(state.qaBundles.find((item) => item.id === candidate.qaBundleId).status, "invalidated");
+  assert.equal(task.status, "merged");
+  assert.equal(task.assignedAgentRole, "owner");
+  assert.deepEqual(task.mergeEvidence, originalTask.mergeEvidence);
+
+  await updateProject(candidate.projectId, {
+    qaIntegration: { validationNetworkPolicy: "loopback_only" },
+  });
+  state = await readState();
+  assert.equal(
+    state.projects.find((item) => item.id === candidate.projectId).qaIntegration.validationNetworkPolicy,
+    "loopback_only",
+  );
 });
 
 test("a merged release PR refuses revocation without changing local QA authority", async () => {
