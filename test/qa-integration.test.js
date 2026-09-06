@@ -710,6 +710,39 @@ test("QA integration skips already-ready tasks unless explicitly forced", () => 
   }).taskCount, 1);
 });
 
+test("QA planning binds an explicit loopback-only validation policy and rejects unknown values", () => {
+  const state = {
+    projects: [{
+      id: "project_1",
+      key: "demo",
+      name: "Demo",
+      repoPath: "/tmp/demo",
+      defaultBranch: "main",
+      validationCommands: ["npm test"],
+      qaIntegration: { validationNetworkPolicy: "loopback_only" },
+      reviewPolicy: { trustLeadApprovals: true, integrationBranch: "qa/demo" },
+    }],
+    tasks: [{
+      id: "task_1",
+      projectId: "project_1",
+      title: "Candidate",
+      status: "qa_review",
+      branchName: "codex/demo-task",
+      reviewSubjectSha: "b".repeat(40),
+      reviewSubjectCycle: 1,
+      candidateIdentity: { commitSha: "b".repeat(40), candidateCycle: 1 },
+    }],
+    reviews: [],
+  };
+  const plan = planQaIntegrations(state, { project: "demo" }).projects[0];
+  assert.equal(plan.validationNetworkPolicy, "loopback_only");
+  state.projects[0].qaIntegration.validationNetworkPolicy = "internet";
+  assert.throws(
+    () => planQaIntegrations(state, { project: "demo" }),
+    /Unsupported project validation network policy/,
+  );
+});
+
 test("QA integration honors retry windows for unchanged blocked work", () => {
   const nowMs = Date.parse("2026-07-22T20:00:00.000Z");
   const state = {

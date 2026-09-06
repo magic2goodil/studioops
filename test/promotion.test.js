@@ -776,6 +776,19 @@ test("promotion validation policy binds the canonical effective PATH and executa
     defaultPlan.validationToolchain.commandExecutables.find((entry) => entry.command === "npm")?.digest || "",
     /^sha256:[a-f0-9]{64}$/,
   );
+  const loopbackProject = structuredClone(project);
+  loopbackProject.promotion.validationNetworkPolicy = "loopback_only";
+  const loopbackCandidate = structuredClone(candidate);
+  delete loopbackCandidate.qaPacket;
+  delete loopbackCandidate.qaDecision.ownerQaPacketDigest;
+  const loopbackState = baseState({
+    projects: [loopbackProject],
+    tasks: [structuredClone(task)],
+    candidates: [loopbackCandidate],
+  });
+  const loopbackPlan = planPromotions(loopbackState, { validationPath: pathA }).projects[0];
+  assert.equal(loopbackPlan.validationNetworkPolicy, "loopback_only");
+  assert.notEqual(loopbackPlan.validationPolicyDigest, planA.validationPolicyDigest);
   for (const [validationPath, reason] of [
     ["", /non-empty absolute directories/i],
     ["relative/bin", /non-empty absolute directories/i],
