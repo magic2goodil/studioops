@@ -47,6 +47,7 @@ import {
   openFailureCircuit,
   recordFailureRecoveryActivity,
   scheduleFailureBackoff,
+  selectFailureIncident,
 } from "./failure-containment.js";
 import {
   assertIsolatedTestEnvironment,
@@ -3317,30 +3318,54 @@ function failureClaimAuthority(input = {}) {
   return { fingerprint, evidence };
 }
 
+function equivalentFailureIncident(db, authority) {
+  const incidents = db.prepare(`SELECT * FROM failure_incidents WHERE task_id = ? AND state NOT IN ('closed', 'superseded')`)
+    .all(authority.fingerprint.value.taskId).map(failureIncidentFromRow);
+  return selectFailureIncident(incidents, authority.fingerprint.value);
+}
+
+async function beginFailureContainmentTransaction(db, operationName) {
+  const deadlineAt = Date.now() + SERIALIZED_REPLAY_LOCK_DEADLINE_MS;
+  let attempts = 0;
+  while (true) {
+    try {
+      beginSerializedReplayTransaction(db, operationName, deadlineAt, attempts);
+      return;
+    } catch (error) {
+      if (!isSqliteBusy(error) || Date.now() >= deadlineAt) throw error;
+      await sleep(Math.min(retryDelayMs(++attempts), Math.max(1, deadlineAt - Date.now())));
+    }
+  }
+}
+
 /**
  * Atomically claim one paid model attempt from the current evidence generation.
  * SDK, CLI, dispatcher, and watchdog callers share this single table and cap.
  */
 export async function claimFailureContainmentPaidAttempt(input = {}) {
   const authority = failureClaimAuthority(input);
-  return withStateDatabaseConnection((db) => {
-    db.exec("BEGIN IMMEDIATE");
+  return withStateDatabaseConnection(async (db) => {
+    await beginFailureContainmentTransaction(db, "failure_containment.claim_paid_attempt");
     try {
       const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
       assertMaintenanceWriteAllowed({ meta });
-      const previous = failureIncidentFromRow(latestFailureIncidentRow(
-        db,
-        authority.fingerprint.value.taskId,
-        authority.fingerprint.digest,
+      const equivalent = equivalentFailureIncident(db, authority);
+      const previous = equivalent?.incident || failureIncidentFromRow(latestFailureIncidentRow(
+        db, authority.fingerprint.value.taskId, authority.fingerprint.digest,
       ));
-      const initial = previous || createFailureIncident({
+      let initial = previous || createFailureIncident({
         fingerprint: authority.fingerprint,
         evidence: authority.evidence,
         now: input.now,
       });
+      const alias = previous && previous.fingerprintDigest !== authority.fingerprint.digest;
+      const evidence = alias && !input.verifier ? failureEvidence(previous.evidence) : authority.evidence;
+      if (equivalent?.paidAttempts >= 2 && initial.paidAttempts < 2 && evidence.digest === initial.evidenceDigest) {
+        initial = openFailureCircuit(initial, input);
+      }
       const result = claimPaidFailureAttempt(initial, {
         ...input,
-        evidence: authority.evidence,
+        evidence,
       });
       supersedePriorFailureGeneration(db, previous, result.incident);
       upsertFailureIncidentRow(db, result.incident);
@@ -3355,15 +3380,13 @@ export async function claimFailureContainmentPaidAttempt(input = {}) {
 
 async function mutateFailureIncident(input, transition, options = {}) {
   const authority = failureClaimAuthority(input);
-  return withStateDatabaseConnection((db) => {
-    db.exec("BEGIN IMMEDIATE");
+  return withStateDatabaseConnection(async (db) => {
+    await beginFailureContainmentTransaction(db, "failure_containment.transition");
     try {
       const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
       assertMaintenanceWriteAllowed({ meta });
-      const previous = failureIncidentFromRow(latestFailureIncidentRow(
-        db,
-        authority.fingerprint.value.taskId,
-        authority.fingerprint.digest,
+      const previous = equivalentFailureIncident(db, authority)?.incident || failureIncidentFromRow(latestFailureIncidentRow(
+        db, authority.fingerprint.value.taskId, authority.fingerprint.digest,
       ));
       const initial = previous || (options.createIfMissing ? createFailureIncident({
         fingerprint: authority.fingerprint,
@@ -3371,7 +3394,8 @@ async function mutateFailureIncident(input, transition, options = {}) {
         now: input.now,
       }) : null);
       if (!initial) throw new Error("Failure incident does not exist.");
-      const current = transition(initial, authority.evidence);
+      const alias = previous && previous.fingerprintDigest !== authority.fingerprint.digest;
+      const current = transition(initial, alias && !input.verifier ? failureEvidence(previous.evidence) : authority.evidence);
       supersedePriorFailureGeneration(db, previous, current);
       upsertFailureIncidentRow(db, current);
       db.exec("COMMIT");

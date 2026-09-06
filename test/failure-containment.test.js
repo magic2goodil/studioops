@@ -15,6 +15,7 @@ import {
   failureIncidentCompatibilityCircuit,
   recordFailureRecoveryActivity,
   scheduleFailureBackoff,
+  selectFailureIncident,
 } from "../src/failure-containment.js";
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { applyFailureIncidentCompatibilityReadModelInState } from "../src/store.js";
@@ -23,6 +24,38 @@ const execFileAsync = promisify(execFile);
 const stateDatabaseModuleUrl = pathToFileURL(path.join(process.cwd(), "src/state-database.js")).href;
 const storeModuleUrl = pathToFileURL(path.join(process.cwd(), "src/store.js")).href;
 const NOW = "2026-09-04T12:00:00.000Z";
+
+test("retry admission recognizes action aliases and metadata-only candidate changes", () => {
+  const input = fingerprintInput();
+  let incident = createFailureIncident({...input, now: NOW});
+  incident = claimPaidFailureAttempt(incident, {evidence: incident.evidence, now: NOW}).incident;
+  const changed = {...input, action: "return_to_builder", provider: "codex-cli", candidateIdentity: {...input.candidateIdentity, candidateId: "new-label", candidateCycle: 77, commitSha: "d".repeat(40)}};
+  assert.equal(selectFailureIncident([incident], changed).paidAttempts, 1);
+  assert.equal(selectFailureIncident([incident], {...changed, candidateIdentity: {...changed.candidateIdentity, treeSha: "e".repeat(40)}}), null);
+  assert.equal(selectFailureIncident([incident], {...changed, taskId: "task_unrelated"}), null);
+});
+
+test("output and provider failures retain their cap across changed candidates and worker stages", () => {
+  for (const reasonCode of ["output_guard_exceeded", "provider_unavailable"]) {
+    const input = fingerprintInput({reasonCode});
+    const incident = createFailureIncident({...input, now: NOW});
+    const changed = {...input, action: "continue_review", provider: "codex-cli", candidateIdentity: {commitSha: "e".repeat(40)}};
+    assert.equal(selectFailureIncident([incident], changed).incident.incidentId, incident.incidentId);
+  }
+});
+
+test("legacy alias attempts are summed and only verified repairs reset the allowance", () => {
+  const input = fingerprintInput({reasonCode: "output_guard_exceeded"});
+  const used = (action) => {
+    const incident = createFailureIncident({...input, action, now: NOW});
+    return claimPaidFailureAttempt(incident, {evidence: incident.evidence, now: NOW}).incident;
+  };
+  const first = used("start_builder"), second = used("continue_review");
+  assert.equal(selectFailureIncident([first, second], input).paidAttempts, 2);
+  const evidence = failureEvidence({configurationDigest: `sha256:${"f".repeat(64)}`});
+  const repaired = claimPaidFailureAttempt(first, {evidence, now: "2026-09-04T12:01:00.000Z", verifier: {id:"policy_probe",outcome:"passed",evidenceDigest:evidence.digest}}).incident;
+  assert.equal(selectFailureIncident([first, second, repaired], input).paidAttempts, 1);
+});
 
 function fingerprintInput(overrides = {}) {
   return {
@@ -227,6 +260,59 @@ async function runDatabaseScript(root, source) {
     timeout: 30_000,
   });
 }
+
+test("SQLite caps aliases atomically and waits through transient external write contention", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-failure-alias-"));
+  t.after(() => rm(root, {recursive:true, force:true}));
+  const result = await runDatabaseScript(root, `
+    import assert from 'node:assert/strict';
+    import {spawn} from 'node:child_process';
+    import {claimFailureContainmentPaidAttempt, ensureStateDatabase, DATABASE_FILE, readFailureIncidents} from ${JSON.stringify(stateDatabaseModuleUrl)};
+    await ensureStateDatabase();
+    const child = spawn(process.execPath, ['--input-type=module', '-e',
+      "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(process.argv[1]); db.exec('BEGIN IMMEDIATE'); console.log('locked'); setTimeout(()=>{db.exec('COMMIT');db.close()},800)", DATABASE_FILE], {stdio:['ignore','pipe','pipe']});
+    const exit = new Promise((resolve,reject)=>{child.on('error',reject);child.on('exit',(code)=>code===0?resolve():reject(new Error('lock child failed')))});
+    await new Promise((resolve,reject)=>{child.stdout.once('data',resolve);child.once('error',reject)});
+    const base = {taskId:'task_alias',action:'start_builder',provider:'codex-sdk',reasonCode:'output_guard_exceeded',candidateIdentity:{commitSha:'a'.repeat(40)}};
+    const first = await claimFailureContainmentPaidAttempt(base);
+    await exit;
+    const second = await claimFailureContainmentPaidAttempt({...base, action:'continue_review', provider:'codex-cli',candidateIdentity:{commitSha:'b'.repeat(40),candidateCycle:42}});
+    const third = await claimFailureContainmentPaidAttempt({...base, action:'qa_integration_blocked', candidateIdentity:{commitSha:'c'.repeat(40)}});
+    assert.equal(first.admitted,true);assert.equal(second.admitted,true);assert.equal(third.admitted,false);
+    assert.equal(first.incident.incidentId,second.incident.incidentId);
+    assert.equal(third.incident.state,'open');
+    const rows = await readFailureIncidents({taskId:'task_alias'});
+    assert.equal(rows.length,1);assert.equal(rows[0].paidAttempts,2);
+    console.log(JSON.stringify({attempts:rows[0].paidAttempts,state:rows[0].state}));
+  `);
+  assert.equal(JSON.parse(result.stdout.trim()).state, "open");
+});
+
+test("legacy aggregate cap requires an actual verified evidence change, not a verifier label", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-failure-verifier-"));
+  t.after(() => rm(root, {recursive:true,force:true}));
+  const failureModule = pathToFileURL(path.join(process.cwd(), "src/failure-containment.js")).href;
+  await runDatabaseScript(root, `
+    import assert from 'node:assert/strict';
+    import {withStateDatabaseConnection,claimFailureContainmentPaidAttempt} from ${JSON.stringify(stateDatabaseModuleUrl)};
+    import {createFailureIncident,claimPaidFailureAttempt,failureEvidence} from ${JSON.stringify(failureModule)};
+    const base={taskId:'legacy_alias',provider:'codex',reasonCode:'output_guard_exceeded'};
+    const rows=['start_builder','continue_review'].map(action=>{
+      const incident=createFailureIncident({...base,action,now:'2026-09-04T12:00:00.000Z'});
+      return claimPaidFailureAttempt(incident,{evidence:incident.evidence,now:'2026-09-04T12:00:01.000Z'}).incident;
+    });
+    await withStateDatabaseConnection(db=>{
+      const insert=db.prepare('INSERT INTO failure_incidents (incident_id,task_id,fingerprint_digest,state,generation,evidence_digest,paid_attempts,updated_at,payload) VALUES (?,?,?,?,?,?,?,?,?)');
+      for(const r of rows)insert.run(r.incidentId,r.taskId,r.fingerprintDigest,r.state,r.generation,r.evidenceDigest,r.paidAttempts,r.updatedAt,JSON.stringify(r));
+    });
+    const denied=await claimFailureContainmentPaidAttempt({...base,action:'qa_integration_blocked',evidence:rows[0].evidence,verifier:{id:'policy_probe',outcome:'passed',evidenceDigest:rows[0].evidenceDigest}});
+    assert.equal(denied.admitted,false);assert.equal(denied.incident.generation,1);
+    const changed=failureEvidence({configurationDigest:'sha256:'+ 'f'.repeat(64)});
+    await assert.rejects(claimFailureContainmentPaidAttempt({...base,action:'qa_integration_blocked',evidence:changed.value,verifier:{id:'untrusted',outcome:'passed',evidenceDigest:changed.digest}}),/allowlisted verifier/);
+    const resumed=await claimFailureContainmentPaidAttempt({...base,action:'qa_integration_blocked',evidence:changed.value,verifier:{id:'policy_probe',outcome:'passed',evidenceDigest:changed.digest}});
+    assert.equal(resumed.admitted,true);assert.equal(resumed.incident.generation,2);assert.equal(resumed.incident.paidAttempts,1);
+  `);
+});
 
 function legacyState(task = {}) {
   return {
