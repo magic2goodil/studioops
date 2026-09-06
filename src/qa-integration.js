@@ -582,6 +582,14 @@ function githubRepositorySlug(value) {
   return raw === canonical ? `${segments[0]}/${segments[1]}` : "";
 }
 
+export function canonicalGitHubSshTransport(repoUrl) {
+  const repository = githubRepositorySlug(repoUrl);
+  if (!repository) {
+    throw qaRemotePolicyError("QA local SSH fallback requires a configured canonical GitHub repository URL.");
+  }
+  return `git@github.com:${repository}.git`;
+}
+
 function qaIntegrationAuthEnabled(projectPlan, input = {}) {
   return booleanOption(
     input.githubAppAuth ?? process.env.MISSION_CONTROL_QA_GITHUB_APP_AUTH,
@@ -873,7 +881,9 @@ async function qaRemotePolicy(repoPath, projectPlan, options = {}) {
   }
   return {
     repository: expectedRepository,
-    transportUrl: configuredUrl,
+    transportUrl: options.preferLocalSshTransport
+      ? canonicalGitHubSshTransport(configuredUrl)
+      : configuredUrl,
   };
 }
 
@@ -2482,12 +2492,17 @@ async function verifyMergedIntegrationTarget(repoPath, projectPlan, pr, options 
   };
 }
 
+export function isGitAuthenticationFailure(output) {
+  return /could not read username|permission denied \(publickey\)|authentication failed|repository not found/i
+    .test(String(output || ""));
+}
+
 async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, options = {}) {
   for (const task of projectPlan.tasks) {
     const source = await remoteTaskHead(repoPath, task, options);
     if (!source.ok) {
       return {
-        status: "candidate_drift",
+        status: isGitAuthenticationFailure(source.output) ? "authentication_failed" : "candidate_drift",
         blocker: `Could not verify the reviewed source for ${task.id}: ${source.output}`,
       };
     }
@@ -3321,7 +3336,7 @@ function commentForTask(projectResult, taskResult) {
     return `Protected QA branch handoff for ${taskResult.source}: ${projectResult.integrationCandidateCommit} is published on ${projectResult.integrationCandidateBranch}.${projectResult.integrationPr?.url ? `\n\nPR: ${projectResult.integrationPr.url}` : ""}${branchLine}${checks}\n\n${projectResult.integrationBlocker || projectResult.output}${supersededLine}`;
   }
 
-  if (["candidate_drift", "candidate_publish_failed", "candidate_supersession_failed"].includes(taskResult.status)) {
+  if (["candidate_drift", "candidate_publish_failed", "candidate_supersession_failed", "authentication_failed"].includes(taskResult.status)) {
     return `Protected QA branch handoff is blocked for ${taskResult.source}. StudioOps did not force-push or overwrite the remote candidate.${branchLine}${workspaceLine}\n\n${projectResult.integrationBlocker || projectResult.output}`;
   }
 
@@ -3411,7 +3426,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
   );
   const assignedAgentRole = taskResult.status === "ready"
     ? "owner"
-    : ["pr_waiting", "pr_merged", "validation_sandbox_unavailable"].includes(taskResult.status)
+    : ["pr_waiting", "pr_merged", "validation_sandbox_unavailable", "authentication_failed"].includes(taskResult.status)
       ? "qa-integration-worker"
       : taskResult.status === "pr_closed"
         ? "owner"
@@ -3752,6 +3767,7 @@ export async function runQaIntegration(input = {}) {
           result = localFallbackResultNote(await integrateProject(projectPlan, {
             ...input,
             githubAppAuth: false,
+            preferLocalSshTransport: true,
             env: { ...(input.env || {}) },
             gitAuthEnv: {},
             secrets: normalizeSecrets(input.secrets),

@@ -24,9 +24,11 @@ import {
   trustLeadApprovalsEnabled,
 } from "../src/integration-policy.js";
 import {
+  canonicalGitHubSshTransport,
   createQaOuterSandboxTestAdapter,
   createQaTestGitRunner,
   githubAppLocalFallbackEnabled,
+  isGitAuthenticationFailure,
   isGitHubAppPermissionError,
   planQaIntegrations,
   projectPlanHasWork,
@@ -877,6 +879,14 @@ test("GitHub App local fallback is opt-in and limited to permission failures", (
     true,
   );
   assert.equal(isGitHubAppPermissionError(new Error("repository validation failed")), false);
+  assert.equal(canonicalGitHubSshTransport(GITHUB_REPO_URL), "git@github.com:example/demo.git");
+  assert.throws(
+    () => canonicalGitHubSshTransport("https://github.com/example/demo.git"),
+    /configured canonical GitHub repository URL/,
+  );
+  assert.equal(isGitAuthenticationFailure("fatal: could not read Username for 'https://github.com'"), true);
+  assert.equal(isGitAuthenticationFailure("git@github.com: Permission denied (publickey)."), true);
+  assert.equal(isGitAuthenticationFailure("reviewed source differs from expected SHA"), false);
 });
 
 test("QA integration plans only an explicitly authorized partial candidate subset", () => {
