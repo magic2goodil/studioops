@@ -2590,7 +2590,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
     const changedSummary = changedSources
       .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
       .join(", ");
-    const reason = `StudioOps is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
+    const reason = `StudioOps detected stale integration authority and is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
     const prIsTerminal = ["CLOSED", "MERGED"].includes(String(inspectedPr.state || "").toUpperCase());
     const closed = prIsTerminal
       ? { ok: true, pr: inspectedPr, output: "" }
@@ -2618,6 +2618,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
         state: "CLOSED",
       },
       supersededHandoff: {
+        reasonCode: "stale_integration_authority",
         candidateBranch: handoff.branch,
         candidateCommit: handoff.commit,
         prUrl: handoff.prUrl,

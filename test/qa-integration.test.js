@@ -2679,6 +2679,7 @@ test("merged protected QA handoff is superseded when a reviewed source changes",
     assert.equal(task.integrationSourceHeadSha, correctedHead);
     assert.equal(task.integrationSourceCandidateCycle, 2);
     assert.equal(task.integrationHandoffHistory.length, 1);
+    assert.equal(task.integrationHandoffHistory[0].reasonCode, "stale_integration_authority");
     assert.equal(task.integrationHandoffHistory[0].candidateCommit, previous.integrationCandidateCommit);
     assert.equal(task.integrationHandoffHistory[0].workflowStatus, "merged");
     assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 2);
