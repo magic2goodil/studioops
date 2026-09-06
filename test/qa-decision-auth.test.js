@@ -1226,6 +1226,9 @@ test("release revocation uses promotion-worker auth, closes the PR, and persists
   const dependencies = releaseRevocationDependencies(async (_project, settledCandidate, options) => {
     assert.equal(settledCandidate.id, candidate.id);
     assert.equal(options.githubToken, "ghs_release_revocation_test_token");
+    assert.equal(options.gitAuthEnv.GIT_ASKPASS, "/tmp/studioops-release-revocation-askpass");
+    assert.equal(options.gitAuthEnv.MISSION_CONTROL_GITHUB_TOKEN, "ghs_release_revocation_test_token");
+    assert.equal(options.gitAuthEnv.MISSION_CONTROL_GIT_USERNAME, "x-access-token");
     return {
       status: "closed",
       prUrl: candidate.promotion.prUrl,
