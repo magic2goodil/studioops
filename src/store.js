@@ -1,5 +1,5 @@
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -47,6 +47,8 @@ import {
   ensureStateDatabase,
   mutateCandidateQaDecisionState,
   mutateDatabaseState,
+  mutateHostedRcAggregate,
+  readHostedRcAggregate,
   mutateQaRevocationIntentState,
   mutateQaRevocationSettlementState,
   readDatabaseState,
@@ -6266,4 +6268,157 @@ function slugify(value) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48) || "task";
+}
+
+// Public hosted RC persistence facade. Authority is an executable, trusted
+// composition-root dependency, separate from input JSON. No qa-release internal
+// import or reverse component dependency; the port is implemented by its pure authority.
+const HOSTED_RC_HISTORY_LIMIT = 128;
+function hostedRcError(code) { const error = new Error(code); error.code = code; throw error; }
+function hostedRcReviewState(reviews) {
+  // Internal storage fingerprints retain revocation/change detection without
+  // copying review prose, source excerpts or identities into hosted metadata.
+  return reviews.map((row) => ({ id: row.id,
+    payloadDigest: createHash("sha256").update(JSON.stringify(row)).digest("hex") }));
+}
+function hostedRcAuthority(authority, method) {
+  if (typeof authority?.[method] !== "function" || typeof authority?.digest !== "function") hostedRcError("authority_required");
+}
+function nextHostedRcRecord(previous) {
+  const value = previous ? structuredClone(previous) : {
+    schemaVersion: "studioops.hosted-rc-state.v1", version: 0, generation: 0,
+    policies: [], evidence: [], qualifications: [], audit: [], activePolicyDigest: "",
+  };
+  if (value.schemaVersion !== "studioops.hosted-rc-state.v1") hostedRcError("evidence_malformed");
+  value.version += 1;
+  return value;
+}
+function appendHostedRcHistory(record, field, value) {
+  if (record[field].length >= HOSTED_RC_HISTORY_LIMIT) hostedRcError("history_limit");
+  record[field].push(value);
+}
+function requireHostedRcCandidate(verified, coordinates) {
+  const { candidate, project } = coordinates;
+  if (!candidate || candidate.id !== verified.evidence.binding.candidateId
+    || candidate.manifestDigest !== verified.evidence.binding.manifestDigest
+    || candidate.manifest.integration.sha !== verified.evidence.binding.integrationSha) hostedRcError("candidate_mismatch");
+  if (candidate.projectId !== verified.evidence.binding.projectId) hostedRcError("project_mismatch");
+  if (project.hostedRc?.activePolicyDigest !== verified.policyDigest) hostedRcError("policy_mismatch");
+  if (candidate.invalidation || candidate.qaRevocationIntent || candidate.qaRevocationSettlement) hostedRcError("revoked");
+}
+
+export async function recordReleaseQaPolicy(input, authority) {
+  hostedRcAuthority(authority, "verifyPolicy");
+  return mutateHostedRcAggregate({ projectId: input.projectId, expectedVersion: input.expectedVersion }, (coordinates) => {
+    const policy = authority.verifyPolicy(input, coordinates);
+    const digest = authority.digest(policy);
+    if (coordinates.record?.activePolicyDigest === digest) return { record: coordinates.record, value: { policyDigest: digest, idempotent: true } };
+    const record = nextHostedRcRecord(coordinates.record);
+    const prior = record.policies.at(-1);
+    if (prior && policy.revision <= prior.policy.revision) hostedRcError("policy_mismatch");
+    record.activePolicyDigest = digest;
+    record.generation += 1;
+    appendHostedRcHistory(record, "policies", { digest, policy, proof: input.proof });
+    appendHostedRcHistory(record, "audit", { type: "release_qa_policy_recorded.v1", digest, generation: record.generation });
+    return { record, value: { policyDigest: digest, idempotent: false } };
+  });
+}
+export async function appendHostedRcEvidence(input, authority) {
+  hostedRcAuthority(authority, "verifyEvidence");
+  return mutateHostedRcAggregate(input, (coordinates) => {
+    const verified = authority.verifyEvidence(input, coordinates);
+    requireHostedRcCandidate(verified, coordinates);
+    const digest = verified.evidenceDigest;
+    const existing = coordinates.record?.evidence.find((e) => e.digest === digest);
+    if (existing) return { record: coordinates.record, value: { evidenceDigest: digest, idempotent: true } };
+    const record = nextHostedRcRecord(coordinates.record);
+    appendHostedRcHistory(record, "evidence", { digest, evidence: verified.evidence, proof: input.proof });
+    appendHostedRcHistory(record, "audit", { type: "hosted_rc_evidence_appended.v1", digest, generation: record.generation });
+    return { record, value: { evidenceDigest: digest, idempotent: false } };
+  });
+}
+export async function recordReleaseQualification(input, authority) {
+  hostedRcAuthority(authority, "qualify");
+  hostedRcAuthority(authority, "verifyEvidence");
+  return mutateHostedRcAggregate(input, (coordinates) => {
+    const saved = coordinates.record?.evidence.find((e) => e.digest === input.evidenceDigest);
+    if (!saved) hostedRcError("evidence_missing");
+    const verified = authority.verifyEvidence(saved, coordinates);
+    requireHostedRcCandidate(verified, coordinates);
+    const qualification = authority.qualify(saved, coordinates);
+    if (coordinates.candidate.qaDecision?.outcome !== "passed"
+      || coordinates.candidate.qaPacket?.packetDigest !== qualification.ownerPacketDigest
+      || authority.digest(coordinates.candidate.qaDecision) !== qualification.decisionDigest) hostedRcError("owner_decision_missing");
+    if (qualification.revocationGeneration !== coordinates.record.generation) hostedRcError("revoked");
+    if (qualification.policyDigest !== coordinates.project.hostedRc.activePolicyDigest) hostedRcError("policy_mismatch");
+    const digest = authority.digest(qualification);
+    // Clock progress during a retry is not a new qualification input. Preserve
+    // the first immutable receipt after re-verifying current authority above.
+    const { qualifiedAt: ignoredQualifiedAt, ...identity } = qualification;
+    const identityDigest = authority.digest(identity);
+    const existing = coordinates.record.qualifications.find((q) => {
+      const { qualifiedAt: ignoredPreviousTime, ...previousIdentity } = q.qualification;
+      return authority.digest(previousIdentity) === identityDigest;
+    });
+    if (existing) return { record: coordinates.record,
+      value: { qualification: existing.qualification, digest: existing.digest, idempotent: true } };
+    const record = nextHostedRcRecord(coordinates.record);
+    appendHostedRcHistory(record, "qualifications", { digest, qualification, reviewState: hostedRcReviewState(coordinates.reviews),
+      projectPolicyGeneration: coordinates.project.hostedRc.generation });
+    appendHostedRcHistory(record, "audit", { type: "release_qualification_recorded.v1", digest, generation: record.generation });
+    return { record, value: { qualification, digest, idempotent: false } };
+  });
+}
+export async function invalidateReleaseQualification(input, authority) {
+  hostedRcAuthority(authority, "verifyRevocation");
+  return mutateHostedRcAggregate(input, (coordinates) => {
+    const revocation = authority.verifyRevocation(input, coordinates);
+    const digest = authority.digest(revocation);
+    if (coordinates.record?.audit.some((a) => a.type === "release_qualification_revoked.v1" && a.digest === digest)) {
+      return { record: coordinates.record, value: { generation: coordinates.record.generation, idempotent: true } };
+    }
+    const record = nextHostedRcRecord(coordinates.record);
+    if (revocation.generation !== record.generation + 1) hostedRcError("revoked");
+    record.generation = revocation.generation;
+    appendHostedRcHistory(record, "audit", { type: "release_qualification_revoked.v1", digest,
+      generation: record.generation, revocation, proof: input.proof });
+    return { record, value: { generation: record.generation, idempotent: false } };
+  });
+}
+export async function getReleaseQaPolicy(projectId) {
+  const { project, queryCount } = await readHostedRcAggregate(projectId);
+  return { policy: project.hostedRc?.policies.at(-1)?.policy || null, policyDigest: project.hostedRc?.activePolicyDigest || "",
+    version: project.hostedRc?.version || 0, generation: project.hostedRc?.generation || 0, queryCount };
+}
+export async function getHostedRcEvidence(projectId, candidateId, evidenceDigest) {
+  const { candidate, queryCount } = await readHostedRcAggregate(projectId, candidateId);
+  const saved = candidate.hostedRc?.evidence.find((e) => e.digest === evidenceDigest);
+  return { evidence: saved?.evidence || null, proof: saved?.proof || null, version: candidate.hostedRc?.version || 0, queryCount };
+}
+export async function listHostedRcEvidence(projectId, candidateId, options = {}) {
+  const limit = options.limit ?? 50, offset = options.offset ?? 0;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50 || !Number.isSafeInteger(offset) || offset < 0) hostedRcError("evidence_malformed");
+  const { candidate, queryCount } = await readHostedRcAggregate(projectId, candidateId);
+  const entries = candidate.hostedRc?.evidence || [];
+  const items = entries.slice(offset, offset + limit).map(({ digest, evidence }) => ({ digest,
+    candidateId, projectId, capturedAt: evidence.capturedAt, expiresAt: evidence.expiresAt,
+    result: evidence.result, origin: evidence.environment.origin, policyDigest: evidence.policyDigest }));
+  return { items, nextOffset: offset + limit < entries.length ? offset + limit : null,
+    version: candidate.hostedRc?.version || 0, queryCount };
+}
+/** Display/query status only. Production adapters must re-evaluate fresh observations immediately before activation. */
+export async function getCurrentReleaseQualification(projectId, candidateId, options = {}) {
+  const { project, candidate, reviews, queryCount } = await readHostedRcAggregate(projectId, candidateId, true);
+  const saved = candidate.hostedRc?.qualifications.at(-1);
+  const version = candidate.hostedRc?.version || 0;
+  if (!saved) return { qualification: null, reason: "qualification_missing", version, queryCount };
+  const q = saved.qualification;
+  let reason = "qualified";
+  if (candidate.invalidation || candidate.qaRevocationIntent || candidate.qaRevocationSettlement
+    || q.revocationGeneration !== candidate.hostedRc.generation) reason = "revoked";
+  else if (q.policyDigest !== project.hostedRc?.activePolicyDigest
+    || saved.projectPolicyGeneration !== project.hostedRc?.generation) reason = "policy_mismatch";
+  else if (JSON.stringify(saved.reviewState) !== JSON.stringify(hostedRcReviewState(reviews))) reason = "review_changed";
+  else if (Date.parse(q.expiresAt) <= (options.nowMs ?? Date.now())) reason = "evidence_stale";
+  return { qualification: reason === "qualified" ? q : null, historicalDigest: saved.digest, reason, version, queryCount };
 }
