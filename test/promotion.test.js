@@ -9,6 +9,9 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+import { installHostedPromotionFixture, cleanupHostedPromotionFixtures } from "./hosted-rc-adapters.test.js";
+test.afterEach(cleanupHostedPromotionFixtures);
+test.after(cleanupHostedPromotionFixtures);
 import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { canonicalJson, createCandidateEnvelope } from "../src/candidate-manifest.js";
 import { buildOwnerQaPacket } from "../src/owner-qa-packet.js";
@@ -313,7 +316,17 @@ async function run(command, args, options = {}) {
       trustedLegacyAuthorityBootstrap = false;
     }
   }
-  return execFileAsync(command, args, {
+  const environment = {
+    ...baseEnv, GIT_TERMINAL_PROMPT: "0",
+    ...(trustedLegacyAuthorityBootstrap ? { STUDIOOPS_TEST_TRUST_LEGACY_AUTHORITY_BOOTSTRAP: "1" } : {}),
+    ...(options.env || {}),
+  };
+  if (trustedLegacyAuthorityBootstrap && args.some((arg) => String(arg).includes("runPromotion"))) {
+    await execFileAsync(command, ["--input-type=module", "--eval", `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`],
+      { cwd: options.cwd, env: environment, maxBuffer: 65536 });
+    await installHostedPromotionFixture(options.cwd);
+  }
+  const executed = await execFileAsync(command, args, {
     cwd: options.cwd,
     env: {
       ...baseEnv,
@@ -326,6 +339,16 @@ async function run(command, args, options = {}) {
     timeout: options.timeout || 60_000,
     maxBuffer: 10 * 1024 * 1024,
   });
+  if (executed.stdout.includes('"claim_unavailable"')) {
+    try {
+      const report = JSON.parse(executed.stdout);
+      console.error("Hosted fixture admission diagnostic:", (report.projects || []).filter((p) => p.status === "claim_unavailable").map((p) => p.output).join("\n"));
+    } catch {}
+  }
+  if (executed.stdout.includes('"projects":[]')) {
+    try { console.error("Hosted fixture planning diagnostic:", JSON.parse(executed.stdout).planningFailures); } catch {}
+  }
+  return executed;
 }
 
 async function git(repoPath, args) {
@@ -355,8 +378,12 @@ function baseState(overrides = {}) {
 
 function attachOwnerQaPackets(state) {
   state.qaBundles ||= [];
+  state.reviews ||= [];
   for (const candidate of state.candidates || []) {
     for (const source of candidate.manifest?.sources || []) {
+      for (const review of source.reviews) if (!state.reviews.some((r) => r.id === review.id)) {
+        state.reviews.push({ ...review, taskId: source.taskId, projectId: candidate.projectId, author: `fixture-${review.id}` });
+      }
       const task = (state.tasks || []).find((item) => item.id === source.taskId);
       if (!task) continue;
       task.candidateId ??= candidate.id;
@@ -486,6 +513,9 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
         headSha: sourceSha,
         candidateCycle: 1,
         reviews: [{
+          id: "review_backend_1", stageKey: "backend", role: "backend-reviewer", outcome: "approved",
+          subjectSha: sourceSha, candidateCycle: 1, reviewedAt: "2026-07-25T11:00:00.000Z",
+        }, {
           id: "review_1",
           stageKey: "lead",
           role: "lead-reviewer",
@@ -568,6 +598,9 @@ function mergedCandidateFixture({ baseSha, sourceSha, integrationSha, mergeCommi
         headSha: sourceSha,
         candidateCycle: 1,
         reviews: [{
+          id: "review_backend_2", stageKey: "backend", role: "backend-reviewer", outcome: "approved",
+          subjectSha: sourceSha, candidateCycle: 1, reviewedAt: "2026-07-25T13:05:00.000Z",
+        }, {
           id: "review_2",
           stageKey: "lead",
           role: "lead-reviewer",
@@ -3348,7 +3381,7 @@ test("promotion reconciliation preserves a deployed task while backfilling exact
   }
 });
 
-test("promotion reconciliation closes a superseded candidate when a trusted merged candidate contains it", nestedValidationSandboxTest, async () => {
+test("promotion reconciliation cannot substitute a newer hosted deployment for an older candidate", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("CLOSED");
   try {
     await git(fixture.repoPath, ["checkout", "-b", "feature/replacement", fixture.sourceSha]);
@@ -3427,43 +3460,18 @@ test("promotion reconciliation closes a superseded candidate when a trusted merg
     const first = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
     const persisted = readPersistedState(fixture.root);
 
-    assert.equal(first.projects[0].status, "merged", JSON.stringify(first.projects[0]));
-    assert.equal(first.projects[0].reconciledByCandidateId, replacement.id);
-    assert.equal(first.projects[0].reconciliationReplacement.candidateId, replacement.id);
-    assert.equal(
-      first.projects[0].promotionClaim.reconciliationReplacementDigest,
-      first.projects[0].reconciliationReplacementDigest,
-    );
-    assert.equal(persisted.tasks[0].status, "merged");
-    assert.equal(persisted.tasks[0].mergeEvidence.subjectSha, fixture.sourceSha);
-    assert.equal(persisted.tasks[0].mergeEvidence.reconciledByCandidateId, replacement.id);
-    assert.equal(persisted.tasks[0].mergeEvidence.mergeCommit, replacementMerge);
-    assert.equal(persisted.candidates[0].promotionMerge.reconciledByCandidateId, replacement.id);
-    assert.equal(
-      persisted.meta.promotionAttemptClaims[fixture.candidate.id].reconciliationReplacement.candidateId,
-      replacement.id,
-    );
-    assert.equal(
-      persisted.meta.promotionAttemptClaims[fixture.candidate.id].reconciliationReplacement.qaDecision.manifestDigest,
-      replacement.manifestDigest,
-    );
-    assert.equal(
-      persisted.meta.promotionAttemptClaims[fixture.candidate.id].reconciliationReplacement.observedPromotionPr.state,
-      "MERGED",
-    );
-    assert.equal(
-      persisted.meta.promotionAttemptClaims[fixture.candidate.id].terminalResult.prUrl,
-      replacement.promotion.prUrl,
-    );
-
-    const second = JSON.parse((await run(process.execPath, ["--input-type=module", "-e", script], { cwd: fixture.root })).stdout.trim());
-    assert.equal(second.projects.length, 0);
+    assert.equal(first.projects[0].status, "claim_unavailable");
+    assert.match(first.projects[0].output, /authority_required|policy_mismatch/);
+    assert.equal(persisted.tasks[0].status, "user_review");
+    assert.equal(persisted.tasks[0].mergeEvidence, undefined);
+    assert.equal(persisted.candidates[0].promotionMerge, null);
+    assert.equal(persisted.candidates[0].status, "release_candidate_ready");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
 
-test("superseded reconciliation discards replacement metadata drift before merge recording", nestedValidationSandboxTest, async () => {
+test("superseded reconciliation requires current hosted authority before observing replacement metadata", nestedValidationSandboxTest, async () => {
   const fixture = await reconciliationFixture("CLOSED");
   try {
     await git(fixture.repoPath, ["checkout", "-b", "feature/replacement", fixture.sourceSha]);
@@ -3557,16 +3565,13 @@ test("superseded reconciliation discards replacement metadata drift before merge
     )).stdout.trim());
     const persisted = readPersistedState(fixture.root);
 
-    assert.equal(report.projects[0].status, "reconciliation_unavailable");
-    assert.match(
-      report.projects[0].output,
-      /replacement (?:promotion candidate .* changed|identity is internally inconsistent)/i,
-    );
+    assert.equal(report.projects[0].status, "claim_unavailable");
+    assert.match(report.projects[0].output, /authority_required|policy_mismatch/);
     assert.equal(report.projects[0].reconciledByCandidateId, undefined);
     assert.equal(persisted.tasks[0].status, "user_review");
     assert.equal(persisted.tasks[0].mergeEvidence, undefined);
     assert.equal(persisted.candidates[0].status, "release_candidate_ready");
-    assert.equal(persisted.candidates[1].promotionMerge.mergeCommit, driftedMerge);
+    assert.notEqual(persisted.candidates[1].promotionMerge.mergeCommit, driftedMerge);
     assert.equal(persisted.comments.length, 0);
     assert.equal(persisted.events.length, 0);
   } finally {

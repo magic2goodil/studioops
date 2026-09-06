@@ -823,3 +823,124 @@ not delete incident rows, clear circuits because time passed, or bypass the
 repository-bound project filter during recovery. Pause worker admission before
 database repair and resume only after the loopback API, exact project boundary,
 notification deduplication, and durable restart checks pass.
+
+## Authenticated hosted QA and promotion
+
+Local suites, previews and `qa-pass` retain their diagnostic meaning. Promotion
+also requires a separately authenticated hosted owner decision. Issued manifests
+and diagnostic owner packets are immutable; collection appends a hosted input
+packet to the existing protected candidate aggregate. The packet binds the
+original packet digest, exact candidate/review cycles, source, immutable artifact,
+policy, deployment, environment readiness, snapshot and physical/simulated device
+results. The final owner receipt contains that packet digest; the packet never
+contains the final receipt, avoiding a hash cycle.
+
+The operator installs `hosted-qa-trust.json` in the configured StudioOps config
+root, mode 0600, owned by the current operator, with no symlink/hard-link. The
+bounded file (64 KiB) uses `studioops.hosted-qa-trust.v1` and a `projects` map keyed
+by project ID. Each entry contains `policyKeys`, `producerKeys`, `observerKeys`,
+`actorKeys` (Ed25519 public PEMs keyed by key ID), `approvedProducerIds`,
+`approvedObserverIds`, `approvedOwnerIds`, `productionOrigins`, `reviewActors`
+(persisted review actor/author to authenticated opaque actor ID), and `deployments`
+keyed by candidate ID. A deployment pins `binding` (HostedRcBinding v1), `origin`,
+`deploymentId`, `environmentId`, `snapshotFingerprint`, `snapshotAuthorizationId`,
+`migrationPlanDigest`, `nativeBuildDigest` and `readiness`. Optional
+`certificateAuthorityPem` supports a controlled private CA. No private signing
+keys, copied records, secret values or caller-supplied callbacks belong here.
+
+`readiness` is normalized by `normalizeHostedDeploymentReadiness`:
+
+- `schemaVersion`: `studioops.hosted-deployment-readiness.v1`.
+- `target`: `projectId`, `repository`, `sourceSha`, `artifactDigest`,
+  `provenanceDigest`, `runtimeDigest`, canonical absolute `runtimeRoot`.
+- `backup`: opaque `id`, `artifactDigest`, `evidenceDigest`, `verifiedAt`, `expiresAt`.
+- `rollback`: `sourceSha`, `artifactDigest`, `provenanceDigest`, `runtimeDigest`,
+  `evidenceDigest`, `verifiedAt`, `expiresAt`.
+- `dataTransferMode`: `none`.
+
+The signed policy's `environmentContractDigest` is the canonical digest of this
+readiness contract, also bound by the producer evidence and current independent
+observation. Both source and integration SHA equal the tested release revision.
+Readiness must identify independently verified backup and rollback artifacts,
+with fresh verification and future expiry. Runtime activation additionally
+compares the measured target and actual predecessor to this contract. Merely
+writing metadata does not create a valid policy, producer, or observer signature.
+
+The controlled HTTPS origin serves
+`/.well-known/studioops/hosted-rc?nonce=<challenge>` as bounded JSON
+`{nonce,payload,proof,transportProof}`. `payload` is HostedRcObservation v1;
+`proof` signs `hostedRcSigningBytes('observation', payload)` with an approved
+independent observer key. The same observer signs
+`hostedRcSigningBytes('observation-response', {nonce,payload,proof})` for
+`transportProof`. The observer must independently verify the actual served
+source/artifact/runtime/deployment, snapshot authorization and isolation,
+migration, normal-auth/device scenarios, native distribution/backend, and backup
+and rollback evidence before signing. It must never echo producer assertions.
+Producer and observer keys/IDs must differ. Static signed JSON cannot answer a
+new challenge. HTTPS certificates are verified, DNS is pinned after address
+classification, redirects are rejected, and each observation has a five-second
+DNS-plus-request budget. Loopback, link-local and metadata targets are forbidden;
+RFC1918/ULA destinations require explicit policy authorization.
+
+An authorized real deployment supplies evidence through these local commands:
+
+```sh
+studioops hosted-qa policy --project PROJECT --candidate CANDIDATE --file signed-policy.json
+studioops hosted-qa collect --project PROJECT --candidate CANDIDATE --file signed-evidence.json
+studioops hosted-qa status --project PROJECT --candidate CANDIDATE
+studioops hosted-qa decide --project PROJECT --candidate CANDIDATE --file signed-owner-decision.json
+studioops hosted-qa verify --project PROJECT --candidate CANDIDATE
+studioops hosted-qa revoke --project PROJECT --candidate CANDIDATE --file signed-revocation.json
+```
+
+Input files use the same private-file constraints as trust configuration. Policy
+and evidence files hold the public API payload plus `proof`. The final decision
+file holds `payload` (ReleaseDecisionObservation v1) and `proof`; it binds the
+hosted packet's `inputsDigest`/`packetDigest`, exact live review rows, revocation
+generation and the digest of the persisted diagnostic QA decision. The owner
+must approve these concrete coordinates through the configured signing channel.
+`qa-fail` retains its existing failure/revocation behavior. Signed hosted
+revocation remains available when the origin is offline and survives restart.
+Collection retries preserve identical evidence and packets; stale versions fail
+at the existing SQLite fence. Status/list output is diagnostic (`display_only`),
+with setup_missing, collecting, failed, stale, revoked and qualified states.
+
+`prepareHostedQaAdmission` re-observes HTTPS for every promotion/recovery admission
+and returns process-local synchronous `assertCurrent` authority for the final
+fence. It rechecks current policy/trust configuration, decision, exact reviews,
+revocation generation, readiness and evidence age before mutation. GitHub
+promotion prepares a branch/PR; it does not deploy production or transfer the QA
+database, test history or writable media. Runtime activation belongs to its
+separate fenced runtime adapter. Missing staging, offline observations or changed
+bindings block admission; unchanged full regression evidence can be reused only
+with a fresh matching origin observation. Restoring old code must preserve hosted
+history and hold release until the authority gate is available.
+
+The adapter tests use explicitly labeled, generated-key HTTPS fixtures and an
+isolated database. Their results validate software behavior and do not constitute
+real hosted release QA, device acceptance, backup readiness or production approval.
+
+The opt-in validation network policy `attested_fixture_tcp` uses Darwin's
+**local IPv4 address class on exactly 64 host-selected ports**. The `tcp4`
+`localhost:port` kernel filter includes assigned local RFC1918 addresses; it is
+not exact-IP or exclusively 127.0.0.1 enforcement. Nonlocal addresses, IPv6,
+unlisted ports and Unix sockets remain denied. No wildcard host/port rule is
+added. The host reserves a bounded port set and separately binds one assigned
+RFC1918 fixture address into a digested environment DTO and private process
+capability. It rechecks local assignment and unchanged environment before and
+after each command and final attestation. Missing addresses, exhausted ports,
+collisions without remaining capacity, or changed bindings fail closed. Tests
+retry only port collisions within that set; they cannot request new targets.
+Changing a child DTO cannot enlarge the kernel's local-address class/port set.
+
+`deny_all` remains the default. The legacy `loopback_only` spelling and existing
+permissions remain compatible; on Darwin its measured `localhost:*` filter is
+the local-address class across TCP ports, not exclusively 127.0.0.1/::1. Its
+attestation now describes that boundary accurately. The versioned disposable
+clone policy records the chosen network contract and fixture digest. This
+opt-in requires a reviewed validator installed through the normal immutable
+harness process; changing a live project setting is not part of implementation.
+The same complete aggregate, executable restrictions, capture limits, deadline,
+filesystem checks and final source attestation still apply. Fixture capability
+does not supply hosted qualification: production origin allowlisting, DNS
+pinning, CA verification and independent signed nonce responses are unchanged.

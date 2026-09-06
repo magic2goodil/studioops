@@ -699,6 +699,15 @@ function normalizedReceiptEvidence(value, candidate, policyDigest) {
   };
 }
 
+function hostedRecoveryBinding(candidate) {
+  if (!candidate.hostedRc) return null;
+  const q = candidate.hostedRc.qualifications.at(-1)?.qualification;
+  return { inputsDigest: q?.inputsDigest || "", evidenceDigest: q?.evidenceDigest || "",
+    policyDigest: q?.policyDigest || "", decisionDigest: q?.decisionDigest || "",
+    packetDigest: candidate.hostedRc.packets?.at(-1)?.packet.packetDigest || "",
+    generation: candidate.hostedRc.generation };
+}
+
 function receiptBinding(candidate, policyDigest) {
   const receipt = candidate.promotionValidationRecoveryReceipt;
   if (!receipt) return { receipt: null, receiptDigest: "" };
@@ -709,6 +718,7 @@ function receiptBinding(candidate, policyDigest) {
     || receipt.integrationBranch !== candidate.manifest.integration.branch
     || receipt.integrationSha !== candidate.manifest.integration.sha
     || receipt.policyDigest !== policyDigest
+    || canonicalJson(receipt.hostedQa || null) !== canonicalJson(hostedRecoveryBinding(candidate))
     || !DIGEST_PATTERN.test(String(receipt.validationResultDigest || ""))
     || !Number.isFinite(Date.parse(receipt.validatedAt || ""))
   ) {
@@ -891,8 +901,17 @@ function candidateContext(state, input, versionOverride = null) {
   });
   assertNoCandidateDependencyCycle(candidate, tasks);
   const { receipt, receiptDigest } = receiptBinding(candidate, policyDigest);
+  const hostedQualification = candidate.hostedRc?.qualifications.at(-1)?.qualification;
+  const hostedBinding = candidate.hostedRc ? {
+    hostedQa: { inputsDigest: hostedQualification?.inputsDigest || "",
+      activePolicyDigest: state.projects.find((p) => p.id === projectId)?.hostedRc?.activePolicyDigest || "",
+      generation: candidate.hostedRc.generation,
+      packetDigest: candidate.hostedRc.packets?.at(-1)?.packet.packetDigest || "",
+      decisionDigest: hostedQualification?.decisionDigest || "" },
+  } : {};
   const binding = {
     schemaVersion: CLAIM_SCHEMA_VERSION,
+    ...hostedBinding,
     projectId,
     candidateId,
     mode: attemptMode,
@@ -911,6 +930,7 @@ function candidateContext(state, input, versionOverride = null) {
   };
   const attemptSeriesBinding = {
     schemaVersion: ATTEMPT_SERIES_SCHEMA_VERSION,
+    ...hostedBinding,
     projectId,
     candidateId,
     policyDigest,
@@ -1459,6 +1479,7 @@ export function recordPromotionRecoveryReceiptInState(state, claim, input = {}) 
   );
   const expected = {
     schemaVersion: RECEIPT_SCHEMA_VERSION,
+    ...(checked.context.candidate.hostedRc ? { hostedQa: hostedRecoveryBinding(checked.context.candidate) } : {}),
     candidateId: checked.context.candidate.id,
     manifestDigest: checked.context.candidate.manifestDigest,
     integrationBranch: checked.context.candidate.manifest.integration.branch,

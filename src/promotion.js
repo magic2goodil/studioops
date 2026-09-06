@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { prepareHostedQaAdmission, hostedQaCoordinatesFromState } from "./hosted-qa-adapter.js";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -1597,8 +1598,10 @@ async function renewProjectPromotionAttempt(projectPlan, claim, input = {}) {
 }
 
 async function assertProjectPromotionAttempt(projectPlan, claim, input = {}) {
+  const hostedAdmission = await prepareHostedQaAdmission({ projectId: projectPlan.projectId, candidateId: projectPlan.candidate.id });
   const state = await readState();
   try {
+    hostedAdmission.assertCurrent(hostedQaCoordinatesFromState(state, projectPlan.candidate.id));
     return assertPromotionAttemptClaimInState(
       state,
       claim,
@@ -2739,6 +2742,15 @@ function taskPatchForPromotion(projectResult, taskResult, now, task, candidate) 
 }
 
 async function recordProjectResult(projectResult) {
+  let hostedAdmission = null;
+  try {
+    if (["pr_ready", "pr_merged_detected", "merged"].includes(projectResult.status)) {
+      hostedAdmission = await prepareHostedQaAdmission({ projectId: projectResult.projectId, candidateId: projectResult.candidate.id });
+    }
+  } catch (error) {
+    error.code = "PROMOTION_ATTEMPT_STALE";
+    throw error;
+  }
   if (projectResult.status === "merged") {
     // GitHub may omit fractional seconds. Canonicalize once before binding the
     // terminal claim and writing each durable merge mirror so they cannot
@@ -2746,6 +2758,10 @@ async function recordProjectResult(projectResult) {
     projectResult.mergedAt = new Date(projectResult.mergedAt).toISOString();
   }
   return mutateCandidatePromotionState(projectResult.candidate?.id, projectResult.promotionClaim, async (state) => {
+    let hostedQualification = null;
+    try {
+      if (hostedAdmission) hostedQualification = hostedAdmission.assertCurrent(hostedQaCoordinatesFromState(state, projectResult.candidate.id));
+    } catch (error) { error.code = "PROMOTION_ATTEMPT_STALE"; throw error; }
     const now = new Date().toISOString();
     state.comments = state.comments || [];
     state.events = state.events || [];
@@ -2981,6 +2997,8 @@ async function recordProjectResult(projectResult) {
         commitSha: projectResult.commit || "",
         manifestDigest: candidate.manifestDigest,
         readyAt: now,
+        ...(hostedQualification ? { hostedQa: { qualification: hostedQualification,
+          observation: hostedAdmission.authority.hostedObservation(), dataTransferMode: "none" } } : {}),
       };
       candidate.updatedAt = now;
       state.events.push({

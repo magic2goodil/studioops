@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,10 @@ import {
   prepareProjectValidationSandbox,
   prepareProjectValidationDependencies,
   PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK,
+  PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE,
+  PROJECT_VALIDATION_FIXTURE_NETWORK_ENV,
+  normalizeProjectValidationFixtureNetwork,
+  assertProjectValidationFixtureAddress,
   PROJECT_VALIDATION_SANDBOX_ISOLATION,
   PROJECT_VALIDATION_SANDBOX_POLICY_ID,
   normalizeProjectValidationNetworkPolicy,
@@ -27,10 +31,106 @@ const NESTED_PROJECT_SANDBOX = Boolean(process.env.STUDIOOPS_PROJECT_VALIDATION_
 test("validation network policy accepts only explicit supported values", () => {
   assert.equal(normalizeProjectValidationNetworkPolicy(), "deny_all");
   assert.equal(normalizeProjectValidationNetworkPolicy("loopback_only"), "loopback_only");
+  assert.equal(normalizeProjectValidationNetworkPolicy("attested_fixture_tcp"), "attested_fixture_tcp");
   assert.throws(
     () => normalizeProjectValidationNetworkPolicy("internet"),
     (error) => error.code === "PROJECT_VALIDATION_INPUT_INVALID",
   );
+});
+
+test("fixture tuples are bounded data and cannot choose a trusted capability or survive address loss", async () => {
+  const base = { schemaVersion: "studioops.validation-fixture-network.v1", address: "10.0.0.2",
+    ports: Array.from({ length: 64 }, (_, i) => 50000 + i) };
+  const binding = normalizeProjectValidationFixtureNetwork({ ...base,
+    digest: `sha256:${createHash("sha256").update(JSON.stringify(base)).digest("hex")}` });
+  assertProjectValidationFixtureAddress(binding, { fixture: [{ address: binding.address, family: "IPv4", internal: false }] });
+  assert.throws(() => assertProjectValidationFixtureAddress(binding, {}), { code: "PROJECT_VALIDATION_IDENTITY_DRIFT" });
+  assert.throws(() => normalizeProjectValidationFixtureNetwork({ ...binding, address: "127.0.0.1" }));
+  assert.throws(() => normalizeProjectValidationFixtureNetwork({ ...binding, ports: [443] }));
+  assert.throws(() => normalizeProjectValidationFixtureNetwork({ ...binding, allow: true }));
+  await assert.rejects(prepareProjectValidationSandbox({ networkPolicy: PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE,
+    fixtureAddress: "10.0.0.2" }), { code: "PROJECT_VALIDATION_INPUT_INVALID" });
+});
+
+test("attested fixture policy runs genuine TLS with exclusive concurrent tuples and denies nonlocal addresses, IPv6 and unlisted ports", {
+  skip: process.platform !== "darwin", timeout: 60000,
+}, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "fixture-policy-"));
+  let sandbox;
+  try {
+    let execute;
+    if (NESTED_PROJECT_SANDBOX) {
+      assert.equal(process.env.STUDIOOPS_PROJECT_VALIDATION_NETWORK_POLICY, PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE,
+        "Required real transport coverage needs the reviewed attested fixture policy");
+      normalizeProjectValidationFixtureNetwork(JSON.parse(process.env[PROJECT_VALIDATION_FIXTURE_NETWORK_ENV] || "null"));
+      execute = async (command) => {
+        try { const result = await execFileAsync("/bin/bash", ["--noprofile", "--norc", "-c", command],
+          { cwd: process.cwd(), env: process.env, timeout: 20000, maxBuffer: 65536 });
+          return { ok: true, output: result.stdout + result.stderr }; }
+        catch (error) { return { ok: false, output: error.stdout + error.stderr }; }
+      };
+    } else {
+      const fixture = await repositoryFixture(root);
+      // Exact copies of the real adapter and fixture source, committed ONLY in
+      // this disposable test repository before the ordinary clone attestation.
+      for (const file of ["src/project-validation-sandbox.js", "src/hosted-rc-evidence.js", "src/release-qualification.js",
+        "src/hosted-rc-transport.js", "test/project-validation-sandbox.test.js", "test/hosted-rc-evidence.test.js", "test/hosted-rc-adapters.test.js"]) {
+        await mkdir(path.dirname(path.join(fixture.repoPath, file)), { recursive: true });
+        await writeFile(path.join(fixture.repoPath, file), await readFile(path.join(process.cwd(), file)));
+      }
+      await writeFile(path.join(fixture.repoPath, "package.json"), '{"type":"module"}');
+      await git(fixture.repoPath, ["add", "."]);
+      await git(fixture.repoPath, ["commit", "-m", "seed real TLS validator fixture"]);
+      sandbox = await prepareProjectValidationSandbox({ sourceRepoPath: fixture.repoPath,
+        workspaceRoot: path.join(root, "workspaces"), expectedHeadSha: await git(fixture.repoPath, ["rev-parse", "HEAD"]),
+        networkPolicy: PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE });
+      assert.equal(sandbox.fixtureNetwork.ports.length, 64);
+      assert.equal(sandbox.profile.includes('localhost:*'), false);
+      assert.equal(sandbox.processPolicy.fixtureNetworkDigest, sandbox.fixtureNetwork.digest);
+      execute = (command) => runProjectValidationCommand(sandbox, command, { timeoutMs: 20000, maxCaptureBytes: 65536 });
+      const original = sandbox.environment[PROJECT_VALIDATION_FIXTURE_NETWORK_ENV];
+      sandbox.environment[PROJECT_VALIDATION_FIXTURE_NETWORK_ENV] = '{"address":"1.1.1.1"}';
+      await assert.rejects(execute("true"), { code: "PROJECT_VALIDATION_IDENTITY_DRIFT" });
+      sandbox.environment[PROJECT_VALIDATION_FIXTURE_NETWORK_ENV] = original;
+      await assert.rejects(runProjectValidationCommand({ ...sandbox }, "true"));
+    }
+    const script = `
+      import assert from 'node:assert/strict';
+      import net from 'node:net';
+      import {listenHostedFixture} from './test/hosted-rc-adapters.test.js';
+      const b=JSON.parse(process.env.STUDIOOPS_PROJECT_VALIDATION_FIXTURE_NETWORK);
+      const servers=[net.createServer(s=>s.end('fixture')),net.createServer(s=>s.end('fixture'))];
+      try {
+        await Promise.all(servers.map(s=>listenHostedFixture(s,b)));
+        const occupied=servers.map(s=>s.address().port);
+        assert.notEqual(occupied[0],occupied[1]);
+        await assert.rejects(listenHostedFixture(net.createServer(),{address:b.address,ports:occupied}),{code:'FIXTURE_PORTS_EXHAUSTED'});
+        let other=54000; while(b.ports.includes(other)) other++;
+        for(const target of [{host:b.address,port:other},{host:'1.1.1.1',port:occupied[0]},{host:'::1',port:occupied[0]},{path:'/private/var/run/mDNSResponder'}]) {
+          await assert.rejects(new Promise((resolve,reject)=>{const socket=net.connect(target);
+            socket.on('connect',()=>{socket.destroy();resolve()});socket.on('error',reject);
+            socket.setTimeout(2000,()=>{socket.destroy();reject(new Error('timeout'))});}),e=>['EPERM','EACCES'].includes(e.code));
+        }
+        await assert.rejects(listenHostedFixture(net.createServer(),{address:b.address,ports:[other]}),e=>['EPERM','EACCES'].includes(e.code));
+        console.log('exclusive tuples, collision/exhaustion and OS denials verified');
+      } finally {await Promise.all(servers.map(s=>new Promise(r=>s.close(r))))}
+    `;
+    const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const network = await execute(`${quote(process.execPath)} --input-type=module -e ${quote(script)}`);
+    assert.equal(network.ok, true, network.output);
+    const tls = await execute(`${JSON.stringify(process.execPath)} --test --test-name-pattern='authenticated HTTPS adapter' test/hosted-rc-adapters.test.js`);
+    assert.equal(tls.ok, true, tls.output);
+    if (sandbox) {
+      const inherited = await execute(`${quote(process.execPath)} --test --test-name-pattern='attested fixture policy' test/project-validation-sandbox.test.js`);
+      assert.equal(inherited.ok, true, inherited.output);
+      const attestation = await verifyProjectValidationSandbox(sandbox);
+      assert.equal(attestation.networkPolicy, PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE);
+      assert.equal(attestation.fixtureNetwork.digest, sandbox.fixtureNetwork.digest);
+    }
+  } finally {
+    if (sandbox) await cleanupProjectValidationSandbox(sandbox);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("the release suite observes the active outer data-and-egress boundary", {
@@ -373,7 +473,7 @@ test("explicit loopback validation permits local HTTP while denying external and
     assert.match(denied.output, /(?:EPERM|EACCES),(?:EPERM|EACCES)/);
     const attestation = await verifyProjectValidationSandbox(sandbox);
     assert.equal(attestation.networkPolicy, PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK);
-    assert.equal(attestation.processPolicy.network, "kernel_enforced_tcp_loopback_only");
+    assert.equal(attestation.processPolicy.network, "kernel_enforced_tcp_local_address_class_all_ports");
   } finally {
     if (sandbox) await cleanupProjectValidationSandbox(sandbox);
     await rm(root, { recursive: true, force: true });

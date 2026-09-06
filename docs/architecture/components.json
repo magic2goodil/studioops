@@ -246,7 +246,7 @@
         "test/local-builder-review.test.js"
       ],
       "services": ["worker runner", "isolated git worktree", "validation adapter"],
-      "publicContracts": ["repository-confined worker launch", "atomic pre-provider failure-attempt claim", "bounded redacted validation evidence"],
+      "publicContracts": ["repository-confined worker launch", "atomic pre-provider failure-attempt claim", "bounded redacted validation evidence", "attested local IPv4 address class with host-selected exact fixture ports"],
       "workflows": ["builder execution", "review execution"],
       "deploySurfaces": ["local LaunchAgent runner"],
       "tests": [{ "command": "node scripts/run-tests.js --test-file test/git-lock.test.js --test-file test/github-app-auth.test.js --test-file test/launch-agent-environment.test.js --test-file test/local-builder-review.test.js --test-file test/local-workspace-handoff.test.js --test-file test/project-validation-sandbox.test.js --test-file test/run-output-evidence.test.js --test-file test/runner.test.js --test-file test/runtime-paths.test.js", "layer": "adapter" }],
@@ -295,6 +295,8 @@
       "owner": "release-management",
       "aliases": ["QA", "candidate", "promotion", "release"],
       "paths": [
+        "src/hosted-rc-transport.js",
+        "src/hosted-qa-adapter.js",
         "test/hosted-rc-adapters.test.js",
         "src/hosted-rc-evidence.js",
         "src/release-qualification.js",
@@ -336,9 +338,11 @@
       "publicContracts": ["ReleaseQaPolicy v1", "HostedRcEvidence v1", "ReleaseQualification v1", "Ed25519 authenticated trusted observation and decision DTOs", "releaseQualificationInputs non-circular owner packet coordinates", "createReleaseQualificationAuthority executable persistence port; no workflow-state imports in pure modules","exact-SHA QA evidence", "owner-gated release candidate", "bounded preview startup identity polling"],
       "workflows": ["QA integration", "owner approval", "production promotion"],
       "deploySurfaces": ["protected production branch"],
-      "tests": [{ "command": "node scripts/run-tests.js --test-file test/hosted-rc-evidence.test.js --test-file test/release-qualification.test.js", "layer": "unit-contract" },{ "command": "node scripts/run-tests.js --test-file test/candidate-manifest.test.js --test-file test/promotion-ancestry-observation.test.js --test-file test/promotion-attempt-claim.test.js --test-file test/promotion-remote-observation.test.js --test-file test/promotion-validation-evidence.test.js --test-file test/promotion.test.js --test-file test/qa-approval-revocation.test.js --test-file test/qa-bundle-cli.test.js --test-file test/qa-decision-auth.test.js --test-file test/qa-impact-validation.test.js --test-file test/qa-integration-options.test.js --test-file test/qa-integration.test.js --test-file test/qa-review-discoverability.test.js", "layer": "integration-release" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/hosted-rc-adapters.test.js", "layer": "adapter-composition" },{ "command": "node scripts/run-tests.js --test-file test/hosted-rc-evidence.test.js --test-file test/release-qualification.test.js", "layer": "unit-contract" },{ "command": "node scripts/run-tests.js --test-file test/candidate-manifest.test.js --test-file test/promotion-ancestry-observation.test.js --test-file test/promotion-attempt-claim.test.js --test-file test/promotion-remote-observation.test.js --test-file test/promotion-validation-evidence.test.js --test-file test/promotion.test.js --test-file test/qa-approval-revocation.test.js --test-file test/qa-bundle-cli.test.js --test-file test/qa-decision-auth.test.js --test-file test/qa-impact-validation.test.js --test-file test/qa-integration-options.test.js --test-file test/qa-integration.test.js --test-file test/qa-review-discoverability.test.js", "layer": "integration-release" }],
       "reviewOwners": ["lead-reviewer"],
       "fullRegressionPaths": [
+        "src/hosted-rc-transport.js",
+        "src/hosted-qa-adapter.js",
         "src/hosted-rc-evidence.js",
         "src/release-qualification.js",
         "src/qa-integration.js",
