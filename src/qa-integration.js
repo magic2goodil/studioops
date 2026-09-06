@@ -2450,6 +2450,45 @@ function pendingProtectedHandoff(projectPlan) {
   };
 }
 
+async function invalidHandoffSourceBindings(repoPath, projectPlan, handoff, options = {}) {
+  let candidateExists = await git(
+    repoPath,
+    ["cat-file", "-e", `${handoff.commit}^{commit}`],
+    { ...options, allowFailure: true },
+  );
+  if (!candidateExists.ok) {
+    await git(
+      repoPath,
+      ["fetch", qaRemoteTarget(options), `refs/heads/${normalizeBranchName(projectPlan.integrationBranch)}`],
+      { ...options, allowFailure: true },
+    );
+    candidateExists = await git(
+      repoPath,
+      ["cat-file", "-e", `${handoff.commit}^{commit}`],
+      { ...options, allowFailure: true },
+    );
+  }
+  if (!candidateExists.ok) return [];
+
+  const invalid = [];
+  for (const task of projectPlan.tasks) {
+    const sourceRef = taskSourceRef(task);
+    if (sourceRef) {
+      await git(repoPath, ["fetch", qaRemoteTarget(options), sourceRef], {
+        ...options,
+        allowFailure: true,
+      });
+    }
+    const contained = await git(
+      repoPath,
+      ["merge-base", "--is-ancestor", task.integrationSourceHeadSha, handoff.commit],
+      { ...options, allowFailure: true },
+    );
+    if (!contained.ok) invalid.push(task);
+  }
+  return invalid;
+}
+
 async function verifyMergedIntegrationTarget(repoPath, projectPlan, pr, options = {}) {
   const mergeCommit = String(pr?.mergeCommit?.oid || "").trim().toLowerCase();
   if (!/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(mergeCommit)) {
@@ -2586,11 +2625,18 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
       pr: inspectedPr,
     };
   }
-  if (changedSources.length) {
-    const changedSummary = changedSources
-      .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
-      .join(", ");
-    const reason = `StudioOps detected stale integration authority and is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
+  const invalidSourceBindings = changedSources.length
+    ? []
+    : await invalidHandoffSourceBindings(repoPath, projectPlan, handoff, options);
+  if (changedSources.length || invalidSourceBindings.length) {
+    const changedSummary = changedSources.length
+      ? changedSources
+          .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
+          .join(", ")
+      : invalidSourceBindings
+          .map((task) => `${task.id} ${task.integrationSourceHeadSha} is not contained by ${handoff.commit}`)
+          .join(", ");
+    const reason = `StudioOps detected stale integration authority and is superseding this immutable QA candidate because its source binding no longer proves the current reviewed source: ${changedSummary}. The old candidate remains recorded on each affected task.`;
     const prIsTerminal = ["CLOSED", "MERGED"].includes(String(inspectedPr.state || "").toUpperCase());
     const closed = prIsTerminal
       ? { ok: true, pr: inspectedPr, output: "" }
@@ -2884,8 +2930,8 @@ async function integrateProject(projectPlan, options = {}) {
           status: "merged",
           source: sourceLabel(task),
           sourceRef: taskSourceRef(task),
-          headSha: task.expectedHeadSha,
-          candidateCycle: task.candidateCycle,
+          headSha: task.integrationSourceHeadSha,
+          candidateCycle: task.integrationSourceCandidateCycle,
           reviews: task.reviews,
           output: `Verified merged integration PR ${result.integrationPr?.url || ""} on protected target ${candidatePlan.integrationBranch} at ${preparedHead}.`,
         };

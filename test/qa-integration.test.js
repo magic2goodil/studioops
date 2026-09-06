@@ -2653,6 +2653,15 @@ test("merged protected QA handoff is superseded when a reviewed source changes",
     const correctedHead = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
     await git(fixture.repoPath, ["push", "origin", "feature/task"]);
     await advanceReviewedQaTask(root, "task_1", correctedHead);
+    const corruptBindingScript = `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState((state) => {
+        const task = state.tasks.find((item) => item.id === "task_1");
+        task.integrationSourceHeadSha = ${JSON.stringify(correctedHead)};
+        task.integrationSourceCandidateCycle = 2;
+      });
+    `;
+    await run(process.execPath, ["--input-type=module", "-e", corruptBindingScript], { cwd: root });
 
     const replacement = await runQaIntegrationFixture(root, {
       input: { force: true },
@@ -2682,6 +2691,7 @@ test("merged protected QA handoff is superseded when a reviewed source changes",
     assert.equal(task.integrationHandoffHistory[0].reasonCode, "stale_integration_authority");
     assert.equal(task.integrationHandoffHistory[0].candidateCommit, previous.integrationCandidateCommit);
     assert.equal(task.integrationHandoffHistory[0].workflowStatus, "merged");
+    assert.match(task.integrationHandoffHistory[0].reason, /is not contained by/);
     assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
