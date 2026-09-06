@@ -48,6 +48,7 @@ export async function listenHostedFixture(server, binding = hostedFixtureNetwork
  * exercising existing Git/PR adapters. This is deliberately test-only SQL seed
  * construction, never a product ingestion route. */
 export async function installHostedPromotionFixture(root) {
+  const installed = [];
   const { DatabaseSync } = await import("node:sqlite");
   const { buildHostedOwnerQaPacket } = await import("../src/owner-qa-packet.js");
   const { assertReleaseQualification, releaseQualificationInputs } = await import("../src/release-qualification.js");
@@ -61,6 +62,7 @@ export async function installHostedPromotionFixture(root) {
       const reviews = db.prepare("SELECT payload FROM reviews").all().map((r) => JSON.parse(r.payload)).filter((r) => ids.includes(r.id));
       const f = await createHostedAdapterFixture({ configRoot: root, candidate, project, reviews });
       promotionFixtures.push(f);
+      installed.push(f);
       const context = f.context;
       context.currentReviews = reviews.map((row) => ({ id: row.id, taskId: row.taskId, actorId: `actor-${row.id}`, role: row.stageKey,
         cycle: row.candidateCycle, subjectSha: row.subjectSha, outcome: row.outcome, evidenceDigest: hostedRcDigest(row) }));
@@ -90,6 +92,7 @@ export async function installHostedPromotionFixture(root) {
       db.prepare("UPDATE candidates SET payload=? WHERE id=?").run(JSON.stringify(candidate), candidate.id);
     }
   } finally { db.close(); }
+  return installed;
 }
 export async function cleanupHostedPromotionFixtures() {
   await Promise.all(promotionFixtures.splice(0).map((f) => f.cleanup()));
@@ -111,6 +114,7 @@ export async function createHostedAdapterFixture({ configRoot, candidate = null,
   const stats = { observations: 0, mode: "ok" };
   const server = createServer({ key: await readFile(path.join(root, "key.pem")), cert: ca }, (request, response) => {
     stats.observations += 1;
+    stats.beforeResponse?.();
     if (stats.mode === "offline") { request.socket.destroy(); return; }
     if (stats.mode === "redirect") { response.writeHead(302, { location: "https://127.0.0.1" }); response.end(); return; }
     const nonce = new URL(request.url, "https://fixture.invalid").searchParams.get("nonce");

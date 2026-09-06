@@ -1355,6 +1355,11 @@ test("promotion planning drops stale release candidates after a source task retu
 test("promotion circuit publication CAS preserves validation-policy and attempt-epoch races", async (t) => {
   for (const scenario of [
     {
+      name: "independent hosted review revoked before circuit publication",
+      mutate: 'state.reviews[0].outcome = "changes_requested";',
+      expectedImmediateFailure: /review|candidate|decision/i,
+    },
+    {
       name: "validation commands drift",
       mutate: "state.projects[0].validationCommands = ['npm run changed-check'];",
       expectedImmediateFailure: /Owner QA packet no longer matches current project or task definitions/,
@@ -3962,5 +3967,199 @@ test("promotion invalidates the candidate when its staged integration branch dri
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function hostedFenceFixture(root) {
+  const remotePath = path.join(root, "remote.git");
+  const repoPath = path.join(root, "repo");
+  const fakeBin = path.join(root, "bin");
+    await git(root, ["init", "--bare", remotePath]);
+    await git(root, ["clone", remotePath, repoPath]);
+    await configureRepo(repoPath);
+    await git(repoPath, ["checkout", "-b", "main"]);
+    await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
+    await git(repoPath, ["add", "app.txt"]);
+    await git(repoPath, ["commit", "-m", "base"]);
+    const baseSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "main"]);
+    await git(repoPath, ["checkout", "-b", "feature/task"]);
+    await writeFile(path.join(repoPath, "feature.txt"), "feature\n", "utf8");
+    await git(repoPath, ["add", "feature.txt"]);
+    await git(repoPath, ["commit", "-m", "feature"]);
+    const sourceSha = await git(repoPath, ["rev-parse", "HEAD"]);
+    await git(repoPath, ["push", "-u", "origin", "feature/task"]);
+    await git(repoPath, ["branch", "qa/candidate-demo"]);
+    await git(repoPath, ["push", "origin", "qa/candidate-demo"]);
+    await git(repoPath, ["checkout", "main"]);
+    await bindOriginToGitHub(repoPath);
+    await installLocalGitHubTransport(fakeBin, remotePath);
+
+    const candidate = candidateFixture({ baseSha, sourceSha, integrationSha: sourceSha, status: "qa_passed" });
+    const githubApiStatePath = await writePromotionGitHubApiState(root, {
+      pulls: [],
+      nextNumber: 42,
+      createFailuresRemaining: 0,
+    });
+
+    const validationCommand = "test -f feature.txt";
+    await writeState(root, baseState({
+      projects: [{
+        id: "project_1",
+        key: "demo",
+        name: "Demo",
+        repoPath,
+        repoUrl: GITHUB_REPO_URL,
+        defaultBranch: "main",
+        validationCommands: [validationCommand],
+        promotion: { enabled: true, targetBranch: "main" },
+      }],
+      tasks: [{
+        id: "task_1",
+        projectId: "project_1",
+        title: "Feature task",
+        status: "approved_for_main",
+        stateVersion: 1,
+        branchName: "feature/task",
+        promotionStatus: "queued",
+        reviewSubjectSha: sourceSha,
+        reviewSubjectCycle: 1,
+        qaBundleId: "qa_bundle_1",
+        candidateId: candidate.id,
+      }],
+      qaBundles: [{
+        id: "qa_bundle_1",
+        projectId: "project_1",
+        status: "passed",
+        candidateId: candidate.id,
+        manifestDigest: candidate.manifestDigest,
+        tasks: [{ id: "task_1", title: "Feature task" }],
+      }],
+      candidates: [candidate],
+    }));
+
+  await run(process.execPath, ["--input-type=module", "-e", `import {readState} from ${JSON.stringify(storeModuleUrl)}; await readState();`], {cwd:root});
+  const [hosted] = await installHostedPromotionFixture(root);
+  const execute = async () => JSON.parse((await run(process.execPath, ["--input-type=module", "-e", `
+    import {runPromotion} from ${JSON.stringify(promotionModuleUrl)};
+    const report = await runPromotion({githubAppAuth:false,
+      testGitRunner:${localPromotionGitRunnerExpression(remotePath)},
+      testGitHubApi:${localPromotionGitHubApiExpression(githubApiStatePath)},
+      promotionWorkspaceRoot:${JSON.stringify(path.join(root,"promotion-workspaces"))},
+      validationPath:${JSON.stringify(DEFAULT_PROJECT_VALIDATION_PATH)}});
+    console.log(JSON.stringify(report));
+  `], {cwd:root})).stdout.trim());
+  const changeCandidate = (change) => {
+    const db = new DatabaseSync(path.join(root,"data","mission-control.sqlite3"));
+    try {
+      const row = JSON.parse(db.prepare("SELECT payload FROM candidates WHERE id=?").get(candidate.id).payload);
+      change(row);
+      db.prepare("UPDATE candidates SET payload=? WHERE id=?").run(JSON.stringify(row),candidate.id);
+    } finally { db.close(); }
+  };
+  return {hosted, execute, changeCandidate, candidate};
+}
+
+test("hosted authority rejection cannot acquire claims or mutate promotion history", {}, async (t) => {
+  for (const scenario of ["qualification_missing", "evidence_missing", "policy_stale", "revoked", "owner_missing", "owner_changed", "review_changed", "target_changed", "backup_expired", "rollback_changed"]) {
+    await t.test(scenario, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(),"hosted-claim-denial-"));
+      try {
+        const f = await hostedFenceFixture(root);
+        f.changeCandidate(c => {
+          if (scenario === "qualification_missing") c.hostedRc.qualifications = [];
+          if (scenario === "evidence_missing") c.hostedRc.evidence = [];
+          if (scenario === "policy_stale") c.hostedRc.evidence[0].evidence.policyDigest = "sha256:" + "0".repeat(64);
+          if (scenario === "revoked") c.hostedRc.generation += 1;
+          if (scenario === "owner_missing") delete c.hostedRc.qualifications[0].decisionObservation;
+          if (scenario === "owner_changed") c.qaDecision.reviewDrift = true;
+        });
+        if (scenario === "review_changed") {
+          const db = new DatabaseSync(path.join(root,"data","mission-control.sqlite3"));
+          try {
+            const row = JSON.parse(db.prepare("SELECT payload FROM reviews LIMIT 1").get().payload);
+            row.outcome = "changes_requested";
+            db.prepare("UPDATE reviews SET payload=?,outcome=? WHERE id=?").run(JSON.stringify(row),row.outcome,row.id);
+          } finally { db.close(); }
+        }
+        if (["target_changed", "backup_expired", "rollback_changed"].includes(scenario)) {
+          const trustPath = path.join(root,"hosted-qa-trust.json");
+          const trust = JSON.parse(await readFile(trustPath,"utf8"));
+          const ready = trust.projects.project_1.deployments[f.candidate.id].readiness;
+          if (scenario === "target_changed") ready.target.runtimeRoot += "-changed";
+          if (scenario === "backup_expired") ready.backup.expiresAt = "2000-01-01T00:00:00.000Z";
+          if (scenario === "rollback_changed") ready.rollback.artifactDigest = "sha256:" + "0".repeat(64);
+          await writeFile(trustPath,JSON.stringify(trust),{mode:0o600});
+        }
+        const before = readPersistedState(root);
+        const report = await f.execute();
+        assert.equal(report.projects[0].status,"claim_unavailable",report.projects[0].output);
+        assert.deepEqual(readPersistedState(root),before,"rejected acquisition must write no claim, task, event or receipt");
+      } finally {await cleanupHostedPromotionFixtures(); await rm(root,{recursive:true,force:true});}
+    });
+  }
+});
+
+test("revocation at every live observation boundary preserves all subsequent promotion state", {}, async (t) => {
+  let observations = 0;
+  const baselineRoot = await mkdtemp(path.join(os.tmpdir(),"hosted-fence-baseline-"));
+  try {
+    const f = await hostedFenceFixture(baselineRoot);
+    const result = await f.execute();
+    assert.equal(result.projects[0].status,"pr_ready",result.projects[0].output);
+    observations = f.hosted.stats.observations;
+    assert.ok(observations >= 6,"exercise acquisition, renewal, recovery and final admission");
+  } finally {await cleanupHostedPromotionFixtures();await rm(baselineRoot,{recursive:true,force:true});}
+  for (let at = 1; at <= observations; at++) {
+    await t.test(`revoke before signed observation ${at}/${observations}`, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(),"hosted-fence-race-"));
+      try {
+        const f = await hostedFenceFixture(root);
+        let revokedSnapshot;
+        f.hosted.stats.beforeResponse = () => {
+          if (f.hosted.stats.observations !== at) return;
+          f.changeCandidate(c => {c.hostedRc.generation += 1; c.hostedRc.version += 1;});
+          revokedSnapshot = readPersistedState(root);
+        };
+        const result = await f.execute();
+        assert.ok(revokedSnapshot,"the injected authority change must execute");
+        assert.notEqual(result.projects[0].status,"pr_ready");
+        assert.deepEqual(readPersistedState(root),revokedSnapshot,"revocation must prevent renewal, recovery, reconciliation, terminal, task and event writes");
+      } finally {await cleanupHostedPromotionFixtures(); await rm(root,{recursive:true,force:true});}
+    });
+  }
+});
+
+test("revocation during persisted PR reconciliation preserves claims and task history", {}, async (t) => {
+  let observations = 0;
+  const baselineRoot = await mkdtemp(path.join(os.tmpdir(),"hosted-fence-baseline-"));
+  try {
+    const f = await hostedFenceFixture(baselineRoot);
+    await f.execute();
+    f.hosted.stats.observations = 0;
+    const result = await f.execute();
+    assert.equal(result.projects[0].status,"pending",result.projects[0].output);
+    observations = f.hosted.stats.observations;
+    assert.ok(observations >= 4,"exercise reconciliation acquisition, renewal and final admission");
+  } finally {await cleanupHostedPromotionFixtures();await rm(baselineRoot,{recursive:true,force:true});}
+  for (let at = 1; at <= observations; at++) {
+    await t.test(`revoke before signed observation ${at}/${observations}`, async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(),"hosted-fence-race-"));
+      try {
+        const f = await hostedFenceFixture(root);
+        await f.execute();
+        f.hosted.stats.observations = 0;
+        let revokedSnapshot;
+        f.hosted.stats.beforeResponse = () => {
+          if (f.hosted.stats.observations !== at) return;
+          f.changeCandidate(c => {c.hostedRc.generation += 1; c.hostedRc.version += 1;});
+          revokedSnapshot = readPersistedState(root);
+        };
+        const result = await f.execute();
+        assert.ok(revokedSnapshot,"the injected authority change must execute");
+        assert.notEqual(result.projects[0].status,"pending");
+        assert.deepEqual(readPersistedState(root),revokedSnapshot,"revocation must prevent renewal, recovery, reconciliation, terminal, task and event writes");
+      } finally {await cleanupHostedPromotionFixtures(); await rm(root,{recursive:true,force:true});}
+    });
   }
 });
