@@ -2763,3 +2763,116 @@ test("SQLite archives excess machine QA history without compacting human comment
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("hosted RC persistence fences writes, preserves legacy history, survives restart and revokes without reopening tasks", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-hosted-rc-state-"));
+  const fixtureUrl = pathToFileURL(path.join(process.cwd(), "test/hosted-rc-evidence.test.js")).href;
+  const authorityUrl = pathToFileURL(path.join(process.cwd(), "src/release-qualification.js")).href;
+  const common = `
+    import assert from 'node:assert/strict';
+    import { DatabaseSync } from 'node:sqlite';
+    import { hostedRcFixture } from ${JSON.stringify(fixtureUrl)};
+    import { createReleaseQualificationAuthority } from ${JSON.stringify(authorityUrl)};
+    import * as store from ${JSON.stringify(storeModuleUrl)};
+    import { DATABASE_FILE } from ${JSON.stringify(stateDatabaseModuleUrl)};
+    const f = hostedRcFixture();
+  `;
+  try {
+    await writeLegacyState(root);
+    const { stdout } = await runStoreScript(root, `${common}
+      await store.readState();
+      const { createCandidateEnvelope } = await import(${JSON.stringify(candidateManifestModuleUrl)});
+      const reviews = f.context.currentReviews.map(r=>({id:r.id,taskId:'task_1',projectId:'project_1',stageKey:r.role,
+        role:r.role+'-reviewer',candidateCycle:1,subjectSha:r.subjectSha,outcome:'approved',author:r.actorId,createdAt:'2026-09-06T01:00:00.000Z'}));
+      const candidate = createCandidateEnvelope({qaBundleId:'qa_bundle_1',createdAt:'2026-09-06T01:30:00.000Z',manifest:{
+        candidateId:'candidate_1',projectId:'project_1',base:{branch:'main',sha:'a'.repeat(40)},
+        sources:[{taskId:'task_1',sourceRef:'refs/heads/codex/fixture',headSha:'b'.repeat(40),candidateCycle:1,
+          reviews:reviews.map(r=>({...r,reviewedAt:r.createdAt}))}],
+        integration:{branch:'qa/fixture',sha:'c'.repeat(40)},checks:[{id:'check_1',kind:'local-validation',name:'fixture',outcome:'passed',subjectSha:'c'.repeat(40),evidenceDigest:f.digest('check')}],
+        preview:{url:'http://127.0.0.1:4174/',status:'healthy',commitSha:'c'.repeat(40),verifiedAt:'2026-09-06T01:30:00.000Z',attestation:{kind:'header',key:'commit',observedSha:'c'.repeat(40)}},
+        assembly:{mode:'atomic',requestedTaskIds:['task_1'],includedTaskIds:['task_1'],excludedTaskIds:[]}}});
+      // Hermetic fixture for an already-frozen and owner-decided candidate. No product raw SQL adapter.
+      candidate.qaPacket={packetDigest:f.context.ownerPacketDigest};
+      candidate.qaDecision={outcome:'passed',candidateId:candidate.id,ownerQaPacketDigest:f.context.ownerPacketDigest};
+      const db = new DatabaseSync(DATABASE_FILE);
+      db.prepare('INSERT INTO candidates(id,sequence,project_id,status,manifest_digest,payload) VALUES (?,?,?,?,?,?)')
+        .run(candidate.id,1,candidate.projectId,candidate.status,candidate.manifestDigest,JSON.stringify(candidate));
+      for (const [i,r] of reviews.entries()) db.prepare('INSERT INTO reviews(id,sequence,task_id,outcome,payload) VALUES (?,?,?,?,?)').run(r.id,i,'task_1','approved',JSON.stringify(r));
+      db.close();
+      f.input.evidence.binding.manifestDigest=candidate.manifestDigest; f.context.binding=structuredClone(f.input.evidence.binding);
+      f.context.currentReviews=f.context.currentReviews.map(r=>({...r,evidenceDigest:f.digest('placeholder')}));
+      const { hostedRcDigest } = await import(${JSON.stringify(pathToFileURL(path.join(process.cwd(), 'src/hosted-rc-evidence.js')).href)});
+      f.context.currentReviews=f.context.currentReviews.map(r=>({...r,evidenceDigest:hostedRcDigest(reviews.find(row=>row.id===r.id))}));
+      f.context.decisionDigest=hostedRcDigest(candidate.qaDecision); f.seal();
+      const authority=createReleaseQualificationAuthority(()=>f.context);
+      assert.equal((await store.getCurrentReleaseQualification('project_1','candidate_1')).reason,'qualification_missing');
+      const policy=await store.recordReleaseQaPolicy({projectId:'project_1',expectedVersion:0,policy:f.context.policy,proof:f.context.policyProof},authority);
+      assert.equal(policy.queryCount,2);
+      const policyAgain=await store.recordReleaseQaPolicy({projectId:'project_1',expectedVersion:1,policy:f.context.policy,proof:f.context.policyProof},authority);
+      assert.equal(policyAgain.idempotent,true); assert.equal(policyAgain.version,1);
+      const append={projectId:'project_1',candidateId:'candidate_1',expectedVersion:0,...f.input};
+      const admitted=await store.appendHostedRcEvidence(append,authority);
+      assert.equal(admitted.queryCount,4); assert.equal(admitted.version,1);
+      await assert.rejects(store.appendHostedRcEvidence(append,authority),{code:'state_conflict'});
+      const duplicate=await store.appendHostedRcEvidence({...append,expectedVersion:1},authority);
+      assert.equal(duplicate.idempotent,true); assert.equal(duplicate.version,1);
+      const writeStart=performance.now();
+      const q=await store.recordReleaseQualification({projectId:'project_1',candidateId:'candidate_1',expectedVersion:1,evidenceDigest:admitted.evidenceDigest},authority);
+      const qualificationWriteMs=performance.now()-writeStart;
+      assert.equal(q.version,2);
+      f.context.now='2026-09-06T02:01:01.000Z';
+      const retriedQualification=await store.recordReleaseQualification({projectId:'project_1',candidateId:'candidate_1',expectedVersion:2,evidenceDigest:admitted.evidenceDigest},authority);
+      assert.equal(retriedQualification.idempotent,true); assert.equal(retriedQualification.version,2);
+      assert.deepEqual(retriedQualification.qualification,q.qualification);
+      const readStart=performance.now();
+      const view=await store.getCurrentReleaseQualification('project_1','candidate_1',{nowMs:Date.parse(f.context.now)});
+      const qualificationReadMs=performance.now()-readStart;
+      assert.equal(view.reason,'qualified'); assert.equal(view.queryCount,3);
+      const list=await store.listHostedRcEvidence('project_1','candidate_1',{limit:1});
+      assert.equal(list.items.length,1); assert.equal(list.items[0].evidence,undefined); assert.equal(list.nextOffset,null);
+      await assert.rejects(store.listHostedRcEvidence('project_1','candidate_1',{limit:51}),{code:'evidence_malformed'});
+      const before=await store.readState();
+      assert.ok(before.candidates[0].hostedRc.qualifications[0].reviewState.every(r=>Object.keys(r).sort().join(',')==='id,payloadDigest'));
+      await assert.rejects(store.mutateState(s=>{s.candidates[0].hostedRc.generation=99}),{code:'authority_required'});
+      await assert.rejects(store.writeState({...before,projects:before.projects.map(p=>({...p,hostedRc:{version:99}}))}),{code:'authority_required'});
+      for (let index=0;index<52;index++) {
+        f.input.evidence.evidenceDigests=[f.digest('evidence-page-'+index)]; f.seal();
+        await store.appendHostedRcEvidence({...append,...f.input,expectedVersion:2+index},authority);
+      }
+      const pageStart=performance.now();
+      const page=await store.listHostedRcEvidence('project_1','candidate_1');
+      const summaryPageMs=performance.now()-pageStart;
+      assert.equal(page.items.length,50); assert.equal(page.nextOffset,50);
+      assert.equal((await store.listHostedRcEvidence('project_1','candidate_1',{offset:50})).items.length,3);
+      assert.ok(page.items.every(item=>!('evidence' in item)));
+      console.log(JSON.stringify({envelopeBytes:Buffer.byteLength(JSON.stringify(f.input.evidence)),writeQueryCount:q.queryCount,readQueryCount:view.queryCount,qualificationWriteMs,qualificationReadMs,summaryPageMs,summaryCount:page.items.length}));
+    `);
+    assert.match(stdout, /"writeQueryCount":4/);
+    t.diagnostic(stdout.trim());
+    const restarted = await runStoreScript(root, `${common}
+      const current=await store.getCurrentReleaseQualification('project_1','candidate_1',{nowMs:Date.parse(f.context.now)});
+      assert.equal(current.reason,'qualified'); assert.equal(current.version,54);
+      const authority=createReleaseQualificationAuthority(()=>f.context);
+      const payload={id:'revocation_1',projectId:'project_1',candidateId:'candidate_1',generation:1,reason:'owner_revoked',actorId:'release-owner',observedAt:f.context.now};
+      const input={projectId:'project_1',candidateId:'candidate_1',expectedVersion:54,payload,proof:f.proof('revocation',payload,'owner')};
+      const revoked=await store.invalidateReleaseQualification(input,authority);
+      assert.equal(revoked.generation,1); assert.equal(revoked.version,55);
+      assert.equal((await store.getCurrentReleaseQualification('project_1','candidate_1',{nowMs:Date.parse(f.context.now)})).reason,'revoked');
+      const again=await store.invalidateReleaseQualification({...input,expectedVersion:55},authority);
+      assert.equal(again.idempotent,true); assert.equal(again.version,55);
+      const state=await store.readState(); assert.equal(state.candidates[0].hostedRc.qualifications.length,1);
+      assert.equal(state.candidates[0].manifest.candidateId,'candidate_1');
+      assert.equal(state.tasks[0].status,'ready');
+      f.context.policy.revision=2; f.seal();
+      const policyInput={projectId:'project_1',expectedVersion:1,policy:f.context.policy,proof:f.context.policyProof};
+      const raced=await Promise.allSettled([store.recordReleaseQaPolicy(policyInput,authority),store.recordReleaseQaPolicy(policyInput,authority)]);
+      assert.equal(raced.filter(r=>r.status==='fulfilled').length,1);
+      assert.equal(raced.find(r=>r.status==='rejected').reason.code,'state_conflict');
+      const after=await store.readState();
+      assert.deepEqual(after.tasks,state.tasks); assert.deepEqual(after.candidates[0].manifest,state.candidates[0].manifest);
+      assert.equal(after.projects[0].hostedRc.policies.length,2);
+      console.log('restart-and-revocation-passed');
+    `);
+    assert.match(restarted.stdout, /restart-and-revocation-passed/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

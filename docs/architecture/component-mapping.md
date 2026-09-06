@@ -119,3 +119,130 @@ Set `STUDIOOPS_CONTEXT_RETRIEVAL=0` to disable worker attachment for rollback;
 normal component mapping and validation remain active. No embedding provider is
 enabled by default. The reproducible experiment and limits are documented in
 `repository-context-evaluation.md`.
+
+## Hosted RC authority v1 (task_1010)
+
+`qa-release` owns `hosted-rc-evidence.js` and `release-qualification.js` and
+all normalization, canonical SHA-256 digests and eligibility policy. These two
+modules import only Node crypto and one another; they perform no filesystem,
+provider, database, config-default, worker, promotion or runtime operations.
+`runtime-self-update -> qa-release` is the public consumer dependency.
+`workflow-state` implements an injected executable persistence port: its store
+functions accept a `createReleaseQualificationAuthority(resolveCurrentContext)`
+instance supplied by an approved composition adapter. State never imports the
+release component, preserving the component DAG and single policy owner.
+
+The exported normalizers are the executable DTO schemas; unknown fields are
+rejected, including metadata/pass/force/off/hash additions. Envelopes are at most
+64 KiB. IDs are bounded opaque references, never personal identity or secrets.
+Arrays normalize in deterministic lexical order; object keys sort canonically.
+Private logs/screenshots/snapshots remain outside SQLite by digest. No raw source,
+customer records, credentials, URLs containing credentials/query/fragment, or
+unrestricted evidence bodies belong in these DTOs. Snapshot access and retention
+are represented by opaque authorization IDs, policy digests and expiry; the
+collection adapter owns actual TTL deletion and access enforcement.
+
+`ReleaseQaPolicy v1` binds reviewed applicability, HTTPS origins, explicitly
+approved private origins, native distribution IDs, authorized snapshot source
+and modes, required normal-auth/device scenarios, independent review lanes,
+runtime/environment equivalence and age budgets. `HostedRcEvidence v1` binds
+project/repository/candidate/source/protected-integration/manifest/ownership,
+artifact/provenance/regression digests, environment/runtime identity, consistent
+snapshot/restore/authorization/retention, rehearsal/schema controls, isolated
+secrets/sessions/writes/jobs/outbound/providers/notifications/payments/devices,
+physical vs simulated acceptance, matching native backend, and producer/times.
+The v1 normalizer carries explicit runtime differences and migration evidence
+by digest; the trusted observer must independently verify these claims.
+
+Approved adapters supply the clock, current exact bindings, policy and key
+allowlists, approved producer/observer/owner IDs, production origins, current
+snapshot/deployment/migration/native coordinates, and live review/revocation and
+owner packet/decision coordinates in `context`. Never derive this context or
+key configuration from the evidence request. `hostedRcSigningBytes(kind,payload)`
+provides domain-separated bytes for Ed25519 proofs `{keyId,signature}`. Producer,
+policy, current observation and owner decision each require a valid proof from
+the configured channel. The independent observer must use a different ID and
+key from the producer, verify current served identity and actual isolation/data/
+device evidence, classify resolved network addresses, and reject redirect or
+production endpoint substitution. Pure code cannot perform that observation or
+authenticate transport by itself. No production private keys enter the pure
+API. C owns authenticated transport and observation adapters; D owns fresh
+preactivation checks. General approvals and caller-supplied booleans/hashes have
+no qualification authority.
+
+`evaluateReleaseQaApplicability` returns `applicable:null` for unknown or
+unverified classification. Reviewed non-deployable projects require signed
+policy and matching trusted project classification/reviewer coordinates; they
+receive an applicability result, never a fabricated hosted receipt. Applicable
+projects always use `assertHostedRcEvidence` and
+`evaluateReleaseQualification`/`assertReleaseQualification`.
+
+`releaseQualificationInputs` canonically binds evidence/policy/frozen candidate,
+per-task source SHA and exact-cycle review coordinates and revocation generation before the owner
+packet/decision is created. The decision observation binds this inputs digest
+and the approved packet/decision digests. `ReleaseQualification v1` is a separate
+immutable receipt binding all those coordinates plus fresh observation and
+expiry. Packet construction must never include the final receipt digest.
+
+Public store contracts (input and executable authority are separate arguments):
+
+- `recordReleaseQaPolicy({projectId,expectedVersion,policy,proof}, authority)`
+- `appendHostedRcEvidence({projectId,candidateId,expectedVersion,evidence,proof}, authority)`
+- `recordReleaseQualification({projectId,candidateId,expectedVersion,evidenceDigest}, authority)`
+- `invalidateReleaseQualification({projectId,candidateId,expectedVersion,payload,proof}, authority)`;
+  signed revocation payload carries id/project/candidate/next generation, actor,
+  observedAt and one of owner_revoked/policy_changed/review_changed/
+  evidence_revoked/environment_changed.
+- `getReleaseQaPolicy(projectId)`, `getHostedRcEvidence(projectId,candidateId,digest)`,
+  `listHostedRcEvidence(projectId,candidateId,{offset,limit})` (1–50 summaries),
+  `getCurrentReleaseQualification(projectId,candidateId)` (display/query only).
+
+`resolveCurrentContext(coordinates)` is synchronous and called under the
+transaction for writes. Coordinates include current project, candidate,
+protected hosted record and exact persisted source-review rows. Trusted context.reviewSubjects contains each
+manifest source taskId/headSha/candidateCycle as taskId/subjectSha/cycle; distinct
+source SHAs and cycles in a composed candidate remain distinct. Approved IO
+adapters prepare authenticated observations outside the write transaction, then
+resolve current authority using these rows. `qualify` checks each signed review
+coordinate against its stored row digest, stage, SHA, cycle and non-revocation;
+store also checks actual persisted owner packet/decision and active policy.
+Hosted metadata retains only hashes of review rows, never copies of review prose
+or source excerpts.
+External adapters must not import/use the internal SQLite mutation port or raw
+SQL. Missing authority is a hard error; no default permissive adapter exists.
+
+Persistence adds `projects.hostedRc` policy history and `candidates.hostedRc`
+evidence/receipt/audit history to existing JSON aggregates. Absence means version
+zero with no authority. Old manifests, local preview/check evidence, task states
+and historical approvals retain their original meaning. No table, database,
+queue or cache is added. Point reads use existing primary keys; candidate writes
+read only state-meta, project, candidate and bounded exact source reviews (at
+most four SELECTs). BEGIN IMMEDIATE plus expectedVersion fences writes; rejected
+or duplicate operations do not advance aggregate versions. Retry duplicates
+with the current version; stale versions fail. Histories are append-only through
+the facade, bounded to 128 entries per list and 16 MiB total. Capacity exhaustion
+blocks (`history_limit`); retention must preserve active audit references before
+a future reviewed archival extension. General aggregate writers cannot inject,
+replace or delete hosted authority. Candidate receipts do not reopen tasks.
+Policy changes invalidate current release authority via active digest/generation,
+while preserving history. Revocation is generation-bound and idempotent.
+
+Reads return historical digests but no current receipt after expiry, changed
+policy/review records, candidate invalidation or revocation. These display APIs
+are not production activation authority: the runtime must call the pure
+qualification evaluator with a fresh observation and recheck under its existing
+lease immediately before mutation. Restoring old code must retain additive
+history and hold production while the new gate is unavailable; rollback cannot
+turn local or legacy evidence into hosted approval.
+
+The manifest reserves `hosted-rc-adoption.test.js` to scheduling-dispatch,
+`hosted-rc-adapters.test.js` to qa-release and `hosted-rc-runtime.test.js` to
+runtime-self-update. Those builders add their commands when delivering the tests;
+A's executable commands contain only present tests. The bundled standard belongs
+to scheduling-dispatch and the installer to runtime-self-update. Existing CLI/
+rendering/deploy adapters remain sibling work; this authority prerequisite does
+not claim hosted collection, UI, runtime enforcement or production activation.
+Full regression is mandatory for these public-contract/schema/authorization/
+manifest/deployment and multi-component changes. New tests cover canonical and
+signed valid/invalid evidence, receipt hash separation, persistence/restart/CAS,
+legacy unqualified state, revocation and manifest ownership/pure import guards.

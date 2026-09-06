@@ -1999,6 +1999,7 @@ function assertMergedPromotionRecoveryTransitions(state, snapshot, options = {})
 }
 
 function assertProposedQaAuthorityPreserved(state, snapshot, options = {}) {
+  assertHostedRcProtectedState(state, snapshot);
   const candidates = new Map((state.candidates || []).map((candidate) => [candidate.id, candidate]));
   for (const [id, previous] of snapshot.tables.candidates) {
     const candidate = candidates.get(id);
@@ -3586,4 +3587,82 @@ export async function backupStateDatabase(destination = "") {
   await withStateDatabaseConnection((db) => backup(db, outputPath), { operationName: "state.backup" });
   await chmod(outputPath, 0o600);
   return outputPath;
+}
+
+// Hosted RC records are additive metadata on existing indexed aggregates. Absence is
+// version zero and grants no authority; legacy candidate manifests are never rewritten.
+function hostedRcStorageError(code) {
+  const error = new Error(code); error.code = code; return error;
+}
+function assertHostedRcProtectedState(state, snapshot) {
+  for (const table of ["projects", "candidates"]) {
+    for (const item of state[table] || []) {
+      const prior = snapshot.tables[table].get(item.id);
+      const previous = prior ? JSON.parse(prior.payload).hostedRc : undefined;
+      if (JSON.stringify(previous) !== JSON.stringify(item.hostedRc)) {
+        throw hostedRcStorageError("authority_required");
+      }
+    }
+    for (const [id, row] of snapshot.tables[table]) {
+      if (JSON.parse(row.payload).hostedRc && !(state[table] || []).some((item) => item.id === id)) {
+        throw hostedRcStorageError("authority_required");
+      }
+    }
+  }
+}
+
+/** Internal persistence port; only workflow-state's hosted RC adapter supplies mutator. No network IO in a transaction. */
+export async function mutateHostedRcAggregate(input, mutator) {
+  if (!input || typeof input.projectId !== "string" || !Number.isSafeInteger(input.expectedVersion)
+    || input.expectedVersion < 0 || typeof mutator !== "function") throw hostedRcStorageError("state_conflict");
+  return withStateDatabaseConnection((db) => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const meta = db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get();
+      assertMaintenanceWriteAllowed({ meta: parsePayload(meta?.payload, {}) });
+      const project = parsePayload(db.prepare("SELECT payload FROM projects WHERE id = ?").get(input.projectId)?.payload, null);
+      if (!project) throw hostedRcStorageError("project_mismatch");
+      const candidate = input.candidateId ? parsePayload(db.prepare(
+        "SELECT payload FROM candidates WHERE id = ? AND project_id = ?",
+      ).get(input.candidateId, input.projectId)?.payload, null) : null;
+      if (input.candidateId && !candidate) throw hostedRcStorageError("candidate_mismatch");
+      const aggregate = candidate || project;
+      const previous = aggregate.hostedRc || null;
+      if ((previous?.version || 0) !== input.expectedVersion) throw hostedRcStorageError("state_conflict");
+      const reviewIds = [...new Set((candidate?.manifest?.sources || []).flatMap((s) => (s.reviews || []).map((r) => r.id)))];
+      if (reviewIds.length > 128) throw hostedRcStorageError("history_limit");
+      const reviews = reviewIds.length ? db.prepare(`SELECT payload FROM reviews WHERE id IN (${reviewIds.map(() => "?").join(",")}) ORDER BY id`)
+        .all(...reviewIds).map((r) => parsePayload(r.payload, null)) : [];
+      const result = mutator({ project: structuredClone(project), candidate: structuredClone(candidate),
+        reviews, record: structuredClone(previous) });
+      if (!result || typeof result.then === "function") throw hostedRcStorageError("authority_required");
+      if (JSON.stringify(result.record) !== JSON.stringify(previous)) {
+        if (!result.record || result.record.version !== input.expectedVersion + 1
+          || Buffer.byteLength(JSON.stringify(result.record)) > 16 * 1024 * 1024) throw hostedRcStorageError("history_limit");
+        aggregate.hostedRc = result.record;
+        const table = candidate ? "candidates" : "projects";
+        db.prepare(`UPDATE ${table} SET payload = ? WHERE id = ?`).run(JSON.stringify(aggregate), aggregate.id);
+        db.prepare("UPDATE state_meta SET version = version + 1 WHERE singleton_id = 1").run();
+      }
+      db.exec("COMMIT");
+      return { ...result.value, version: result.record?.version || 0,
+        queryCount: (candidate ? 3 : 2) + (reviewIds.length ? 1 : 0) };
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  }, { operationName: "hosted_rc.fenced_aggregate" });
+}
+
+/** Point lookup, not a full-board state load. Payloads stay behind workflow-state APIs. */
+export async function readHostedRcAggregate(projectId, candidateId = "", includeReviews = false) {
+  return withStateDatabaseRead((db) => {
+    const project = parsePayload(db.prepare("SELECT payload FROM projects WHERE id = ?").get(projectId)?.payload, null);
+    if (!project) throw hostedRcStorageError("project_mismatch");
+    const candidate = candidateId ? parsePayload(db.prepare("SELECT payload FROM candidates WHERE id = ? AND project_id = ?")
+      .get(candidateId, projectId)?.payload, null) : null;
+    if (candidateId && !candidate) throw hostedRcStorageError("candidate_mismatch");
+    const reviewIds = includeReviews ? [...new Set((candidate?.manifest?.sources || []).flatMap((s) => (s.reviews || []).map((r) => r.id)))].sort() : [];
+    if (reviewIds.length > 128) throw hostedRcStorageError("history_limit");
+    const reviews = reviewIds.length ? db.prepare(`SELECT payload FROM reviews WHERE id IN (${reviewIds.map(() => "?").join(",")}) ORDER BY id`)
+      .all(...reviewIds).map((r) => parsePayload(r.payload, null)) : [];
+    return { project, candidate, reviews, queryCount: (candidateId ? 2 : 1) + (reviewIds.length ? 1 : 0) };
+  });
 }
