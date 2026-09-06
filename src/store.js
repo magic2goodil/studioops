@@ -3267,6 +3267,7 @@ function invalidateCandidateQaAuthorityInState(state, candidate, tasks, input, s
     mergeCommit: String(input.promotionSettlement.mergeCommit || ""),
     mergedAt: String(input.promotionSettlement.mergedAt || ""),
   } : null;
+  // Revoking obsolete release authority must not reopen independently terminalized work.
   const terminalTasks = tasks.filter((task) => TASK_TERMINAL_STATUSES.has(task.status));
   const planned = tasks.filter((task) => !TASK_TERMINAL_STATUSES.has(task.status)).map((task) => {
     const evidence = lifecycleEvidenceForTask(state, task, "needs_changes", {
