@@ -69,6 +69,133 @@ function baseState() {
   };
 }
 
+function compactedMergedHistory() {
+  const state = baseState();
+  state.tasks[0].status = "done";
+  const at = "2026-09-04T12:00:00.000Z";
+  const candidate = createCandidateEnvelope({
+    qaBundleId: "qa_bundle_history", createdAt: at,
+    manifest: {
+      candidateId: "candidate_history", projectId: "project_1",
+      base: { branch: "main", sha: "a".repeat(40) },
+      sources: [{ taskId: "task_1", sourceRef: "refs/heads/codex/history",
+        headSha: "b".repeat(40), candidateCycle: 1,
+        reviews: [{ id: "review_history", stageKey: "lead", role: "lead-reviewer",
+          outcome: "approved", subjectSha: "b".repeat(40), candidateCycle: 1, reviewedAt: at }] }],
+      integration: { branch: "qa/history", sha: "c".repeat(40) },
+      checks: [{ id: "check_history", kind: "local-validation", name: "npm test",
+        outcome: "passed", subjectSha: "c".repeat(40), evidenceDigest: `sha256:${"d".repeat(64)}` }],
+      preview: { url: "http://127.0.0.1:4174/", status: "healthy", commitSha: "c".repeat(40),
+        verifiedAt: at, attestation: { kind: "json", key: "commitSha", observedSha: "c".repeat(40) } },
+      assembly: { mode: "atomic", requestedTaskIds: ["task_1"], includedTaskIds: ["task_1"], excludedTaskIds: [] },
+    },
+  });
+  state.reviews = [{ ...candidate.manifest.sources[0].reviews[0], taskId: "task_1", createdAt: at }];
+  const bundle = {
+    id: candidate.qaBundleId, projectId: candidate.projectId, candidateId: candidate.id,
+    manifestDigest: candidate.manifestDigest, integrationBranch: candidate.manifest.integration.branch,
+    integrationCommit: candidate.manifest.integration.sha, previewUrl: candidate.manifest.preview.url,
+    status: "ready", tasks: [{ id: "task_1", title: state.tasks[0].title }],
+  };
+  state.candidates = [candidate];
+  state.qaBundles = [bundle];
+  const packet = buildOwnerQaPacket(state, candidate, { bundle, generatedAt: at });
+  candidate.qaPacket = packet;
+  bundle.qaPacket = structuredClone(packet);
+  bundle.packetDigest = packet.packetDigest;
+  candidate.qaDecision = {
+    outcome: "passed", candidateId: candidate.id, manifestDigest: candidate.manifestDigest,
+    integrationSha: candidate.manifest.integration.sha, ownerQaPacketDigest: packet.packetDigest,
+    taskIds: ["task_1"], repositoryVerifiedAt: at, author: "Historical owner", notes: "Historical approval", decidedAt: at,
+  };
+  bundle.qaDecision = structuredClone(candidate.qaDecision);
+  candidate.promotion = {
+    branch: "qa/history", prUrl: "https://github.com/example/demo/pull/1",
+    commitSha: candidate.manifest.integration.sha, manifestDigest: candidate.manifestDigest, readyAt: at,
+  };
+  candidate.promotionMerge = { mergeCommit: "e".repeat(40), mergedAt: at, reconciledAt: at };
+  Object.assign(bundle, {
+    status: "merged", promotionBranch: candidate.promotion.branch, promotionPrUrl: candidate.promotion.prUrl,
+    promotionCommit: candidate.promotion.commitSha, promotionReadyAt: at, promotedTaskIds: ["task_1"],
+    promotionMergedAt: at, promotionMergeCommit: candidate.promotionMerge.mergeCommit, tasks: [],
+  });
+  candidate.status = "merged";
+  return structuredClone(state);
+}
+
+async function seedCompactedHistory(root, state) {
+  // Reproduce pre-existing storage, not a newly authorized candidate. Normal
+  // writers intentionally cannot create a candidate with historical authority.
+  const initial = baseState(); initial.tasks[0].status = "done";
+  await writeLegacyState(root, initial);
+  await runStoreScript(root, `import { readState } from ${JSON.stringify(storeModuleUrl)}; await readState();`);
+  const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"));
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    for (const [table, rows] of [["candidates", state.candidates], ["qa_bundles", state.qaBundles], ["reviews", state.reviews]]) {
+      for (const [index, row] of rows.entries()) {
+        db.prepare(`INSERT INTO ${table} (id, sequence, payload) VALUES (?, ?, ?)`)
+          .run(row.id, index, JSON.stringify(row));
+      }
+    }
+    db.exec("COMMIT");
+  } finally { db.close(); }
+}
+
+test("compacted merged history permits unrelated writes without changing historical authority", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-merged-history-"));
+  try {
+    const state = compactedMergedHistory();
+    await seedCompactedHistory(root, state);
+    await runStoreScript(root, `import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      await mutateState(state => { state.meta.historyRepairProbe = true; });`);
+    const after = readPersistedState(root);
+    assert.equal(after.meta.historyRepairProbe, true);
+    assert.deepEqual(after.candidates, state.candidates);
+    assert.deepEqual(after.qaBundles, state.qaBundles);
+    assert.deepEqual(after.reviews, state.reviews);
+    assert.equal(after.tasks[0].status, "done");
+    for (const mutation of [
+      'state.candidates[0].status = "qa_passed"',
+      'state.candidates[0].qaDecision.notes = "new approval"',
+      'state.qaBundles[0].tasks = [{id:"task_1"}]',
+      'state.qaBundles[0].qaPacket.tasks[0].title = "rewritten"',
+      'state.qaBundles[0].promotionMergeCommit = "f".repeat(40)',
+    ]) {
+      await assert.rejects(() => runStoreScript(root, `import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState(state => { ${mutation}; });`));
+      const unchanged = readPersistedState(root);
+      assert.deepEqual(unchanged.candidates, after.candidates);
+      assert.deepEqual(unchanged.qaBundles, after.qaBundles);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("compacted history does not excuse active, tampered, or incomplete QA evidence", async () => {
+  const cases = [
+    state => { state.candidates[0].status = "frozen"; },
+    state => { state.qaBundles[0].status = "ready"; },
+    state => { state.qaBundles[0].tasks = [{ id: "wrong_task" }]; },
+    state => { delete state.qaBundles[0].tasks; },
+    state => { delete state.candidates[0].promotionMerge; },
+    state => { state.qaBundles[0].promotionMergeCommit = "f".repeat(40); },
+    state => { state.qaBundles[0].qaDecision.notes = "changed"; },
+    state => { state.candidates[0].qaPacket.tasks[0].title = "changed";
+      state.qaBundles[0].qaPacket = structuredClone(state.candidates[0].qaPacket); },
+    state => { state.qaBundles[0].packetDigest = `sha256:${"f".repeat(64)}`; },
+  ];
+  for (const change of cases) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-rejected-history-"));
+    try {
+      const state = compactedMergedHistory(); change(state);
+      await seedCompactedHistory(root, state);
+      await assert.rejects(() => runStoreScript(root, `import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+        await mutateState(state => { state.meta.shouldNotCommit = true; });`),
+      /owner QA packet|owner packet|packet digest|authority|candidate identity|mirror|bundle identity/i);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
 test("terminal run retention preserves configured attempt-budget evidence", () => {
   const state = baseState();
   state.runs = Array.from({ length: 7 }, (_, index) => ({
