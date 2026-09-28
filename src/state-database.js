@@ -1517,6 +1517,58 @@ function exactIntegrityMigrationPreservation(state, candidate, bundle, options =
   ));
 }
 
+/**
+ * Older retention passes emptied summaries on already-merged bundles. Validate
+ * that terminal history against its frozen packet, without rewriting storage or
+ * granting it fresh QA/promotion authority. All packet digest/identity checks and
+ * append-only lifecycle guards still run. Active or incomplete history gets no
+ * compatibility treatment.
+ */
+function historicalOwnerQaBundle(candidate, bundle) {
+  if (
+    candidate.status !== "merged" || bundle?.status !== "merged"
+    || !Array.isArray(bundle.tasks) || bundle.tasks.length !== 0
+    || candidate.qaPacket?.schemaVersion !== "studioops.owner-qa-packet.v2"
+  ) return bundle;
+  const packet = candidate.qaPacket;
+  const decision = candidate.qaDecision;
+  const promotion = candidate.promotion;
+  const merge = candidate.promotionMerge;
+  const taskIds = candidate.manifest.sources.map((source) => source.taskId).sort();
+  if (
+    !taskIds.length
+    || decision?.outcome !== "passed"
+    || typeof decision.author !== "string" || !decision.author.trim()
+    || !exactIsoTimestamp(decision.decidedAt)
+    || !exactIsoTimestamp(decision.repositoryVerifiedAt)
+    || decision.candidateId !== candidate.id
+    || decision.manifestDigest !== candidate.manifestDigest
+    || decision.integrationSha !== candidate.manifest.integration.sha
+    || decision.ownerQaPacketDigest !== packet.packetDigest
+    || canonicalJson(decision.taskIds) !== canonicalJson(taskIds)
+    || canonicalJson(bundle.qaDecision) !== canonicalJson(decision)
+    || !promotion || promotion.manifestDigest !== candidate.manifestDigest
+    || typeof promotion.branch !== "string" || !promotion.branch.trim()
+    || !/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/[1-9]\d*$/.test(promotion.prUrl || "")
+    || promotion.commitSha !== candidate.manifest.integration.sha
+    || bundle.promotionCommit !== promotion.commitSha
+    || bundle.promotionBranch !== promotion.branch
+    || bundle.promotionPrUrl !== promotion.prUrl
+    || !exactIsoTimestamp(promotion.readyAt)
+    || bundle.promotionReadyAt !== promotion.readyAt
+    || canonicalJson([...(bundle.promotedTaskIds || [])].sort()) !== canonicalJson(taskIds)
+    || !merge || !/^[a-f0-9]{40}$/.test(merge.mergeCommit || "")
+    || !exactIsoTimestamp(merge.mergedAt)
+    || !exactIsoTimestamp(merge.reconciledAt)
+    || bundle.promotionMergeCommit !== merge.mergeCommit
+    || bundle.promotionMergedAt !== merge.mergedAt
+    || canonicalJson(packet) !== canonicalJson(bundle.qaPacket)
+    || bundle.packetDigest !== packet.packetDigest
+  ) return bundle;
+  // This temporary view never escapes validation and is never persisted.
+  return { ...bundle, tasks: packet.tasks };
+}
+
 function assertOwnerQaPacketMirrors(state, options = {}) {
   const candidatesById = new Map((state.candidates || []).map((candidate) => [candidate.id, candidate]));
   const bundlesById = new Map((state.qaBundles || []).map((bundle) => [bundle.id, bundle]));
@@ -1529,7 +1581,7 @@ function assertOwnerQaPacketMirrors(state, options = {}) {
     if (candidate.invalidation) continue;
     const bundle = bundlesById.get(candidate.qaBundleId);
     if (!bundle) throw new Error(`Candidate ${candidate.id} owner QA packet has no immutable bundle.`);
-    const packet = assertOwnerQaPacket(candidate.qaPacket, candidate, bundle);
+    const packet = assertOwnerQaPacket(candidate.qaPacket, candidate, historicalOwnerQaBundle(candidate, bundle));
     if (
       bundle.packetDigest !== packet.packetDigest
       || JSON.stringify(bundle.qaPacket) !== JSON.stringify(packet)
@@ -1622,7 +1674,7 @@ function assertOwnerQaPacketMirrors(state, options = {}) {
       throw new Error(`QA bundle ${bundle.id} owner packet has no matching candidate packet.`);
     }
     if (candidate.invalidation) continue;
-    const packet = assertOwnerQaPacket(bundle.qaPacket, candidate, bundle);
+    const packet = assertOwnerQaPacket(bundle.qaPacket, candidate, historicalOwnerQaBundle(candidate, bundle));
     if (
       candidate.qaPacket.packetDigest !== packet.packetDigest
       || bundle.packetDigest !== packet.packetDigest
