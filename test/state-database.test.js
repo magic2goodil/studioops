@@ -183,6 +183,15 @@ test("compacted history does not excuse active, tampered, or incomplete QA evide
     state => { state.candidates[0].qaPacket.tasks[0].title = "changed";
       state.qaBundles[0].qaPacket = structuredClone(state.candidates[0].qaPacket); },
     state => { state.qaBundles[0].packetDigest = `sha256:${"f".repeat(64)}`; },
+    ...["author", "decidedAt", "repositoryVerifiedAt"].map(field => state => {
+      delete state.candidates[0].qaDecision[field]; delete state.qaBundles[0].qaDecision[field];
+    }),
+    state => { state.candidates[0].qaDecision.author = " "; state.qaBundles[0].qaDecision.author = " "; },
+    ...[["branch", "promotionBranch"], ["prUrl", "promotionPrUrl"]].map(([field, mirror]) => state => {
+      delete state.candidates[0].promotion[field]; delete state.qaBundles[0][mirror];
+    }),
+    state => { state.candidates[0].promotion.prUrl = "not-a-pr"; state.qaBundles[0].promotionPrUrl = "not-a-pr"; },
+    state => { delete state.candidates[0].promotionMerge.reconciledAt; },
   ];
   for (const change of cases) {
     const root = await mkdtemp(path.join(os.tmpdir(), "studioops-rejected-history-"));

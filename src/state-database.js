@@ -1538,6 +1538,9 @@ function historicalOwnerQaBundle(candidate, bundle) {
   if (
     !taskIds.length
     || decision?.outcome !== "passed"
+    || typeof decision.author !== "string" || !decision.author.trim()
+    || !exactIsoTimestamp(decision.decidedAt)
+    || !exactIsoTimestamp(decision.repositoryVerifiedAt)
     || decision.candidateId !== candidate.id
     || decision.manifestDigest !== candidate.manifestDigest
     || decision.integrationSha !== candidate.manifest.integration.sha
@@ -1545,6 +1548,8 @@ function historicalOwnerQaBundle(candidate, bundle) {
     || canonicalJson(decision.taskIds) !== canonicalJson(taskIds)
     || canonicalJson(bundle.qaDecision) !== canonicalJson(decision)
     || !promotion || promotion.manifestDigest !== candidate.manifestDigest
+    || typeof promotion.branch !== "string" || !promotion.branch.trim()
+    || !/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/[1-9]\d*$/.test(promotion.prUrl || "")
     || promotion.commitSha !== candidate.manifest.integration.sha
     || bundle.promotionCommit !== promotion.commitSha
     || bundle.promotionBranch !== promotion.branch
@@ -1554,6 +1559,7 @@ function historicalOwnerQaBundle(candidate, bundle) {
     || canonicalJson([...(bundle.promotedTaskIds || [])].sort()) !== canonicalJson(taskIds)
     || !merge || !/^[a-f0-9]{40}$/.test(merge.mergeCommit || "")
     || !exactIsoTimestamp(merge.mergedAt)
+    || !exactIsoTimestamp(merge.reconciledAt)
     || bundle.promotionMergeCommit !== merge.mergeCommit
     || bundle.promotionMergedAt !== merge.mergedAt
     || canonicalJson(packet) !== canonicalJson(bundle.qaPacket)
