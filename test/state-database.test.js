@@ -998,7 +998,7 @@ test("concurrent worker processes serialize updates without dropping comments", 
   }
 });
 
-test("conflicting idempotent mutations finish through serialized replay", async () => {
+test("conflicting idempotent mutations finish through optimistic replay", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-serialized-replay-"));
   try {
     await writeLegacyState(root);
@@ -1024,9 +1024,9 @@ test("conflicting idempotent mutations finish through serialized replay", async 
         WHERE operation_name LIKE 'test.serialized_replay_%'
       `).all();
       assert.equal(timings.length, 4);
-      assert.equal(timings.some((timing) => timing.outcome === "serialized_replay"), true);
+      assert.equal(timings.some((timing) => timing.outcome === "optimistic_replay"), true);
       assert.equal(
-        timings.every((timing) => timing.outcome !== "serialized_replay" || Number(timing.retry_count) >= 1),
+        timings.every((timing) => timing.outcome !== "optimistic_replay" || Number(timing.retry_count) >= 1),
         true,
       );
       assert.equal(
@@ -1041,7 +1041,7 @@ test("conflicting idempotent mutations finish through serialized replay", async 
   }
 });
 
-test("same-process asynchronous mutations retain every update through serialized replay", async () => {
+test("same-process asynchronous mutations retain every update through optimistic replay", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-shared-connection-"));
   try {
     await writeLegacyState(root);
@@ -1061,13 +1061,13 @@ test("same-process asynchronous mutations retain every update through serialized
     const health = JSON.parse(stdout);
     assert.equal(health.successfulOperationCount, 4);
     assert.equal(health.failedOperationCount, 0);
-    assert.ok(health.recent.some((event) => event.outcome === "serialized_replay"));
+    assert.ok(health.recent.some((event) => event.outcome === "optimistic_replay"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("async replay permits committed reads and queues unrelated coordination and state writers", async () => {
+test("slow replay leaves the writer free and rebases after unrelated commits", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-replay-consumers-"));
   try {
     await writeLegacyState(root);
@@ -1101,18 +1101,127 @@ test("async replay permits committed reads and queues unrelated coordination and
       let leaseFinished = false;
       const lease = claimResourceLease({ resourceKey: "test:consumer", aggregateType: "task", aggregateId: "task_1", ownerProcessIdentity: "test:worker", expectedStateVersion: before.tasks[0].stateVersion, leaseTtlMs: 10000 }).then((result) => { leaseFinished = true; return result; });
       const write = mutateState((state) => { state.meta.other = true; });
-      await assert.rejects(withStateDatabaseConnection(() => {}, { deadlineAt: Date.now() + 25 }), { code: "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT" });
-      assert.equal(leaseFinished, false);
-      resumeReplay();
+      try {
+        await Promise.race([
+          Promise.all([lease, write]),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Replay held the database writer")), 1000)),
+        ]);
+        await withStateDatabaseConnection(() => {}, { deadlineAt: Date.now() + 100 });
+        assert.equal(leaseFinished, true);
+      } finally { resumeReplay(); }
       await Promise.all([slow, lease, write]);
       const after = await readState();
       assert.equal(after.meta.slow, true);
       assert.equal(after.meta.other, true);
       assert.equal(leaseFinished, true);
+      assert.ok(attempts >= 3, "slow replay must refresh after the unrelated write");
     `);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("mutation validation and serialization do not hold the SQLite writer", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-prepare-plan-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { DatabaseSync } from "node:sqlite";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { DATABASE_FILE } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      const probe = new DatabaseSync(DATABASE_FILE);
+      probe.exec("PRAGMA busy_timeout = 1");
+      let observations = 0;
+      try {
+        await mutateState((state) => {
+          Object.defineProperty(state.tasks[0], "title", { enumerable: true, get() {
+            probe.exec("BEGIN IMMEDIATE");
+            probe.exec("ROLLBACK");
+            observations += 1;
+            return "Prepared before locking";
+          }});
+        }, { idempotent: false });
+        assert.ok(observations > 0);
+        assert.equal((await readState()).tasks[0].title, "Prepared before locking");
+      } finally { probe.close(); }
+    `);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("idle sweeps preserve state versions while real metadata changes persist", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-noop-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { DatabaseSync } from "node:sqlite";
+      import { mutateState, readState, automationTick } from ${JSON.stringify(storeModuleUrl)};
+      import { DATABASE_FILE, readDatabaseStateCached } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await mutateState((state) => { state.meta.operatorPause = { active: true, reason: "test" }; });
+      const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+      const version = () => db.prepare("SELECT version FROM state_meta").get().version;
+      const before = version(), cached = await readDatabaseStateCached();
+      const taskVersion = cached.tasks[0].stateVersion;
+      for (let i = 0; i < 3; i += 1) assert.equal((await automationTick()).paused, true);
+      assert.equal(version(), before);
+      assert.equal(await readDatabaseStateCached(), cached);
+      await mutateState((state) => { state.meta.observedAt = "new genuine metadata"; });
+      assert.equal(version(), before + 1);
+      assert.equal((await readState()).meta.observedAt, "new genuine metadata");
+      assert.equal((await readState()).tasks[0].stateVersion, taskVersion);
+      db.close();
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a stale no-op is reevaluated after another writer changes its input", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-stale-noop-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      let ready, resume, calls = 0;
+      const started = new Promise(resolve => { ready = resolve; });
+      const pause = new Promise(resolve => { resume = resolve; });
+      const conditional = mutateState(async (state) => {
+        if (++calls === 1) { ready(); await pause; }
+        if (state.meta.pendingWork) state.meta.handled = true;
+        return Boolean(state.meta.pendingWork);
+      });
+      await started;
+      await mutateState(state => { state.meta.pendingWork = true; });
+      resume();
+      assert.equal(await conditional, true);
+      assert.equal(calls, 2);
+      assert.equal((await readState()).meta.handled, true);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("maintenance acquired during no-op preparation still blocks its commit", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-noop-maintenance-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      let ready, resume;
+      const started = new Promise(resolve => { ready = resolve; });
+      const pause = new Promise(resolve => { resume = resolve; });
+      const noop = mutateState(async () => { ready(); await pause; });
+      await started;
+      await mutateState(state => { state.meta.selfUpdateLease = { id: "maintenance_test", ownerPid: "other", expiresAt: new Date(Date.now()+60000).toISOString() }; });
+      const rejection = assert.rejects(noop, { code: "STUDIOOPS_MAINTENANCE" });
+      resume();
+      await rejection;
+      assert.equal((await readState()).meta.selfUpdateLease.id, "maintenance_test");
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("cached display snapshots are immutable and follow committed versions across connections", async () => {

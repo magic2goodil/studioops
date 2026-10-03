@@ -726,25 +726,25 @@ function archivePayload(entityType, item) {
   };
 }
 
-function archiveOperationalHistory(db, archived, now) {
+function prepareArchiveRows(archived, now) {
+  return Object.entries(archived).flatMap(([entityType, items]) => items.map((item) => [
+    entityType, item.id, item.projectId || "", item.taskId || "", item.createdAt || "",
+    now, JSON.stringify(archivePayload(entityType, item)),
+  ]));
+}
+
+function writeArchiveRows(db, rows) {
+  if (!rows.length) return;
   const statement = db.prepare(`
     INSERT OR IGNORE INTO operational_archive(
       entity_type, entity_id, project_id, task_id, created_at, archived_at, payload
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
-  for (const [entityType, items] of Object.entries(archived)) {
-    for (const item of items) {
-      statement.run(
-        entityType,
-        item.id,
-        item.projectId || "",
-        item.taskId || "",
-        item.createdAt || "",
-        now,
-        JSON.stringify(archivePayload(entityType, item)),
-      );
-    }
-  }
+  for (const row of rows) statement.run(...row);
+}
+
+function archiveOperationalHistory(db, archived, now) {
+  writeArchiveRows(db, prepareArchiveRows(archived, now));
 }
 
 function archivedItemCount(archived) {
@@ -989,8 +989,7 @@ function stateDatabaseInitialized(db) {
   );
 }
 
-function upsertEntity(db, table, item, sequence) {
-  const payload = JSON.stringify(item);
+function upsertEntity(db, table, item, sequence, payload = JSON.stringify(item)) {
   if (table === "projects") {
     db.prepare(`
       INSERT INTO projects(id, sequence, key, payload) VALUES (?, ?, ?, ?)
@@ -2100,7 +2099,9 @@ function assertValidTaskStatuses(state) {
   }
 }
 
-function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
+// Validate and serialize before taking SQLite's writer lock. The version fence
+// at commit makes these checks authoritative for exactly the snapshot prepared.
+function prepareMutationWrite(state, snapshot, options = {}) {
   normalizeTaskStateVersions(state, snapshot);
   if (options.validateTaskStatuses !== false) {
     if (options.repairTaskId) {
@@ -2130,18 +2131,7 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
     }
   }
   assertOwnerQaPacketMirrors(state, options);
-  const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
-  const version = Number(previous?.version || 0) + 1;
-  const updatedAt = state.meta?.updatedAt || new Date().toISOString();
-  db.prepare(`
-    INSERT INTO state_meta(singleton_id, payload, version, updated_at)
-    VALUES (1, ?, ?, ?)
-    ON CONFLICT(singleton_id) DO UPDATE SET
-      payload = excluded.payload,
-      version = excluded.version,
-      updated_at = excluded.updated_at
-  `).run(JSON.stringify(state.meta || {}), version, updatedAt);
-
+  const plan = { metaPayload: JSON.stringify(state.meta || {}), updatedAt: state.meta?.updatedAt, upserts: [], deletes: [] };
   for (const table of ENTITY_TABLES) {
     const previousItems = snapshot.tables[table];
     const currentIds = new Set();
@@ -2166,19 +2156,45 @@ function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
       if (table === "reviews" && prior) {
         assertReviewTransition(JSON.parse(prior.payload), item);
       }
+      const payload = !prior || MUTABLE_ENTITY_TABLES.has(table) || prior.sequence !== sequence
+        ? JSON.stringify(item) : "";
       const changed = !prior
         || prior.sequence !== sequence
-        || (MUTABLE_ENTITY_TABLES.has(table) && prior.payload !== JSON.stringify(item));
-      if (changed) upsertEntity(db, table, item, sequence);
+        || (MUTABLE_ENTITY_TABLES.has(table) && prior.payload !== payload);
+      // Detach indexed fields from the mutator's objects as well as freezing the
+      // payload bytes; delayed callbacks must not change the prepared SQL values.
+      if (changed) plan.upserts.push({ table, item: JSON.parse(payload), sequence, payload });
     }
     const tableName = TABLE_NAME[table] || table;
     for (const id of previousItems.keys()) {
       if (!currentIds.has(id)) {
         if (["candidates", "reviews"].includes(table)) throw new Error(`${table === "candidates" ? "Candidate" : "Review"} ${id} cannot be deleted.`);
-        db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
+        plan.deletes.push({ tableName, id });
       }
     }
   }
+  plan.hasChanges = plan.metaPayload !== snapshot.meta || plan.upserts.length > 0 || plan.deletes.length > 0;
+  return plan;
+}
+
+function applyMutationWrite(db, plan) {
+  if (!plan.hasChanges) return;
+  const previous = db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get();
+  const version = Number(previous?.version || 0) + 1;
+  db.prepare(`
+    INSERT INTO state_meta(singleton_id, payload, version, updated_at)
+    VALUES (1, ?, ?, ?)
+    ON CONFLICT(singleton_id) DO UPDATE SET
+      payload = excluded.payload,
+      version = excluded.version,
+      updated_at = excluded.updated_at
+  `).run(plan.metaPayload, version, plan.updatedAt || new Date().toISOString());
+  for (const { table, item, sequence, payload } of plan.upserts) upsertEntity(db, table, item, sequence, payload);
+  for (const { tableName, id } of plan.deletes) db.prepare(`DELETE FROM ${tableName} WHERE id = ?`).run(id);
+}
+
+function writeMutationToOpenDatabase(db, state, snapshot, options = {}) {
+  applyMutationWrite(db, prepareMutationWrite(state, snapshot, options));
 }
 
 function upsertFailureIncidentRow(db, incidentInput) {
@@ -2711,9 +2727,16 @@ async function prepareDatabaseMutation(state, mutator, options) {
   const archived = compactOperationalHistory(state);
   const now = new Date().toISOString();
   if (archivedItemCount(archived)) recordOperationalArchiveMetadata(state, archived, now);
-  state.meta.updatedAt = now;
   state.meta.storageBackend = "sqlite";
-  return { state, snapshot, result, archived, now };
+  const plan = prepareMutationWrite(state, snapshot, options);
+  const archiveRows = prepareArchiveRows(archived, now);
+  if (plan.hasChanges || archiveRows.length) {
+    plan.hasChanges = true;
+    state.meta.updatedAt = now;
+    plan.updatedAt = now;
+    plan.metaPayload = JSON.stringify(state.meta);
+  }
+  return { result, plan, archiveRows };
 }
 
 export async function mutateDatabaseState(mutator, options = {}) {
@@ -2723,57 +2746,51 @@ export async function mutateDatabaseState(mutator, options = {}) {
   const startedAt = Date.now();
   let retryCount = 0;
   let lockWaitMs = 0;
-  let serializedReplay = false;
-  let serializedReplayDeadlineAt = 0;
+  let retryDeadlineAt = 0;
+  let expectedVersion = 0;
+  let prepared = null;
 
   while (true) {
     try {
-      let expectedVersion = 0;
-      let prepared;
-      if (!serializedReplay) {
+      if (!prepared) {
         const snapshot = await withStateDatabaseRead(readStateSnapshot);
         expectedVersion = snapshot.version;
         prepared = await prepareDatabaseMutation(snapshot.state, mutator, options);
       }
       const lockAttemptStartedAt = Date.now();
       let acquired = false;
-      const result = await withStateDatabaseConnection(async (db) => {
+      const result = await withStateDatabaseConnection((db) => {
         let transactionStarted = false;
         try {
-          if (serializedReplay) {
-            beginSerializedReplayTransaction(db, operationName, serializedReplayDeadlineAt, retryCount);
+          if (retryDeadlineAt) {
+            beginSerializedReplayTransaction(db, operationName, retryDeadlineAt, retryCount);
           } else {
             db.exec("BEGIN IMMEDIATE");
           }
           transactionStarted = true;
           lockWaitMs += Date.now() - lockAttemptStartedAt;
           acquired = true;
-          if (serializedReplay) {
-            prepared = await prepareDatabaseMutation(readStateFromOpenDatabase(db), mutator, options);
-          }
-          const { state, snapshot, result: mutationResult, archived, now } = prepared;
-          if (!serializedReplay) {
-            const currentVersion = Number(
-              db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
+          const { result: mutationResult, plan, archiveRows } = prepared;
+          const currentVersion = Number(
+            db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0,
+          );
+          if (currentVersion !== expectedVersion) {
+            const conflict = new Error(
+              `StudioOps state changed during ${operationName}; expected version ${expectedVersion}, observed ${currentVersion}.`,
             );
-            if (currentVersion !== expectedVersion) {
-              const conflict = new Error(
-                `StudioOps state changed during ${operationName}; expected version ${expectedVersion}, observed ${currentVersion}.`,
-              );
-              conflict.code = "STUDIOOPS_STATE_CONFLICT";
-              throw conflict;
-            }
+            conflict.code = "STUDIOOPS_STATE_CONFLICT";
+            throw conflict;
           }
           const currentMeta = parsePayload(
             db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload,
             {},
           );
           assertMaintenanceWriteAllowed({ meta: currentMeta });
-          if (archivedItemCount(archived)) archiveOperationalHistory(db, archived, now);
-          writeMutationToOpenDatabase(db, state, snapshot, options);
+          writeArchiveRows(db, archiveRows);
+          applyMutationWrite(db, plan);
           recordContentionEvent(db, {
             operationName,
-            outcome: serializedReplay ? "serialized_replay" : "committed",
+            outcome: !plan.hasChanges ? "noop" : retryCount ? "optimistic_replay" : "committed",
             waitMs: lockWaitMs,
             durationMs: Date.now() - startedAt,
             retryCount,
@@ -2787,7 +2804,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
         }
       }, {
         operationName,
-        ...(serializedReplay ? { deadlineAt: serializedReplayDeadlineAt } : {}),
+        ...(retryDeadlineAt ? { deadlineAt: retryDeadlineAt } : {}),
       }).finally(() => {
         if (!acquired) lockWaitMs += Date.now() - lockAttemptStartedAt;
       });
@@ -2795,13 +2812,13 @@ export async function mutateDatabaseState(mutator, options = {}) {
       return result;
     } catch (error) {
       const retryableConflict = error.code === "STUDIOOPS_STATE_CONFLICT" || isSqliteBusy(error);
-      const serializedLockCanWait = serializedReplay
+      const lockCanWait = retryDeadlineAt
         && isSqliteBusy(error)
-        && Date.now() < serializedReplayDeadlineAt;
+        && Date.now() < retryDeadlineAt;
       if (
         !retryableConflict
         || !retryPolicy.idempotent
-        || (!serializedLockCanWait && retryCount >= retryPolicy.maxRetries)
+        || (!lockCanWait && retryCount >= retryPolicy.maxRetries)
       ) {
         error.operationName = operationName;
         error.retryCount = retryCount;
@@ -2811,13 +2828,14 @@ export async function mutateDatabaseState(mutator, options = {}) {
         throw error;
       }
       retryCount += 1;
-      if (!serializedReplay) {
-        serializedReplay = true;
-        serializedReplayDeadlineAt = Date.now() + SERIALIZED_REPLAY_LOCK_DEADLINE_MS;
-      }
+      // A busy lock alone does not invalidate a prepared plan. A version
+      // conflict always requires a fresh snapshot, with all preparation outside
+      // the SQL transaction. Never fall back to lock-held replay.
+      if (error.code === "STUDIOOPS_STATE_CONFLICT") prepared = null;
+      if (!retryDeadlineAt) retryDeadlineAt = Date.now() + SERIALIZED_REPLAY_LOCK_DEADLINE_MS;
       const delayMs = Math.min(
         retryDelayMs(retryCount),
-        Math.max(1, serializedReplayDeadlineAt - Date.now()),
+        Math.max(1, retryDeadlineAt - Date.now()),
       );
       await sleep(delayMs);
     }
