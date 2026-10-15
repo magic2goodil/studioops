@@ -1,0 +1,76 @@
+@startuml
+left to right direction
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName SansSerif
+skinparam defaultFontSize 14
+skinparam shadowing false
+skinparam componentStyle uml2
+skinparam ArrowColor #42566D
+skinparam component {
+  BackgroundColor #EEF5FC
+  BorderColor #406284
+  FontColor #17334D
+}
+skinparam package {
+  BackgroundColor #FAFCFE
+  BorderColor #B8C8D8
+}
+skinparam databaseBackgroundColor #F4F0FC
+skinparam databaseBorderColor #76658D
+skinparam noteBackgroundColor #FFF9E9
+skinparam noteBorderColor #D8C69D
+title StudioOps | Shared records, separate workers
+caption UML component diagram. Local single-owner control plane; components share durable records, not private model context.
+
+actor "Project owner" as Owner
+package "Local control plane" {
+  component "Board / CLI / plugin" as Intake
+  component "Supervisor + steward\nreadiness and routing" as Routing
+  component "Dispatcher\nadmission + durable run" as Dispatch
+  component "Runner\nclaim + execute + verify" as Runner
+  component "Workflow store\nvalidation + fenced writes" as Store
+  database "SQLite / WAL\ntasks, runs, reviews,\ncandidates, events" as State
+  component "Commit-bound context\ncomponent map + retrieval" as Context
+  component "QA integration\nnon-production bundle" as QA
+  component "Promotion\nrelease-candidate PR" as Promotion
+  component "Heartbeats + watchdog\nbounded recovery" as Watchdog
+}
+package "Project development boundary" {
+  component "Isolated builder and\nreviewer workspaces" as Workers
+  component "Git remote\nbranches + pull requests" as Git
+}
+package "Operator-controlled release boundary" #E9F6EF {
+  component "Hosted RC + acceptance\nexact revision and isolated data" as RC
+  component "Protected release\nproduction verification + rollback" as Release
+}
+
+Owner --> Intake : define / inspect / decide
+Intake --> Store : task and decision operations
+Routing --> Store : route / inspect
+Dispatch --> Store : persist eligible run
+Runner --> Store : claim / heartbeat / outcome
+Store --> State : short version-checked transactions
+Runner --> Context : exact checkout identity
+Context --> Workers : bounded advisory context
+Runner --> Workers : scoped prompts
+Workers --> Git : branch / PR / review evidence
+QA --> Store : candidate + QA evidence
+QA --> Git : non-production integration
+Promotion --> Store : verify immutable QA decision
+Promotion --> Git : create candidate PR
+Watchdog --> Store : recover within policy
+Owner --> RC : authorize / accept
+Git --> RC : reviewed candidate revision
+RC --> Release : matching evidence + authorization
+Owner --> Release : protected release authority
+
+note bottom of Workers
+  Builder/reviewer execution is privileged development work.
+  Workspace separation is not a hostile-code sandbox.
+end note
+note bottom of Release
+  The worker loop stops before production release.
+  Hosted qualification is an operating requirement;
+  not every collection/enforcement adapter is implemented.
+end note
+@enduml

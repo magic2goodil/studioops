@@ -1,10 +1,10 @@
 {
-  "generatedAt": "2026-07-26",
-  "engine": "Google Chrome for Testing 149.0.7827.55",
+  "generatedAt": "2026-10-15T14:37:04.778Z",
+  "engine": "Playwright Chromium 151.0.7922.34",
   "deviceScaleFactor": 1,
   "fixturePolicy": "synthetic-only",
   "canonicalAssetSha256": "3ae6318136d074f0613e6b972757022cb8460473e5eda2669ba581c63de57fa6",
-  "contentContractSha256": "dd177fdc96ddb29b7e65e99718b8c3c0f590c969b273ed3b4671774f8367bb90",
+  "contentContractSha256": "502dbf07b05216f1a6e74350ea4d5f166844b52411ff2fab33a39647387eda2c",
   "references": [
     {
       "file": "390x844-action-required.png",
@@ -27,7 +27,7 @@
       "route": "/qa/candidates/candidate_synthetic",
       "width": 1440,
       "height": 1000,
-      "sha256": "fc0a05b5af2248dd60e7daddb0f338f209013928df85c67ef66242612744c790",
+      "sha256": "0e01dba96f83e6e8ee11ecfd212892e0c7786a2daddc134e53c1e3e4a0be5b10",
       "annotation": "Requested immutable candidate starts main with integrity and packet evidence."
     }
   ]

@@ -29,7 +29,7 @@ Require clear opt-in and revocation paths for:
 - social presence, friend visibility, check-ins, and "headed there" activity
 - behavioral analytics tied to a user profile
 - personalization or recommendation profiles
-- AI training, coaching, persuasion, hypnosis, or other behavior-shaping experiences
+- Personalized coaching or other behavior-shaping experiences
 - sharing data with third parties, integrations, advertisers, or business customers
 
 Consent copy should explain what is collected, why it is collected, how it is used, who can see it, and how the user can turn it off. Do not bundle unrelated permissions together when separate consent is practical.

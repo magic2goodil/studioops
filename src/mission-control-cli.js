@@ -503,7 +503,7 @@ Task fields:
   --depends-on                  Dependency task IDs, comma or newline separated
 
 Automation:
-  studioops automation-tick --project dollos --limit 10
+  studioops automation-tick --project sample-app --limit 10
   studioops automation-pause --reason "Incident investigation"
   studioops automation-resume --reason "Database and workers verified"
   studioops circuit-reset --task task_101 --expected-opened-at 2026-01-01T00:00:00.000Z --reason "Credentials verified"

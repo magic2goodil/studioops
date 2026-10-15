@@ -1,33 +1,37 @@
-# StudioOps Codex Plugin
+# StudioOps Codex plugin
 
-StudioOps ships as a skills-first Codex plugin. Version 0.1 provides a real local intake path while keeping the visual board and worker system in the StudioOps application.
+StudioOps is a skills-first plugin for setting up a local software-delivery board and capturing structured engineering work. It remains a developer preview. The visual board and workers run in the separately installed StudioOps application.
 
-## Install From A Local Checkout
+## Install or update
+
+From a reviewed source checkout:
 
 ```bash
 codex plugin marketplace add /absolute/path/to/studioops
 codex plugin add studioops@studioops-marketplace
 ```
 
-Start a new Codex task after installing or updating a plugin. Bundled skills are loaded when a new task begins.
+Use a local workspace such as `~/.codex/workspaces/studioops`. Start a new Codex task after installing or updating: existing tasks may retain the earlier skill snapshot. Confirm the marketplace points to the intended checkout and that the installed plugin version matches `.codex-plugin/plugin.json`.
 
-## What Works In 0.1
+## Included skills
 
-- Implicitly recognizes requests to capture, plan, build, or review software through StudioOps.
-- Inspects the active repository before intake.
-- Reuses an existing StudioOps project or creates one.
-- Writes structured tasks to the local board through the StudioOps HTTP API.
-- Returns the durable task ID, direct board URL, current status, and next owner.
-- Keeps secrets, production releases, paid connectivity, and unsupported completion claims outside the automatic intake path.
+- `setup-studioops`: inspects the active repository, configures the local control plane, registers the project and verifies installation.
+- `run-studioops`: captures a project/task with user story, outcome, acceptance criteria, standards, validation and privacy notes; returns the durable task ID, local board URL, status and next owner.
 
-The local service defaults to `http://127.0.0.1:4317`. Set `STUDIOOPS_URL` when the service uses another local URL.
+The bundled client communicates with `http://127.0.0.1:4317` by default. `STUDIOOPS_URL` can select another reviewed local service address. The plugin contains no credentials or model account, no MCP server and no hosted StudioOps service. It does not grant production release authority.
 
-## Validate During Development
+Codex and GitHub interactions use the operator's configured accounts. Model usage remains subject to that provider's plan and limits; the MIT software license is not a promise of free model execution. Existing operator pauses and project-specific permissions remain authoritative.
 
-```bash
-python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/studioops
-python3 /path/to/skill-creator/scripts/quick_validate.py plugins/studioops/skills/run-studioops
-node plugins/studioops/scripts/studioops.mjs status
-```
+## Distribution
 
-The first paid integration should be an optional StudioOps Cloud MCP/app connection. The free skill and local client should continue working without cloud authentication.
+Run `npm run plugin:package` from the source checkout. The ZIP includes an explicit file allowlist: plugin manifest, the two skills and their references, local client, three icon/logo assets, this guide, MIT license and policy/support notices. It excludes screenshots, tests, operator configuration, databases, run output, private reference material and Git history.
+
+The npm distribution uses a separate allowlist for the runnable application, standards, operating documentation and installer scripts. Managed runtime installation/self-update still require a canonical Git checkout with its lockfile; use the Git-based setup for those operations. A package's current files can be audited independently, but its canonical source links and installer still lead to the public repository and its contributor history. See [Sharing and evaluation](https://github.com/magic2goodil/studioops/blob/main/docs/SHARING.md).
+
+For development, use the plugin-creator validator and each skill's validator available in your Codex installation. Update plugin versions with the plugin-creator cachebuster helper, align the prepared listing version, rebuild the ZIP, and reinstall from the verified marketplace. Record the source revision and package SHA-256 outside the package; do not treat a version label alone as release evidence.
+
+## Scope of the workflow
+
+The application supports isolated builders, specialist and lead review, local QA and release-candidate PR preparation. Hosted release qualification and deployment need project-specific operator work. Jira integration is a proposed extension, not included functionality. See the [workflow UML](https://github.com/magic2goodil/studioops/blob/main/docs/workflow-uml/README.md).
+
+[Source and setup](https://github.com/magic2goodil/studioops) · [Privacy](https://github.com/magic2goodil/studioops/blob/main/PRIVACY.md) · [Support](https://github.com/magic2goodil/studioops/blob/main/SUPPORT.md)

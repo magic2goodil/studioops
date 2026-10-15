@@ -55,15 +55,16 @@ Default automated task flow:
 4. Backend reviewer records `approved`, `skipped`, or `changes_requested`.
 5. Frontend reviewer records `approved`, `skipped`, or `changes_requested`.
 6. Accessibility reviewer records `approved`, `skipped`, or `changes_requested` before lead review for UI/frontend work.
-7. Primary team lead reviewer records `approved` or `changes_requested`.
-8. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled.
-9. QA integration merges `qa_review` PR heads into a non-production QA branch and refreshes the local preview when configured.
-10. Human owner reviews only after `user_review` or after the local QA preview is ready.
-11. Owner QA pass moves the task to `approved_for_main`; owner QA fail moves it back to `needs_changes`.
-12. The promotion worker merges `approved_for_main` task heads into the configured target branch after validation, using a non-force push.
-13. Production deployment remains release/tag gated and separate from PR, QA-branch, or target-branch promotion.
+7. Applicable regression review checks behavior and validation evidence before primary lead review.
+8. Primary team lead reviewer records `approved` or `changes_requested`.
+9. Automation tick moves fully reviewed work to `user_review`, or to `qa_review` when Trust Leads is enabled.
+10. QA integration merges `qa_review` PR heads into a non-production QA branch and refreshes the local preview when configured.
+11. Human owner reviews only after `user_review` or after the local QA preview is ready.
+12. Owner QA pass moves the task to `approved_for_main`; owner QA fail moves it back to `needs_changes`.
+13. The promotion worker validates approved work on a release branch and opens a release-candidate PR against the configured target branch. It does not directly push or merge the protected branch.
+14. Production deployment remains release/tag gated and separate from PR, QA-branch, or target-branch promotion.
 
-Backend, frontend, and accessibility review can be explicitly skipped only when that lane has no relevant surface. The skip must be recorded as a review outcome with a reason.
+Backend, frontend, accessibility, and regression review can be explicitly skipped only when that lane has no relevant surface. The skip must be recorded as a review outcome with a reason.
 
 Reviewers should fix small deterministic issues directly when project policy allows it, then document the fix and continue the review. Material issues use `changes_requested`. The default review policy allows two routine builder review cycles; after that, non-lead change requests route to the primary lead reviewer for the final automation decision instead of creating another builder-review loop.
 
@@ -72,7 +73,7 @@ Default PR rule: one PR should have one primary StudioOps task. Related tasks ca
 Run the steward manually with:
 
 ```bash
-npm run automation-tick -- --project dollos --limit 10
+npm run automation-tick -- --project sample-app --limit 10
 ```
 
 The scheduled steward LaunchAgent runs this periodically for every registered project. It routes dependencies/reviews but intentionally leaves `ready` and `queued` tasks available for the dispatcher:
@@ -177,4 +178,6 @@ automatic merge, tag, release, deployment, or external notification.
 
 When a task reaches `user_review`, StudioOps emits an `owner_review_requested` event and assigns the owner role. When Trust Leads routes a task to `qa_review`, StudioOps emits `qa_review_requested` and the supervisor reports `notify_qa_review`. External notifications should be built from those events rather than arbitrary status polling.
 
-When local QA passes, StudioOps emits `qa_passed`, assigns the promotion worker, and queues target-branch promotion. When promotion succeeds, it emits `release_candidate_ready` for the project. That event means the target branch is ready for owner release-candidate review; it does not mean production has deployed.
+When local QA passes, StudioOps emits `qa_passed`, assigns the promotion worker, and queues preparation of a release-candidate PR. Successful preparation emits `release_candidate_ready`. This means a PR is ready for owner review; it does not mean the protected branch was merged or production deployed.
+
+Local preview approval is not hosted release qualification. Before production, complete the project's controlled HTTPS release-candidate testing, isolated production-data-copy and migration rehearsal, normal authentication/device acceptance, and rollback checks. Promote the same qualified revision. These operator-controlled requirements are described in [the workflow UML](workflow-uml/README.md); this release does not provide an end-to-end Jira or hosted-environment adapter.

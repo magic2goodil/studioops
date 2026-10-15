@@ -72,9 +72,9 @@ test("experimental fusion is deterministic, bounded, and has no query-specific w
   assert.deepEqual(fuseRankings([], [], 5), []);
 });
 
-test("fixed source-labeled suite covers five repositories and required query classes", async () => {
+test("public source-labeled suite covers StudioOps and required query classes", async () => {
   const fixture = JSON.parse(await readFile(DEFAULT_FIXTURE, "utf8"));
-  assert.equal(fixture.repositories.length, 5);
+  assert.equal(fixture.repositories.length, 1);
   const kinds = new Set(fixture.repositories.flatMap((repo) => repo.queries.map((query) => query.kind)));
   for (const kind of ["exact", "conceptual", "confusing", "no-match", "repository-isolation"]) assert.ok(kinds.has(kind));
   for (const repository of fixture.repositories) {
@@ -86,5 +86,5 @@ test("fixed source-labeled suite covers five repositories and required query cla
       for (const file of query.neededFiles) assert.ok(!file.startsWith("/") && !file.includes(".."));
     }
   }
-  assert.doesNotMatch(JSON.stringify(fixture), /\/Users\/|@gmail\.com|Team Robison/);
+  assert.doesNotMatch(JSON.stringify(fixture), /\/Users\/|@gmail\.com/);
 });

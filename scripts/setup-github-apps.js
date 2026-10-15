@@ -8,7 +8,6 @@ import { URL } from "node:url";
 import { defaultStudioOpsCredentialsRoot, expandLocalPath } from "../src/runtime-paths.js";
 
 const DEFAULT_PORT = 4328;
-const DEFAULT_OWNER = "magic2goodil";
 const CONFIG_DIR = path.resolve(expandLocalPath(
   process.env.STUDIOOPS_GITHUB_APPS_DIR
     || process.env.MISSION_CONTROL_GITHUB_APPS_DIR
@@ -90,13 +89,13 @@ function usage() {
   console.log(`StudioOps GitHub App setup
 
 Usage:
-  npm run setup-github-app
-  npm run setup-github-role-apps
-  node scripts/setup-github-apps.js single --owner magic2goodil --open
-  node scripts/setup-github-apps.js roles --owner magic2goodil --open
+  npm run setup-github-app -- --owner YOUR_GITHUB_USER
+  npm run setup-github-role-apps -- --owner YOUR_ORGANIZATION --org
+  node scripts/setup-github-apps.js single --owner YOUR_GITHUB_USER --open
+  node scripts/setup-github-apps.js roles --owner YOUR_ORGANIZATION --org --open
 
 Options:
-  --owner NAME          GitHub user or organization that will own the app registration.
+  --owner NAME          Required. GitHub user or organization that will own the app registration.
   --org                Register under an organization instead of the signed-in user account.
   --port PORT          Local callback server port. Default: ${DEFAULT_PORT}.
   --open               Open the local setup page in the default browser.
@@ -288,7 +287,10 @@ async function main() {
 
   const port = Number(args.port || DEFAULT_PORT);
   if (!Number.isFinite(port) || port <= 0) throw new Error(`Invalid port: ${args.port}`);
-  const owner = String(args.owner || DEFAULT_OWNER);
+  if (typeof args.owner !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(args.owner)) {
+    throw new Error("Supply --owner with your GitHub username or organization name before creating an app.");
+  }
+  const owner = args.owner;
   const org = Boolean(args.org);
   const baseUrl = `http://127.0.0.1:${port}`;
   const endpoint = appEndpoint({ owner, org });

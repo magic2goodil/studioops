@@ -92,8 +92,8 @@ function fixtureState() {
 test("handoffs deduplicate findings, preserve attribution, order severity, and redact sensitive data", () => {
   const task = fixtureState().tasks[0];
   const handoff = createRemediationHandoff(task, [
-    review("review_1", "High: authorization bypass. Token: github_pat_abcdefghijk and owner@example.com in /Users/jrobison/project."),
-    review("review_2", "High: authorization bypass. Token: github_pat_abcdefghijk and owner@example.com in /Users/jrobison/project.", {
+    review("review_1", "High: authorization bypass. Token: github_pat_abcdefghijk and owner@example.com in /Users/example/project."),
+    review("review_2", "High: authorization bypass. Token: github_pat_abcdefghijk and owner@example.com in /Users/example/project.", {
       stageKey: "lead",
       role: "lead-reviewer",
       author: "Primary Lead",
@@ -105,7 +105,7 @@ test("handoffs deduplicate findings, preserve attribution, order severity, and r
   assert.equal(handoff.findings[0].severity, "high");
   assert.equal(handoff.findings[0].sources.length, 2);
   assert.deepEqual(handoff.findings[0].sources.map((source) => source.reviewId), ["review_1", "review_2"]);
-  assert.doesNotMatch(JSON.stringify(handoff), /github_pat_|owner@example\.com|\/Users\/jrobison/);
+  assert.doesNotMatch(JSON.stringify(handoff), /github_pat_|owner@example\.com|\/Users\/example/);
   assert.match(JSON.stringify(handoff), /REDACTED/);
 });
 

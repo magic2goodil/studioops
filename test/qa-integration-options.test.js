@@ -46,7 +46,7 @@ test("explicit QA authentication flags override configured defaults", () => {
 
 test("project filters and partial candidate authority remain explicit", () => {
   const options = resolveQaIntegrationOptions({
-    project: "event-horizons-web",
+    project: "example-app",
     task: "task_621",
     "partial-tasks": "task_621",
     "partial-actor-id": "release-owner",
@@ -54,7 +54,7 @@ test("project filters and partial candidate authority remain explicit", () => {
     force: true,
   }, {});
 
-  assert.equal(options.project, "event-horizons-web");
+  assert.equal(options.project, "example-app");
   assert.equal(options.task, "task_621");
   assert.equal(options.partialTasks, "task_621");
   assert.equal(options.partialActorId, "release-owner");

@@ -9,13 +9,13 @@ StudioOps has a bounded automation steward. It advances ticket ownership and rev
 Run one pass manually with:
 
 ```bash
-npm run automation-tick -- --project dollos --limit 10
+npm run automation-tick -- --project sample-app --limit 10
 ```
 
 or directly:
 
 ```bash
-node src/mission-control-cli.js automation-tick --project dollos --limit 10
+node src/mission-control-cli.js automation-tick --project sample-app --limit 10
 ```
 
 For cross-project monitoring, run:
@@ -37,7 +37,7 @@ The automation tick:
 - marks tasks `blocked` when dependencies are unfinished
 - rechecks blocked tasks and returns them to the queue when dependencies are complete
 - requires branch and PR links before reviewer routing
-- routes each `builder_review` task through backend, frontend, accessibility, and lead review stages
+- routes each `builder_review` task through backend, frontend, accessibility, applicable regression, and lead review stages
 - records owner handoff by moving fully reviewed tasks to `user_review`
 - when Trust Leads is enabled, records QA handoff by moving lead-approved tasks to `qa_review` instead of per-task `user_review`
 
@@ -86,29 +86,33 @@ A reviewer-side commit does not consume another builder review cycle. When the r
    - Review must cover mobile, tablet, and desktop behavior unless the task explicitly scopes one breakpoint only.
    - May be explicitly skipped with a review outcome when there is no frontend/user-visible accessibility surface.
 
-7. `lead_review`
+7. `regression_review`
+   - When required by project policy, verify existing behavior and validation evidence for the current candidate before lead review.
+   - This automated review stage does not replace owner QA or hosted release qualification.
+
+8. `lead_review`
    - Primary team lead checks product fit, acceptance criteria, architecture, cross-cutting risk, prior reviewer findings, task/PR scope, deployment safety, and readiness for the human owner.
    - Always required before `qa_review` or `user_review`.
 
-8. `qa_review`
+9. `qa_review`
    - Optional Trust Leads gate for projects with `trustLeadApprovals: true` and a safe `integrationBranch`.
    - The QA integration worker prepares an isolated workspace for the project, merges lead-approved PR heads into the configured non-production integration branch, runs validation commands, and records conflicts or validation failures back on the task.
    - The registered project `repoPath` remains on the owner's active branch with its existing dirty or clean state; QA reports and task comments show the isolated workspace path used for the run.
    - This branch must not be `main`, `master`, `production`, or the project default branch.
-   - The human owner should test the full QA bundle locally before approving production.
+   - The human owner should test the full QA bundle locally; required hosted qualification follows before production.
    - This is not production approval.
 
-9. `user_review`
+10. `user_review`
    - Work is ready for the human owner to inspect, test, request changes, approve, merge, or deploy.
 
-10. `needs_changes`
+11. `needs_changes`
    - Any reviewer or the human owner can send the work back.
    - The task should include a comment with concrete requested changes.
    - Builder fixes the same branch/PR unless the reviewer asks for a split PR.
    - At the configured review-cycle limit, unresolved non-lead findings route to lead review instead of another routine builder pass.
 
-11. `done`
-   - Work is merged/deployed or intentionally closed.
+12. `done`
+   - Required delivery evidence records the completed outcome. Intentionally closed work is a separate disposition, not proof of deployment.
 
 ## Reviewer Outcome Rules
 
@@ -176,7 +180,7 @@ Trust Leads is a project-level option for reducing owner review fatigue.
 
 When `reviewPolicy.trustLeadApprovals` is `true`, StudioOps trusts the primary lead's `approved` or `skipped` outcome after backend/frontend/accessibility review is complete. The task moves to `qa_review` instead of `user_review`, and the supervisor reports `notify_qa_review`.
 
-Use `reviewPolicy.integrationBranch` to name the non-production branch or bundle target that should collect lead-approved work for local testing, for example `qa/event-horizons-web`.
+Use `reviewPolicy.integrationBranch` to name the non-production branch or bundle target that should collect lead-approved work for local testing, for example `qa/example-app`.
 
 Trust Leads does not allow production deploys. It only changes the handoff from "review every PR" to "review the QA bundle." Production release still requires explicit owner approval and the project's protected deployment workflow.
 
@@ -217,3 +221,7 @@ Before a task reaches `user_review`, StudioOps should show:
 - accessibility review result or explicit skip note
 - primary lead review result
 - known gaps and residual risk
+
+## Hosted release qualification
+
+A successful local QA preview and a release-candidate PR are intermediate results. Production additionally requires a controlled HTTPS candidate with production-equivalent runtime, an isolated verified production-data copy where applicable, rehearsed migrations, normal authentication and required device acceptance, and rollback evidence. Release the same reviewed and tested revision under the project's recorded authorization. StudioOps does not supply a complete hosted-environment or Jira adapter in this release. See [Workflow UML](workflow-uml/README.md).

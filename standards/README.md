@@ -23,3 +23,5 @@ Default standards:
 - `review-checklist.md`
 
 For visual work, the default expectation is mobile-first implementation with mobile, tablet, and desktop coverage. If a task is intentionally limited to one breakpoint, the task must say so explicitly.
+
+- [Hosted release-candidate QA](hosted-release-candidate-qa.md): controlled HTTPS qualification, isolated data, candidate-bound acceptance and rollback before production.

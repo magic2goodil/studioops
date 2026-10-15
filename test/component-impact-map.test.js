@@ -73,15 +73,15 @@ async function writeManifest(root, value) {
 }
 
 test("component maps are canonical, validated, and content addressed", () => {
-  const first = validateComponentImpactMap(manifest("dollos", "https://github.com/example/dollos.git"));
+  const first = validateComponentImpactMap(manifest("sample-app", "https://github.com/example/sample-app.git"));
   const second = validateComponentImpactMap({
-    ...manifest("dollos", "git@github.com:example/dollos.git"),
+    ...manifest("sample-app", "git@github.com:example/sample-app.git"),
     fullRegressionTriggers: ["schema"],
   });
-  assert.equal(first.project.repository, "https://github.com/example/dollos");
+  assert.equal(first.project.repository, "https://github.com/example/sample-app");
   assert.equal(first.project.repository, second.project.repository);
   assert.equal(sha256Digest(first), sha256Digest(structuredClone(first)));
-  assert.throws(() => validateComponentImpactMap({ ...manifest("dollos", "https://github.com/example/dollos"), schemaVersion: 2 }), /Unsupported/);
+  assert.throws(() => validateComponentImpactMap({ ...manifest("sample-app", "https://github.com/example/sample-app"), schemaVersion: 2 }), /Unsupported/);
 });
 
 test("checked-in StudioOps primary map is repository-bound and has unique authorities", () => {
@@ -232,22 +232,22 @@ test("checked-in StudioOps map fails closed for uncertain and release-sensitive 
 
 test("repository identity prevents cross-project lookup even with identical component names", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-component-isolation-"));
-  const dollosRoot = path.join(root, "dollos");
-  const teamRoot = path.join(root, "team-robison");
-  await writeManifest(dollosRoot, manifest("dollos", "https://github.com/example/dollos", "src/dollos-catalog.js"));
-  await writeManifest(teamRoot, manifest("team-robison", "https://github.com/example/team-robison", "src/team-catalog.js"));
+  const sampleAppRoot = path.join(root, "sample-app");
+  const teamRoot = path.join(root, "sample-site");
+  await writeManifest(sampleAppRoot, manifest("sample-app", "https://github.com/example/sample-app", "src/sample-app-catalog.js"));
+  await writeManifest(teamRoot, manifest("sample-site", "https://github.com/example/sample-site", "src/team-catalog.js"));
   try {
-    const dollos = loadProjectComponentImpactMap({
-      id: "project_1", key: "dollos", repoUrl: "https://github.com/example/dollos", repoPath: dollosRoot,
+    const sampleApp = loadProjectComponentImpactMap({
+      id: "project_1", key: "sample-app", repoUrl: "https://github.com/example/sample-app", repoPath: sampleAppRoot,
     });
     const team = loadProjectComponentImpactMap({
-      id: "project_2", key: "team-robison", repoUrl: "https://github.com/example/team-robison", repoPath: teamRoot,
+      id: "project_2", key: "sample-site", repoUrl: "https://github.com/example/sample-site", repoPath: teamRoot,
     });
-    assert.deepEqual(dollos.manifest.components.catalog.paths, ["src/dollos-catalog.js", "src/catalog-api.js", "test/catalog.test.js"]);
+    assert.deepEqual(sampleApp.manifest.components.catalog.paths, ["src/sample-app-catalog.js", "src/catalog-api.js", "test/catalog.test.js"]);
     assert.deepEqual(team.manifest.components.catalog.paths, ["src/team-catalog.js", "src/catalog-api.js", "test/catalog.test.js"]);
-    assert.notEqual(dollos.digest, team.digest);
+    assert.notEqual(sampleApp.digest, team.digest);
     assert.throws(() => loadProjectComponentImpactMap({
-      id: "project_1", key: "dollos", repoUrl: "https://github.com/example/dollos", repoPath: teamRoot,
+      id: "project_1", key: "sample-app", repoUrl: "https://github.com/example/sample-app", repoPath: teamRoot,
     }), ComponentMapIsolationError);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -258,8 +258,8 @@ test("candidate remapping reads the exact commit without crossing repository aut
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-candidate-map-"));
   const project = {
     id: "project_1",
-    key: "dollos",
-    repoUrl: "https://github.com/example/dollos",
+    key: "sample-app",
+    repoUrl: "https://github.com/example/sample-app",
     repoPath: root,
   };
   try {
@@ -284,7 +284,7 @@ test("candidate remapping reads the exact commit without crossing repository aut
     assert.notEqual(candidate.digest, checkedOut.digest);
     assert.equal(candidate.sourceCommit, candidateSha);
     assert.throws(
-      () => loadProjectComponentImpactMapAtCommit({ ...project, repoUrl: "https://github.com/example/team-robison" }, candidateSha),
+      () => loadProjectComponentImpactMapAtCommit({ ...project, repoUrl: "https://github.com/example/sample-site" }, candidateSha),
       ComponentMapIsolationError,
     );
   } finally {
@@ -293,8 +293,8 @@ test("candidate remapping reads the exact commit without crossing repository aut
 });
 
 test("planner emits a narrow context packet and targeted tests for mapped work", () => {
-  const project = { id: "project_1", key: "dollos", repoUrl: "https://github.com/example/dollos" };
-  const normalized = validateComponentImpactMap(manifest("dollos", project.repoUrl));
+  const project = { id: "project_1", key: "sample-app", repoUrl: "https://github.com/example/sample-app" };
+  const normalized = validateComponentImpactMap(manifest("sample-app", project.repoUrl));
   const plan = resolveProjectImpactPlan({
     project,
     task: {
@@ -315,8 +315,8 @@ test("planner emits a narrow context packet and targeted tests for mapped work",
 });
 
 test("unmapped, sensitive, shared, and multi-component impact fails closed", () => {
-  const project = { id: "project_1", key: "dollos", repoUrl: "https://github.com/example/dollos" };
-  const raw = manifest("dollos", project.repoUrl);
+  const project = { id: "project_1", key: "sample-app", repoUrl: "https://github.com/example/sample-app" };
+  const raw = manifest("sample-app", project.repoUrl);
   raw.components.identity = {
     owner: "identity-owner",
     aliases: ["authorization"],
@@ -356,7 +356,7 @@ test("changed files outside the content-addressed scope block handoff", () => {
 });
 
 test("schema rejects duplicate path and policy authorities plus prohibited edges", () => {
-  const raw = manifest("dollos", "https://github.com/example/dollos");
+  const raw = manifest("sample-app", "https://github.com/example/sample-app");
   raw.components.other = {
     owner: "other-owner",
     paths: ["src/catalog.js"],
@@ -381,8 +381,8 @@ test("schema rejects duplicate path and policy authorities plus prohibited edges
 });
 
 test("immutable changed paths and public-contract paths force full regression", () => {
-  const project = { id: "project_1", key: "dollos", repoUrl: "https://github.com/example/dollos" };
-  const normalized = validateComponentImpactMap(manifest("dollos", project.repoUrl));
+  const project = { id: "project_1", key: "sample-app", repoUrl: "https://github.com/example/sample-app" };
+  const normalized = validateComponentImpactMap(manifest("sample-app", project.repoUrl));
   const plan = resolveProjectImpactPlan({
     project,
     task: {
@@ -417,7 +417,7 @@ test("changed-file evidence is recomputed from the exact local Git candidate", a
     execFileSync("git", ["add", "."], { cwd: root });
     execFileSync("git", ["commit", "-qm", "candidate"], { cwd: root });
     const commitSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-    const actual = exactCandidateChangedFiles({ id: "project_1", key: "dollos", repoPath: root }, { baseSha, commitSha }, { cwd: root });
+    const actual = exactCandidateChangedFiles({ id: "project_1", key: "sample-app", repoPath: root }, { baseSha, commitSha }, { cwd: root });
     assert.deepEqual(actual, ["src/catalog.js", "src/payments.js"]);
     assert.throws(
       () => assertChangedFileEvidenceMatches(actual, ["src/catalog.js"]),
@@ -450,7 +450,7 @@ test("immutable diff includes deletion, both rename paths, and file type changes
 });
 
 test("coverage detects uncovered files and overlapping glob ownership", () => {
-  const raw = manifest("dollos", "https://github.com/example/dollos");
+  const raw = manifest("sample-app", "https://github.com/example/sample-app");
   raw.coverageRoots = ["src", "test"];
   let normalized = validateComponentImpactMap(raw);
   const missing = inspectComponentMapCoverage(normalized, ["src/catalog.js", "src/new-module.js", "README.md"]);
@@ -460,18 +460,18 @@ test("coverage detects uncovered files and overlapping glob ownership", () => {
   normalized = validateComponentImpactMap(raw);
   assert.deepEqual(inspectComponentMapCoverage(normalized, ["src/catalog.js"]).conflictingFiles,
     [{ path: "src/catalog.js", owners: ["catalog", "storage"] }]);
-  const plan = resolveProjectImpactPlan({ project: { key: "dollos", repoUrl: raw.project.repository }, task: { workAreas: ["src/catalog.js"] },
+  const plan = resolveProjectImpactPlan({ project: { key: "sample-app", repoUrl: raw.project.repository }, task: { workAreas: ["src/catalog.js"] },
     loadedMap: { status: "drifted", manifest: validateComponentImpactMap({ ...raw, components: { catalog: raw.components.catalog } }), coverage: missing } });
   assert.equal(plan.fullRegression, true);
   assert.ok(plan.reasonCodes.includes("component_map_coverage_drift"));
 });
 
 test("dependency context and dependent tests do not widen editable scope", () => {
-  const raw = manifest("dollos", "https://github.com/example/dollos");
+  const raw = manifest("sample-app", "https://github.com/example/sample-app");
   raw.components.storage = { ...raw.components.catalog, paths: ["src/storage.js"], tests: ["node --test test/storage.test.js"], dependsOn: [] };
   raw.components.catalog.dependsOn = ["storage"];
   raw.components.checkout = { ...raw.components.catalog, paths: ["src/checkout.js"], tests: ["node --test test/checkout.test.js"], dependsOn: ["catalog"] };
-  const plan = resolveProjectImpactPlan({ project: { key: "dollos", repoUrl: raw.project.repository }, task: { workAreas: ["src/catalog.js"] },
+  const plan = resolveProjectImpactPlan({ project: { key: "sample-app", repoUrl: raw.project.repository }, task: { workAreas: ["src/catalog.js"] },
     loadedMap: { status: "mapped", manifest: validateComponentImpactMap(raw) } });
   assert.deepEqual(plan.supportingFileScope, ["src/storage.js"]);
   assert.deepEqual(plan.dependentTests, ["node --test test/checkout.test.js"]);
@@ -535,7 +535,7 @@ test("exceptional discovery output is redacted, bounded, content addressed, and 
   try {
     const artifact = await writeBoundedDiscoveryArtifact({
       artifactRoot: root,
-      projectKey: "dollos",
+      projectKey: "sample-app",
       runId: "run_1",
       reasonCode: "unclassified_impact",
       output: `token=super-secret-value\n${"x".repeat(200)}`,
@@ -558,9 +558,9 @@ test("dispatcher persists one repository-bound context packet on both run and ta
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-context-packet-"));
   const project = {
     id: "project_1",
-    key: "dollos",
-    name: "DollOS",
-    repoUrl: "https://github.com/example/dollos",
+    key: "sample-app",
+    name: "Sample App",
+    repoUrl: "https://github.com/example/sample-app",
     repoPath: root,
   };
   await writeManifest(root, manifest(project.key, project.repoUrl));
@@ -593,7 +593,7 @@ test("dispatcher persists one repository-bound context packet on both run and ta
     }], { state });
     assert.equal(report.runs.length, 1);
     assert.equal(report.runs[0].impactPlan.project.id, project.id);
-    assert.equal(report.runs[0].impactPlan.project.repository, "https://github.com/example/dollos");
+    assert.equal(report.runs[0].impactPlan.project.repository, "https://github.com/example/sample-app");
     assert.deepEqual(report.runs[0].fileScope, ["src/catalog-api.js", "src/catalog.js", "test/catalog.test.js"]);
     assert.equal(task.impactPlan.manifest.digest, report.runs[0].impactPlan.manifest.digest);
     assert.deepEqual(task.impactScopePlan.allowedFileScope, report.runs[0].fileScope);

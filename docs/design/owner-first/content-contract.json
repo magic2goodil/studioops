@@ -57,7 +57,7 @@
     "oneOverdue": "1 overdue",
     "qaTitle": "Verify the Meridian onboarding candidate",
     "releaseTitle": "Approve Northstar Atlas release 0.8.0",
-    "exceptionTitle": "Choose a dependency exception for Lumen Desk",
+    "exceptionTitle": "Choose a dependency exception for Example Desk",
     "incidentTitle": "Acknowledge the paused build queue",
     "qaMeta": "14 min old · due in 46 min",
     "releaseMeta": "31 min old · due in 29 min",

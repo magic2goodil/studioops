@@ -29,7 +29,7 @@ npm run automation-tick -- --limit 50
 Limit to one project:
 
 ```bash
-npm run automation-tick -- --project event-horizons-web --limit 20
+npm run automation-tick -- --project example-app --limit 20
 ```
 
 ## Scheduled Local Agent

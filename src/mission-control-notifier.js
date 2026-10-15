@@ -85,7 +85,7 @@ Usage:
   studioops-notifier --plan
   studioops-notifier
   studioops-notifier --watch --interval 10
-  studioops notifier --project event-horizons-web
+  studioops notifier --project example-app
 
 The notifier sends local macOS notifications when a task reaches owner review,
 Trust Leads QA review, or when an automated run fails. It does not approve,
