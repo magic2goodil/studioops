@@ -43,7 +43,7 @@ Information voluntarily submitted through GitHub issues, pull requests, discussi
 
 Published packages are source and skill snapshots, not copies of an operator's database. Review the package manifest and use a fresh local workspace for evaluation. Screenshots in the README use synthetic data. Do not include local configuration, backups, task exports, private photos or production captures when redistributing the software.
 
-The source repository retains contributor attribution and historical commits. A clean current archive does not erase or anonymize Git history, linked issues or pull requests. See [Sharing and evaluation](docs/SHARING.md) for the scope of a current-snapshot review.
+The source repository retains contributor attribution and historical commits. A clean current archive does not erase or anonymize Git history, linked issues or pull requests. See [Sharing and evaluation](https://github.com/magic2goodil/studioops/blob/main/docs/SHARING.md) for the scope of a current-snapshot review.
 
 ## Security
 

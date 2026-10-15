@@ -6,10 +6,10 @@ StudioOps is an open-source developer-preview project maintained through GitHub.
 
 Review:
 
-- [Getting Started](docs/GETTING_STARTED.md)
-- [Local Automation](docs/LOCAL_AUTOMATION.md)
+- [Getting Started](https://github.com/magic2goodil/studioops/blob/main/docs/GETTING_STARTED.md)
+- [Local Automation](https://github.com/magic2goodil/studioops/blob/main/docs/LOCAL_AUTOMATION.md)
 - [Security Policy](SECURITY.md)
-- [Troubleshooting](docs/GETTING_STARTED.md#troubleshooting)
+- [Troubleshooting](https://github.com/magic2goodil/studioops/blob/main/docs/GETTING_STARTED.md#troubleshooting)
 
 Inspect the local installation with:
 

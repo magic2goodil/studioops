@@ -39,7 +39,7 @@ Never store secrets, access tokens, private keys, passwords, customer records, o
 - Git history
 - logs or run output
 
-GitHub App credentials belong under the local ignored credentials directory described in [docs/GITHUB_APP_BOTS.md](docs/GITHUB_APP_BOTS.md). Project secrets belong in each project's existing secret manager or protected environment.
+GitHub App credentials belong under the local ignored credentials directory described in [docs/GITHUB_APP_BOTS.md](https://github.com/magic2goodil/studioops/blob/main/docs/GITHUB_APP_BOTS.md). Project secrets belong in each project's existing secret manager or protected environment.
 
 Treat authentication data, payment data, precise location, social graphs, behavioral analytics, private repository content, and production operational data as sensitive. Minimize collection, redact logs, define retention, and require explicit consent when a product task introduces sensitive user data or outbound communication.
 
