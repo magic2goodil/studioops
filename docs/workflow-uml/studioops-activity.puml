@@ -1,0 +1,102 @@
+@startuml
+!pragma useVerticalIf on
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName SansSerif
+skinparam defaultFontSize 14
+skinparam shadowing false
+skinparam ArrowColor #42566D
+skinparam activity {
+  BackgroundColor #EEF5FC
+  BorderColor #406284
+  FontColor #17334D
+  DiamondBackgroundColor #FFF4DB
+  DiamondBorderColor #947735
+  StartColor #247B75
+  EndColor #247B75
+}
+skinparam swimlaneTitleBackgroundColor #E6EEF6
+skinparam swimlaneBorderColor #B8C8D8
+skinparam noteBackgroundColor #FFF9E9
+skinparam noteBorderColor #D8C69D
+title StudioOps | Reviewed delivery
+caption UML activity diagram. Configured QA-bundle path is shown; see the companion guide for the per-task path.
+
+|Owner / project policy|
+start
+:Define task, acceptance criteria,\nscope, dependencies and standards;
+if (Broad work needs architecture?) then (yes)
+  :Record architecture and\ndependency-linked tasks;
+endif
+
+|Control plane|
+:Check readiness, dependencies,\noperator pause, quota and failure budget;
+if (Admitted?) then (yes)
+  :Create durable run [queued];
+else (no)
+  :Record blocker, wait for\na meaningful state change;
+  stop
+endif
+
+|Builder|
+:Claim run [running], task [in_progress],\nprepare isolated Git workspace;
+:Read task, skills, standards and\ncommit-bound repository context;
+repeat
+  :Implement and validate,\nlink branch, PR and exact source SHA;
+  :Submit candidate [builder_review];
+  |Independent reviewers|
+  :Applicable backend, frontend,\naccessibility and regression review;
+  if (Specialist reviews clear?) then (yes)
+    :Lead review of the same\nsource SHA and review cycle;
+  else (no)
+    :Retain specialist findings,\nreturn to bounded repair;
+  endif
+  if (Material findings remain?) then (yes)
+    |Control plane|
+    if (Another bounded repair is justified?) then (yes)
+      :Record concrete changes [needs_changes];
+    else (no)
+      |Owner / project policy|
+      :Resolve blocker or revise scope,\nautomatic retry stops;
+      stop
+    endif
+  endif
+  |Builder|
+repeat while (Changes requested?) is (yes) not (no)
+
+|Control plane|
+:Assemble immutable non-production\nQA bundle [qa_review];
+:Validate integration SHA,\nprepare owner QA packet;
+
+|Owner / project policy|
+:Inspect the exact bundle,\nrecord owner QA decision;
+if (QA passed?) then (yes)
+  :[approved_for_main];
+else (no)
+  :Return concrete findings [needs_changes];
+  stop
+endif
+
+|Control plane|
+:Create validated release-candidate PR\nagainst the protected target;
+note right
+  This worker does not merge
+  the PR or deploy production.
+end note
+
+|Owner / project policy|
+:Hosted RC: same revision, isolated\nauthorized production-data copy,\nregression and required device acceptance;
+if (Current evidence and release\nauthorization match the candidate?) then (yes)
+  :Protected merge / release process,\npromote the tested revision;
+  :Verify production identity and health,\nretain backup, audit and rollback;
+else (no)
+  :Hold release, resolve missing\nor stale qualification;
+  stop
+endif
+stop
+
+legend bottom
+  The final owner lane performs required hosted qualification and deployment.
+  These steps remain outside the automatic workflow worker loop.
+  A changed source SHA invalidates prior-candidate review approval.
+endlegend
+@enduml

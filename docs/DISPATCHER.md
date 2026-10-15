@@ -56,7 +56,7 @@ npm run dispatcher
 Limit to one project:
 
 ```bash
-npm run dispatcher -- --project event-horizons-web --limit 3
+npm run dispatcher -- --project example-app --limit 3
 ```
 
 ## Run Continuously

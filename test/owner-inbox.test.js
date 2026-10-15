@@ -17,7 +17,7 @@ const BASE_SHA = "b".repeat(40);
 const INTEGRATION_SHA = "c".repeat(40);
 const PROMOTION_SHA = "d".repeat(40);
 const PREVIEW_URL = "http://127.0.0.1:5080/";
-const INTEGRATION_BRANCH = "qa/candidate-dollos";
+const INTEGRATION_BRANCH = "qa/candidate-sample-app";
 
 function withPacketDigest(packet) {
   const { packetDigest: _discarded, ...base } = packet;
@@ -53,14 +53,14 @@ function fixtureState() {
     meta: {},
     projects: [{
       id: "project_1",
-      key: "dollos",
-      name: "DollOS",
-      repoUrl: "https://github.com/example/dollos",
+      key: "sample-app",
+      name: "Sample App",
+      repoUrl: "https://github.com/example/sample-app",
       localQaPreview: {
         previewUrl: PREVIEW_URL,
       },
       reviewPolicy: {
-        integrationBranch: "qa/dollos",
+        integrationBranch: "qa/sample-app",
       },
     }],
     tasks: [{
@@ -72,8 +72,8 @@ function fixtureState() {
       reviewCycle: 1,
       reviewSubjectSha: SUBJECT_SHA,
       reviewSubjectCycle: 1,
-      branchName: "codex/dollos-task_7",
-      prUrl: "https://github.com/example/dollos/pull/36",
+      branchName: "codex/sample-app-task_7",
+      prUrl: "https://github.com/example/sample-app/pull/36",
       acceptanceCriteria: [
         "The updated ritual duration is visible in the local preview.",
       ],
@@ -105,7 +105,7 @@ function candidateManifest() {
     },
     sources: [{
       taskId: "task_7",
-      sourceRef: "refs/heads/codex/dollos-task_7",
+      sourceRef: "refs/heads/codex/sample-app-task_7",
       headSha: SUBJECT_SHA,
       candidateCycle: 1,
       reviews: [{
@@ -171,7 +171,7 @@ function addCurrentBundle(state, status = "ready", input = {}) {
       decidedAt: "2026-07-23T15:04:45.000Z",
     };
     candidate.promotion = {
-      branch: "release/candidate-dollos",
+      branch: "release/candidate-sample-app",
       prUrl: input.promotionPrUrl || "",
       commitSha: PROMOTION_SHA,
       manifestDigest: candidate.manifestDigest,
@@ -243,8 +243,8 @@ test("owner QA packet v2 snapshots complete approval authority and detects defin
   state.projects[0] = {
     ...state.projects[0],
     description: "Owner-visible product scope",
-    repoPath: "/workspace/dollos",
-    repoUrl: "https://github.com/example/dollos",
+    repoPath: "/workspace/sample-app",
+    repoUrl: "https://github.com/example/sample-app",
     validationCommands: ["npm test"],
     contextLinks: ["https://example.com/product-brief"],
     standards: ["modular architecture"],
@@ -260,14 +260,14 @@ test("owner QA packet v2 snapshots complete approval authority and detects defin
     architectureDecision: "Use the existing duration service.",
     deliveryMode: "functional",
     attachments: [{ id: "attachment_1", name: "reference.png" }],
-    branchName: "codex/dollos-task_7",
-    prUrl: "https://github.com/example/dollos/pull/7",
+    branchName: "codex/sample-app-task_7",
+    prUrl: "https://github.com/example/sample-app/pull/7",
     operationalLocalArtifactRef: "artifact://owner-preview/task_7",
     candidateIdentity: {
       commitSha: SUBJECT_SHA,
       treeSha: "e".repeat(40),
       baseSha: BASE_SHA,
-      branch: "codex/dollos-task_7",
+      branch: "codex/sample-app-task_7",
       candidateCycle: 1,
     },
   };
@@ -275,7 +275,7 @@ test("owner QA packet v2 snapshots complete approval authority and detects defin
 
   const packet = assertCurrentOwnerQaPacket(state, state.candidates[0], state.qaBundles[0]);
   assert.equal(packet.schemaVersion, "studioops.owner-qa-packet.v2");
-  assert.equal(packet.project.definition.reviewPolicy.integrationBranch, "qa/dollos");
+  assert.equal(packet.project.definition.reviewPolicy.integrationBranch, "qa/sample-app");
   assert.deepEqual(packet.project.definition.safetyRules, ["Never expose credentials"]);
   assert.deepEqual(packet.project.validationCommands, ["npm test"]);
   assert.deepEqual(packet.project.definition.contextLinks, ["https://example.com/product-brief"]);
@@ -286,8 +286,8 @@ test("owner QA packet v2 snapshots complete approval authority and detects defin
   assert.equal(packet.tasks[0].architecture.decision, "Use the existing duration service.");
   assert.equal(packet.tasks[0].delivery.mode, "functional");
   assert.equal(packet.tasks[0].attachments[0].id, "attachment_1");
-  assert.equal(packet.tasks[0].definition.branchName, "codex/dollos-task_7");
-  assert.equal(packet.tasks[0].definition.prUrl, "https://github.com/example/dollos/pull/7");
+  assert.equal(packet.tasks[0].definition.branchName, "codex/sample-app-task_7");
+  assert.equal(packet.tasks[0].definition.prUrl, "https://github.com/example/sample-app/pull/7");
   assert.equal(packet.tasks[0].definition.operationalLocalArtifactRef, "artifact://owner-preview/task_7");
   assert.equal(packet.tasks[0].candidateIdentity.commitSha, SUBJECT_SHA);
   assert.match(packet.packetDigest, /^sha256:[a-f0-9]{64}$/);
@@ -331,7 +331,7 @@ test("current owner exceptions remain decision-counted after desktop notificatio
   assert.equal(inbox.items[0].classification, "owner_exception");
   assert.equal(inbox.items[0].taskId, "task_7");
   assert.equal(inbox.items[0].notification.status, "sent");
-  assert.equal(inbox.items[0].prUrl, "https://github.com/example/dollos/pull/36");
+  assert.equal(inbox.items[0].prUrl, "https://github.com/example/sample-app/pull/36");
   assert.equal(inbox.items[0].checklist[0].taskId, "task_7");
   assert.match(inbox.items[0].checklist[0].text, /ritual duration/);
 });
@@ -388,7 +388,7 @@ test("Trust Leads QA handoffs remain legacy until integration and preview valida
   const state = fixtureState();
   state.projects[0].reviewPolicy = {
     trustLeadApprovals: true,
-    integrationBranch: "qa/dollos",
+    integrationBranch: "qa/sample-app",
   };
   state.tasks[0].status = "qa_review";
   delete state.tasks[0].integrationStatus;
@@ -492,7 +492,7 @@ test("a blocked circuit with candidate drift is not reported as a current Operat
       commitSha: "f".repeat(40),
       treeSha: "e".repeat(40),
       baseSha: BASE_SHA,
-      branch: "codex/dollos-task_7",
+      branch: "codex/sample-app-task_7",
       candidateCycle: 2,
     },
     automationBlocker: {
@@ -512,10 +512,10 @@ test("a blocked circuit with candidate drift is not reported as a current Operat
           commitSha: SUBJECT_SHA,
           treeSha: "e".repeat(40),
           baseSha: BASE_SHA,
-          branch: "codex/dollos-task_7",
+          branch: "codex/sample-app-task_7",
           candidateCycle: 1,
         },
-        branchName: "codex/dollos-task_7",
+        branchName: "codex/sample-app-task_7",
       },
     },
   };
@@ -539,7 +539,7 @@ test("project circuits remain visibly resettable in Operations", () => {
   assert.equal(inbox.counts.operations, 1);
   assert.equal(operation.kind, "project_automation_blocked");
   assert.equal(operation.blocker.reason, "Repository access is unavailable.");
-  assert.match(operation.primaryAction.value, /circuit-reset --project dollos/);
+  assert.match(operation.primaryAction.value, /circuit-reset --project sample-app/);
   assert.equal(operation.notification.status, "not_applicable");
 });
 
@@ -564,7 +564,7 @@ test("immutable ready QA bundles expose preview and task evidence as one decisio
 test("release candidates count only with immutable evidence and a concrete PR action", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
-    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+    promotionPrUrl: "https://github.com/example/sample-app/pull/99",
   });
 
   const inbox = buildOwnerInbox(state);
@@ -572,7 +572,7 @@ test("release candidates count only with immutable evidence and a concrete PR ac
   assert.equal(inbox.count, 1);
   assert.equal(decision.classification, "release_approval");
   assert.equal(decision.primaryAction.type, "pr");
-  assert.equal(decision.primaryAction.href, "https://github.com/example/dollos/pull/99");
+  assert.equal(decision.primaryAction.href, "https://github.com/example/sample-app/pull/99");
 });
 
 test("release candidates with a PR in another GitHub repository route to non-actionable Operations", () => {
@@ -594,7 +594,7 @@ test("release candidates with a PR in another GitHub repository route to non-act
 test("release candidates with durable QA revocation intent route to non-actionable Operations", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
-    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+    promotionPrUrl: "https://github.com/example/sample-app/pull/99",
   });
   addPendingQaRevocation(state);
 
@@ -618,13 +618,13 @@ test("remote revocation settlement cannot restore release approval before local 
   for (const status of ["closed", "merged"]) {
     const state = fixtureState();
     addCurrentBundle(state, "release_candidate_ready", {
-      promotionPrUrl: "https://github.com/example/dollos/pull/99",
+      promotionPrUrl: "https://github.com/example/sample-app/pull/99",
     });
     addPendingQaRevocation(state, {
       settlement: {
         schemaVersion: "studioops.qa-revocation-settlement.v1",
         status,
-        prUrl: "https://github.com/example/dollos/pull/99",
+        prUrl: "https://github.com/example/sample-app/pull/99",
         observedAt: "2026-07-23T15:07:00.000Z",
         mergeCommit: status === "merged" ? "e".repeat(40) : "",
         mergedAt: status === "merged" ? "2026-07-23T15:06:30.000Z" : "",
@@ -641,7 +641,7 @@ test("remote revocation settlement cannot restore release approval before local 
 test("release candidates without a passed immutable QA decision route to Operations", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
-    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+    promotionPrUrl: "https://github.com/example/sample-app/pull/99",
   });
   state.candidates[0].qaDecision = null;
   state.qaBundles[0].qaDecision = null;
@@ -655,7 +655,7 @@ test("release candidates without a passed immutable QA decision route to Operati
 test("release candidates with stale QA decision bindings route to Operations", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
-    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+    promotionPrUrl: "https://github.com/example/sample-app/pull/99",
   });
   state.candidates[0].qaDecision.integrationSha = BASE_SHA;
   state.qaBundles[0].qaDecision = state.candidates[0].qaDecision;
@@ -669,7 +669,7 @@ test("release candidates with stale QA decision bindings route to Operations", (
 test("malformed QA task membership fails closed without crashing the inbox", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
-    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+    promotionPrUrl: "https://github.com/example/sample-app/pull/99",
   });
   state.candidates[0].qaDecision.taskIds = { task_7: true };
   state.qaBundles[0].qaDecision = state.candidates[0].qaDecision;
@@ -700,9 +700,9 @@ test("release candidates with unsafe or local primary actions route to Operation
 test("release candidates with a mismatched promotion handoff route to Operations", () => {
   const state = fixtureState();
   addCurrentBundle(state, "release_candidate_ready", {
-    promotionPrUrl: "https://github.com/example/dollos/pull/99",
+    promotionPrUrl: "https://github.com/example/sample-app/pull/99",
   });
-  state.candidates[0].promotion.prUrl = "https://github.com/example/dollos/pull/98";
+  state.candidates[0].promotion.prUrl = "https://github.com/example/sample-app/pull/98";
 
   const inbox = buildOwnerInbox(state);
   assert.equal(inbox.count, 0);
@@ -818,7 +818,7 @@ test("synthetic circuit failures are explicitly labeled non-production diagnosti
 
 test("inbox response items expose only whitelisted project identity fields", () => {
   const state = fixtureState();
-  state.projects[0].repoPath = "/private/studioops/repositories/dollos";
+  state.projects[0].repoPath = "/private/studioops/repositories/sample-app";
   state.projects[0].repoUrl = "https://token@example.invalid/private.git";
   state.projects[0].qaIntegration = {
     internalMarker: "private-project-config",

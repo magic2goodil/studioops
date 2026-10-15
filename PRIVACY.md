@@ -1,6 +1,6 @@
 # StudioOps Privacy Notice
 
-Effective July 23, 2026
+Effective July 23, 2026 · clarified October 15, 2026
 
 StudioOps is an open-source, local-first developer tool. This notice describes the data handled by the StudioOps software and Codex plugin distributed by StudioOps contributors.
 
@@ -31,13 +31,19 @@ StudioOps may invoke services that the user separately configures:
 - GitHub may receive branches, commits, pull requests, comments, and reviews when GitHub automation is enabled.
 - Project validation commands may use package registries, APIs, or other services selected by the project.
 
-StudioOps does not silently enable these integrations. Users are responsible for reviewing the data handling and permissions of each configured service.
+Users are responsible for reviewing the data handling and permissions of each configured service before enabling workers. Local storage or a corporate firewall does not mean repository context stays on the machine: a configured cloud coding agent may receive that context. Use approved accounts and minimized or synthetic data; do not infer regulatory approval from the tool's deployment location.
 
 ## Sharing And Sale
 
 StudioOps contributors do not receive the Community edition's local task database, repository contents, prompts, or logs merely because the software is installed. StudioOps contributors do not sell personal information collected by the Community edition.
 
 Information voluntarily submitted through GitHub issues, pull requests, discussions, or security reports is handled by GitHub and is visible according to the selected GitHub channel.
+
+## Distribution and evaluation
+
+Published packages are source and skill snapshots, not copies of an operator's database. Review the package manifest and use a fresh local workspace for evaluation. Screenshots in the README use synthetic data. Do not include local configuration, backups, task exports, private photos or production captures when redistributing the software.
+
+The source repository retains contributor attribution and historical commits. A clean current archive does not erase or anonymize Git history, linked issues or pull requests. See [Sharing and evaluation](https://github.com/magic2goodil/studioops/blob/main/docs/SHARING.md) for the scope of a current-snapshot review.
 
 ## Security
 

@@ -145,7 +145,7 @@ function releaseReadyState() {
 
 test("QA bundles produce one checklist notification with the preview URL", () => {
   const notification = notificationForBundle({
-    projectKey: "event-horizons-web",
+    projectKey: "example-app",
     status: "ready",
     previewUrl: "http://127.0.0.1:4174/",
     tasks: [
@@ -162,9 +162,9 @@ test("QA bundles produce one checklist notification with the preview URL", () =>
 
 test("release candidates notify with their PR and exhausted notification retries stop", () => {
   const notification = notificationForBundle({
-    projectKey: "event-horizons-web",
+    projectKey: "example-app",
     status: "release_candidate_ready",
-    promotionPrUrl: "https://github.com/example/event-horizon/pull/42",
+    promotionPrUrl: "https://github.com/example/example-app/pull/42",
     tasks: [{ id: "task_126", title: "Fix map categories" }],
   });
 

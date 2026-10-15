@@ -6,20 +6,21 @@ StudioOps is an open-source developer-preview project maintained through GitHub.
 
 Review:
 
-- [Getting Started](docs/GETTING_STARTED.md)
-- [Local Automation](docs/LOCAL_AUTOMATION.md)
+- [Getting Started](https://github.com/magic2goodil/studioops/blob/main/docs/GETTING_STARTED.md)
+- [Local Automation](https://github.com/magic2goodil/studioops/blob/main/docs/LOCAL_AUTOMATION.md)
 - [Security Policy](SECURITY.md)
-- the troubleshooting section in [README.md](README.md)
+- [Troubleshooting](https://github.com/magic2goodil/studioops/blob/main/docs/GETTING_STARTED.md#troubleshooting)
 
-Run:
+Inspect the local installation with:
 
 ```bash
-npm run check
 npm run status-agents
 npm run supervisor
 npm run dispatcher -- --plan
 npm run runner -- --plan
 ```
+
+For a source-code problem, run `npm run check` once after reproducing the failure. Reuse successful evidence for an unchanged candidate, and retry failures only after a concrete fix. Redact operational output before sharing.
 
 ## Bug Reports And Feature Requests
 

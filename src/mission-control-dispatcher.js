@@ -148,7 +148,7 @@ Usage:
   studioops-dispatcher --dry-run
   studioops-dispatcher
   studioops-dispatcher --watch --interval 10
-  studioops dispatcher --project event-horizons-web --limit 3
+  studioops dispatcher --project example-app --limit 3
 
 The dispatcher consumes supervisor actions and creates durable run records. It
 does not merge PRs, deploy production, or send external notifications.

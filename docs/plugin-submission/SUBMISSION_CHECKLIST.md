@@ -9,13 +9,13 @@
 - [x] Public support page
 - [x] Listing copy and starter prompts
 - [x] Exactly five positive tests and three negative tests
-- [x] Initial release notes
-- [x] Deterministic package builder and repository validation
+- [x] Current release notes
+- [x] Allowlisted package builder and repository validation
 
 ## Publisher Actions
 
-- [ ] Merge and publish the public policy URLs on the repository's default branch
-- [ ] Confirm whether the publisher identity should be Team Robison or a verified individual
+- [x] Public policy URLs exist on the repository's default branch
+- [ ] Verify the submitting publisher identity; the contributor label is not business verification
 - [ ] Confirm Apps Management write access in the selected OpenAI organization
 - [ ] Complete developer or business verification
 - [ ] Select countries or regions where the listing, support, privacy notice, and terms are ready
@@ -26,3 +26,5 @@
 - [ ] Publish only after OpenAI approval and a final owner review
 
 Do not mark publisher identity, regional availability, or policy attestations complete on the owner's behalf.
+
+Local packaging and installation do not submit this listing to an external marketplace. Record a final package digest and verify current policy URLs before any separately authorized submission.

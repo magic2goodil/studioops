@@ -1,10 +1,9 @@
 {
   "name": "studioops",
-  "version": "0.1.0+codex.20260722185818",
-  "description": "Run software work through a senior AI engineering team and a structured delivery board.",
+  "version": "0.1.0+codex.20261015142508",
+  "description": "Coordinate software work through structured tasks, isolated builders, specialist review, and human release control.",
   "author": {
-    "name": "Team Robison",
-    "url": "https://github.com/magic2goodil"
+    "name": "StudioOps contributors"
   },
   "homepage": "https://github.com/magic2goodil/studioops",
   "repository": "https://github.com/magic2goodil/studioops",
@@ -20,7 +19,7 @@
     "displayName": "StudioOps",
     "shortDescription": "AI software delivery workflow",
     "longDescription": "Install and run a local-first AI software delivery workflow. StudioOps turns ideas into structured projects and tasks, routes work through isolated builders and specialist reviews, assembles approved changes in non-production QA, and keeps releases under human control.",
-    "developerName": "Team Robison",
+    "developerName": "StudioOps contributors",
     "category": "Developer Tools",
     "capabilities": [
       "One-step local setup",

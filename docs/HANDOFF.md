@@ -148,7 +148,7 @@ As a business owner, I want to create an event with a photo and category tags, s
 ```
 
 ```text
-As a mobile user, I want location permission explained before the permission prompt, so that I understand why Event Horizon needs access.
+As a mobile user, I want location permission explained before the permission prompt, so that I understand why Example App needs access.
 ```
 
 Acceptance criteria should be observable. Prefer:
@@ -345,7 +345,7 @@ When asked to break a mockup into tasks:
 
 The first implementation task after a mockup breakdown should usually be a foundation task. It prevents six parallel builders from creating six button systems, six card systems, or six incompatible Sass APIs.
 
-For Event Horizon, useful slices include:
+For Example App, useful slices include:
 
 - Landing hero and brand system
 - Consumer discovery map
@@ -383,7 +383,7 @@ Consent-sensitive features include:
 - social presence, friend visibility, check-ins, or "headed there" status
 - behavioral analytics tied to a user
 - personalization and inferred interest profiles
-- AI training, coaching, persuasion, hypnosis, or similar behavior-shaping experiences
+- Personalized coaching or other behavior-shaping experiences
 - third-party sharing, ads, or business-facing analytics derived from users
 
 Those tasks must say how consent is requested, what the user is told, how consent can be revoked, and what happens to already-collected data.
@@ -422,7 +422,7 @@ If a future assistant cannot run the local app, it should still create or update
 
 ```bash
 node src/mission-control-cli.js add-task \
-  --project event-horizon \
+  --project example-app \
   --title "Task title" \
   --story "As a user..." \
   --description "Problem and context" \

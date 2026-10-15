@@ -35,7 +35,7 @@ npm run runner -- --plan
 Limit to one project:
 
 ```bash
-npm run runner -- --plan --project event-horizons-web
+npm run runner -- --plan --project example-app
 ```
 
 ## Run Once

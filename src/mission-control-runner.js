@@ -147,7 +147,7 @@ Usage:
   studioops-runner --no-github-app-auth
   MISSION_CONTROL_RUNNER_PROVIDER=codex-sdk studioops-runner
   MISSION_CONTROL_RUNNER_MODEL=gpt-5.6-sol MISSION_CONTROL_RUNNER_REASONING_EFFORT=high studioops-runner
-  studioops runner --project event-horizons-web --limit 3
+  studioops runner --project example-app --limit 3
 
 The runner claims queued builder/reviewer dispatch runs and launches a Codex
 provider against the target project repository. Providers: codex-cli, codex-sdk.

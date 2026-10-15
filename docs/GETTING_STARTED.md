@@ -31,9 +31,10 @@ StudioOps does not need Postgres, Redis, Docker, or a hosted service for a local
 ## 2. Clone And Validate
 
 ```bash
-git clone https://github.com/magic2goodil/studioops.git
-cd studioops
-npm install
+mkdir -p "$HOME/.codex/workspaces"
+git clone https://github.com/magic2goodil/studioops.git "$HOME/.codex/workspaces/studioops"
+cd "$HOME/.codex/workspaces/studioops"
+npm ci
 npm run check
 ```
 
@@ -137,13 +138,13 @@ The runner uses isolated Git workspaces by default. It may edit files, run proje
 The recommended automation identity is a private GitHub App installed only on repositories StudioOps should access:
 
 ```bash
-npm run setup-github-app
+npm run setup-github-app -- --owner YOUR_GITHUB_USER
 ```
 
 For separate role identities:
 
 ```bash
-npm run setup-github-role-apps
+npm run setup-github-role-apps -- --owner YOUR_GITHUB_USER
 ```
 
 Follow [GITHUB_APP_BOTS.md](GITHUB_APP_BOTS.md) to select permissions, install the app, and store its credentials outside the repository. When app authentication is required and missing, automation fails closed before Codex starts.
@@ -190,7 +191,7 @@ npm run self-update -- --plan
 npm run self-update
 ```
 
-The updater refuses dirty or divergent checkouts and active non-stale builder/reviewer runs.
+The updater refuses dirty or divergent checkouts and active workflow claims, including non-stale builder/reviewer runs and QA/promotion work. Review an exact candidate, preserve a verified rollback, and complete hosted qualification before applying a production update.
 
 ## Give This Guide To Codex
 
@@ -206,8 +207,10 @@ to the internet or authorize production deployment.
 
 ## Troubleshooting
 
-- `npm run check` fails: verify Node.js is at least `22.5`, reinstall dependencies, and rerun the command.
+- `npm run check` fails: inspect the first failure and verify Node.js is at least `22.5`. Retry only after fixing the specific environment, dependency or source problem; repeated unchanged runs do not resolve it.
 - GitHub operations fail: run `gh auth status`, verify repository access, and check the GitHub App installation and permissions.
 - A task is not moving: inspect `npm run supervisor`, `npm run dispatcher -- --plan`, `npm run runner -- --plan`, and `npm run status-agents`.
 - The local UI is stale: verify the web LaunchAgent and configured local QA preview health check in [LOCAL_AUTOMATION.md](LOCAL_AUTOMATION.md).
 - A worker appears stuck: inspect `data/launch-agents/`, `data/run-outputs/`, and watchdog events without committing those files.
+
+`automation-tick` writes routing state; it is not a dry run. Dispatcher and runner commands with `--plan` preview work without launching model workers. Keep paused projects and usage limits intact during evaluation. Codex/provider usage is separate from the MIT software license.

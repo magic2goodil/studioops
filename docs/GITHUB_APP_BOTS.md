@@ -9,7 +9,7 @@ GitHub requires one browser approval step to create an App registration. StudioO
 Start with one private app:
 
 ```bash
-npm run setup-github-app
+npm run setup-github-app -- --owner YOUR_GITHUB_USER
 ```
 
 This creates a local setup page at:
@@ -35,7 +35,7 @@ The runner uses GitHub App auth by default for builder and reviewer runs. If cre
 If you want GitHub to show different bot actors for different automation roles, run:
 
 ```bash
-npm run setup-github-role-apps
+npm run setup-github-role-apps -- --owner YOUR_GITHUB_USER
 ```
 
 This creates manifests for:
