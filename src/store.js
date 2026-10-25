@@ -6346,8 +6346,13 @@ export async function recordReleaseQualification(input, authority) {
     const verified = authority.verifyEvidence(saved, coordinates);
     requireHostedRcCandidate(verified, coordinates);
     const qualification = authority.qualify(saved, coordinates);
+    const hostedPacket = coordinates.record?.packets?.at(-1)?.packet;
+    if (hostedPacket) {
+      hostedRcAuthority(authority, "ownerPacket");
+      if (authority.digest(authority.ownerPacket(saved, coordinates)) !== authority.digest(hostedPacket)) hostedRcError("candidate_mismatch");
+    }
     if (coordinates.candidate.qaDecision?.outcome !== "passed"
-      || coordinates.candidate.qaPacket?.packetDigest !== qualification.ownerPacketDigest
+      || (hostedPacket?.packetDigest || coordinates.candidate.qaPacket?.packetDigest) !== qualification.ownerPacketDigest
       || authority.digest(coordinates.candidate.qaDecision) !== qualification.decisionDigest) hostedRcError("owner_decision_missing");
     if (qualification.revocationGeneration !== coordinates.record.generation) hostedRcError("revoked");
     if (qualification.policyDigest !== coordinates.project.hostedRc.activePolicyDigest) hostedRcError("policy_mismatch");
@@ -6363,10 +6368,37 @@ export async function recordReleaseQualification(input, authority) {
     if (existing) return { record: coordinates.record,
       value: { qualification: existing.qualification, digest: existing.digest, idempotent: true } };
     const record = nextHostedRcRecord(coordinates.record);
-    appendHostedRcHistory(record, "qualifications", { digest, qualification, reviewState: hostedRcReviewState(coordinates.reviews),
+    appendHostedRcHistory(record, "qualifications", { digest, qualification,
+      ...(hostedPacket ? { decisionObservation: authority.decisionObservation(coordinates),
+        observation: authority.hostedObservation() } : {}),
+      reviewState: hostedRcReviewState(coordinates.reviews),
       projectPolicyGeneration: coordinates.project.hostedRc.generation });
     appendHostedRcHistory(record, "audit", { type: "release_qualification_recorded.v1", digest, generation: record.generation });
     return { record, value: { qualification, digest, idempotent: false } };
+  });
+}
+/** Read-only public adapter coordinates; no raw SQL or database writer escapes. */
+export async function readHostedQaCoordinates(projectId, candidateId) {
+  const result = await readHostedRcAggregate(projectId, candidateId, true);
+  return { ...result, record: result.candidate?.hostedRc || null };
+}
+
+export async function recordHostedRcOwnerPacket(input, authority) {
+  hostedRcAuthority(authority, "verifyEvidence");
+  hostedRcAuthority(authority, "ownerPacket");
+  return mutateHostedRcAggregate(input, (coordinates) => {
+    const saved = coordinates.record?.evidence.find((e) => e.digest === input.evidenceDigest);
+    if (!saved) hostedRcError("evidence_missing");
+    requireHostedRcCandidate(authority.verifyEvidence(saved, coordinates), coordinates);
+    const packet = authority.ownerPacket(saved, coordinates);
+    const digest = authority.digest(packet);
+    const existing = coordinates.record?.packets?.at(-1);
+    if (existing?.digest === digest) return { record: coordinates.record, value: { packet, idempotent: true } };
+    const record = nextHostedRcRecord(coordinates.record);
+    record.packets ||= [];
+    appendHostedRcHistory(record, "packets", { digest, packet });
+    appendHostedRcHistory(record, "audit", { type: "hosted_owner_packet_recorded.v1", digest, generation: record.generation });
+    return { record, value: { packet, idempotent: false } };
   });
 }
 export async function invalidateReleaseQualification(input, authority) {

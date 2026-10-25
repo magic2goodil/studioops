@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runHostedQaCommand } from "./hosted-qa-adapter.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import readline from "node:readline/promises";
@@ -464,7 +465,9 @@ Commands:
   run-prompt RUN_ID             Print the prompt snapshot for a dispatch run
   update-run RUN_ID             Update dispatch run status, thread ID, or notes
   prompt TASK_ID --role         Print builder, architect, reviewer, QA, or release-manager prompt
-  qa-list [--json]              List actionable QA tasks/bundles and exact decision coordinates
+  qa-list [--json]              List QA tasks/bundles, hosted states and exact decision coordinates
+  hosted-qa policy|collect|decide|revoke|verify|status --project ID --candidate ID [--file SIGNED_JSON]
+                               Inspect or collect authenticated hosted release authority
 
 Task fields:
   --story                       User story, such as "As a customer..."
@@ -557,6 +560,12 @@ Automation:
     return;
   }
 
+  if (command === "hosted-qa") {
+    const result = await runHostedQaCommand({ action: args._[1], projectId: args.project,
+      candidateId: args.candidate, file: args.file });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   if (command === "qa-list") {
     const state = await readState();
     const projectFilter = args.project
@@ -579,6 +588,8 @@ Automation:
         id: task.id,
         project: project?.key || task.projectId,
         actionable: task.actionable ? "yes" : "no",
+        hostedQa: task.hostedQa.status,
+        hostedOrigin: task.hostedQa.origin,
         decisionSelector: task.decisionSelector
           ? `${task.decisionSelector.kind}:${task.decisionSelector.id}`
           : "",
@@ -619,6 +630,8 @@ Automation:
       "id",
       "project",
       "actionable",
+      "hostedQa",
+      "hostedOrigin",
       "decisionSelector",
       "qaBundleId",
       "candidateId",

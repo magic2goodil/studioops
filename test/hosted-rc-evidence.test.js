@@ -62,8 +62,10 @@ export function hostedRcFixture() {
       observerId: "deployment-adapter", observedAt: "2026-09-06T02:00:30.000Z" });
     context.observation = { payload: observation, proof: proof("observation", observation, "observer") };
     const inputs = releaseQualificationInputs({ binding: e.binding, evidenceDigest: hostedRcDigest(e), policyDigest: e.policyDigest,
-      revocationGeneration: context.revocationGeneration, reviews: context.currentReviews });
-    const decision = normalizeReleaseDecisionObservation({ schemaVersion: "studioops.release-decision-observation.v1",
+      revocationGeneration: context.revocationGeneration, reviews: context.currentReviews,
+      ...(context.policy.reviewStages ? {reviewStages:context.policy.reviewStages} : {}) });
+    const decision = normalizeReleaseDecisionObservation({ schemaVersion: context.policy.reviewStages
+      ? "studioops.release-decision-observation.v2" : "studioops.release-decision-observation.v1",
       binding: e.binding, inputsDigest: hostedRcDigest(inputs), evidenceDigest: hostedRcDigest(e), policyDigest: e.policyDigest,
       ownerPacketDigest: context.ownerPacketDigest, decisionDigest: context.decisionDigest, actorId: "release-owner", outcome: "approved",
       revocationGeneration: context.revocationGeneration, reviews: context.currentReviews, decidedAt: "2026-09-06T02:00:45.000Z" });

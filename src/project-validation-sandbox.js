@@ -4,10 +4,13 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createServer as createTcpServer, isIP } from "node:net";
 
-export const PROJECT_VALIDATION_SANDBOX_POLICY_ID = "darwin-seatbelt-v4-disposable-clone-attested-network";
+export const PROJECT_VALIDATION_SANDBOX_POLICY_ID = "darwin-seatbelt-v5-disposable-clone-local-address-exact-ports";
 export const PROJECT_VALIDATION_NETWORK_POLICY_DENY_ALL = "deny_all";
 export const PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK = "loopback_only";
+export const PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE = "attested_fixture_tcp";
+export const PROJECT_VALIDATION_FIXTURE_NETWORK_ENV = "STUDIOOPS_PROJECT_VALIDATION_FIXTURE_NETWORK";
 export const PROJECT_VALIDATION_SANDBOX_ISOLATION = Object.freeze({
   filesystem: "kernel_enforced_allowlist",
   network: "kernel_enforced_deny_all",
@@ -213,7 +216,7 @@ async function canonicalVerifierExecutable() {
 
 export function normalizeProjectValidationNetworkPolicy(value) {
   const policy = String(value || PROJECT_VALIDATION_NETWORK_POLICY_DENY_ALL).trim().toLowerCase();
-  if (![PROJECT_VALIDATION_NETWORK_POLICY_DENY_ALL, PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK].includes(policy)) {
+  if (![PROJECT_VALIDATION_NETWORK_POLICY_DENY_ALL, PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK, PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE].includes(policy)) {
     throw sandboxError(
       `Unsupported project validation network policy: ${policy || "(empty)"}.`,
       "PROJECT_VALIDATION_INPUT_INVALID",
@@ -222,7 +225,63 @@ export function normalizeProjectValidationNetworkPolicy(value) {
   return policy;
 }
 
-function validationEnvironment(homePath, validationPath, networkPolicy) {
+const fixtureAddress = (value) => isIP(value) === 4
+  && /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(value);
+const fixtureDigest = (value) => `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+
+/** Data validation only; this DTO never grants sandbox authority. The private
+ * capability retains the selected address; the OS profile allows the local IPv4
+ * address class on only the host-selected ports, independently of this DTO. */
+export function normalizeProjectValidationFixtureNetwork(value) {
+  if (!value || Object.keys(value).sort().join() !== "address,digest,ports,schemaVersion"
+    || value.schemaVersion !== "studioops.validation-fixture-network.v1" || !fixtureAddress(value.address)
+    || !Array.isArray(value.ports) || value.ports.length !== 64
+    || value.ports.some((p) => !Number.isSafeInteger(p) || p < 1024 || p > 65535)
+    || new Set(value.ports).size !== value.ports.length) {
+    throw sandboxError("Invalid attested fixture network binding.", "PROJECT_VALIDATION_INPUT_INVALID");
+  }
+  const base = { schemaVersion: value.schemaVersion, address: value.address, ports: [...value.ports].sort((a, b) => a - b) };
+  if (value.digest !== fixtureDigest(base)) throw sandboxError("Fixture network digest mismatch.", "PROJECT_VALIDATION_INPUT_INVALID");
+  return Object.freeze({ ...base, ports: Object.freeze(base.ports), digest: value.digest });
+}
+
+/** Observation validator; production call sites always obtain interfaces from
+ * node:os outside the sandbox. No caller observation enters a capability. */
+export function assertProjectValidationFixtureAddress(binding, interfaces) {
+  if (!Object.values(interfaces).flat().some((v) => v.family === "IPv4" && !v.internal && v.address === binding.address)) {
+    throw sandboxError("Attested fixture address is no longer locally assigned.", "PROJECT_VALIDATION_IDENTITY_DRIFT");
+  }
+}
+
+async function allocateFixtureNetwork() {
+  const interfaces = os.networkInterfaces();
+  const address = Object.values(interfaces).flat().find((v) => v.family === "IPv4" && !v.internal && fixtureAddress(v.address))?.address;
+  if (!address) throw sandboxError("No supported local fixture address is available.", "PROJECT_VALIDATION_INPUT_INVALID");
+  const reservations = [];
+  try {
+    for (let index = 0; index < 64; index += 1) {
+      const server = createTcpServer();
+      reservations.push(server);
+      await new Promise((resolve, reject) => { server.once("error", reject); server.listen({ host: address, port: 0, exclusive: true }, resolve); });
+    }
+    const base = { schemaVersion: "studioops.validation-fixture-network.v1", address,
+      ports: reservations.map((s) => s.address().port).sort((a, b) => a - b) };
+    return normalizeProjectValidationFixtureNetwork({ ...base, digest: fixtureDigest(base) });
+  } finally {
+    await Promise.all(reservations.map((s) => new Promise((resolve) => s.close(resolve))));
+  }
+}
+
+function assertFixtureCapabilityCurrent(capability) {
+  if (!capability.fixtureNetwork) return;
+  assertProjectValidationFixtureAddress(capability.fixtureNetwork, os.networkInterfaces());
+  if (capability.environment[PROJECT_VALIDATION_FIXTURE_NETWORK_ENV] !== JSON.stringify(capability.fixtureNetwork)
+    || capability.environment.STUDIOOPS_PROJECT_VALIDATION_NETWORK_POLICY !== PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE) {
+    throw sandboxError("Fixture network environment changed.", "PROJECT_VALIDATION_IDENTITY_DRIFT");
+  }
+}
+
+function validationEnvironment(homePath, validationPath, networkPolicy, fixtureNetwork = null) {
   return {
     PATH: validationPath,
     HOME: homePath,
@@ -244,10 +303,11 @@ function validationEnvironment(homePath, validationPath, networkPolicy) {
     GIT_TERMINAL_PROMPT: "0",
     STUDIOOPS_PROJECT_VALIDATION_SANDBOX: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
     STUDIOOPS_PROJECT_VALIDATION_NETWORK_POLICY: networkPolicy,
+    ...(fixtureNetwork ? { [PROJECT_VALIDATION_FIXTURE_NETWORK_ENV]: JSON.stringify(fixtureNetwork) } : {}),
   };
 }
 
-function seatbeltProfile(rootPath, readableToolRoots, verifierExecutable, networkPolicy) {
+function seatbeltProfile(rootPath, readableToolRoots, verifierExecutable, networkPolicy, fixtureNetwork = null) {
   const explicitRoots = unique([rootPath, ...readableToolRoots, ...SYSTEM_RUNTIME_READ_ROOTS]);
   const explicitReadRoots = explicitRoots
     .map((entry) => `(subpath ${seatbeltLiteral(entry)})`)
@@ -279,7 +339,13 @@ function seatbeltProfile(rootPath, readableToolRoots, verifierExecutable, networ
         "(allow network-inbound (local tcp \"localhost:*\"))",
         "(allow network-outbound (remote tcp \"localhost:*\"))",
       ]
-    : [];
+    : networkPolicy === PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE
+      ? fixtureNetwork.ports.flatMap((port) => [
+          `(allow network-bind (local tcp4 "localhost:${port}"))`,
+          `(allow network-inbound (local tcp4 "localhost:${port}"))`,
+          `(allow network-outbound (remote tcp4 "localhost:${port}"))`,
+        ])
+      : [];
   return [
     "(version 1)",
     "(deny default)",
@@ -536,6 +602,9 @@ async function validateSeatbeltExecutable(executable) {
 }
 
 export async function prepareProjectValidationSandbox(input = {}) {
+  if (["fixtureNetwork", "fixtureAddress", "fixturePorts", "fixtureNetworkBinding"].some((key) => Object.hasOwn(input, key))) {
+    throw sandboxError("Caller-selected fixture network targets are forbidden.", "PROJECT_VALIDATION_INPUT_INVALID");
+  }
   const networkPolicy = normalizeProjectValidationNetworkPolicy(input.networkPolicy);
   const requestedSourceRepoPath = String(input.sourceRepoPath || "");
   const requestedWorkspaceRoot = String(input.workspaceRoot || "");
@@ -618,13 +687,15 @@ export async function prepareProjectValidationSandbox(input = {}) {
     const resolvedHomePath = await realpath(homePath);
     const verifierExecutable = await canonicalVerifierExecutable();
     const expectedWorkspaceManifest = await snapshotWorkspaceManifest(resolvedRepoPath);
-    const profile = seatbeltProfile(resolvedRoot, pathRoots, verifierExecutable, networkPolicy);
-    const environment = validationEnvironment(resolvedHomePath, validationPath, networkPolicy);
+    const fixtureNetwork = networkPolicy === PROJECT_VALIDATION_NETWORK_POLICY_FIXTURE ? await allocateFixtureNetwork() : null;
+    const profile = seatbeltProfile(resolvedRoot, pathRoots, verifierExecutable, networkPolicy, fixtureNetwork);
+    const environment = validationEnvironment(resolvedHomePath, validationPath, networkPolicy, fixtureNetwork);
     const processPolicy = Object.freeze({
       ...PROJECT_VALIDATION_SANDBOX_ISOLATION,
       network: networkPolicy === PROJECT_VALIDATION_NETWORK_POLICY_LOOPBACK
-        ? "kernel_enforced_tcp_loopback_only"
-        : PROJECT_VALIDATION_SANDBOX_ISOLATION.network,
+        ? "kernel_enforced_tcp_local_address_class_all_ports"
+        : fixtureNetwork ? "kernel_enforced_tcp4_local_address_class_exact_ports" : PROJECT_VALIDATION_SANDBOX_ISOLATION.network,
+      ...(fixtureNetwork ? { fixtureNetworkDigest: fixtureNetwork.digest } : {}),
     });
     const sandbox = {
       rootPath: resolvedRoot,
@@ -634,6 +705,7 @@ export async function prepareProjectValidationSandbox(input = {}) {
       profile,
       environment,
       policyId: PROJECT_VALIDATION_SANDBOX_POLICY_ID,
+      fixtureNetwork,
       strategy: "disposable_full_clone",
       networkPolicy,
       processPolicy,
@@ -686,6 +758,7 @@ export async function prepareProjectValidationSandbox(input = {}) {
       profile,
       environment,
       verifierExecutable,
+      fixtureNetwork,
       networkPolicy,
       processPolicy,
       expectedHeadSha,
@@ -716,7 +789,8 @@ function sandboxCapability(sandbox, options = {}) {
 
 export async function runProjectValidationCommand(sandbox, command, options = {}) {
   const capability = sandboxCapability(sandbox);
-  return runCaptured(capability.executable, [
+  assertFixtureCapabilityCurrent(capability);
+  const result = await runCaptured(capability.executable, [
     "-p",
     capability.profile,
     "/bin/bash",
@@ -730,6 +804,8 @@ export async function runProjectValidationCommand(sandbox, command, options = {}
     timeoutMs: Number(options.timeoutMs || DEFAULT_TIMEOUT_MS),
     maxCaptureBytes: options.maxCaptureBytes,
   });
+  assertFixtureCapabilityCurrent(capability);
+  return result;
 }
 
 function dependencyAcquisitionError(message, output = "") {
@@ -847,6 +923,7 @@ export async function installPreparedProjectValidationDependencies(sandbox, opti
 
 export async function verifyProjectValidationSandbox(sandbox) {
   const capability = sandboxCapability(sandbox);
+  assertFixtureCapabilityCurrent(capability);
   // The checkout, index, and local Git configuration are untrusted after a
   // project command runs. Git verifies only the ref identity with replacement
   // objects disabled. A pre-validation byte/mode/symlink manifest verifies the
@@ -894,6 +971,7 @@ export async function verifyProjectValidationSandbox(sandbox) {
     strategy: "disposable_full_clone",
     networkPolicy: capability.networkPolicy,
     processPolicy: capability.processPolicy,
+    ...(capability.fixtureNetwork ? { fixtureNetwork: capability.fixtureNetwork } : {}),
   };
 }
 
