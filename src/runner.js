@@ -41,13 +41,19 @@ import {
   renewGitHubRemoteRecoveryProbeLease,
   scheduleGitHubRemoteRecoveryProbeInState,
   taskHasExactReviewSubject,
+  persistCreditAdmissionPauseInState,
+  recoverCreditAdmissionPauseInState,
 } from "./store.js";
 import {
   DEFAULT_RUN_OUTPUT_GUARD,
   loadConfig,
+  canonicalCreditPolicyConfig,
   normalizeRunOutputGuard,
   normalizeWorkspaceRetention,
 } from "./config.js";
+import { assessCreditAdmission, getCodexCreditSnapshot } from "./credit-policy.js";
+import { createCreditReservationPlan, creditFallbackAttemptKey, assessCreditReservation,
+  releaseQueuedCreditReservation, recordCreditClaim, sanitizedCreditAdmission, updateCreditExhaustionState } from "./credit-reservations.js";
 import { laneProfile, laneProfilesConflict, repositoryConflictIdentity } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, normalizeExecutionUsage, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
@@ -911,6 +917,7 @@ export function queuedRunExecutionBlocker(state, run, input = {}) {
 
 export function runConsumesExecutionCapacity(state, run, input = {}) {
   if (ACTIVE_STATUSES.has(run?.status)) return true;
+  if (run?.creditClaimBlocker) return false;
   return RUNNABLE_STATUSES.has(run?.status) && !queuedRunExecutionBlocker(state, run, input);
 }
 
@@ -1699,8 +1706,10 @@ export function planRunnableRuns(state, input = {}) {
   const runnable = [];
   const skipped = [];
   const plannedRuns = [];
+  const creditPlan = input.creditPolicy?.enabled ? createCreditReservationPlan(state,
+    run => runConsumesExecutionCapacity(state, run, input), input.failureIncidents) : null;
 
-  for (const run of state.runs || []) {
+  for (const [index, run] of (state.runs || []).entries()) {
     if (!RUNNABLE_STATUSES.has(run.status)) continue;
     if (selfUpdateLease) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `self_update_in_progress:${selfUpdateLease.id}` });
@@ -1713,6 +1722,12 @@ export function planRunnableRuns(state, input = {}) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: executionBlocker });
       continue;
     }
+    const creditAdmission = creditPlan ? creditClaimAssessment(state, run, creditPlan, input, index) : null;
+    if (creditAdmission && !creditAdmission.allowed) {
+      releaseQueuedCreditReservation(creditPlan, run.id);
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: `credit_gate:${creditAdmission.code}` });
+      continue;
+    }
     const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
     if (laneConflict) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `lane_conflict:${laneConflict.taskId || laneConflict.id}` });
@@ -1723,6 +1738,9 @@ export function planRunnableRuns(state, input = {}) {
       continue;
     }
     plannedRuns.push(run);
+    // Provisional ownership belongs only to admitted candidates. This updates
+    // the local plan, never the durable run or its actual-claim evidence.
+    if (creditPlan) recordCreditClaim(creditPlan, run, creditAdmission);
     runnable.push({
       ...run,
       project,
@@ -2512,9 +2530,46 @@ async function blockQueuedRunForPreflight(state, run, failure, now) {
   });
 }
 
+function creditClaimAssessment(state, run, plan, input, index) {
+  const task = findTask(state, run.taskId);
+  const policy = resolveExecutionPolicy(task || {}, run, input);
+  const admission = assessCreditAdmission(input.creditSnapshot,
+    { ...policy, modelTier: run.modelTier || policy.modelTier, labels: task?.labels }, input.creditPolicy,
+    { knownExhaustion: state.meta?.creditObservedExhaustion });
+  const binding = run.creditAdmission?.reservationBinding || {};
+  if ((binding.taskId && binding.taskId !== run.taskId) || (binding.runId && binding.runId !== run.id)) {
+    return sanitizedCreditAdmission({ ...admission, allowed: false,
+      code: "fallback_reservation_binding_invalid", reasonCode: "fallback_reservation_binding_invalid" });
+  }
+  if (!admission.fallbackUsed) return admission;
+  return assessCreditReservation({ ...admission,
+    maxAttempts: Math.min(policy.maxAttempts, admission.maxAttempts || policy.maxAttempts),
+  }, plan, {
+    taskId: task?.id || run.taskId, claimRunId: run.id, claimIndex: index,
+    attemptKey: creditFallbackAttemptKey(task || { id: run.taskId }, run, plan.incidentsByTask.get(run.taskId) || []),
+  });
+}
+
 export async function claimRuns(input = {}) {
+  input = { ...input };
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
   const preflightState = input.state || await readState();
+  const eligibleQueue = (preflightState.runs || []).filter(run => RUNNABLE_STATUSES.has(run.status)
+    && !queuedRunExecutionBlocker(preflightState, run, input));
+  if (!input.state && input.creditPolicy === undefined) {
+    const config = await loadConfig();
+    input.creditPolicy = canonicalCreditPolicyConfig({ ...config?.defaults?.creditPolicy, ...config?.creditPolicy });
+  }
+  const activeCount = (preflightState.runs || []).filter(run => ACTIVE_STATUSES.has(run.status)
+    && !activeRunStaleReason(run, input)).length;
+  const canPlan = activeCount < limit && !activeSelfUpdateLease(preflightState, input);
+  if (eligibleQueue.length && canPlan && input.creditPolicy?.enabled && input.creditSnapshot === undefined && !input.state) {
+    input.creditSnapshot = await getCodexCreditSnapshot(input.creditPolicy);
+  }
+  if (!input.failureIncidents && eligibleQueue.length && canPlan && input.creditPolicy?.enabled) {
+    const ids = [...new Set(eligibleQueue.map(run => run.taskId))];
+    input.failureIncidents = (await Promise.all(ids.map(taskId => readFailureIncidents({ taskId })))).flat();
+  }
   const candidates = planRunnableRuns(preflightState, { ...input, limit }).runnable;
   const preflightResults = new Map();
   for (const candidate of candidates) {
@@ -2548,6 +2603,7 @@ export async function claimRuns(input = {}) {
     state.events = state.events || [];
     state.comments = state.comments || [];
     const now = new Date().toISOString();
+    updateCreditExhaustionState(state, input.creditSnapshot, { policy: input.creditPolicy, now });
     const activeCount = state.runs.filter((run) => (
       ACTIVE_STATUSES.has(run.status) && !activeRunStaleReason(run, input)
     )).length;
@@ -2558,7 +2614,8 @@ export async function claimRuns(input = {}) {
 
     const claimed = [];
     const plannedRuns = [];
-    for (const run of state.runs) {
+    const creditPlan = createCreditReservationPlan(state, run => runConsumesExecutionCapacity(state, run, input), input.failureIncidents);
+    for (const [runIndex, run] of state.runs.entries()) {
       if (claimed.length >= available) break;
       const project = findProject(state, run.projectId);
       if (!RUNNABLE_STATUSES.has(run.status)) continue;
@@ -2568,6 +2625,7 @@ export async function claimRuns(input = {}) {
         continue;
       }
       if (executionBlocker) {
+        releaseQueuedCreditReservation(creditPlan, run.id);
         run.status = "cancelled";
         run.exitCode = executionBlocker.replace(/^stale_run:/, "");
         run.completedAt = now;
@@ -2589,9 +2647,19 @@ export async function claimRuns(input = {}) {
       }
       const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
       if (laneConflict) continue;
+      const creditAdmission = creditClaimAssessment(state, run, creditPlan, input, runIndex);
+      if (!creditAdmission.allowed) {
+        run.creditClaimBlocker = sanitizedCreditAdmission(creditAdmission);
+        releaseQueuedCreditReservation(creditPlan, run.id);
+        if (task) persistCreditAdmissionPauseInState(state, task, {
+          actionType: run.actionType, creditAdmission, now,
+        });
+        continue;
+      }
       const preflight = preflightResults.get(run.id);
       if (!preflight) continue;
       if (!preflight?.ok) {
+        releaseQueuedCreditReservation(creditPlan, run.id);
         await blockQueuedRunForPreflight(state, run, preflight || preflightFailure(
           "runner_preflight_failed",
           "Runner preflight returned no result.",
@@ -2599,6 +2667,15 @@ export async function claimRuns(input = {}) {
         ), now);
         continue;
       }
+
+      delete run.creditClaimBlocker;
+      run.creditClaimAdmission = sanitizedCreditAdmission(creditAdmission);
+      if (creditAdmission.fallbackUsed) {
+        run.maxFallbackAttempts = creditAdmission.maxAttempts;
+        run.fallbackAttempt = Number(creditAdmission.observedCounters?.attemptsConsumed || 0) + 1;
+      }
+      if (task?.creditAdmissionPause?.active) recoverCreditAdmissionPauseInState(state, task, { creditAdmission, now });
+      recordCreditClaim(creditPlan, run, creditAdmission);
 
       run.status = "running";
       run.workflowMode = preflight.workflowMode;

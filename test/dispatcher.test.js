@@ -1811,7 +1811,7 @@ test("live dispatch retries one transient unknown snapshot outside admission and
   assert.equal(state.tasks.at(-1).automationCircuit, undefined);
 });
 
-test("live dispatch probes an unknown snapshot exactly once and opens one circuit if still unknown", async () => {
+test("unknown telemetry probes once then preserves one transient pause across unchanged ticks", async () => {
   const { state, action, options } = criticalCreditFixture();
   let probes = 0;
   options.creditSnapshotProbe = async () => {
@@ -1824,8 +1824,12 @@ test("live dispatch probes an unknown snapshot exactly once and opens one circui
   assert.equal(probes, 1);
   assert.equal(report.runs.length, 0);
   assert.equal(report.skipped[0].reason, "credit_gate:credit_snapshot_unknown");
-  assert.equal(state.tasks.at(-1).automationCircuit.state, "open");
-  assert.equal(state.events.filter((event) => event.type === "credit_admission_blocked").length, 1);
+  assert.equal(state.tasks.at(-1).automationCircuit, undefined);
+  assert.equal(state.tasks.at(-1).creditAdmissionPause.active, true);
+  assert.equal(state.events.filter((event) => event.type === "credit_admission_paused").length, 1);
+  await dispatchSupervisorActions([action], options);
+  assert.equal(probes, 1);
+  assert.equal(state.events.filter((event) => event.type === "credit_admission_paused").length, 1);
 });
 
 test("plan mode never performs the unknown credit recovery probe", async () => {
