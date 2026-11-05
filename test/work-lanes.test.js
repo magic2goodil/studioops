@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import path from "node:path";
+import os from "node:os";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { laneProfilesConflict, repositoryConflictIdentity } from "../src/work-lanes.js";
 
 function profile(project, overrides = {}) {
@@ -53,6 +56,34 @@ test("the same checkout serializes edits even when remote names differ or are ab
   const right = { id: "right", repoUrl: "https://github.com/example/two", repoPath: "/work/parent/../one/" };
   assert.equal(laneProfilesConflict(profile(left), profile(right)), true);
   assert.equal(laneProfilesConflict(profile({ id: "a", repoPath: "/work/one" }), profile({ id: "b", repoPath: "/work/one/." })), true);
+});
+
+test("checkout symlink aliases serialize edits and refresh identity after retargeting", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-repository-alias-"));
+  try {
+    const checkout = path.join(root, "checkout");
+    const otherCheckout = path.join(root, "other-checkout");
+    const alias = path.join(root, "alias");
+    await mkdir(checkout);
+    await mkdir(otherCheckout);
+    await symlink(checkout, alias, "dir");
+    const original = { id: "original", repoPath: checkout };
+    const linked = { id: "linked", repoPath: alias };
+    assert.equal(repositoryConflictIdentity(original).repositoryPath, repositoryConflictIdentity(linked).repositoryPath);
+    assert.equal(laneProfilesConflict(profile(original), profile(linked)), true);
+    assert.equal(laneProfilesConflict(
+      profile({ ...original, repoUrl: "https://github.com/example/original" }),
+      profile({ ...linked, repoUrl: "https://github.com/example/other-name" }),
+    ), true);
+
+    await rm(alias);
+    await symlink(otherCheckout, alias, "dir");
+    assert.notEqual(repositoryConflictIdentity(original).repositoryPath, repositoryConflictIdentity(linked).repositoryPath);
+    assert.equal(laneProfilesConflict(profile(original), profile(linked)), false);
+    assert.equal(laneProfilesConflict(profile({ id: "other", repoPath: otherCheckout }), profile(linked)), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("unknown or ambiguous edit scope cannot open another lane through a repository alias", () => {

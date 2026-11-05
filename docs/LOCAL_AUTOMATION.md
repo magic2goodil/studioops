@@ -823,3 +823,33 @@ not delete incident rows, clear circuits because time passed, or bypass the
 repository-bound project filter during recovery. Pause worker admission before
 database repair and resume only after the loopback API, exact project boundary,
 notification deduplication, and durable restart checks pass.
+
+## Parallel delivery profile
+
+For an owner who wants independent projects and explicitly disjoint work to run
+in parallel, configure global metered-run capacity and role/runner limits to 10,
+with each project's `wipPolicy.maxActiveRuns` at 10. Leave
+`wipPolicy.maxActiveTasks` at 0 when queued task count should not stop execution.
+Repository overlap checks still serialize conflicting edits, including duplicate
+project registrations and filesystem symlinks. This profile changes capacity;
+architecture, review, QA and release authority continue to govern delivery.
+
+Use the normal execution policy of two stage attempts with a 30-second base
+backoff. Durable failure containment separately bounds attempts for an unchanged
+fault; a verified repair is required for a new recovery generation. Attempt
+admission is checked before creating another run.
+
+A 25,000-character SDK command threshold provides discovery guidance while the
+160,000-character cumulative command-output ceiling and repeated identical
+oversized-output protection remain hard bounds. Effective-token budgets and the
+30-minute worker timeout are separate controls. See [Runner](RUNNER.md) for the
+SDK limitation and private evidence behavior.
+
+The normal quota policy reserves 2% for mechanical work, 5% for economy,
+balanced and critical work, and 35% for an explicitly selected frontier tier.
+Configured bounded telemetry fallback may admit only its small documented
+concurrency/attempt/token allowance when a snapshot is unknown or stale.
+Observed provider rate limits and exhausted quota remain stop conditions.
+Review these settings against the owner's intended workload; they are not a
+measurement of billed credits or a promise of provider capacity. Paused project
+schedules and production permissions require their own authorization.

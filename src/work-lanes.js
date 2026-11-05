@@ -1,5 +1,6 @@
 import path from "node:path";
 import os from "node:os";
+import { realpathSync } from "node:fs";
 
 const FRONTEND_TYPES = new Set([
   "frontend",
@@ -236,7 +237,16 @@ function normalizedRepositoryPath(value) {
     return path.win32.normalize(localPath).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
   }
   if (!path.isAbsolute(localPath)) return "";
-  return path.normalize(localPath).replace(/\/+$/, "") || path.parse(localPath).root;
+  const lexicalPath = path.normalize(localPath).replace(/\/+$/, "") || path.parse(localPath).root;
+  try {
+    // Resolve this authoritative checkout on every admission check. A cached
+    // result could open a second edit lane after an alias is retargeted.
+    return realpathSync(lexicalPath);
+  } catch {
+    // Nonexistent checkout declarations remain useful lexical identities.
+    // Foreign Windows paths above are normalized without host filesystem I/O.
+    return lexicalPath;
+  }
 }
 
 /** Bind conflict checks to authoritative project identity, never a worker clone. */

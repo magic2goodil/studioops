@@ -1,6 +1,6 @@
 {
   "name": "studioops",
-  "version": "0.1.0+codex.20261015142508",
+  "version": "0.1.0+codex.20261105",
   "description": "Coordinate software work through structured tasks, isolated builders, specialist review, and human release control.",
   "author": {
     "name": "StudioOps contributors"
@@ -15,6 +15,7 @@
     "codex"
   ],
   "skills": "./skills/",
+  "requires_local_executor": true,
   "interface": {
     "displayName": "StudioOps",
     "shortDescription": "AI software delivery workflow",
