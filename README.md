@@ -8,6 +8,8 @@ StudioOps coordinates AI-assisted software delivery through structured tasks, is
 
 > **Developer preview:** a local, single-owner control plane. It is not an enterprise multi-user service. Review [limitations](#current-limitations) and [sharing guidance](docs/SHARING.md) before evaluating it with a team.
 
+The [GitHub repository](https://github.com/magic2goodil/studioops) is the current public project home, with source, setup instructions and documentation. The application runs on the operator's computer at [the local board](http://127.0.0.1:4317); this repository does not provide a public hosted application.
+
 ![Illustrative StudioOps workflow from structured request through review, QA and authorized release](plugins/studioops/assets/screenshot-flow-overview.png)
 
 ## What works today
@@ -66,7 +68,7 @@ Open [the local board](http://127.0.0.1:4317). Setup writes local configuration 
 
 ## Codex plugin
 
-The repository is also a local Codex plugin marketplace:
+The optional Codex plugin lives in [`plugins/studioops`](plugins/studioops) in this same repository. The small [`studioops-marketplace` catalog](.agents/plugins/marketplace.json) exposes it for repository or local installation:
 
 ```bash
 codex plugin marketplace add "$HOME/.codex/workspaces/studioops"
@@ -86,7 +88,7 @@ Create a StudioOps task for this feature, with acceptance criteria and validatio
 Do not start a builder yet. Send me the task link and next owner.
 ```
 
-See [Plugin guide](docs/PLUGIN.md) for development, packaging and updates. The plugin is skills-first; it does not include credentials, a hosted account or an MCP server.
+See [Plugin guide](docs/PLUGIN.md) for development, packaging and updates. The plugin is skills-first; it does not include credentials, a hosted account or an MCP server. Repository installation is available; publication in the official public Plugins Directory is unverified. A local marketplace is an installation catalog separate from that public directory, as described in the [official plugin packaging documentation](https://developers.openai.com/plugins/build/plugins).
 
 ## Operation and usage
 

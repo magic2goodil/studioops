@@ -197,12 +197,13 @@
         "test/product-tiers.test.js",
         "test/execution-policy.test.js",
         "test/supervisor.test.js",
-        "test/automation-blocker.test.js"
+        "test/automation-blocker.test.js",
+        "test/work-lanes.test.js"
       ],
       "services": ["supervisor planner", "dispatcher admission"],
       "publicContracts": ["bundled hosted RC default policy reference and CLI setup/collect/status presentation; policy semantics delegated to qa-release","dispatch admission decision", "lane-safe immutable run snapshot"],
       "workflows": ["architecture builder reviewer and owner dispatch"],
-      "tests": [{ "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js", "layer": "unit-contract" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js --test-file test/work-lanes.test.js", "layer": "unit-contract" }],
       "reviewOwners": ["backend-reviewer"],
       "fullRegressionPaths": [
         "standards/hosted-release-candidate-qa.md",

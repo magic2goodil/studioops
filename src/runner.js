@@ -48,7 +48,7 @@ import {
   normalizeRunOutputGuard,
   normalizeWorkspaceRetention,
 } from "./config.js";
-import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
+import { laneProfile, laneProfilesConflict, repositoryConflictIdentity } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, normalizeExecutionUsage, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
 import { defaultStudioOpsWorkspaceRoot, missionControlRoot } from "./runtime-paths.js";
@@ -110,6 +110,16 @@ const DEFAULT_RUNNER_PATH = [
 ].join(":");
 
 const WORKSPACE_CLEANUP_LIMIT = 25;
+export const WORKER_OUTPUT_POLICY_VERSION = "bounded-command-guidance-v2";
+const MAX_OVERSIZED_READ_IDENTITIES = 64;
+
+function oversizedReadIdentity(event, output) {
+  const command = String(event.item?.command || "").trim().replace(/\s+/g, " ");
+  return {
+    commandDigest: command ? sha256Digest(command) : "",
+    outputDigest: sha256Digest(output),
+  };
+}
 
 export function observeRunOutput(event, state = {}, policy = {}) {
   const guard = normalizeRunOutputGuard({
@@ -137,13 +147,29 @@ export function observeRunOutput(event, state = {}, policy = {}) {
     };
   }
   if (commandOutputChars > guard.maxCommandOutputChars) {
+    const identity = oversizedReadIdentity(event, output);
+    const priorReads = Array.isArray(nextState.oversizedReadIdentities) ? nextState.oversizedReadIdentities : [];
+    // A validation command can legitimately return different output after an
+    // edit. Only identical oversized output establishes an equivalent reread.
+    const repeated = priorReads.some((prior) => prior.outputDigest === identity.outputDigest);
+    if (repeated || priorReads.length >= MAX_OVERSIZED_READ_IDENTITIES) {
+      return {
+        state: nextState,
+        violation: {
+          code: "repeated_command_output_budget_exceeded",
+          message: "The worker repeated identical oversized output. StudioOps preserved the evidence and stopped this attempt to prevent repeated discovery churn; use the existing artifact and targeted excerpts.",
+        },
+        warning: null,
+      };
+    }
+    nextState.oversizedReadIdentities = [...priorReads, identity];
     return {
       state: nextState,
-      violation: {
-        code: "command_output_budget_exceeded",
-        message: `A worker command returned ${commandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCommandOutputChars.toLocaleString()}-character per-command limit. StudioOps preserved the output as a local discovery artifact and stopped this attempt so recovery can continue with targeted excerpts.`,
+      violation: null,
+      warning: {
+        code: "command_output_budget_warning",
+        message: `A worker command returned ${commandOutputChars.toLocaleString()} characters, exceeding the ${guard.maxCommandOutputChars.toLocaleString()}-character per-command guidance. StudioOps preserved its redacted discovery artifact and bounded the stored event; the same worker continues under the hard cumulative limit. Use targeted excerpts and do not repeat this broad read.`,
       },
-      warning: null,
     };
   }
   return { state: nextState, violation: null, warning: null };
@@ -165,6 +191,33 @@ export function boundedRunOutputEvent(event, maxOutputChars) {
       ...event.item,
       aggregated_output: `${output.slice(0, headChars)}${marker}${tailChars ? output.slice(-tailChars) : ""}`,
     },
+  };
+}
+
+export async function captureRunOutputEvent(event, input = {}) {
+  const observation = observeRunOutput(event, input.state, input.policy);
+  let discoveryArtifact = null;
+  if (observation.warning || observation.violation) {
+    const output = String(event.item?.aggregated_output || "");
+    if (output) {
+      discoveryArtifact = await writeBoundedDiscoveryArtifact({
+        artifactRoot: input.artifactRoot,
+        projectKey: input.projectKey,
+        runId: input.runId,
+        reasonCode: observation.violation?.code || "oversized_command_output",
+        output: redactSecrets(output, input.secrets || []),
+        maxBytes: MAX_VALIDATION_ARTIFACT_BYTES,
+      });
+    }
+  }
+  return {
+    ...observation,
+    discoveryArtifact,
+    // This bounds persisted orchestration evidence only. The SDK has already
+    // delivered the tool result to its worker; it is not a model-context filter.
+    loggedEvent: observation.warning || observation.violation
+      ? boundedRunOutputEvent(event, input.policy?.maxCommandOutputChars)
+      : event,
   };
 }
 
@@ -748,6 +801,7 @@ function runLaneContext(state, run) {
   if (!task) return null;
   const profile = laneProfile(task, run);
   return {
+    ...repositoryConflictIdentity(findProject(state, task.projectId || run.projectId) || {}),
     id: run.id,
     taskId: run.taskId,
     projectId: run.projectId || task.projectId,
@@ -1759,6 +1813,12 @@ Automation rules:
 - When implementation/review work is ready, update the task and leave a clear StudioOps comment with changed files, validation, known gaps, branch/PR, and next review step.
 - If blocked, add a StudioOps comment explaining the blocker and set the task to an appropriate blocked/needs_changes state.
 - The runner will mark this run completed or failed based on your process exit code.
+Bounded inspection rules:
+- Use the precomputed scoped/repository context packets already supplied. They are advisory, but unchanged context does not need to be printed again.
+- Inspect component maps by the required component or JSON keys. Read one targeted excerpt from one file per command, normally at most 80 lines and 8,000 output characters; explicitly cap search results and summaries.
+- Do not concatenate full source, test, standard, README, state, task, or log files into one command. Redirect noisy validation output to a private local log and print only exit status plus a short relevant excerpt.
+- The first oversized command is guidance and the same worker continues. Use the output already returned; do not repeat an equivalent broad command or output. Preserved discovery artifacts are digest-bound evidence for targeted excerpts, not an instruction to print the artifact again.
+- The cumulative output limit is a hard stop; split decisions into focused reads rather than spending that limit on repeated discovery.
 ${run.workflowMode === "local"
     ? "- Local mode forbids pushes and pull requests; leave the local branch, exact full subject SHA, validation evidence, and builder comment recorded on the task."
     : "- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. StudioOps verifies this handoff after the process exits."}
@@ -2022,19 +2082,41 @@ function failureCandidateForRun(run = {}) {
   };
 }
 
-function failureEvidenceForRun(run = {}, state = {}) {
+function failureExecutionConfiguration(run = {}, input = {}) {
+  const recorded = run.failureEvidenceConfiguration || {};
+  const executableIdentityDigest = input.codexBin || !recorded.executableIdentityDigest
+    ? sha256Digest({ provider: normalizeFailureProvider(run.provider || input.provider || "codex"), executable: resolveCodexBin(input) })
+    : recorded.executableIdentityDigest;
+  return {
+    outputGuard: normalizeRunOutputGuard(input.outputGuard || recorded.outputGuard),
+    executableIdentityDigest,
+    timeoutMs: Math.max(60_000, Number(input.timeoutMs || recorded.timeoutMs || run.timeoutMs
+      || process.env.MISSION_CONTROL_RUN_TIMEOUT_MS || DEFAULT_RUN_TIMEOUT_MS)),
+    maxAttempts: Math.max(1, Number(input.maxAttempts || recorded.maxAttempts || run.maxAttempts || DEFAULT_EXECUTION_POLICY.maxAttempts)),
+    retryBackoffMs: Math.max(1_000, Number(input.retryBackoffMs || recorded.retryBackoffMs || run.retryBackoffMs || DEFAULT_EXECUTION_POLICY.retryBackoffMs)),
+    readPolicyVersion: WORKER_OUTPUT_POLICY_VERSION,
+  };
+}
+
+export function failureEvidenceForRun(run = {}, state = {}, input = {}) {
   const task = findTask(state, run.taskId) || run.task || {};
-  const dependencies = (task.dependencies || task.dependsOn || [])
-    .map((entry) => typeof entry === "string" ? entry : entry?.taskId)
-    .filter(Boolean)
+  const dependencyIds = [...new Set((task.dependsOnTaskIds || task.dependencies || task.dependsOn || [])
+    .map((entry) => typeof entry === "string" ? entry : entry?.taskId || entry?.id)
+    .filter(Boolean))].sort();
+  const dependencyDelivery = dependencyIds
     .map((taskId) => {
       const dependency = findTask(state, taskId);
+      const candidate = failureCandidateForRun(dependency || {});
       return {
         taskId,
-        stateVersion: Math.max(0, Number(dependency?.stateVersion || 0)),
         status: String(dependency?.status || "unknown").toLowerCase().replace(/[^a-z0-9_.:-]/g, "_") || "unknown",
+        source: { commitSha: candidate.commitSha, treeSha: candidate.treeSha, baseSha: candidate.baseSha },
       };
     });
+  // General stateVersion advances for comments and bookkeeping. Only delivered
+  // status/candidate changes may establish new dependency recovery evidence.
+  const dependencies = dependencyDelivery.map(({ taskId, status }) => ({ taskId, stateVersion: 0, status }));
+  const configuration = failureExecutionConfiguration(run, input);
   const identity = failureCandidateForRun(run);
   const componentMapDigest = String(run.impactPlan?.manifest?.digest || task.impactEvidence?.componentMapDigest || "");
   return {
@@ -2047,27 +2129,29 @@ function failureEvidenceForRun(run = {}, state = {}) {
     credentialClass: /missing|credential|auth/.test(String(run.exitCode || "").toLowerCase()) ? "missing" : "unknown",
     configurationDigest: sha256Digest({
       workflowMode: run.workflowMode || run.project?.workflowMode || "auto",
-      timeoutMs: Number(run.timeoutMs || DEFAULT_RUN_TIMEOUT_MS),
+      ...configuration,
     }),
     policyDigest: sha256Digest({
       action: run.actionType,
       group: run.group,
       lane: run.lane || "",
       fileScope: run.fileScope || [],
+      dependencyDelivery,
+      readPolicyVersion: WORKER_OUTPUT_POLICY_VERSION,
     }),
     componentMapDigest: /^sha256:[a-f0-9]{64}$/.test(componentMapDigest) ? componentMapDigest : "",
     serviceHealth: { runner: "healthy" },
   };
 }
 
-function failureAuthorityForRun(run, reasonCode, state, evidenceOverride = null) {
+function failureAuthorityForRun(run, reasonCode, state, evidenceOverride = null, input = {}) {
   return {
     taskId: run.taskId,
     action: run.actionType,
     provider: normalizeFailureProvider(run.provider || "codex"),
     reasonCode,
     candidate: failureCandidateForRun(run),
-    evidence: evidenceOverride || failureEvidenceForRun(run, state),
+    evidence: evidenceOverride || failureEvidenceForRun(run, state, input),
   };
 }
 
@@ -2128,7 +2212,7 @@ export async function claimCurrentFailureAttempt(run, input = {}) {
   const state = input.state || await (input.readState || readState)();
   const incidents = input.failureIncidents || await (input.readFailureIncidents || readFailureIncidents)({ taskId: run.taskId });
   const matches = [...new Set(incidents.map((incident) => incident.reasonCode))]
-    .map((reasonCode) => selectFailureIncident(incidents, failureAuthorityForRun(run, reasonCode, state))).filter(Boolean);
+    .map((reasonCode) => selectFailureIncident(incidents, failureAuthorityForRun(run, reasonCode, state, null, input))).filter(Boolean);
   const selected = matches.find(({incident, paidAttempts}) => incident.state === "open" || paidAttempts >= 2)
     || matches.find(({incident}) => incident.state === "backoff" && Date.parse(incident.backoffUntil) > Date.now()) || matches[0];
   const match = selected?.incident;
@@ -2190,7 +2274,7 @@ async function recordFailureContainmentOutcome(run, reasonCode, input = {}) {
     project: run.project || findProject(state, run.projectId),
     task: run.task || findTask(state, run.taskId),
   };
-  const authority = failureAuthorityForRun(authorityRun, reasonCode, state);
+  const authority = failureAuthorityForRun(authorityRun, reasonCode, state, null, input);
   let incident;
   if (run.failureContainmentClaim?.reasonCode === reasonCode) {
     const incidents = await (input.readFailureIncidents || readFailureIncidents)({
@@ -2541,6 +2625,7 @@ export async function claimRuns(input = {}) {
       run.maxAttempts = Math.max(1, Number(run.maxAttempts || executionPolicy.maxAttempts));
       run.retryBackoffMs = Math.max(1_000, Number(run.retryBackoffMs || executionPolicy.retryBackoffMs));
       run.staleRunMs = Math.max(60_000, Number(run.staleRunMs || executionPolicy.staleRunMs));
+      run.failureEvidenceConfiguration = failureExecutionConfiguration(run, input);
       run.startedAt = now;
       run.completedAt = "";
       run.exitCode = "";
@@ -2608,6 +2693,7 @@ export async function completeRun(runId, input = {}) {
     if (input.impactPlan) run.impactPlan = structuredClone(input.impactPlan);
     if (input.contextEvidence) run.contextEvidence = structuredClone(input.contextEvidence);
     if (input.repositoryContext) run.repositoryContext = repositoryContextEvidence(input.repositoryContext);
+    if (input.failureEvidenceConfiguration) run.failureEvidenceConfiguration = structuredClone(input.failureEvidenceConfiguration);
     if (/^[a-f0-9]{40}$/.test(input.executionCommitSha || "")) run.executionCommitSha = input.executionCommitSha;
     const budget = recordRunUsage(run, input.usage, now);
     const task = findTask(state, run.taskId);
@@ -2778,6 +2864,7 @@ export async function completeRunAfterExecution(run, input, executionRun = run) 
     ...input,
     repositoryContext: executionRun.repositoryContext,
     executionCommitSha: executionRun.executionCommitSha,
+    failureEvidenceConfiguration: input.failureEvidenceConfiguration || executionRun.failureEvidenceConfiguration,
   };
   let preserveBuilderReviewCycle = false;
   if (input.status === "completed" && run.workflowMode === "local" && run.group === "builder") {
@@ -2967,6 +3054,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = await withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
     executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
+    executionRun.failureEvidenceConfiguration = failureExecutionConfiguration(executionRun, input);
     log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
     const failureClaim = await claimCurrentFailureAttempt(executionRun, input);
     if (!failureClaim.admitted) {
@@ -2998,21 +3086,17 @@ async function runClaimedRunWithSdk(run, input = {}) {
     const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
 
     for await (const event of events) {
-      const observation = observeRunOutput(event, outputGuardState, outputGuard);
-      if (observation.warning || observation.violation) {
-        const reasonCode = observation.violation?.code || "oversized_command_output";
-        const commandOutput = String(event.item?.aggregated_output || "");
-        if (commandOutput) {
-          const artifact = await writeBoundedDiscoveryArtifact({
-            artifactRoot: path.join(RUN_OUTPUT_DIR, "context-artifacts"),
-            projectKey: executionRun.project?.key || run.projectId,
-            runId: run.id,
-            reasonCode,
-            output: redactSecrets(commandOutput, githubAppAuthSecrets(authContext)),
-          });
-          discoveryArtifacts.push(artifact);
-          log.write(`StudioOps discovery artifact: ${artifact.path} (${artifact.digest})\n`);
-        }
+      const observation = await captureRunOutputEvent(event, {
+        state: outputGuardState,
+        policy: outputGuard,
+        artifactRoot: path.join(RUN_OUTPUT_DIR, "context-artifacts"),
+        projectKey: executionRun.project?.key || run.projectId,
+        runId: run.id,
+        secrets: githubAppAuthSecrets(authContext),
+      });
+      if (observation.discoveryArtifact) {
+        discoveryArtifacts.push(observation.discoveryArtifact);
+        log.write(`StudioOps discovery artifact: ${observation.discoveryArtifact.path} (${observation.discoveryArtifact.digest})\n`);
       }
       if (observation.violation) {
         const error = new Error(observation.violation.message);
@@ -3024,10 +3108,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
       if (observation.warning) {
         log.write(`\nStudioOps output guidance: ${observation.warning.message}\n`);
       }
-      const loggedEvent = observation.warning
-        ? boundedRunOutputEvent(event, outputGuard.maxCommandOutputChars)
-        : event;
-      log.write(`${redactSecrets(JSON.stringify(loggedEvent), githubAppAuthSecrets(authContext))}\n`);
+      log.write(`${redactSecrets(JSON.stringify(observation.loggedEvent), githubAppAuthSecrets(authContext))}\n`);
       if (event.type === "thread.started") {
         await persistRunThread(run, event.thread_id);
       } else if (event.type === "item.completed" && event.item?.type === "agent_message") {
@@ -3049,6 +3130,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     notes = redactSecrets(error?.message || String(error), githubAppAuthSecrets(authContext));
     const outputGuardCode = [
       "command_output_budget_exceeded",
+      "repeated_command_output_budget_exceeded",
       "cumulative_command_output_budget_exceeded",
     ].includes(error?.code) ? error.code : "";
     pauseReason = automationPauseReason(error?.code, notes);
@@ -3112,6 +3194,7 @@ async function runClaimedRunWithCli(run, input = {}) {
     const workspace = await prepareRunWorkspace(run, input, log, authContext);
     executionRun = await withExecutionImpactPlan(withExecutionWorkspace(run, workspace));
     executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
+    executionRun.failureEvidenceConfiguration = failureExecutionConfiguration(executionRun, input);
     log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
     const failureClaim = await claimCurrentFailureAttempt(executionRun, input);
     if (!failureClaim.admitted) {

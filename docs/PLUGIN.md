@@ -2,6 +2,8 @@
 
 StudioOps is a skills-first plugin for setting up a local software-delivery board and capturing structured engineering work. It remains a developer preview. The visual board and workers run in the separately installed StudioOps application.
 
+The [public project home](https://github.com/magic2goodil/studioops) contains both the application and the plugin at `plugins/studioops`. The application runs locally; the plugin provides setup and task intake. The repository's `.agents/plugins/marketplace.json` is the optional `studioops-marketplace` installation catalog. Official public Plugins Directory publication is unverified. Keep these distribution states distinct: [local marketplaces are separate from the universal public directory](https://developers.openai.com/plugins/build/plugins).
+
 ## Install or update
 
 From a reviewed source checkout:
@@ -11,7 +13,7 @@ codex plugin marketplace add /absolute/path/to/studioops
 codex plugin add studioops@studioops-marketplace
 ```
 
-Use a local workspace such as `~/.codex/workspaces/studioops`. Start a new Codex task after installing or updating: existing tasks may retain the earlier skill snapshot. Confirm the marketplace points to the intended checkout and that the installed plugin version matches `.codex-plugin/plugin.json`.
+Use a local workspace such as `~/.codex/workspaces/studioops`. Start a new Codex task after installing or updating: existing tasks may retain the earlier skill snapshot. Confirm the marketplace points to the intended checkout and that the installed plugin version matches `plugins/studioops/.codex-plugin/plugin.json` in that checkout. The [official packaging guide](https://developers.openai.com/plugins/build/plugins) also describes adding a Git-backed marketplace and installing through the desktop Plugins Directory.
 
 ## Included skills
 
@@ -29,6 +31,8 @@ Run `npm run plugin:package` from the source checkout. The ZIP includes an expli
 The npm distribution uses a separate allowlist for the runnable application, standards, operating documentation and installer scripts. Managed runtime installation/self-update still require a canonical Git checkout with its lockfile; use the Git-based setup for those operations. A package's current files can be audited independently, but its canonical source links and installer still lead to the public repository and its contributor history. See [Sharing and evaluation](https://github.com/magic2goodil/studioops/blob/main/docs/SHARING.md).
 
 For development, use the plugin-creator validator and each skill's validator available in your Codex installation. Update plugin versions with the plugin-creator cachebuster helper, align the prepared listing version, rebuild the ZIP, and reinstall from the verified marketplace. Record the source revision and package SHA-256 outside the package; do not treat a version label alone as release evidence.
+
+The manifest declares `requires_local_executor: true` because the skills call local programs. This is the documented [desktop-only metadata for a skills-only plugin](https://developers.openai.com/plugins/deploy/desktop-only). It does not submit or publish the plugin. The prepared [submission checklist](https://github.com/magic2goodil/studioops/blob/main/docs/plugin-submission/SUBMISSION_CHECKLIST.md) tracks the separate publisher steps; current requirements are in the [official submission guide](https://developers.openai.com/plugins/deploy/submission).
 
 ## Scope of the workflow
 
