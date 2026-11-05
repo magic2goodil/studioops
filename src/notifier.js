@@ -732,6 +732,22 @@ function needsNotification(run) {
   return false;
 }
 
+function activeCreditAdmissionPause(task) {
+  const pause = task?.creditAdmissionPause;
+  return pause?.active === true && typeof pause.fingerprint === "string" && pause.fingerprint.length > 0
+    ? pause
+    : null;
+}
+
+function safeNoticeToken(value, fallback = "unclassified") {
+  const token = String(value || "").trim();
+  return /^[a-z0-9_.-]{1,120}$/i.test(token) ? token : fallback;
+}
+
+function needsBudgetPauseNotification(pause) {
+  return pause.notificationStatus !== "sent" && notificationRetryReady(pause);
+}
+
 export function notificationRetryReady(item) {
   if (item.notificationStatus !== "failed") return true;
   if (Number(item.notificationAttempts || 0) >= MAX_NOTIFICATION_ATTEMPTS) return false;
@@ -812,6 +828,19 @@ export function notificationForFailureCircuit(item = {}) {
   };
 }
 
+export function notificationForBudgetPause(item = {}) {
+  const pause = item.pause || item.creditAdmissionPause || item;
+  const admission = pause.creditAdmission || {};
+  const tier = safeNoticeToken(admission.tier || admission.riskTier);
+  const rule = safeNoticeToken(pause.ruleId || admission.ruleId);
+  const reason = safeNoticeToken(pause.reasonCode || admission.reasonCode || admission.code, "credit_admission_paused");
+  return {
+    title: "StudioOps budget pause",
+    subtitle: `${safeNoticeToken(item.projectKey || item.projectId || "StudioOps", "StudioOps")} · ${safeNoticeToken(item.taskId || "task", "task")}`,
+    body: `Credit telemetry is unavailable. StudioOps will retry automatically. Tier: ${tier}. Rule: ${rule}. Reason: ${reason}.`,
+  };
+}
+
 function notificationForOutboxItem(item) {
   if (item.kind === "pipeline_stall") return notificationForPipelineStall(item);
   if (item.kind === "failure_circuit") return notificationForFailureCircuit(item);
@@ -889,6 +918,35 @@ export async function planNotifications(input = {}) {
       ...item,
       notificationType: "outbox",
       notification: notificationForOutboxItem(item),
+    });
+  }
+  for (const task of state.tasks || []) {
+    const pause = activeCreditAdmissionPause(task);
+    if (!pause || !needsBudgetPauseNotification(pause)) continue;
+    const project = findProject(state, task.projectId);
+    if (!projectAllowed(task, project, input)) {
+      skipped.push({ taskId: task.id, reason: "project_filter" });
+      continue;
+    }
+    if (!configuredNotificationChannels(project, input).has("macos")) {
+      skipped.push({ taskId: task.id, reason: "notification_channel_disabled" });
+      continue;
+    }
+    if (pending.length >= limit) {
+      skipped.push({ taskId: task.id, reason: "notifier_limit" });
+      continue;
+    }
+    pending.push({
+      id: task.id,
+      projectId: task.projectId,
+      taskId: task.id,
+      pauseFingerprint: pause.fingerprint,
+      notificationType: "budget_pause",
+      notification: notificationForBudgetPause({
+        projectKey: project?.key || task.projectId,
+        taskId: task.id,
+        pause,
+      }),
     });
   }
   for (const bundle of state.qaBundles || []) {
@@ -1010,6 +1068,38 @@ export async function markNotificationAttempt(itemId, statusPatch, notificationT
   }, { operationName: "notification.record_attempt" });
 }
 
+/** Records delivery evidence only when the active pause still matches this plan. */
+export async function markBudgetPauseNotificationAttempt(taskId, expectedFingerprint, statusPatch = {}, input = {}) {
+  const mark = async (state) => {
+    const task = findTask(state, taskId);
+    const pause = activeCreditAdmissionPause(task);
+    if (!pause || pause.fingerprint !== expectedFingerprint) {
+      return { applied: false, reason: "pause_changed", pause: pause ? structuredClone(pause) : null };
+    }
+    const nowMs = Number(input.nowMs || Date.now());
+    const now = input.now || new Date(nowMs).toISOString();
+    const status = statusPatch.notificationStatus === "sent" ? "sent" : "failed";
+    pause.notificationStatus = status;
+    pause.notificationChannel = String(statusPatch.notificationChannel || "macos").slice(0, 32);
+    pause.notificationError = String(statusPatch.notificationError || "").slice(0, 240);
+    pause.notificationAttempts = Number(pause.notificationAttempts || 0) + 1;
+    if (status === "sent") {
+      pause.notificationSentAt = now;
+      pause.notificationRetryNotBefore = "";
+    } else {
+      pause.notificationFailedAt = now;
+      if (pause.notificationAttempts < MAX_NOTIFICATION_ATTEMPTS) {
+        pause.notificationRetryNotBefore = new Date(nowMs + NOTIFICATION_RETRY_MS).toISOString();
+      } else {
+        pause.notificationRetryNotBefore = "";
+      }
+    }
+    return { applied: true, pause: structuredClone(pause) };
+  };
+  if (input.state) return mark(input.state);
+  return mutateState(mark, { operationName: "notification.record_budget_pause_attempt" });
+}
+
 export async function sendPendingNotifications(input = {}) {
   if (!input.dryRun) {
     await escalateDueNotifications(input);
@@ -1030,16 +1120,31 @@ export async function sendPendingNotifications(input = {}) {
     if (input.dryRun) continue;
     try {
       await (input.sendMac || sendMacNotification)(item.notification);
-      sent.push(await markNotificationAttempt(item.id, {
+      const marked = item.notificationType === "budget_pause"
+        ? await markBudgetPauseNotificationAttempt(item.taskId, item.pauseFingerprint, {
+          notificationStatus: "sent",
+          notificationChannel: "macos",
+        }, input)
+        : await markNotificationAttempt(item.id, {
         notificationStatus: "sent",
         notificationChannel: "macos",
-      }, item.notificationType));
+        }, item.notificationType);
+      if (marked.applied === false) plan.skipped.push({ taskId: item.taskId, reason: marked.reason });
+      else sent.push(marked);
     } catch (error) {
-      sent.push(await markNotificationAttempt(item.id, {
+      const marked = item.notificationType === "budget_pause"
+        ? await markBudgetPauseNotificationAttempt(item.taskId, item.pauseFingerprint, {
+          notificationStatus: "failed",
+          notificationChannel: "macos",
+          notificationError: error.message,
+        }, input)
+        : await markNotificationAttempt(item.id, {
         notificationStatus: "failed",
         notificationChannel: "macos",
         notificationError: error.message,
-      }, item.notificationType));
+        }, item.notificationType);
+      if (marked.applied === false) plan.skipped.push({ taskId: item.taskId, reason: marked.reason });
+      else sent.push(marked);
     }
   }
   for (const item of claimed) {

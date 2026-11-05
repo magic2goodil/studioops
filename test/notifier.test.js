@@ -10,7 +10,9 @@ import {
   escalateDueNotificationsInState,
   notificationForBundle,
   notificationForFailureCircuit,
+  notificationForBudgetPause,
   notificationForOwnerQaPacket,
+  markBudgetPauseNotificationAttempt,
   notificationForPipelineStall,
   notificationRetryReady,
   planNotifications,
@@ -841,4 +843,69 @@ test("one unchanged failure circuit generation creates one local notification in
   assert.equal(state.notificationOutbox.length, 2);
   assert.equal(state.notificationOutbox[0].status, "acknowledged");
   assert.equal(state.notificationOutbox[0].resolutionReason, "failure_generation_changed");
+});
+
+test("budget pauses plan one safe local notification and retain only delivery evidence", async () => {
+  const state = qaReadyState();
+  state.tasks[0].creditAdmissionPause = {
+    active: true,
+    fingerprint: "pause:critical:unknown",
+    ruleId: "critical-bounded",
+    reasonCode: "credit_snapshot_unknown",
+    creditAdmission: { tier: "critical" },
+  };
+  const plan = await planNotifications({ state });
+  assert.equal(plan.pending.length, 1);
+  assert.equal(plan.pending[0].notificationType, "budget_pause");
+  assert.equal(plan.pending[0].notification.title, "StudioOps budget pause");
+  assert.match(plan.pending[0].notification.body, /retry automatically/);
+
+  const taskBefore = structuredClone(state.tasks[0]);
+  const report = await sendPendingNotifications({ state, sendMac: async () => {} });
+  assert.equal(report.sent.length, 1);
+  assert.equal(state.tasks[0].status, taskBefore.status);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationStatus, "sent");
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 1);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationSentAt.length > 0, true);
+});
+
+test("budget pause marks cannot overwrite a newer fingerprint and stop after three failures", async () => {
+  const state = qaReadyState();
+  state.tasks[0].creditAdmissionPause = {
+    active: true,
+    fingerprint: "pause:old",
+    creditAdmission: { tier: "critical" },
+  };
+  state.tasks[0].creditAdmissionPause.fingerprint = "pause:new";
+  const stale = await markBudgetPauseNotificationAttempt("task_1", "pause:old", {
+    notificationStatus: "sent",
+  }, { state, now: "2026-08-17T00:03:00.000Z" });
+  assert.equal(stale.applied, false);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationStatus, undefined);
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const marked = await markBudgetPauseNotificationAttempt("task_1", "pause:new", {
+      notificationStatus: "failed",
+      notificationError: "local adapter unavailable",
+    }, { state, nowMs: Date.now() - (attempt * 600_000) });
+    assert.equal(marked.applied, true);
+  }
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 3);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationRetryNotBefore, "");
+  assert.equal((await planNotifications({ state })).pending.length, 0);
+});
+
+test("budget pause copy excludes provider text, account identity, credentials, and local paths", () => {
+  const notification = notificationForBudgetPause({
+    projectKey: "account@example.invalid",
+    taskId: "/Users/private/task",
+    pause: {
+      ruleId: "Bearer abcdefghijklmnopqrstuvwxyz",
+      reasonCode: "token=secret-value",
+      creditAdmission: { tier: "critical" },
+    },
+  });
+  const copy = JSON.stringify(notification);
+  assert.doesNotMatch(copy, /account@example|\/Users\/private|abcdefghijklmnopqrstuvwxyz|secret-value/);
+  assert.match(notification.body, /Tier: critical/);
 });

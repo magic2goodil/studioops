@@ -81,6 +81,25 @@ function notificationSummary(run) {
   };
 }
 
+function pauseNotificationSummary(pause = {}) {
+  return {
+    status: pause.notificationStatus || "pending",
+    channel: pause.notificationChannel || "",
+    attemptedAt: pause.notificationSentAt || pause.notificationFailedAt || "",
+    error: pause.notificationError || "",
+  };
+}
+
+function boundedNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function ownerAdmissionToken(value, fallback = "unclassified") {
+  const token = String(value || "").trim();
+  return /^[a-z0-9_.-]{1,120}$/i.test(token) ? token : fallback;
+}
+
 function checklistForTask(task) {
   const criteria = Array.isArray(task?.acceptanceCriteria) ? task.acceptanceCriteria : [];
   return criteria.map((text) => ({
@@ -375,6 +394,57 @@ function operationTaskItem(state, task, input = {}) {
     notification: notificationSummary(latestRunForTask(state, task.id)),
     diagnostic,
     diagnosticLabel: diagnostic ? "Non-production diagnostic" : "",
+  };
+}
+
+/** Read-only owner adapter for a transient, telemetry-driven admission pause. */
+function creditAdmissionPauseItem(state, task, input = {}) {
+  const { record } = taskRecord(state, task, input);
+  const pause = task.creditAdmissionPause || {};
+  const admission = pause.creditAdmission || {};
+  const observed = admission.observedCounters || {};
+  return {
+    id: `task:${task.id}:credit-admission-pause`,
+    group: "operations",
+    classification: "budget_pause",
+    kind: "credit_admission_pause",
+    severity: "warning",
+    ...record,
+    status: "budget_paused",
+    previewUrl: "",
+    title: `${task.title} is budget paused`,
+    nextAction: "StudioOps will retry automatically when fresh credit telemetry is available; wait for the next telemetry check.",
+    primaryAction: {
+      type: "task",
+      label: "Open paused task",
+      href: record.taskUrl,
+      taskId: task.id,
+    },
+    blocker: null,
+    admission: {
+      tier: ownerAdmissionToken(admission.tier || admission.riskTier),
+      rule: ownerAdmissionToken(pause.ruleId || admission.ruleId),
+      reason: ownerAdmissionToken(
+        pause.reasonCode || admission.reasonCode || admission.code,
+        "credit_admission_paused",
+      ),
+      retry: "Automatic telemetry retry",
+      maxConcurrentRuns: boundedNumber(admission.maxConcurrentRuns),
+      attemptsConsumed: boundedNumber(observed.attemptsConsumed),
+      maxAttempts: boundedNumber(admission.maxAttempts),
+      estimatedTokensPerRun: boundedNumber(admission.estimatedTokensPerRun),
+      maxInFlightEstimatedTokens: boundedNumber(admission.maxInFlightEstimatedTokens),
+    },
+    checklistLabel: "Automatic retry",
+    checklist: [{
+      taskId: task.id,
+      taskTitle: task.title,
+      text: "Fresh telemetry will remove this Operations record when admission recovers.",
+    }],
+    notification: pauseNotificationSummary(pause),
+    diagnostic: false,
+    diagnosticLabel: "",
+    updatedAt: pause.pausedAt || task.updatedAt || task.createdAt || "",
   };
 }
 
@@ -820,6 +890,10 @@ export function buildOwnerInbox(state, input = {}) {
 
   for (const task of state.tasks || []) {
     const project = findProject(state, task.projectId);
+    if (task.creditAdmissionPause?.active === true) {
+      groupedItems.operations.push(creditAdmissionPauseItem(state, task, input));
+      continue;
+    }
     const circuitBlocker = task.automationBlocker?.type === "circuit";
     const blocked = circuitBlocker
       ? taskAutomationCircuitIsCurrent(task)

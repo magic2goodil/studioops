@@ -375,6 +375,10 @@ h2 {
   border-left-color: var(--blue);
 }
 
+.owner-inbox-item.warning {
+  border-left-color: var(--amber);
+}
+
 .owner-inbox-item.legacy {
   border-left-color: rgba(245, 247, 251, 0.28);
 }
@@ -391,6 +395,38 @@ h2 {
 .inbox-status {
   color: var(--muted);
   font-size: 0.8rem;
+}
+
+.inbox-label.budget-paused {
+  background: rgba(255, 184, 77, 0.18);
+  border: 1px solid rgba(255, 184, 77, 0.56);
+  border-radius: 999px;
+  color: #ffe0a3;
+  font-size: 0.76rem;
+  font-weight: 800;
+  padding: 5px 8px;
+}
+
+.admission-summary {
+  display: grid;
+  gap: 8px 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 12px 0;
+}
+
+.admission-summary div {
+  min-width: 0;
+}
+
+.admission-summary dt {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.admission-summary dd {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
 }
 
 .inbox-item-meta {
@@ -577,6 +613,12 @@ h2 {
 .inbox-state.error {
   border-color: rgba(255, 92, 122, 0.4);
   background: rgba(255, 92, 122, 0.08);
+}
+
+@media (max-width: 700px) {
+  .admission-summary {
+    grid-template-columns: 1fr;
+  }
 }
 
 .inbox-state button {

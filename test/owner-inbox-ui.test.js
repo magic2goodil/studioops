@@ -220,6 +220,19 @@ test("inbox layout defines desktop, tablet, mobile, focus, and reduced-motion be
   assert.match(css, /\.owner-inbox-actions button/);
 });
 
+test("budget-pause Operations cards expose bounded admission evidence without a recovery reset", async () => {
+  const { app, css } = await uiSources();
+  assert.match(app, /function admissionSummary\(item\)/);
+  assert.match(app, /Budget paused/);
+  assert.match(app, /Automatic telemetry retry/);
+  assert.match(app, /maxConcurrentRuns/);
+  assert.match(app, /maxInFlightEstimatedTokens/);
+  assert.match(css, /\.inbox-label\.budget-paused/);
+  assert.match(css, /\.admission-summary/);
+  assert.match(css, /@media \(max-width: 700px\)[\s\S]*\.admission-summary/);
+  assert.doesNotMatch(app, /budget_pause[\s\S]{0,300}circuit-reset/);
+});
+
 test("inbox primary action text meets WCAG AA contrast across its gradient", async () => {
   const { css } = await uiSources();
   const rule = css.match(/\.owner-inbox-actions \.primary-action\s*\{([\s\S]*?)\}/)?.[1] || "";

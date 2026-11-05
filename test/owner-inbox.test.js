@@ -454,6 +454,63 @@ test("open circuits and operator pauses remain operational without becoming owne
   assert.doesNotMatch(operation.nextAction, /code review/i);
 });
 
+test("active credit admission pauses are warning Operations records and recover on refresh", () => {
+  const state = fixtureState();
+  state.tasks[0].creditAdmissionPause = {
+    active: true,
+    fingerprint: "pause:critical:unknown",
+    ruleId: "critical-bounded",
+    reasonCode: "credit_snapshot_unknown",
+    pausedAt: "2026-07-23T15:04:00.000Z",
+    creditAdmission: {
+      tier: "critical",
+      maxConcurrentRuns: 2,
+      maxAttempts: 3,
+      estimatedTokensPerRun: 80000,
+      maxInFlightEstimatedTokens: 160000,
+      observedCounters: { attemptsConsumed: 1 },
+    },
+  };
+
+  const before = structuredClone(state);
+  const inbox = buildOwnerInbox(state);
+  const operation = group(inbox, "operations").items[0];
+  assert.deepEqual(state, before);
+  assert.equal(inbox.count, 0);
+  assert.equal(operation.classification, "budget_pause");
+  assert.equal(operation.kind, "credit_admission_pause");
+  assert.equal(operation.status, "budget_paused");
+  assert.equal(operation.severity, "warning");
+  assert.equal(operation.admission.tier, "critical");
+  assert.equal(operation.admission.maxConcurrentRuns, 2);
+  assert.equal(operation.notification.status, "pending");
+  assert.match(operation.nextAction, /retry automatically/i);
+  assert.doesNotMatch(operation.nextAction, /circuit-reset/i);
+
+  state.tasks[0].creditAdmissionPause.notificationStatus = "sent";
+  state.tasks[0].creditAdmissionPause.notificationSentAt = "2026-07-23T15:05:00.000Z";
+  assert.equal(group(buildOwnerInbox(state), "operations").items[0].notification.status, "sent");
+  state.tasks[0].creditAdmissionPause.notificationStatus = "failed";
+  state.tasks[0].creditAdmissionPause.notificationError = "local adapter unavailable";
+  assert.equal(group(buildOwnerInbox(state), "operations").items[0].notification.status, "failed");
+
+  state.tasks[0].creditAdmissionPause.active = false;
+  assert.equal(group(buildOwnerInbox(state), "operations").count, 0);
+});
+
+test("budget pause payloads retain only bounded, redacted owner evidence", () => {
+  const state = fixtureState();
+  state.tasks[0].creditAdmissionPause = {
+    active: true,
+    fingerprint: "pause:1",
+    reasonCode: "token=secret-value /Users/example/private",
+    creditAdmission: { tier: "critical", ruleId: "Bearer abcdefghijklmnopqrstuvwxyz" },
+  };
+  const body = JSON.stringify(buildOwnerInbox(state));
+  assert.doesNotMatch(body, /secret-value|\/Users\/example|abcdefghijklmnopqrstuvwxyz/);
+  assert.match(body, /credit_admission_paused/);
+});
+
 test("a stale circuit does not duplicate a current QA decision as an Operations failure", () => {
   const state = fixtureState();
   addCurrentBundle(state);
