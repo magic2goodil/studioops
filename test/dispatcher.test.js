@@ -54,6 +54,109 @@ function fixtureState() {
   };
 }
 
+function executionRecoveryFixture() {
+  const state = fixtureState();
+  state.tasks = [{ id: "task_1", projectId: "project_1", title: "Repair delivery", status: "ready", workAreas: ["src/a.js"] }];
+  const action = { id: "task_1:start_builder", type: "start_builder", role: "builder", taskId: "task_1", projectId: "project_1", taskStatus: "ready" };
+  return { state, action };
+}
+
+test("exhausted stage is rejected before creating a run and reconciles one blocker", async () => {
+  const { state, action } = executionRecoveryFixture();
+  state.runs.push({ id: "run_1", taskId: "task_1", projectId: "project_1", status: "failed", group: "builder", role: "builder", attemptKey: "task_1:0:start_builder:builder", attempt: 1 });
+  const incident = createFailureIncident({ fingerprint: failureFingerprint({ taskId: "task_1", action: "start_builder", provider: "codex", reasonCode: "execution_failed" }) });
+  incident.paidAttempts = 1;
+  const options = { state, executionPolicy: { maxAttempts: 1 }, failureIncidents: [incident] };
+  const preview = planDispatches(state, [action], options);
+  assert.equal(preview.selected.length, 0);
+  assert.equal(preview.skipped[0].reason, "attempt_budget_exhausted");
+  const first = await dispatchSupervisorActions([action], options);
+  assert.equal(first.runs.length, 0);
+  assert.equal(state.runs.length, 1);
+  assert.equal(state.tasks[0].status, "blocked");
+  assert.equal(state.tasks[0].automationCircuit.reasonCode, "attempt_budget_exhausted");
+  assert.equal(state.comments.length, 1);
+  await dispatchSupervisorActions([action], options);
+  assert.equal(state.runs.length, 1);
+  assert.equal(state.comments.length, 1);
+  assert.equal(state.events.filter(e => e.type === "stage_attempt_budget_exhausted").length, 1);
+});
+
+test("pre-launch cancellation is free but builder aliases share the exhausted launch budget", () => {
+  const { state, action } = executionRecoveryFixture();
+  state.runs.push({ id: "run_1", taskId: "task_1", status: "cancelled", attemptKey: "task_1:0:start_builder:builder" });
+  const options = { executionPolicy: { maxAttempts: 1 } };
+  assert.equal(planDispatches(state, [action], options).selected.length, 1);
+  state.runs.push({ id: "run_2", taskId: "task_1", status: "failed", attemptKey: "task_1:0:return_to_builder:builder" });
+  const incident = createFailureIncident({ fingerprint: failureFingerprint({ taskId: "task_1", action: "return_to_builder", provider: "codex-cli", reasonCode: "execution_failed" }) });
+  incident.paidAttempts = 1;
+  options.failureIncidents = [incident];
+  assert.equal(planDispatches(state, [action], options).skipped[0].reason, "attempt_budget_exhausted");
+});
+
+test("an approved larger stage budget recovers its unchanged circuit without changing durable failure authority", async () => {
+  const { state, action } = executionRecoveryFixture();
+  const incident = createFailureIncident({ fingerprint: failureFingerprint({ taskId: "task_1", action: "start_builder", provider: "codex", reasonCode: "execution_failed" }) });
+  incident.paidAttempts = 1;
+  const options = { state, executionPolicy: { maxAttempts: 1 }, failureIncidents: [incident] };
+  await dispatchSupervisorActions([action], options);
+  assert.equal(state.tasks[0].status, "blocked");
+  options.executionPolicy.maxAttempts = 2;
+  const resumed = await dispatchSupervisorActions([action], options);
+  assert.equal(resumed.runs.length, 1);
+  assert.equal(resumed.runs[0].attempt, 2);
+  assert.equal(resumed.runs[0].maxAttempts, 2);
+  assert.equal(incident.paidAttempts, 1);
+  assert.equal(state.tasks[0].automationCircuit.state, "closed");
+});
+
+test("absent ledger evidence and unrelated sweeps cannot reset an exhausted stage", async () => {
+  const { state, action } = executionRecoveryFixture();
+  const incident = createFailureIncident({ fingerprint: failureFingerprint({ taskId: "task_1", action: "start_builder", provider: "codex", reasonCode: "execution_failed" }) });
+  incident.paidAttempts = 1;
+  await dispatchSupervisorActions([action], { state, executionPolicy: { maxAttempts: 1 }, failureIncidents: [incident] });
+  const before = structuredClone(state.tasks[0].automationCircuit);
+  await dispatchSupervisorActions([action], { state, executionPolicy: { maxAttempts: 1 }, failureIncidents: [] });
+  assert.deepEqual(state.tasks[0].automationCircuit, before);
+  await dispatchSupervisorActions([], { state, executionPolicy: { maxAttempts: 2 }, failureIncidents: [] });
+  assert.deepEqual(state.tasks[0].automationCircuit, before);
+  assert.equal(state.runs.length, 0);
+});
+
+test("review aliases share the budget while a new exact review subject gets its own stage", () => {
+  const { state, action } = executionRecoveryFixture();
+  const sha = "a".repeat(40);
+  Object.assign(state.tasks[0], { status: "backend_review", reviewSubjectSha: sha, reviewSubjectCycle: 1, reviewCycle: 1 });
+  Object.assign(action, { type: "continue_review", role: "backend-reviewer", taskStatus: "backend_review" });
+  state.runs.push({ id: "run_1", taskId: "task_1", status: "failed", attemptKey: `task_1:1:candidate-1:sha-${sha}:start_review:backend-reviewer` });
+  const incident = createFailureIncident({ fingerprint: failureFingerprint({ taskId: "task_1", action: "start_review", provider: "codex-sdk", reasonCode: "execution_failed", candidateIdentity: { commitSha: sha, candidateCycle: 1 } }) });
+  incident.paidAttempts = 1;
+  const options = { executionPolicy: { maxAttempts: 1 }, failureIncidents: [incident] };
+  assert.equal(planDispatches(state, [action], options).skipped[0].reason, "attempt_budget_exhausted");
+  state.tasks[0].reviewSubjectSha = "b".repeat(40);
+  assert.equal(planDispatches(state, [action], options).selected.length, 1);
+});
+
+test("dispatcher serializes repository aliases but permits independent and disjoint work", () => {
+  const { state, action } = executionRecoveryFixture();
+  state.projects[0].repoUrl = "https://github.com/Example/Demo.git";
+  state.projects.push({ id: "project_2", key: "alias", repoUrl: "git@github.com:example/demo.git" });
+  state.tasks.push({ ...state.tasks[0], id: "task_2", projectId: "project_2" });
+  const actions = [action, { ...action, id: "task_2:start_builder", taskId: "task_2", projectId: "project_2" }];
+  const options = { builderConcurrency: 10 };
+  const blocked = planDispatches(state, actions, options);
+  assert.equal(blocked.selected.length, 1);
+  assert.match(blocked.skipped[0].reason, /^lane_conflict:/);
+  state.tasks[1].workAreas = ["src/b.js"];
+  assert.equal(planDispatches(state, actions, options).selected.length, 2);
+  state.tasks[1].workAreas = ["src/a.js"];
+  state.projects[1].repoUrl = "https://github.com/example/independent.git";
+  assert.equal(planDispatches(state, actions, options).selected.length, 2);
+  state.runs.push({ id: "run_active", taskId: "task_2", projectId: "project_2", status: "running", role: "builder", group: "builder", fileScope: ["src/a.js"], fileScopeExplicit: true, lane: "backend" });
+  state.projects[1].repoUrl = "git@github.com:example/demo.git";
+  assert.match(planDispatches(state, [action], options).skipped[0].reason, /^lane_conflict:/);
+});
+
 function finalAttemptReviewFixture(status = "running") {
   const state = fixtureState();
   state.projects[0].reviewPipeline = [

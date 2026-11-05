@@ -141,6 +141,14 @@ configured limit. The sweep limit is separate from group concurrency.
 
 The dispatcher also deduplicates by task, role, action type, review cycle, and target status so the same task is not re-dispatched every five minutes.
 
+Worker attempt admission uses the durable failure ledger and its verified
+recovery generations. An exhausted stage is rejected before a durable run is
+created, with one visible blocker. Old failed or cancelled run totals cannot
+make an admitted recovery start above its launch limit. Missing ledger evidence
+cannot reset a circuit; automatic recovery requires a changed configured stage
+allowance or verified successor evidence for the unchanged workflow, and cannot
+override an open durable failure incident.
+
 The dispatcher also attaches a work lane and file-scope hint to each builder/reviewer run. If a task does not explicitly set `lane` or `workAreas`, StudioOps infers the lane from task type, area, title, story, expected outcome, and reviewer role.
 
 Lane conflict rules:
@@ -148,7 +156,12 @@ Lane conflict rules:
 - backend and frontend can dispatch together for the same project
 - frontend and design conflict by default because they often share UI/CSS/assets
 - devops and project-wide work conflict with all same-project lanes
-- different projects can dispatch independently
+- different repositories can dispatch independently; project records targeting
+  the same repository share overlap checks across HTTPS/SSH remote aliases and
+  normalized source paths
+
+Explicit disjoint file scopes may run concurrently within a shared repository.
+Overlapping or unknown scopes through repository aliases remain serialized.
 
 Capacity and collision denials are reported separately. A
 `*_concurrency_limit` means the effective configured group limit is full. A

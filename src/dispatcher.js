@@ -14,7 +14,7 @@ import {
   taskAutomationCircuitIsCurrent,
   workflowSnapshotForTask,
 } from "./store.js";
-import { laneProfile, laneProfilesConflict } from "./work-lanes.js";
+import { laneProfile, laneProfilesConflict, repositoryConflictIdentity } from "./work-lanes.js";
 import { compactPromptPacket, executionAttemptKey, resolveExecutionPolicy } from "./execution-policy.js";
 import { assessCreditAdmission, requestCodexCreditSnapshot } from "./credit-policy.js";
 import { runConsumesExecutionCapacity } from "./runner.js";
@@ -168,10 +168,33 @@ export function executionAttemptWasConsumed(run = {}) {
   return ["running", "completed", "failed"].includes(run.status);
 }
 
-function executionAttemptCount(state, attemptKey) {
-  return (state.runs || []).filter((run) => (
-    run.attemptKey === attemptKey && executionAttemptWasConsumed(run)
-  )).length;
+function currentStageIncidents(task, action, options) {
+  // The durable ledger, including verified recovery generations and equivalent
+  // SDK/CLI/action identities, owns attempts. Historical/cancelled run totals
+  // cannot resurrect a repaired incident or manufacture attempt N > max.
+  return [...new Set((options.failureIncidents || [])
+    .filter(incident => incident.taskId === task.id).map(incident => incident.reasonCode))]
+    .map(reasonCode => selectFailureIncident(options.failureIncidents, {
+      taskId: task.id, action: failureActionIdentity(action),
+      candidateIdentity: failureCandidateIdentity(task),
+      provider: failureProviderFor(task, options), reasonCode,
+    }))
+    .filter(Boolean);
+}
+
+function currentStagePaidAttempts(task, action, options) {
+  return currentStageIncidents(task, action, options)
+    .reduce((total, match) => total + match.paidAttempts, 0);
+}
+
+function stageAttemptAdmission(state, task, action, options) {
+  if (runGroupFor(action) === "owner") return null;
+  const policy = resolveExecutionPolicy(task, action, options);
+  const attemptKey = executionAttemptKey(task, action);
+  const consumed = currentStagePaidAttempts(task, action, options);
+  return consumed >= policy.maxAttempts
+    ? { attemptKey, consumed, maxAttempts: policy.maxAttempts }
+    : null;
 }
 
 function hasExistingDispatch(state, action, task) {
@@ -382,6 +405,7 @@ function activeLaneProfiles(state, selected = []) {
         id: run.id,
         taskId: run.taskId,
         projectId: run.projectId || task.projectId,
+        ...repositoryConflictIdentity(findProject(state, run.projectId || task.projectId)),
         lane: profile.lane,
         conflictGroup: profile.conflictGroup,
         fileScope: profile.fileScope,
@@ -394,6 +418,7 @@ function activeLaneProfiles(state, selected = []) {
     id: item.action.id,
     taskId: item.task.id,
     projectId: item.task.projectId,
+    ...repositoryConflictIdentity(findProject(state, item.task.projectId)),
     lane: item.profile.lane,
     conflictGroup: item.profile.conflictGroup,
     fileScope: item.profile.fileScope,
@@ -409,6 +434,7 @@ function findLaneConflict(state, selected, action, task) {
     id: action.id,
     taskId: task.id,
     projectId: task.projectId,
+    ...repositoryConflictIdentity(findProject(state, task.projectId)),
     lane: profile.lane,
     conflictGroup: profile.conflictGroup,
     fileScope: profile.fileScope,
@@ -456,7 +482,79 @@ function preCreditDispatchSafetyReason(state, task, action, options) {
   const project = findProject(state, task.projectId);
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";
   if (task.automationCircuit?.state === "open") return "task_circuit_open";
+  if (stageAttemptAdmission(state, task, action, options)) return "attempt_budget_exhausted";
   return "";
+}
+
+function openExhaustedStageCircuits(state, actions, skipped, options, now) {
+  const opened = [];
+  for (const item of skipped) {
+    if (item.reason !== "attempt_budget_exhausted" || opened.includes(item.taskId)) continue;
+    const task = findTask(state, item.taskId);
+    const action = skippedAction(actions, item);
+    if (!task || !action || task.automationCircuit?.state === "open") continue;
+    const admission = stageAttemptAdmission(state, task, action, options);
+    if (!admission) continue;
+    const snapshot = workflowSnapshotForTask(task);
+    task.automationCircuit = {
+      state: "open", scope: "task", reasonCode: "attempt_budget_exhausted",
+      normalizedReason: "The workflow stage exhausted its worker-launch budget.",
+      failureFingerprint: admission.attemptKey,
+      attemptsConsumed: admission.consumed, maxAttempts: admission.maxAttempts,
+      admissionAction: { type: action.type, role: action.role },
+      openedAt: now, snapshot,
+      nextCheapProbe: "Inspect the preserved stage run and verify a concrete repair before recovery; no model was launched.",
+      resumeAction: `studioops circuit-reset --task ${task.id} --expected-opened-at ${now} --reason verified`,
+    };
+    task.automationBlocker = {
+      type: "circuit", reason: "attempt_budget_exhausted", blockedAt: now,
+      attempts: admission.consumed, resumeStatus: task.status,
+    };
+    task.status = "blocked";
+    task.updatedAt = now;
+    state.comments.push({
+      id: nextId(state.comments, "comment"), taskId: task.id,
+      author: "StudioOps Dispatcher", createdAt: now,
+      body: `Stage launch budget exhausted (${admission.consumed}/${admission.maxAttempts}). No new run was created. Inspect the preserved failure and record a verified repair before recovery.`,
+    });
+    state.events.push({
+      id: nextId(state.events, "event"), type: "stage_attempt_budget_exhausted",
+      taskId: task.id, projectId: task.projectId, createdAt: now,
+      attemptKey: admission.attemptKey, attemptsConsumed: admission.consumed,
+      maxAttempts: admission.maxAttempts,
+    });
+    opened.push(task.id);
+  }
+  return opened;
+}
+
+function recoverStageAttemptCircuitsInState(state, actions, options, now) {
+  const recovered = [];
+  const requested = new Set(actions.filter(action => projectAllowed(action, options)).map(action => action.taskId));
+  const loaded = new Set(options.failureIncidentTaskIds || []);
+  for (const task of state.tasks || []) {
+    const circuit = task.automationCircuit;
+    if (circuit?.state !== "open" || circuit.reasonCode !== "attempt_budget_exhausted"
+      || !circuit.admissionAction || !taskAutomationCircuitIsCurrent(task)
+      || !requested.has(task.id) || !loaded.has(task.id)) continue;
+    const action = circuit.admissionAction;
+    const policy = resolveExecutionPolicy(task, action, options);
+    const paidAttempts = currentStagePaidAttempts(task, action, options);
+    const verifiedRecovery = currentStageIncidents(task, action, options).some(({ incident }) => (
+      incident.history.some(event => event.type === "evidence_verified")
+    ));
+    const materialChange = policy.maxAttempts > circuit.maxAttempts
+      || (verifiedRecovery && paidAttempts < circuit.attemptsConsumed);
+    if (!materialChange || paidAttempts >= policy.maxAttempts
+      || durableFailureAdmissionReason(task, action, options, Date.parse(now))) continue;
+    resetAutomationCircuitInState(state, {
+      task: task.id, expectedOpenedAt: circuit.openedAt, expectedSnapshot: circuit.snapshot,
+      reason: "Changed stage policy or verified durable recovery now admits this unchanged workflow.",
+      author: "StudioOps Dispatcher", automatic: true, now,
+    });
+    recovered.push(task.id);
+  }
+  return recovered;
 }
 
 function dispatchSafetyReason(state, task, action, options) {
@@ -823,7 +921,7 @@ function makeRun(state, task, action, options, now) {
     options.creditPolicy,
   );
   const attemptKey = executionAttemptKey(task, action);
-  const attempt = executionAttemptCount(state, attemptKey) + 1;
+  const attempt = currentStagePaidAttempts(task, action, options) + 1;
   return {
     id: nextId(state.runs, "run"),
     taskId: task.id,
@@ -1065,7 +1163,6 @@ export async function dispatchSupervisorActions(actions, input = {}) {
     && (!inputState || dispatchInput.loadFailureIncidents)
   ) {
     const taskIds = [...new Set((actions || [])
-      .filter((action) => DISPATCHABLE_ACTIONS.has(action.type))
       .map((action) => String(action.taskId || ""))
       .filter(Boolean))];
     const incidentGroups = await Promise.all(taskIds.flatMap((taskId) => (
@@ -1074,8 +1171,12 @@ export async function dispatchSupervisorActions(actions, input = {}) {
     dispatchInput.failureIncidents = [...new Map(incidentGroups
       .flat()
       .map((incident) => [incident.incidentId, incident])).values()];
+    dispatchInput.failureIncidentTaskIds = taskIds;
   } else if (!Array.isArray(dispatchInput.failureIncidents)) {
     dispatchInput.failureIncidents = [];
+    dispatchInput.failureIncidentTaskIds = [];
+  } else {
+    dispatchInput.failureIncidentTaskIds = [...new Set((actions || []).map(action => action.taskId).filter(Boolean))];
   }
   const preflightOptions = { ...DEFAULTS, ...dispatchInput };
   if (!preflightOptions.dryRun && preflightOptions.creditPolicy?.enabled) {
@@ -1098,6 +1199,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
     const recoveredCreditCircuitTaskIds = options.dryRun
       ? []
       : recoverAffordableCreditCircuitsInState(state, options, { now });
+    if (!options.dryRun) recoverStageAttemptCircuitsInState(state, actions || [], options, now);
     const plan = planDispatches(state, actions, options);
     const runs = [];
 
@@ -1113,7 +1215,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
       };
     }
 
-    const openedTaskIds = new Set();
+    const openedTaskIds = new Set(openExhaustedStageCircuits(state, actions, plan.skipped, options, now));
     const creditBlockedTaskIds = openCreditAdmissionCircuits(
       state,
       actions,

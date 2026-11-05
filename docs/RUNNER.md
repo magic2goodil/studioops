@@ -54,7 +54,7 @@ Every dispatched run is explicitly pinned to `gpt-5.6-sol`. Ordinary work uses `
 
 The watch process schedules a fresh durable-claim sweep on every configured interval even while earlier claimed jobs are still running. Transactional claims and the configured runner/concurrency limits bound work; a long builder or reviewer no longer prevents a newly queued independent architect or reviewer from using available capacity.
 
-Each workflow action gets two worker-launch attempts by default with a 30-second base backoff. A cancellation before claim does not consume an attempt. After the launch limit and one bounded transient-recovery cycle, StudioOps opens a visible task circuit with the run ID and failure reason for owner repair. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
+Each workflow action gets two worker-launch attempts by default with a 30-second base backoff. A cancellation before claim does not consume an attempt. The durable failure ledger owns the current attempt count, including equivalent action/provider aliases and verified recovery generations. Historical run totals cannot make a recovered run start above its limit. The dispatcher rejects an exhausted stage before creating a run and records one actionable blocker. A larger configured stage allowance or a verified successor incident may recover an unchanged workflow; missing incident evidence cannot do so. A runner startup sweep also recovers dead-PID and overlong `running` records so one crashed process cannot consume concurrency forever.
 
 Before claiming work, the runner checks the data volume used for SQLite state and run output. The default safety floor is 5 GiB or 2% free, whichever is stricter. Existing builders are not killed by this check; new claims pause until capacity is restored, and the watchdog records the reason instead of entering a restart loop.
 
@@ -185,6 +185,21 @@ See [GitHub App Bots](GITHUB_APP_BOTS.md) for setup and rotation.
 
 ## Output
 
+For SDK workers, the per-command output threshold is guidance: the first large
+result is saved as a private redacted, digest-bound artifact, its persisted event
+is bounded, and the same worker continues. An identical oversized result repeated
+in that worker or the hard cumulative output ceiling stops the attempt. A
+validation command with changed output may continue within the cumulative bound.
+The SDK reports completed tool results after delivering them to its model;
+bounding the StudioOps log does not retroactively truncate that model context.
+Workers receive explicit instructions to use component maps, context packets and
+small excerpts instead of concatenating whole files or dumping board state.
+
+Recovery evidence includes the output/read policy, retry settings, executable
+selection and meaningful dependency source/status. SDK/CLI transport changes and
+candidate bookkeeping alone do not establish a repair. Existing verified-recovery
+requirements and durable attempt caps still apply.
+
 Runner logs are written to:
 
 ```text
@@ -281,6 +296,9 @@ Dispatch and runner claim both enforce lane conflicts:
 - backend and frontend can run at the same time for one project
 - frontend and design conflict by default because they often share UI/CSS/assets
 - devops and lead/project-wide work conflict with all lanes for the same project
-- different projects can run independently
+- different repositories can run independently; project aliases targeting the
+  same repository share overlap checks using the authoritative project remote
+  and source path
 
-This is intentionally conservative. Use explicit `--work-area` values when a future scheduler needs finer-grained file ownership.
+Use explicit `--work-area` values to permit disjoint work in the same repository.
+Overlapping or unknown scopes through repository aliases remain serialized.

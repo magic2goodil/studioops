@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -11,12 +12,14 @@ import {
   applyFailedRunToTask,
   branchReuseSafetyReason,
   boundedRunOutputEvent,
+  captureRunOutputEvent,
   claimCurrentFailureAttempt,
   classifyRunFailureReason,
   claimRuns,
   cloneFallbackSource,
   completeRun,
   completeRunAfterExecution,
+  failureEvidenceForRun,
   observeRunOutput,
   automationPauseReason,
   performGitHubRemoteRecoveryProbe,
@@ -43,7 +46,7 @@ import { eligibleRunWorkspaceSnapshotsInState, resumeBudgetPauseInState } from "
 
 const execFileAsync = promisify(execFile);
 
-test("worker output guard stops one oversized command and cumulative dumps", () => {
+test("worker output guard warns once without ending the worker and retains the hard cumulative limit", () => {
   const event = (size) => ({
     type: "item.completed",
     item: { type: "command_execution", aggregated_output: "x".repeat(size) },
@@ -52,8 +55,9 @@ test("worker output guard stops one oversized command and cumulative dumps", () 
     maxCommandOutputChars: 10,
     maxCumulativeCommandOutputChars: 30,
   });
-  assert.equal(oversized.violation.code, "command_output_budget_exceeded");
-  assert.equal(oversized.warning, null);
+  assert.equal(oversized.violation, null);
+  assert.equal(oversized.warning.code, "command_output_budget_warning");
+  assert.match(oversized.warning.message, /same worker continues/);
   const bounded = boundedRunOutputEvent(event(30), 20);
   assert.ok(bounded.item.aggregated_output.length <= 20);
   assert.match(bounded.item.aggregated_output, /StudioOps bounded/);
@@ -67,6 +71,104 @@ test("worker output guard stops one oversized command and cumulative dumps", () 
     maxCommandOutputChars: 10,
     maxCumulativeCommandOutputChars: 15,
   }).violation.code, "cumulative_command_output_budget_exceeded");
+});
+
+test("worker output guard permits changed validation output but stops identical oversized rereads", () => {
+  const state = {};
+  const policy = { maxCommandOutputChars: 10, maxCumulativeCommandOutputChars: 100 };
+  const event = (command, output) => ({ type: "item.completed", item: { type: "command_execution", command, aggregated_output: output } });
+  assert.equal(observeRunOutput(event("validate private-file", "first-large-output"), state, policy).violation, null);
+  const changedValidation = observeRunOutput(event("validate private-file", "changed-large-output"), state, policy);
+  assert.equal(changedValidation.violation, null);
+  assert.equal(changedValidation.warning.code, "command_output_budget_warning");
+  assert.equal(state.cumulativeCommandOutputChars, "first-large-outputchanged-large-output".length);
+  assert.doesNotMatch(JSON.stringify(state.oversizedReadIdentities), /private-file|large-output/);
+
+  const otherState = {};
+  observeRunOutput(event("cat a", "identical-large-output"), otherState, policy);
+  assert.equal(observeRunOutput(event("sed b", "identical-large-output"), otherState, policy).violation.code,
+    "repeated_command_output_budget_exceeded");
+  assert.equal(observeRunOutput(event("sed c", "a-different-large-output"), otherState, policy).violation, null);
+});
+
+test("oversized output preserves redacted digest-bound evidence and bounds only the persisted event", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-output-evidence-"));
+  try {
+    const secret = "synthetic-private-token";
+    const output = `${secret}\n${"x".repeat(100)}`;
+    const event = { type: "item.completed", item: { type: "command_execution", command: "synthetic read", aggregated_output: output } };
+    const result = await captureRunOutputEvent(event, {
+      state: {},
+      policy: { maxCommandOutputChars: 40, maxCumulativeCommandOutputChars: 200 },
+      artifactRoot: root,
+      projectKey: "synthetic",
+      runId: "run_test",
+      secrets: [secret],
+    });
+    assert.equal(result.violation, null);
+    assert.equal(result.warning.code, "command_output_budget_warning");
+    assert.ok(result.loggedEvent.item.aggregated_output.length <= 40);
+    // SDK tool output is already delivered; this helper never mutates it or
+    // claims that bounded persisted logs truncate the worker's model context.
+    assert.equal(event.item.aggregated_output, output);
+    const preserved = await readFile(result.discoveryArtifact.path, "utf8");
+    assert.doesNotMatch(preserved, new RegExp(secret));
+    assert.ok(preserved.includes("x".repeat(100)));
+    assert.equal(result.discoveryArtifact.truncated, false);
+    assert.match(result.discoveryArtifact.digest, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(result.discoveryArtifact.digest, `sha256:${createHash("sha256").update(preserved).digest("hex")}`);
+    assert.equal((await lstat(result.discoveryArtifact.path)).mode & 0o777, 0o600);
+    const repeated = await captureRunOutputEvent(event, {
+      state: result.state,
+      policy: { maxCommandOutputChars: 40, maxCumulativeCommandOutputChars: 1000 },
+      artifactRoot: root,
+      projectKey: "synthetic",
+      runId: "run_test",
+      secrets: [secret],
+    });
+    assert.equal(repeated.violation.code, "repeated_command_output_budget_exceeded");
+    assert.equal(await readFile(repeated.discoveryArtifact.path, "utf8"), preserved);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failure recovery evidence includes output retry executable and read policy without raw configuration", () => {
+  const run = { ...builderRun(), provider: "codex-sdk", taskId: "task_subject", maxAttempts: 1, retryBackoffMs: 1000 };
+  const state = { tasks: [{ id: run.taskId, dependsOnTaskIds: ["task_dep", "task_dep"] },
+    { id: "task_dep", stateVersion: 1, status: "done", reviewSubjectSha: "a".repeat(40) }] };
+  const options = { codexBin: "/private/synthetic/codex", outputGuard: { maxCommandOutputChars: 25_000, maxCumulativeCommandOutputChars: 160_000 } };
+  const baseline = failureEvidenceForRun(run, state, options);
+  assert.deepEqual(baseline.dependencies, [{ taskId: "task_dep", stateVersion: 0, status: "done" }]);
+  assert.doesNotMatch(JSON.stringify(baseline), /private\/synthetic/);
+  assert.deepEqual(failureEvidenceForRun({ ...run, provider: "codex-cli" }, state, options), baseline,
+    "transport failover cannot establish changed executable or policy evidence");
+  for (const changed of [
+    { ...options, codexBin: "/private/synthetic/new-codex" },
+    { ...options, outputGuard: { ...options.outputGuard, maxCommandOutputChars: 30_000 } },
+    { ...options, maxAttempts: 2 },
+    { ...options, retryBackoffMs: 2000 },
+  ]) assert.notEqual(failureEvidenceForRun(run, state, changed).configurationDigest, baseline.configurationDigest);
+  state.tasks[1].stateVersion = 999;
+  assert.deepEqual(failureEvidenceForRun(run, state, options), baseline);
+  Object.assign(state.tasks[1], {
+    candidateId: "replacement_candidate",
+    candidateCycle: 999,
+    candidateManifestDigest: `sha256:${"c".repeat(64)}`,
+    candidateIdentity: { candidateCycle: 999 },
+  });
+  assert.deepEqual(failureEvidenceForRun(run, state, options), baseline,
+    "candidate bookkeeping cannot establish changed dependency source evidence");
+  state.tasks[1].candidateIdentity.treeSha = "c".repeat(40);
+  assert.notEqual(failureEvidenceForRun(run, state, options).policyDigest, baseline.policyDigest);
+  delete state.tasks[1].candidateIdentity.treeSha;
+  state.tasks[1].candidateIdentity.baseSha = "d".repeat(40);
+  assert.notEqual(failureEvidenceForRun(run, state, options).policyDigest, baseline.policyDigest);
+  delete state.tasks[1].candidateIdentity.baseSha;
+  state.tasks[1].reviewSubjectSha = "b".repeat(40);
+  assert.notEqual(failureEvidenceForRun(run, state, options).policyDigest, baseline.policyDigest);
+  state.tasks[1].status = "blocked";
+  assert.notDeepEqual(failureEvidenceForRun(run, state, options).dependencies, baseline.dependencies);
 });
 
 test("output guard failures remain recoverable and do not become owner configuration blocks", () => {
@@ -589,6 +691,32 @@ test("runner serializes queued builders whose explicit scopes overlap", () => {
 
   assert.deepEqual(report.runnable.map((run) => run.id), ["run_a"]);
   assert.equal(report.skipped[0].reason, "lane_conflict:task_a");
+});
+
+test("runner uses authoritative repository identity across project aliases for active and queued conflicts", () => {
+  const state = fixtureState({
+    id: "task_a", status: "in_progress", integrationStatus: "", assignedAgentRole: "builder", lane: "backend", workAreas: ["src/shared/**"],
+  }, {
+    id: "run_a", taskId: "task_a", actionType: "start_builder", status: "running", integrationStatus: "",
+    lane: "backend", fileScope: ["src/shared/**"], fileScopeExplicit: true,
+  });
+  state.projects[0].repoUrl = "git@github.com:example/shared.git";
+  state.projects.push({ id: "project_alias", key: "alias", repoPath: "/tmp/separate-checkout", repoUrl: "https://github.com/example/shared" });
+  state.tasks.push({ id: "task_b", projectId: "project_alias", status: "queued", assignedAgentRole: "builder", lane: "backend", workAreas: ["src/shared/child.js"] });
+  state.runs.push({ ...state.runs[0], id: "run_b", taskId: "task_b", projectId: "project_alias", status: "queued", fileScope: ["src/shared/child.js"],
+    // Run snapshots cannot substitute an unrelated identity for the project.
+    repositoryUrl: "https://github.com/example/unrelated" });
+  assert.deepEqual(planRunnableRuns(state, { limit: 2 }).runnable, []);
+  state.runs[0].status = "queued";
+  state.tasks[0].status = "queued";
+  assert.deepEqual(planRunnableRuns(state, { limit: 2 }).runnable.map((run) => run.id), ["run_a"]);
+  state.runs[1].fileScope = ["src/independent/**"];
+  state.tasks[1].workAreas = ["src/independent/**"];
+  assert.deepEqual(planRunnableRuns(state, { limit: 2 }).runnable.map((run) => run.id), ["run_a", "run_b"]);
+  state.runs[1].fileScope = ["src/shared/child.js"];
+  state.tasks[1].workAreas = ["src/shared/child.js"];
+  state.projects[1].repoUrl = "https://github.com/example/another";
+  assert.deepEqual(planRunnableRuns(state, { limit: 2 }).runnable.map((run) => run.id), ["run_a", "run_b"]);
 });
 
 test("runner claim is the transition from queued to in progress", async () => {

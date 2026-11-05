@@ -1,3 +1,6 @@
+import path from "node:path";
+import os from "node:os";
+
 const FRONTEND_TYPES = new Set([
   "frontend",
   "component",
@@ -204,13 +207,63 @@ export function fileScopesMayOverlap(leftScope, rightScope) {
   return leftScope.some((left) => rightScope.some((right) => scopePairMayOverlap(left, right)));
 }
 
+function normalizedRepositoryUrl(value) {
+  let remote = String(value || "").trim();
+  if (!remote) return "";
+  // SCP-style Git remotes and HTTPS/SSH URLs describe the same repository.
+  remote = remote.replace(/^[^/@:\s]+@([^:\s]+):(.+)$/, "ssh://$1/$2");
+  let parsed;
+  try {
+    parsed = new URL(remote);
+  } catch {
+    return "";
+  }
+  if (!["http:", "https:", "ssh:", "git:"].includes(parsed.protocol) || !parsed.hostname) return "";
+  const repositoryPath = parsed.pathname.replace(/\/+$/, "").replace(/\.git$/i, "").replace(/^\/+/, "").toLowerCase();
+  if (!repositoryPath) return "";
+  const defaultPort = { "http:": "80", "https:": "443", "ssh:": "22", "git:": "9418" }[parsed.protocol];
+  const port = parsed.port && parsed.port !== defaultPort ? `:${parsed.port}` : "";
+  // Omit transport, userinfo, query and fragment. Identity must never carry a
+  // credential, and changing a Git transport cannot create another edit lane.
+  return `${parsed.hostname.toLowerCase()}${port}/${repositoryPath}`;
+}
+
+function normalizedRepositoryPath(value) {
+  let localPath = String(value || "").trim();
+  if (localPath === "~") localPath = os.homedir();
+  else if (localPath.startsWith("~/")) localPath = path.join(os.homedir(), localPath.slice(2));
+  if (/^[a-z]:[\\/]/i.test(localPath)) {
+    return path.win32.normalize(localPath).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  }
+  if (!path.isAbsolute(localPath)) return "";
+  return path.normalize(localPath).replace(/\/+$/, "") || path.parse(localPath).root;
+}
+
+/** Bind conflict checks to authoritative project identity, never a worker clone. */
+export function repositoryConflictIdentity(project = {}) {
+  return {
+    repositoryUrl: normalizedRepositoryUrl(project.repoUrl || project.repositoryUrl || project.repository || project.remoteUrl),
+    repositoryPath: normalizedRepositoryPath(project.sourceRepoPath || project.repoPath),
+  };
+}
+
+function sameRepository(left, right) {
+  return Boolean(
+    (left.repositoryUrl && left.repositoryUrl === right.repositoryUrl)
+    || (left.repositoryPath && left.repositoryPath === right.repositoryPath),
+  );
+}
+
 export function laneProfilesConflict(left, right) {
   if (!left || !right) return false;
-  if (left.projectId && right.projectId && left.projectId !== right.projectId) return false;
+  const differentProjects = left.projectId && right.projectId && left.projectId !== right.projectId;
+  const repositoryAlias = differentProjects && sameRepository(left, right);
+  if (differentProjects && !repositoryAlias) return false;
   if (left.conflictGroup === "read-only" || right.conflictGroup === "read-only") return false;
   if (left.conflictGroup === "owner" || right.conflictGroup === "owner") return false;
   if (left.conflictGroup === "project-wide" || right.conflictGroup === "project-wide") return true;
   const bothScopesExplicit = left.fileScopeExplicit === true && right.fileScopeExplicit === true;
+  if (repositoryAlias && !bothScopesExplicit) return true;
   if (left.conflictGroup === right.conflictGroup && !bothScopesExplicit) return true;
   if (!bothScopesExplicit) return false;
   return fileScopesMayOverlap(left.fileScope, right.fileScope);
