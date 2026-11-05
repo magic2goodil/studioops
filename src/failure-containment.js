@@ -162,7 +162,7 @@ export function failureFingerprint(input = {}) {
 
 // Keep stored v1 fingerprints intact. Admission compares the work they describe,
 // so old incidents cannot be bypassed by a new transport, action alias or label.
-function failureWorkIdentity(input) {
+export function failureWorkIdentity(input) {
   const value = failureFingerprint(input).value;
   const infrastructure = new Set([
     "configuration_invalid", "credential_unavailable", "dependency_unavailable",

@@ -854,3 +854,53 @@ enforcement. Observed provider rate limits and exhausted quota remain stop condi
 Review these settings against the owner's intended workload; they are not a
 measurement of billed credits or a promise of provider capacity. Paused project
 schedules and production permissions require their own authorization.
+
+
+## Bounded telemetry reservation contract
+
+Quota classification remains in `src/credit-policy.js`. The shared
+`src/credit-reservations.js` adapter applies its configured degraded-telemetry
+concurrency, claimed-launch and estimated-token bounds at dispatch and again
+inside the runner claim transaction. These bounds add to global capacity,
+repository/file conflicts, workflow readiness and durable failure containment.
+No counter is a measurement of billed credits or provider token usage.
+
+- A first unknown/stale live sweep may claim one read-only telemetry probe.
+  Its persisted lease uses the configured refresh interval (at least 30 seconds,
+  five minutes by default), so unchanged ticks and concurrent dispatchers do not
+  repeat app-server probes. Plan mode never probes or persists a pause.
+- A denied degraded rule or occupied reservation writes one additive
+  `creditAdmissionPause`, without changing workflow status, assignment or failure
+  circuits. A changed reason can update the audit; unchanged pauses do not add
+  comments. Fresh telemetry clears the transient pause and normal admission is
+  evaluated in that same sweep. Available bounded capacity can also clear a
+  capacity-only pause, with distinct recovery wording.
+- Running fallback ownership remains reserved even when its task is paused.
+  Only eligible queued ownership reserves capacity; terminal, stale and
+  budget-paused queues release it. A runner waiting on credit remains queued
+  and consumes neither a model launch nor general execution capacity. At claim,
+  the candidate does not double-count its own reservation; earlier eligible
+  queued ownership and running ownership retain precedence.
+- Fallback launch limits use a digest bound to task, source, semantic action,
+  reviewer role and verified repair lineage. Provider/action aliases, rule
+  renaming and candidate bookkeeping cannot reset the allowance. The run's
+  `fallbackAttempt`/`maxFallbackAttempts` are distinct from its durable fault
+  `attempt`/`maxAttempts`; combining these different counters would recreate an
+  invalid attempt-two/max-one cancellation.
+- Initial `creditAdmission` evidence stays immutable. A current-policy
+  `creditClaimAdmission` records the actual claim decision and binding. Evidence
+  is allowlisted; raw account/provider/configuration payloads are never copied.
+- Observed exhaustion is a hard stop even if telemetry later becomes unknown or
+  stale. A small dated `creditObservedExhaustion` marker contains its reason and
+  observation time, never a balance. Only newer measured healthy capacity that
+  is fresh under the current configured policy can clear it. An available or
+  recovered status without quota, balance, or explicit unlimited evidence is
+  unknown telemetry; it cannot clear exhaustion or authorize normal admission.
+  Dry-run dispatch uses a private snapshot and never writes this memory.
+
+These fields are additive JSON on existing operational records; no database
+migration is required. Legacy payloads still load. Missing or corrupt active
+fallback evidence fails closed. Keep an installation's fallback disabled until
+this exact candidate has completed its required QA/review. Rollback first drains
+running fallback work, restores fail-closed telemetry policy, then restores the
+prior runtime without replacing production data.

@@ -86,8 +86,20 @@ export const DEFAULT_CREDIT_POLICY = Object.freeze({
 let cachedSnapshot = null;
 
 function finiteNumber(value) {
+  if (!["number", "string"].includes(typeof value) || String(value).trim() === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function creditCapacity(snapshot) {
+  const remaining = finiteNumber(snapshot?.remainingPercent);
+  const remainingPercent = remaining !== null && remaining >= 0 && remaining <= 100 ? remaining : null;
+  const balance = snapshot?.credits?.available === true ? finiteNumber(snapshot.credits.balance) : null;
+  const unlimited = snapshot?.credits?.unlimited === true;
+  const exhausted = snapshot?.reached === true || (remaining !== null && remaining <= 0)
+    || (!unlimited && balance !== null && balance <= 0);
+  return { remainingPercent, balance, unlimited, exhausted,
+    measured: remainingPercent !== null || balance !== null || unlimited };
 }
 
 function normalizedList(value, fallback = []) {
@@ -235,7 +247,8 @@ export function normalizeCreditSnapshot(result, input = {}) {
     || (usedPercent !== null && usedPercent >= 100);
 
   return {
-    status: "available",
+    status: reached || usedPercent !== null || (credits?.hasCredits === true && balance !== null)
+      || credits?.unlimited === true ? "available" : "unknown",
     source: "codex-app-server",
     observedAt,
     bucketId: sanitizedBucketId(bucket.limitId || "codex"),
@@ -453,6 +466,7 @@ function sanitizedSnapshotEvidence(snapshot, policy, evaluation = {}) {
     ? Math.max(0, evaluatedMs - observedMs)
     : null;
   const rawStatus = String(snapshot?.status || "unknown").trim().toLowerCase();
+  const capacity = creditCapacity(snapshot);
   const stale = rawStatus === "stale"
     || (
       ["available", "recovered"].includes(rawStatus)
@@ -461,7 +475,7 @@ function sanitizedSnapshotEvidence(snapshot, policy, evaluation = {}) {
         || snapshotAgeMs > Number(policy.snapshotMaxAgeMs)
       )
     );
-  const recovered = !stale && (
+  const recovered = !stale && capacity.measured && ["available", "recovered"].includes(rawStatus) && (
     rawStatus === "recovered"
     || (rawStatus === "available" && snapshot?.recovered === true)
     || evaluation.recovered === true
@@ -472,7 +486,7 @@ function sanitizedSnapshotEvidence(snapshot, policy, evaluation = {}) {
       ? "stale"
       : recovered
         ? "recovered"
-        : rawStatus === "available"
+        : rawStatus === "available" && capacity.measured
           ? "available"
           : "unknown";
   const defaultReason = status === "disabled"
@@ -490,6 +504,14 @@ function sanitizedSnapshotEvidence(snapshot, policy, evaluation = {}) {
     snapshotAgeMs,
     snapshotReason: defaultReason,
   };
+}
+
+/** Shared dated proof for clearance; a status label alone is never capacity. */
+export function freshHealthyCreditEvidence(snapshot, input = {}, evaluation = {}) {
+  const evidence = sanitizedSnapshotEvidence(snapshot, mergedCreditPolicy(input), evaluation);
+  const capacity = creditCapacity(snapshot);
+  return { ...evidence, healthyCapacity: capacity.measured && !capacity.exhausted
+    && ["available", "recovered"].includes(evidence.snapshotStatus) };
 }
 
 function fallbackDecision(snapshotStatus, rule) {
@@ -542,7 +564,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     nowMs: input.nowMs,
     recovered: input.recovered,
   };
-  const snapshotEvidence = sanitizedSnapshotEvidence(snapshot, policy, evaluationInput);
+  const { healthyCapacity, ...snapshotEvidence } = freshHealthyCreditEvidence(snapshot, policy, evaluationInput);
   const budget = {
     estimatedCredits: 0,
     minRemainingPercent: 0,
@@ -550,13 +572,14 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
   };
   const estimatedCredits = Math.max(0, Number(budget.estimatedCredits || 0));
   const minRemainingPercent = Math.max(0, Number(budget.minRemainingPercent || 0));
-  const remainingPercent = finiteNumber(snapshot?.remainingPercent);
+  const { remainingPercent, balance, unlimited } = creditCapacity(snapshot);
   const base = {
     enabled: Boolean(policy.enabled),
     tier,
     riskTier: tier,
     estimatedCredits,
     minRemainingPercent,
+    remainingPercent,
     policyVersion: fallbackRule.policyVersion,
     ruleId: fallbackRule.ruleId,
     explicitFailClosedMatch: fallbackRule.explicitFailClosedMatch,
@@ -578,6 +601,39 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     };
   }
 
+  const prior = evaluationInput.knownExhaustion;
+  const obsoleteObservation = prior?.active === false
+    && Date.parse(prior.clearedByFreshSnapshotAt || "") > Date.parse(snapshotEvidence.snapshotObservedAt || "");
+  if (obsoleteObservation) {
+    // A delayed observer cannot resurrect an exhaustion record superseded by
+    // dated fresh evidence. Its older payload is stale, not live quota proof.
+    return { ...base, ...fallbackDecision("stale", fallbackRule),
+      snapshotStatus: "stale", fallbackUsed: true };
+  }
+  const priorValid = prior?.active === true
+    && ["rate_limit_reached", "insufficient_credit_balance"].includes(prior.reasonCode)
+    && Number.isFinite(Date.parse(prior.observedAt || ""));
+  const newerFresh = healthyCapacity
+    && Date.parse(snapshotEvidence.snapshotObservedAt || "") > Date.parse(prior?.observedAt || "");
+  if (priorValid && !newerFresh) {
+    return { ...base, allowed: false, code: prior.reasonCode, mode: "normal",
+      reasonCode: prior.reasonCode, fallbackUsed: false, remainingPercent,
+      reason: "Previously observed exhaustion requires a newer fresh snapshot before admission." };
+  }
+  // Observed exhaustion cannot become permission merely because its telemetry
+  // later ages or a caller cannot refresh it. Only a new healthy snapshot may
+  // replace that evidence.
+  if (snapshot?.reached === true || (finiteNumber(snapshot?.remainingPercent) !== null && finiteNumber(snapshot.remainingPercent) <= 0)) {
+    return { ...base, allowed: false, code: "rate_limit_reached", mode: "normal",
+      reasonCode: "rate_limit_reached", fallbackUsed: false, remainingPercent,
+      reason: "Codex reports that the active usage limit has been reached." };
+  }
+  if (snapshot?.credits?.available === true && snapshot.credits.unlimited !== true
+    && finiteNumber(snapshot.credits.balance) !== null && finiteNumber(snapshot.credits.balance) <= 0) {
+    return { ...base, allowed: false, code: "insufficient_credit_balance", mode: "normal",
+      reasonCode: "insufficient_credit_balance", fallbackUsed: false, remainingPercent,
+      reason: "The observed credit balance is exhausted." };
+  }
   if (["unknown", "stale"].includes(snapshotEvidence.snapshotStatus)) {
     const decision = fallbackDecision(snapshotEvidence.snapshotStatus, fallbackRule);
     return {
@@ -587,7 +643,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     };
   }
 
-  if (snapshot.credits?.unlimited) {
+  if (unlimited) {
     return {
       ...base,
       allowed: true,
@@ -596,18 +652,6 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       reasonCode: "unlimited_credit_access",
       fallbackUsed: false,
       remainingPercent,
-    };
-  }
-  if (snapshot.reached) {
-    return {
-      ...base,
-      allowed: false,
-      code: "rate_limit_reached",
-      mode: "normal",
-      reasonCode: "rate_limit_reached",
-      fallbackUsed: false,
-      remainingPercent,
-      reason: "Codex reports that the active usage limit has been reached.",
     };
   }
   if (
@@ -626,7 +670,6 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     };
   }
 
-  const balance = snapshot.credits?.available ? finiteNumber(snapshot.credits.balance) : null;
   const requiredCredits = estimatedCredits + Math.max(0, Number(policy.reserveCredits || 0));
   if (balance !== null && balance < requiredCredits) {
     return {
@@ -652,6 +695,17 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     remainingPercent,
     requiredCredits,
   };
+}
+
+/** Dated control evidence only: no account identity, balance, or raw payload. */
+export function creditExhaustionObservation(snapshot, checkedAt = new Date().toISOString()) {
+  let reasonCode = "";
+  if (snapshot?.reached === true || (finiteNumber(snapshot?.remainingPercent) !== null && finiteNumber(snapshot.remainingPercent) <= 0)) reasonCode = "rate_limit_reached";
+  else if (snapshot?.credits?.available === true && snapshot.credits.unlimited !== true
+    && finiteNumber(snapshot.credits.balance) !== null && finiteNumber(snapshot.credits.balance) <= 0) reasonCode = "insufficient_credit_balance";
+  if (!reasonCode) return null;
+  const observedAt = Number.isFinite(Date.parse(snapshot.observedAt || "")) ? new Date(snapshot.observedAt).toISOString() : checkedAt;
+  return { active: true, reasonCode, observedAt };
 }
 
 export function clearCreditSnapshotCache() {

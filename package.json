@@ -23,6 +23,8 @@
     "src/config.js",
     "src/coordination.js",
     "src/credit-policy.js",
+    "src/credit-admission-evidence.js",
+    "src/credit-reservations.js",
     "src/dispatcher.js",
     "src/execution-policy.js",
     "src/failure-containment.js",
