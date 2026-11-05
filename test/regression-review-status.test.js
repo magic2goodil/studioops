@@ -6,6 +6,7 @@ import {
   planDispatches,
 } from "../src/dispatcher.js";
 import { executionAttemptKey } from "../src/execution-policy.js";
+import { createCandidateEnvelope } from "../src/candidate-manifest.js";
 import {
   completeRun,
   planRunnableRuns,
@@ -14,6 +15,7 @@ import {
 import { createSupervisorReport } from "../src/supervisor.js";
 import {
   candidateReviewEvidenceForTask,
+  applyLifecycleTransitionInState,
   generatePrompt,
   normalizeReviewPipeline,
   recordReviewInState,
@@ -21,6 +23,7 @@ import {
 
 const SUBJECT_SHA = "a".repeat(40);
 const REVIEWER_FIX_SHA = "b".repeat(40);
+const INTEGRATION_SHA = "c".repeat(40);
 
 function fixtureState(taskPatch = {}, reviews = []) {
   return {
@@ -94,6 +97,137 @@ test("human local QA is not interpreted as an automated regression stage", () =>
   assert.equal(report.actions.length, 1);
   assert.equal(report.actions[0].type, "qa_bundle_ready");
   assert.equal(report.actions[0].role, "owner");
+});
+
+test("owner rejection invalidates user-review evidence and one corrected SHA restarts bounded review", () => {
+  const candidate = createCandidateEnvelope({
+    createdAt: "2026-07-26T11:00:00.000Z",
+    qaBundleId: "qa_bundle_1",
+    manifest: {
+      candidateId: "candidate_1",
+      projectId: "project_1",
+      base: { branch: "main", sha: "d".repeat(40) },
+      sources: [{
+        taskId: "task_1",
+        sourceRef: "refs/heads/codex/demo-task_1",
+        headSha: SUBJECT_SHA,
+        candidateCycle: 2,
+        reviews: [{
+          id: "review_lead",
+          stageKey: "lead",
+          role: "lead-reviewer",
+          outcome: "approved",
+          subjectSha: SUBJECT_SHA,
+          candidateCycle: 2,
+          reviewedAt: "2026-07-26T10:30:00.000Z",
+        }],
+      }],
+      integration: { branch: "qa/demo", sha: INTEGRATION_SHA },
+      checks: [{
+        id: "check_1",
+        kind: "full-regression",
+        name: "npm run check",
+        outcome: "passed",
+        subjectSha: INTEGRATION_SHA,
+        evidenceDigest: `sha256:${"e".repeat(64)}`,
+      }],
+      preview: {
+        url: "http://127.0.0.1:4317/",
+        status: "healthy",
+        commitSha: INTEGRATION_SHA,
+        verifiedAt: "2026-07-26T11:00:00.000Z",
+        attestation: { kind: "header", key: "x-studioops-commit", observedSha: INTEGRATION_SHA },
+      },
+      assembly: {
+        mode: "atomic",
+        requestedTaskIds: ["task_1"],
+        includedTaskIds: ["task_1"],
+        excludedTaskIds: [],
+      },
+    },
+  });
+  const state = fixtureState({
+    status: "user_review",
+    stateVersion: 9,
+    assignedAgentRole: "owner",
+    reviewCycle: 2,
+    reviewSubjectCycle: 2,
+    reviewSubjectSha: SUBJECT_SHA,
+    candidateId: candidate.id,
+    qaBundleId: candidate.qaBundleId,
+    qaDecision: { outcome: "passed" },
+    integrationStatus: "ready",
+    promotionStatus: "ready",
+    promotionEvidence: { candidateId: candidate.id, subjectSha: SUBJECT_SHA },
+  }, [{
+    id: "review_lead",
+    taskId: "task_1",
+    stageKey: "lead",
+    role: "lead-reviewer",
+    outcome: "approved",
+    candidateCycle: 2,
+    subjectSha: SUBJECT_SHA,
+  }]);
+  state.candidates = [candidate];
+  state.qaBundles = [{ id: candidate.qaBundleId, candidateId: candidate.id, status: "ready" }];
+
+  const rejected = applyLifecycleTransitionInState(state, {
+    action: "request_changes",
+    taskId: "task_1",
+    expectedStateVersion: 9,
+    actorContext: { actorId: "local-owner", actorType: "owner", role: "owner", trusted: true },
+    evidence: { targetStatus: "needs_changes", candidateCycle: 2, subjectSha: SUBJECT_SHA },
+  }, { now: "2026-07-26T12:00:00.000Z" });
+
+  assert.equal(rejected.task.status, "needs_changes");
+  assert.equal(Boolean(state.reviews[0].invalidatedAt), true);
+  assert.equal(state.candidates[0].status, "invalidated");
+  assert.equal(state.qaBundles[0].status, "invalidated");
+  assert.equal(rejected.task.candidateId, "");
+  assert.equal(rejected.task.qaBundleId, "");
+  assert.equal(rejected.task.qaDecision, null);
+  assert.equal(rejected.task.integrationStatus, "");
+  assert.equal(rejected.task.promotionStatus, "");
+  assert.equal(rejected.task.promotionEvidence, null);
+  assert.deepEqual(
+    rejected.decision.invalidationIds.sort(),
+    ["candidate_1", "qa_bundle_1", "review_lead"],
+  );
+  assert.deepEqual({
+    action: state.events.at(-1).action,
+    from: state.events.at(-1).fromStatus,
+    to: state.events.at(-1).toStatus,
+    actorType: state.events.at(-1).actor.type,
+    actorRole: state.events.at(-1).actor.role,
+  }, {
+    action: "request_changes",
+    from: "user_review",
+    to: "needs_changes",
+    actorType: "owner",
+    actorRole: "owner",
+  });
+
+  const resubmitted = applyLifecycleTransitionInState(state, {
+    action: "record_builder_handoff",
+    taskId: "task_1",
+    expectedStateVersion: 10,
+    actorContext: { actorId: "workflow-engine", actorType: "system", role: "workflow-engine", trusted: true },
+    evidence: { targetStatus: "builder_review", candidateCycle: 3, subjectSha: REVIEWER_FIX_SHA },
+  }, { now: "2026-07-26T12:05:00.000Z" });
+
+  assert.equal(resubmitted.task.status, "builder_review");
+  assert.equal(resubmitted.task.reviewCycle, 3);
+  assert.equal(resubmitted.task.reviewSubjectCycle, 3);
+  assert.equal(resubmitted.task.reviewSubjectSha, REVIEWER_FIX_SHA);
+  const reviewEvidence = candidateReviewEvidenceForTask(state, resubmitted.task);
+  assert.equal(reviewEvidence.ok, false);
+  assert.match(reviewEvidence.error, /Regression QA is not complete/);
+  const report = createSupervisorReport(state);
+  assert.equal(report.actions.length, 1);
+  assert.equal(report.actions[0].type, "start_review");
+  assert.equal(report.actions[0].nextStatus, "regression_review");
+  assert.equal(report.actions[0].candidateCycle, 3);
+  assert.equal(report.actions[0].reviewSubjectSha, REVIEWER_FIX_SHA);
 });
 
 test("review pipelines reject the human QA status", () => {
