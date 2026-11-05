@@ -2450,6 +2450,45 @@ function pendingProtectedHandoff(projectPlan) {
   };
 }
 
+async function invalidHandoffSourceBindings(repoPath, projectPlan, handoff, options = {}) {
+  let candidateExists = await git(
+    repoPath,
+    ["cat-file", "-e", `${handoff.commit}^{commit}`],
+    { ...options, allowFailure: true },
+  );
+  if (!candidateExists.ok) {
+    await git(
+      repoPath,
+      ["fetch", qaRemoteTarget(options), `refs/heads/${normalizeBranchName(projectPlan.integrationBranch)}`],
+      { ...options, allowFailure: true },
+    );
+    candidateExists = await git(
+      repoPath,
+      ["cat-file", "-e", `${handoff.commit}^{commit}`],
+      { ...options, allowFailure: true },
+    );
+  }
+  if (!candidateExists.ok) return [];
+
+  const invalid = [];
+  for (const task of projectPlan.tasks) {
+    const sourceRef = taskSourceRef(task);
+    if (sourceRef) {
+      await git(repoPath, ["fetch", qaRemoteTarget(options), sourceRef], {
+        ...options,
+        allowFailure: true,
+      });
+    }
+    const contained = await git(
+      repoPath,
+      ["merge-base", "--is-ancestor", task.integrationSourceHeadSha, handoff.commit],
+      { ...options, allowFailure: true },
+    );
+    if (!contained.ok) invalid.push(task);
+  }
+  return invalid;
+}
+
 async function verifyMergedIntegrationTarget(repoPath, projectPlan, pr, options = {}) {
   const mergeCommit = String(pr?.mergeCommit?.oid || "").trim().toLowerCase();
   if (!/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(mergeCommit)) {
@@ -2579,19 +2618,27 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
     && task.integrationSourceHeadSha !== task.expectedHeadSha
   ));
   const missingSourceSnapshots = projectPlan.tasks.filter((task) => !task.integrationSourceHeadSha);
-  if (inspectedPr.workflowStatus !== "merged" && changedSources.length) {
-    if (missingSourceSnapshots.length) {
-      return {
-        status: "candidate_drift",
-        blocker: `Newly reviewed source evidence is available, but the previous handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not replace the open PR without auditable evidence.`,
-        pr: inspectedPr,
-      };
-    }
-    const changedSummary = changedSources
-      .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
-      .join(", ");
-    const reason = `StudioOps is superseding this immutable QA candidate because newly reviewed source evidence replaced the prior handoff: ${changedSummary}. The old candidate remains recorded on each affected task.`;
-    const closed = String(inspectedPr.state || "").toUpperCase() === "CLOSED"
+  if (missingSourceSnapshots.length) {
+    return {
+      status: "stale_integration_authority",
+      blocker: `The protected QA handoff lacks immutable source snapshots for ${missingSourceSnapshots.map((task) => task.id).join(", ")}. StudioOps will not reuse it or create owner QA authority.`,
+      pr: inspectedPr,
+    };
+  }
+  const invalidSourceBindings = changedSources.length
+    ? []
+    : await invalidHandoffSourceBindings(repoPath, projectPlan, handoff, options);
+  if (changedSources.length || invalidSourceBindings.length) {
+    const changedSummary = changedSources.length
+      ? changedSources
+          .map((task) => `${task.id} ${task.integrationSourceHeadSha} -> ${task.expectedHeadSha}`)
+          .join(", ")
+      : invalidSourceBindings
+          .map((task) => `${task.id} ${task.integrationSourceHeadSha} is not contained by ${handoff.commit}`)
+          .join(", ");
+    const reason = `StudioOps detected stale integration authority and is superseding this immutable QA candidate because its source binding no longer proves the current reviewed source: ${changedSummary}. The old candidate remains recorded on each affected task.`;
+    const prIsTerminal = ["CLOSED", "MERGED"].includes(String(inspectedPr.state || "").toUpperCase());
+    const closed = prIsTerminal
       ? { ok: true, pr: inspectedPr, output: "" }
       : await closeIntegrationPr(repoPath, projectPlan, inspectedPr, reason, options);
     if (!closed.ok) {
@@ -2617,6 +2664,7 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
         state: "CLOSED",
       },
       supersededHandoff: {
+        reasonCode: "stale_integration_authority",
         candidateBranch: handoff.branch,
         candidateCommit: handoff.commit,
         prUrl: handoff.prUrl,
@@ -2882,8 +2930,8 @@ async function integrateProject(projectPlan, options = {}) {
           status: "merged",
           source: sourceLabel(task),
           sourceRef: taskSourceRef(task),
-          headSha: task.expectedHeadSha,
-          candidateCycle: task.candidateCycle,
+          headSha: task.integrationSourceHeadSha,
+          candidateCycle: task.integrationSourceCandidateCycle,
           reviews: task.reviews,
           output: `Verified merged integration PR ${result.integrationPr?.url || ""} on protected target ${candidatePlan.integrationBranch} at ${preparedHead}.`,
         };
@@ -3422,6 +3470,7 @@ function taskPatchForResult(projectResult, taskResult, now, reportFingerprint) {
     "candidate_drift",
     "candidate_publish_failed",
     "candidate_supersession_failed",
+    "stale_integration_authority",
   ]);
   const integrationStatus = remediationStatuses.has(taskResult.status)
     ? "blocked"
