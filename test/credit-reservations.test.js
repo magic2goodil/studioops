@@ -78,6 +78,57 @@ test("claim rechecks current capacity atomically for normal-queued runs that now
   assert.ok(preflights <= 2);
 });
 
+test("a denied queue head consumes neither the single preflight slot nor provisional lane ownership", async () => {
+  for (const sameScope of [false, true]) {
+    const { state, options } = fixture();
+    const first = queued(state, state.tasks[0], "run_blocked"), second = queued(state, state.tasks[1], "run_admitted");
+    state.tasks[0].labels = ["credit-fail-closed"];
+    first.creditAdmission = { fallbackUsed: true, tier: "balanced", estimatedTokensPerRun: 1000 };
+    if (sameScope) {
+      state.tasks[1].workAreas = state.tasks[0].workAreas;
+      second.fileScope = first.fileScope;
+    }
+    const preflights = [];
+    const claimed = await claimRuns({ ...options, limit: 1,
+      preflightRun: async run => { preflights.push(run.id); return { ok: true, workflowMode: "local" }; } });
+    assert.deepEqual(preflights, [second.id]);
+    assert.deepEqual(claimed.map(run => run.id), [second.id]);
+    assert.equal(first.status, "queued");
+    assert.equal(first.creditClaimBlocker.code, "credit_snapshot_unknown");
+  }
+});
+
+test("eligible queued fallback ownership keeps its order under a one-run limit", async () => {
+  const { state, options } = fixture();
+  const runs = state.tasks.slice(0, 2).map((task, i) => queued(state, task, `run_${i}`));
+  for (const run of runs) run.creditAdmission = { fallbackUsed: true, tier: "balanced", estimatedTokensPerRun: 1000 };
+  const preflights = [];
+  const claimed = await claimRuns({ ...options, limit: 1,
+    preflightRun: async run => { preflights.push(run.id); return { ok: true, workflowMode: "local" }; } });
+  assert.deepEqual(preflights, [runs[0].id]);
+  assert.deepEqual(claimed.map(run => run.id), [runs[0].id]);
+  assert.equal(runs[1].status, "queued");
+});
+
+test("unchanged denied fresh capacity does not recover a pause or repeat its audit", async () => {
+  const { state, actions, options } = fixture();
+  delete options.executionPolicy; // The queued tier remains authoritative even if current task routing differs.
+  const run = queued(state, state.tasks[0], "run_paused");
+  options.creditSnapshot = { status: "available", observedAt: new Date().toISOString(), remainingPercent: 10 };
+  options.creditPolicy.tierBudgets = { balanced: { minRemainingPercent: 20, estimatedCredits: 15 } };
+  const input = { ...options, limit: 1, preflightRun: async () => ({ ok: true, workflowMode: "local" }) };
+  await claimRuns(input);
+  const pause = structuredClone(state.tasks[0].creditAdmissionPause);
+  for (let i = 0; i < 3; i++) {
+    await dispatchSupervisorActions([{ ...actions[0], taskStatus: "queued" }], options);
+    assert.equal((await claimRuns(input)).length, 0);
+  }
+  assert.equal(run.status, "queued");
+  assert.deepEqual(state.tasks[0].creditAdmissionPause, pause);
+  assert.equal(state.events.filter(event => event.type === "credit_admission_paused").length, 1);
+  assert.equal(state.events.filter(event => event.type === "credit_admission_recovered").length, 0);
+});
+
 test("own queued reservation is not double counted and earlier queue owner wins", async () => {
   const { state, options } = fixture();
   for (let i = 0; i < 2; i++) {

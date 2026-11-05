@@ -1706,8 +1706,10 @@ export function planRunnableRuns(state, input = {}) {
   const runnable = [];
   const skipped = [];
   const plannedRuns = [];
+  const creditPlan = input.creditPolicy?.enabled ? createCreditReservationPlan(state,
+    run => runConsumesExecutionCapacity(state, run, input), input.failureIncidents) : null;
 
-  for (const run of state.runs || []) {
+  for (const [index, run] of (state.runs || []).entries()) {
     if (!RUNNABLE_STATUSES.has(run.status)) continue;
     if (selfUpdateLease) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `self_update_in_progress:${selfUpdateLease.id}` });
@@ -1720,6 +1722,12 @@ export function planRunnableRuns(state, input = {}) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: executionBlocker });
       continue;
     }
+    const creditAdmission = creditPlan ? creditClaimAssessment(state, run, creditPlan, input, index) : null;
+    if (creditAdmission && !creditAdmission.allowed) {
+      releaseQueuedCreditReservation(creditPlan, run.id);
+      skipped.push({ runId: run.id, taskId: run.taskId, reason: `credit_gate:${creditAdmission.code}` });
+      continue;
+    }
     const laneConflict = findRunnableLaneConflict(state, run, plannedRuns);
     if (laneConflict) {
       skipped.push({ runId: run.id, taskId: run.taskId, reason: `lane_conflict:${laneConflict.taskId || laneConflict.id}` });
@@ -1730,6 +1738,9 @@ export function planRunnableRuns(state, input = {}) {
       continue;
     }
     plannedRuns.push(run);
+    // Provisional ownership belongs only to admitted candidates. This updates
+    // the local plan, never the durable run or its actual-claim evidence.
+    if (creditPlan) recordCreditClaim(creditPlan, run, creditAdmission);
     runnable.push({
       ...run,
       project,
@@ -2543,24 +2554,25 @@ export async function claimRuns(input = {}) {
   input = { ...input };
   const limit = Math.max(1, Number(input.limit || input.maxRuns || 1));
   const preflightState = input.state || await readState();
-  const candidates = planRunnableRuns(preflightState, { ...input, limit }).runnable;
+  const eligibleQueue = (preflightState.runs || []).filter(run => RUNNABLE_STATUSES.has(run.status)
+    && !queuedRunExecutionBlocker(preflightState, run, input));
   if (!input.state && input.creditPolicy === undefined) {
     const config = await loadConfig();
     input.creditPolicy = canonicalCreditPolicyConfig({ ...config?.defaults?.creditPolicy, ...config?.creditPolicy });
   }
-  if (candidates.length && input.creditPolicy?.enabled && input.creditSnapshot === undefined && !input.state) {
+  const activeCount = (preflightState.runs || []).filter(run => ACTIVE_STATUSES.has(run.status)
+    && !activeRunStaleReason(run, input)).length;
+  const canPlan = activeCount < limit && !activeSelfUpdateLease(preflightState, input);
+  if (eligibleQueue.length && canPlan && input.creditPolicy?.enabled && input.creditSnapshot === undefined && !input.state) {
     input.creditSnapshot = await getCodexCreditSnapshot(input.creditPolicy);
   }
-  if (!input.failureIncidents && candidates.length && input.creditPolicy?.enabled) {
-    const ids = [...new Set(candidates.map(run => run.taskId))];
+  if (!input.failureIncidents && eligibleQueue.length && canPlan && input.creditPolicy?.enabled) {
+    const ids = [...new Set(eligibleQueue.map(run => run.taskId))];
     input.failureIncidents = (await Promise.all(ids.map(taskId => readFailureIncidents({ taskId })))).flat();
   }
-  const preCreditPlan = createCreditReservationPlan(preflightState,
-    run => runConsumesExecutionCapacity(preflightState, run, input), input.failureIncidents);
-  const preIndexes = new Map(preflightState.runs.map((run, index) => [run.id, index]));
+  const candidates = planRunnableRuns(preflightState, { ...input, limit }).runnable;
   const preflightResults = new Map();
   for (const candidate of candidates) {
-    if (!creditClaimAssessment(preflightState, candidate, preCreditPlan, input, preIndexes.get(candidate.id)).allowed) continue;
     try {
       const check = input.preflightRun || preflightRun;
       let result = await check(candidate, input);

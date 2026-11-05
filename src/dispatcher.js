@@ -1263,14 +1263,21 @@ export async function dispatchSupervisorActions(actions, input = {}) {
     if (!options.dryRun) recoverStageAttemptCircuitsInState(state, actions || [], options, now);
     if (!options.dryRun) {
       const visited = new Set();
+      const queuedByTask = new Map();
+      for (const run of state.runs) {
+        if (run.status === "queued" && !queuedByTask.has(run.taskId)) queuedByTask.set(run.taskId, run);
+      }
       for (const action of actions || []) {
         if (!projectAllowed(action, options) || visited.has(action.taskId)) continue;
         visited.add(action.taskId);
         const task = findTask(state, action.taskId);
         if (!task?.creditAdmissionPause?.active) continue;
+        const execution = resolveExecutionPolicy(task, action, options);
         const admission = assessCreditAdmission(options.creditSnapshot,
-          { ...resolveExecutionPolicy(task, action, options), labels: task.labels }, options.creditPolicy);
-        if (!admission.fallbackUsed && ["available", "recovered"].includes(admission.snapshotStatus)) {
+          { ...execution, modelTier: queuedByTask.get(task.id)?.modelTier || execution.modelTier,
+            labels: task.labels }, options.creditPolicy,
+          { knownExhaustion: state.meta?.creditObservedExhaustion, evaluatedAt: now });
+        if (admission.allowed && !admission.fallbackUsed && ["available", "recovered"].includes(admission.snapshotStatus)) {
           recoverCreditAdmissionPauseInState(state, task, { creditAdmission: admission, now });
         }
       }
