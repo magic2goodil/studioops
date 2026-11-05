@@ -1432,7 +1432,10 @@ export async function preflightRun(run, input = {}) {
   const checkRemote = input.checkGitHubRemote || defaultGitHubRemoteCheck;
   let authContext = null;
   try {
-    authContext = await prepareAuth(githubRun, input);
+    authContext = await prepareRunAuth({ ...githubRun, gitAuthStrategy: "github-app" }, {
+      ...input,
+      prepareGitHubAppAuth: prepareAuth,
+    });
   } catch (error) {
     const code = githubCredentialFailure(error);
     const inheritedDetail = inheritedCredentialFailure
@@ -1683,10 +1686,44 @@ export async function withExecutionImpactPlan(run) {
   };
 }
 
-async function prepareRunAuth(run, input = {}) {
+function sameAuthFileScope(left, right) {
+  const scope = (value) => Array.isArray(value)
+    ? JSON.stringify([...value].sort()) : "";
+  return scope(left) === scope(right);
+}
+
+export async function prepareRunAuth(run, input = {}) {
   if (run.workflowMode === "local" || run.gitAuthStrategy === "inherited-ssh") return null;
+  // Worker snapshots and caller-supplied workAreas are not permission authority.
+  // Re-read immediately before each preflight/execution token mint so a task
+  // edit, cancelled run or changed project cannot reuse an earlier declaration.
+  const state = input.state || await (input.readState || readState)();
+  const currentRun = (state.runs || []).find((candidate) => candidate.id === run.id);
+  const task = (state.tasks || []).find((candidate) => candidate.id === currentRun?.taskId);
+  const project = (state.projects || []).find((candidate) => candidate.id === currentRun?.projectId);
+  const sameIdentity = currentRun && task && project
+    && task.projectId === project.id
+    && ["id", "taskId", "projectId", "group", "role", "actionType", "branchName"]
+      .every((field) => String(currentRun[field] || "") === String(run[field] || ""))
+    && (!run.project?.id || run.project.id === project.id)
+    && JSON.stringify(repositoryConflictIdentity(run.project)) === JSON.stringify(repositoryConflictIdentity(project));
+  const scopeIsCurrent = sameIdentity
+    // Assignment is separate permission authority. Legacy remediation actions
+    // may remain runnable after reassignment, but cannot retain workflow write.
+    && currentRun.group === "builder"
+    && currentRun.role === "builder"
+    && task.assignedAgentRole === currentRun.role
+    && ["queued", "running"].includes(currentRun.status)
+    && !currentRun.completedAt
+    && !staleRunReason(state, currentRun)
+    && sameAuthFileScope(currentRun.fileScope, run.fileScope);
+  const authRun = {
+    ...run,
+    ...(sameIdentity ? { project: { ...project, workflowMode: run.workflowMode || project.workflowMode } } : {}),
+    workAreas: scopeIsCurrent && Array.isArray(task.workAreas) ? [...task.workAreas] : [],
+  };
   const prepareAuth = input.prepareGitHubAppAuth || prepareGitHubAppAuth;
-  return prepareAuth(run, input);
+  return prepareAuth(authRun, input);
 }
 
 export function planRunnableRuns(state, input = {}) {

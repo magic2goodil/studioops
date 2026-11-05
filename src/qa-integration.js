@@ -262,7 +262,7 @@ function parseJsonOutput(result, label) {
   }
 }
 
-function integrationPrCheckState(pr) {
+export function integrationPrCheckState(pr) {
   const checks = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
   const failedConclusions = new Set([
     "ACTION_REQUIRED",
@@ -296,7 +296,7 @@ function integrationPrCheckState(pr) {
   };
 }
 
-function integrationPrBlocker(pr, checkState) {
+export function integrationPrBlocker(pr, checkState) {
   const state = String(pr?.state || "").toUpperCase();
   const reviewDecision = String(pr?.reviewDecision || "").toUpperCase();
   if (state === "MERGED") return "";
@@ -318,7 +318,7 @@ function integrationPrBlocker(pr, checkState) {
   return "All reported checks passed; the protected branch still requires the pull request to be merged by an authorized human.";
 }
 
-function integrationPrStatus(pr, checkState) {
+export function integrationPrStatus(pr, checkState) {
   const state = String(pr?.state || "").toUpperCase();
   const reviewDecision = String(pr?.reviewDecision || "").toUpperCase();
   if (state === "MERGED") return "merged";
@@ -326,6 +326,18 @@ function integrationPrStatus(pr, checkState) {
   if (checkState.state === "failed") return "checks_failed";
   if (reviewDecision === "CHANGES_REQUESTED") return "changes_requested";
   return "pr_waiting";
+}
+
+function protectedPrPermissionError(projectPlan) {
+  const projectKey = safeRefSegment(projectPlan.projectKey || projectPlan.projectId || "project");
+  const error = new Error([
+    "QA integration could not inspect protected PR checks/statuses with its GitHub App installation token.",
+    "Verify checks:read and statuses:read on the QA App, approve any pending permission update and install or re-approve the App on the target repository, then mint a fresh token.",
+    `Retry the existing candidate with \`npm run qa-integrate -- --project ${projectKey} --force\`; this skips only the StudioOps cooldown and preserves branch protection, reviews and checks.`,
+    "The preserved candidate is not rewritten or merged, and personal-credential fallback is disabled.",
+  ].join(" "));
+  error.code = "qa_github_app_check_permissions_missing";
+  return error;
 }
 
 function exactIntegrationPrIdentity(pr, projectPlan, candidateBranch, repository) {
@@ -372,6 +384,9 @@ async function findIntegrationPr(repoPath, projectPlan, candidateBranch, options
     allowFailure: true,
   });
   if (!result.ok) {
+    if (/resource not accessible by integration/i.test(String(result.output || ""))) {
+      throw protectedPrPermissionError(projectPlan);
+    }
     throw new Error(`Could not inspect the integration pull request: ${truncateOutput(result.output)}`);
   }
   const prs = parseJsonOutput(result, "gh pr list");
@@ -597,9 +612,9 @@ function qaIntegrationAuthEnabled(projectPlan, input = {}) {
   );
 }
 
-async function prepareQaIntegrationAuth(projectPlan, input = {}) {
+export async function prepareQaIntegrationAuth(projectPlan, input = {}) {
   if (!qaIntegrationAuthEnabled(projectPlan, input)) return null;
-  const role = input.githubAppRole || input.githubAppAuthRole || "qa-integration-worker";
+  const role = "qa-integration-worker";
   return prepareGitHubAppAuth(
     {
       id: `qa_${projectPlan.projectId || projectPlan.projectKey || "project"}`,
@@ -614,7 +629,7 @@ async function prepareQaIntegrationAuth(projectPlan, input = {}) {
     },
     {
       ...input,
-      githubAppDefaultRole: input.githubAppDefaultRole || "builder",
+      githubAppDefaultRole: input.githubAppDefaultRole || input.githubAppRole || input.githubAppAuthRole || "builder",
     },
   );
 }
@@ -2315,6 +2330,11 @@ export function planQaIntegrations(state, input = {}) {
             integrationCandidateCommit: task.integrationCandidateCommit || "",
             integrationPrUrl: task.integrationPrUrl || "",
             integrationPrNumber: task.integrationPrNumber || 0,
+            integrationPrState: task.integrationPrState || "",
+            integrationPrHeadSha: task.integrationPrHeadSha || "",
+            integrationPrMergeState: task.integrationPrMergeState || "",
+            integrationPrReviewDecision: task.integrationPrReviewDecision || "",
+            integrationMergeCommit: task.integrationMergeCommit || "",
             integrationCheckState: task.integrationCheckState || null,
             integrationBlocker: task.integrationBlocker || "",
             integrationValidation: task.integrationValidation || null,
@@ -3236,43 +3256,63 @@ async function integrateProject(projectPlan, options = {}) {
 }
 
 function authFailureProjectResult(projectPlan, error) {
-  const output = `GitHub App auth failed for QA integration: ${error.message}`;
+  const permissionDenied = isGitHubAppPermissionError(error);
+  const pending = permissionDenied ? pendingProtectedHandoff(projectPlan) : null;
+  const handoff = pending && !pending.error ? pending : null;
+  const first = handoff?.tasks?.[0];
+  const output = error?.code === "qa_github_app_check_permissions_missing"
+    ? error.message
+    : `GitHub App auth failed for QA integration: ${error.message}`;
+  const failureStatus = permissionDenied ? "authentication_failed" : "blocked";
+  const tasks = allTaskResults(handoff?.tasks || projectPlan.tasks, failureStatus, output);
+  if (handoff) {
+    for (const taskResult of tasks) {
+      const source = handoff.tasks.find((task) => task.id === taskResult.taskId);
+      // A denied inspection cannot upgrade an old handoff to newly reviewed
+      // source evidence. Keep the prior immutable source snapshot, even absent.
+      taskResult.headSha = source.integrationSourceHeadSha || "";
+      taskResult.candidateCycle = Number(source.integrationSourceCandidateCycle || 0);
+    }
+  }
   return {
     ...projectPlan,
-    tasks: allTaskResults(projectPlan.tasks, "blocked", output),
-    status: "blocked",
+    tasks,
+    status: failureStatus,
     output: truncateOutput(output),
-    commit: "",
-    validation: [],
+    commit: handoff?.commit || "",
+    validation: first?.integrationValidation?.commands || [],
+    validationSandbox: first?.integrationValidation?.sandbox || null,
+    validationSelection: first?.integrationValidation?.selection || null,
     sourceRepoPath: projectPlan.repoPath || "",
     workspacePath: "",
     workspaceStrategy: "",
+    protectedBranchFallback: Boolean(handoff),
+    integrationCandidateBranch: handoff?.branch || "",
+    integrationCandidateCommit: handoff?.commit || "",
+    integrationMergeCommit: first?.integrationMergeCommit || "",
+    integrationPr: handoff ? {
+      url: handoff.prUrl,
+      number: Number(first?.integrationPrNumber || 0),
+      state: first?.integrationPrState || "",
+      headRefOid: first?.integrationPrHeadSha || "",
+      mergeStateStatus: first?.integrationPrMergeState || "",
+      reviewDecision: first?.integrationPrReviewDecision || "",
+    } : null,
+    integrationCheckState: first?.integrationCheckState || null,
+    integrationBlocker: permissionDenied ? output : "",
+    deferredTaskIds: handoff?.deferredTasks?.map((task) => task.id) || [],
   };
 }
 
-export function githubAppLocalFallbackEnabled(input = {}) {
-  return booleanOption(
-    input.githubAppFallbackToLocalAuth
-      ?? process.env.MISSION_CONTROL_QA_GITHUB_APP_LOCAL_FALLBACK,
-    false,
-  );
+export function githubAppLocalFallbackEnabled() {
+  // Compatibility query only: failed App inspection never changes identity.
+  return false;
 }
 
 export function isGitHubAppPermissionError(error) {
-  return /resource not accessible by integration|installation token.*permission|github app.*permission/i
+  return ["qa_github_app_check_permissions_missing", "github_app_permissions_not_approved"].includes(error?.code)
+    || /resource not accessible by integration|installation token.*permission|github app.*permission/i
     .test(String(error?.message || error || ""));
-}
-
-function localFallbackResultNote(result) {
-  const note = "GitHub App inspection lacked the required read scope; StudioOps retried once with the configured local GitHub identity and no installation-token environment.";
-  return {
-    ...result,
-    output: appendOutput(note, result.output),
-    tasks: (result.tasks || []).map((task) => ({
-      ...task,
-      output: appendOutput(note, task.output),
-    })),
-  };
 }
 
 function validationSummary(result) {
@@ -3765,33 +3805,7 @@ export async function runQaIntegration(input = {}) {
         assertQaClaim: assertClaim,
       });
     } catch (error) {
-      const canFallback = authContext
-        && githubAppLocalFallbackEnabled(input)
-        && isGitHubAppPermissionError(error);
-      if (!canFallback) {
-        result = authFailureProjectResult(projectPlan, error);
-      } else {
-        await cleanupGitHubAppAuth(authContext);
-        authContext = null;
-        try {
-          result = localFallbackResultNote(await integrateProject(projectPlan, {
-            ...input,
-            githubAppAuth: false,
-            preferLocalSshTransport: true,
-            env: { ...(input.env || {}) },
-            gitAuthEnv: {},
-            secrets: normalizeSecrets(input.secrets),
-            sourceRepoPath: projectPlan.repoPath,
-            renewQaClaim: renewClaim,
-            assertQaClaim: assertClaim,
-          }));
-        } catch (fallbackError) {
-          result = authFailureProjectResult(
-            projectPlan,
-            new Error(`GitHub App permission fallback also failed: ${fallbackError.message}`),
-          );
-        }
-      }
+      result = authFailureProjectResult(projectPlan, error);
     } finally {
       await cleanupGitHubAppAuth(authContext);
     }
