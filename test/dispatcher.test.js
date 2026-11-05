@@ -123,6 +123,24 @@ test("absent ledger evidence and unrelated sweeps cannot reset an exhausted stag
   assert.equal(state.runs.length, 0);
 });
 
+test("one recovered launch recorded under two fault reasons is not charged twice", async () => {
+  const { state, action } = executionRecoveryFixture();
+  const prior = createFailureIncident({ generation: 2, fingerprint: failureFingerprint({ taskId: "task_1", action: "start_builder", provider: "codex-sdk", reasonCode: "provider_unavailable" }) });
+  const changedReason = createFailureIncident({ fingerprint: failureFingerprint({ taskId: "task_1", action: "return_to_builder", provider: "codex-cli", reasonCode: "output_guard_exceeded" }) });
+  prior.paidAttempts = 1;
+  changedReason.paidAttempts = 1;
+  const options = { state, executionPolicy: { maxAttempts: 2 }, failureIncidents: [prior, changedReason] };
+  const report = await dispatchSupervisorActions([action], options);
+  assert.equal(report.runs.length, 1);
+  assert.equal(report.runs[0].attempt, 2);
+  assert.equal(report.runs[0].attemptAccounting, "current_durable_fault_counter");
+  assert.equal(state.tasks[0].automationCircuit, undefined);
+  const open = openFailureCircuit(changedReason);
+  const blocked = planDispatches({ ...state, runs: [] }, [{ ...action, taskStatus: state.tasks[0].status }], { ...options, failureIncidents: [prior, open] });
+  assert.equal(blocked.selected.length, 0);
+  assert.equal(blocked.skipped[0].reason, "failure_circuit_open");
+});
+
 test("review aliases share the budget while a new exact review subject gets its own stage", () => {
   const { state, action } = executionRecoveryFixture();
   const sha = "a".repeat(40);

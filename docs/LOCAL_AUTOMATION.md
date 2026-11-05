@@ -834,8 +834,8 @@ Repository overlap checks still serialize conflicting edits, including duplicate
 project registrations and filesystem symlinks. This profile changes capacity;
 architecture, review, QA and release authority continue to govern delivery.
 
-Use the normal execution policy of two stage attempts with a 30-second base
-backoff. Durable failure containment separately bounds attempts for an unchanged
+Use the normal execution policy of two attempts for an unchanged fault with a
+30-second base backoff. Durable failure containment separately bounds attempts for an unchanged
 fault; a verified repair is required for a new recovery generation. Attempt
 admission is checked before creating another run.
 
@@ -847,9 +847,10 @@ SDK limitation and private evidence behavior.
 
 The normal quota policy reserves 2% for mechanical work, 5% for economy,
 balanced and critical work, and 35% for an explicitly selected frontier tier.
-Configured bounded telemetry fallback may admit only its small documented
-concurrency/attempt/token allowance when a snapshot is unknown or stale.
-Observed provider rate limits and exhausted quota remain stop conditions.
+Keep unknown or stale telemetry fail closed until dispatch reservation enforcement
+for the configured fallback concurrency, attempts and aggregate tokens has been
+qualified. A bounded decision from the credit assessor alone is not reservation
+enforcement. Observed provider rate limits and exhausted quota remain stop conditions.
 Review these settings against the owner's intended workload; they are not a
 measurement of billed credits or a promise of provider capacity. Paused project
 schedules and production permissions require their own authorization.

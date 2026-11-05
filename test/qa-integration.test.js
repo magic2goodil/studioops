@@ -1709,7 +1709,8 @@ test("successful QA integration waits through bounded preview startup before fre
     await git(repoPath, ["push", "origin", "feature/task"]);
 
     await git(root, ["clone", remotePath, previewPath]);
-    await git(previewPath, ["checkout", "-b", "main", "origin/main"]);
+    // A fresh clone may already select main when the bare remote's HEAD does.
+    await git(previewPath, ["checkout", "-B", "main", "origin/main"]);
 
     await git(repoPath, ["checkout", "-b", "owner/work", "main"]);
     await writeFile(path.join(repoPath, "owner-notes.txt"), "uncommitted owner note\n", "utf8");

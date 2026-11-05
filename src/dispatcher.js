@@ -183,8 +183,11 @@ function currentStageIncidents(task, action, options) {
 }
 
 function currentStagePaidAttempts(task, action, options) {
-  return currentStageIncidents(task, action, options)
-    .reduce((total, match) => total + match.paidAttempts, 0);
+  // One recovered launch may preclaim an earlier fault and then record its new
+  // failure reason. Those are not two launches. Use the dominant current fault
+  // counter; each fault's durable aggregate remains independently authoritative.
+  return Math.max(0, ...currentStageIncidents(task, action, options)
+    .map(match => match.paidAttempts));
 }
 
 function stageAttemptAdmission(state, task, action, options) {
@@ -987,6 +990,7 @@ function makeRun(state, task, action, options, now) {
     },
     attemptKey,
     attempt,
+    attemptAccounting: "current_durable_fault_counter",
     maxAttempts: executionPolicy.maxAttempts,
     retryBackoffMs: executionPolicy.retryBackoffMs,
     staleRunMs: executionPolicy.staleRunMs,

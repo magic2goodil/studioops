@@ -149,6 +149,12 @@ cannot reset a circuit; automatic recovery requires a changed configured stage
 allowance or verified successor evidence for the unchanged workflow, and cannot
 override an open durable failure incident.
 
+The displayed attempt number is the current durable fault counter, not a count
+of all physical launches. One recovered launch may be recorded under its prior
+fault and a newly discovered reason; those records are not added together.
+Each unchanged fault retains its own hard aggregate limit. Run records remain
+the evidence for actual launches and provider usage.
+
 The dispatcher also attaches a work lane and file-scope hint to each builder/reviewer run. If a task does not explicitly set `lane` or `workAreas`, StudioOps infers the lane from task type, area, title, story, expected outcome, and reviewer role.
 
 Lane conflict rules:
