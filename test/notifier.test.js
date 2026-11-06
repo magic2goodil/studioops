@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import test from "node:test";
+import { promisify } from "node:util";
+import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+import { sanitizedCreditAdmission } from "../src/credit-admission-evidence.js";
 import {
   authorizeNotificationOutboxDeliveryInState,
   claimNotificationOutboxInState,
@@ -10,7 +14,9 @@ import {
   escalateDueNotificationsInState,
   notificationForBundle,
   notificationForFailureCircuit,
+  notificationForBudgetPause,
   notificationForOwnerQaPacket,
+  markBudgetPauseNotificationAttempt,
   notificationForPipelineStall,
   notificationRetryReady,
   planNotifications,
@@ -841,4 +847,262 @@ test("one unchanged failure circuit generation creates one local notification in
   assert.equal(state.notificationOutbox.length, 2);
   assert.equal(state.notificationOutbox[0].status, "acknowledged");
   assert.equal(state.notificationOutbox[0].resolutionReason, "failure_generation_changed");
+});
+
+function budgetPauseState() {
+  return {
+    meta: {},
+    projects: [{ id: "project_1", key: "budget-example", notificationPolicy: { channels: ["macos"] } }],
+    tasks: [{
+      id: "task_1", projectId: "project_1", title: "Wait for credit telemetry",
+      status: "in_progress", assignedAgentRole: "builder", stateVersion: 1,
+      creditAdmissionPause: {
+        active: true, fingerprint: "pause:balanced:unknown", pausedAt: "2026-11-06T01:00:00.000Z",
+        reasonCode: "credit_snapshot_unknown", ruleId: "balanced-small",
+        creditAdmission: { tier: "balanced" },
+      },
+    }],
+    runs: [], reviews: [], candidates: [], qaBundles: [], comments: [], events: [], notificationOutbox: [],
+  };
+}
+
+test("budget pauses plan one safe local notification and retain only delivery evidence", async () => {
+  const state = qaReadyState();
+  state.tasks[0].creditAdmissionPause = {
+    active: true,
+    fingerprint: "pause:critical:unknown",
+    ruleId: "critical-bounded",
+    reasonCode: "credit_snapshot_unknown",
+    creditAdmission: { tier: "critical" },
+  };
+  const plan = await planNotifications({ state });
+  assert.equal(plan.pending.length, 1);
+  assert.equal(plan.pending[0].notificationType, "outbox");
+  assert.equal(plan.pending[0].kind, "budget_pause");
+  assert.equal(plan.pending[0].notification.title, "StudioOps budget pause");
+  assert.match(plan.pending[0].notification.body, /retry automatically/);
+
+  const taskBefore = structuredClone(state.tasks[0]);
+  const report = await sendPendingNotifications({ state, sendMac: async () => {} });
+  assert.equal(report.sent.length, 1);
+  assert.equal(state.tasks[0].status, taskBefore.status);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationStatus, "sent");
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 1);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationSentAt.length > 0, true);
+  assert.deepEqual(state.tasks[0].creditAdmissionPause.creditAdmission, taskBefore.creditAdmissionPause.creditAdmission);
+});
+
+test("budget notification copy distinguishes canonical exhaustion from unknown or stale telemetry", async () => {
+  for (const [code, reasonCode, snapshotStatus, telemetryPause] of [
+    ["rate_limit_reached", "rate_limit_reached", "available", false],
+    ["insufficient_credit_balance", "insufficient_credit_balance", "available", false],
+    ["insufficient_quota_headroom", "insufficient_quota_headroom", "available", false],
+    ["rate_limit_reached", "rate_limit_reached", "unknown", false],
+    ["insufficient_credit_balance", "insufficient_credit_balance", "stale", false],
+    ["credit_snapshot_unknown", "explicit_fail_closed_label", "unknown", true],
+    ["credit_snapshot_stale", "configured_fail_closed_rule", "stale", true],
+  ]) {
+    const state = budgetPauseState();
+    Object.assign(state.tasks[0].creditAdmissionPause, {
+      reasonCode,
+      creditAdmission: sanitizedCreditAdmission({ allowed: false, tier: "critical", code, reasonCode, snapshotStatus }),
+    });
+    const before = structuredClone(state.tasks[0]);
+    const planned = await planNotifications({ state });
+    assert.equal(planned.pending.length, 1, code);
+    const { notification } = planned.pending[0];
+    assert.match(notification.body, /Credit admission is paused/);
+    assert.match(notification.body, /retry automatically when budget conditions allow/);
+    assert.doesNotMatch(notification.body, /Credit telemetry is unavailable/);
+    assert.equal(notification.body.includes("Waiting for fresh credit telemetry."), telemetryPause, code);
+    assert.equal(planned.pending[0].packet.pause.creditAdmission.code, code);
+    assert.deepEqual(state.tasks[0], before);
+  }
+});
+
+test("concurrent budget-pause notifier passes share one delivery claim", async () => {
+  const state = budgetPauseState();
+  let deliveries = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const sendMac = async () => { deliveries += 1; await gate; };
+  const passes = [sendPendingNotifications({ state, sendMac }), sendPendingNotifications({ state, sendMac })];
+  await new Promise(setImmediate);
+  release();
+  const reports = await Promise.all(passes);
+  assert.equal(deliveries, 1);
+  assert.equal(reports.reduce((count, report) => count + report.sent.length, 0), 1);
+  assert.equal(state.notificationOutbox.length, 1);
+  assert.equal(state.notificationOutbox[0].status, "delivered");
+  assert.equal(state.notificationOutbox[0].attempts, 1);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 1);
+  assert.equal(state.tasks[0].stateVersion, 1);
+});
+
+test("durable budget-pause claims exclude concurrent delivery through the existing state API", async () => {
+  const isolated = await createHermeticTestEnvironment();
+  try {
+    const source = `
+      import assert from "node:assert/strict";
+      import { mutateState, readState } from ${JSON.stringify(new URL("../src/store.js", import.meta.url).href)};
+      import { sendPendingNotifications } from ${JSON.stringify(new URL("../src/notifier.js", import.meta.url).href)};
+      const fixture = ${JSON.stringify(budgetPauseState())};
+      await mutateState(state => {
+        state.projects = fixture.projects;
+        state.tasks = fixture.tasks;
+      });
+      let release, started;
+      let calls = 0;
+      const gate = new Promise(resolve => { release = resolve; });
+      const deliveryStarted = new Promise(resolve => { started = resolve; });
+      const sendMac = async () => { calls += 1; started(); await gate; };
+      const passes = [sendPendingNotifications({sendMac}), sendPendingNotifications({sendMac})];
+      let timer;
+      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("delivery claim did not exclude the second pass")), 10_000); });
+      try {
+        await Promise.race([deliveryStarted, timeout]);
+        const excluded = await Promise.race([...passes, timeout]);
+        assert.equal(excluded.sent.length, 0);
+      } finally { clearTimeout(timer); release(); }
+      await Promise.all(passes);
+      const state = await readState();
+      console.log(JSON.stringify({calls, notices: state.notificationOutbox.length,
+        status: state.notificationOutbox[0].status, attempts: state.notificationOutbox[0].attempts,
+        taskStatus: state.tasks[0].status, notificationAttempts: state.tasks[0].creditAdmissionPause.notificationAttempts}));
+    `;
+    const { stdout } = await promisify(execFile)(process.execPath, ["--input-type=module", "-e", source], {
+      env: isolated.env, timeout: 30_000,
+    });
+    assert.deepEqual(JSON.parse(stdout.trim().split("\n").at(-1)), {
+      calls: 1, notices: 1, status: "delivered", attempts: 1,
+      taskStatus: "in_progress", notificationAttempts: 1,
+    });
+  } finally {
+    await isolated.cleanup();
+  }
+});
+
+test("budget-pause delivery rechecks recovery and same-fingerprint replacement before sending", async () => {
+  for (const replacement of ["recovered", "same-fingerprint-new-episode"]) {
+    const state = budgetPauseState();
+    let deliveries = 0;
+    const report = await sendPendingNotifications({
+      state,
+      beforeOutboxDelivery: async () => {
+        state.tasks[0].creditAdmissionPause = {
+          ...state.tasks[0].creditAdmissionPause,
+          ...(replacement === "recovered" ? { active: false } : { pausedAt: "2026-11-06T01:01:00.000Z" }),
+        };
+      },
+      sendMac: async () => { deliveries += 1; },
+    });
+    assert.equal(deliveries, 0, replacement);
+    assert.equal(report.skipped.some((item) => item.reason === "pause_changed"), true);
+    assert.equal(state.notificationOutbox[0].status, "acknowledged");
+    assert.equal(state.tasks[0].creditAdmissionPause.notificationStatus, undefined);
+    assert.equal(state.tasks[0].status, "in_progress");
+  }
+});
+
+test("an authorized old delivery cannot annotate a newer budget pause", async () => {
+  const state = budgetPauseState();
+  await sendPendingNotifications({ state, sendMac: async () => {
+    state.tasks[0].creditAdmissionPause = {
+      ...state.tasks[0].creditAdmissionPause, pausedAt: "2026-11-06T01:01:00.000Z",
+    };
+  } });
+  assert.equal(state.notificationOutbox[0].status, "delivered");
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationStatus, undefined);
+  let deliveries = 0;
+  await sendPendingNotifications({ state, sendMac: async () => { deliveries += 1; } });
+  assert.equal(deliveries, 1);
+  assert.equal(state.notificationOutbox.length, 2);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 1);
+});
+
+test("budget-pause delivery failures back off and stop after three actual claims", async () => {
+  const state = budgetPauseState();
+  const before = structuredClone(state.tasks[0]);
+  const nowMs = Date.now();
+  let deliveries = 0;
+  const sendMac = async () => { deliveries += 1; throw new Error("local adapter unavailable"); };
+  await sendPendingNotifications({ state, nowMs, sendMac });
+  await sendPendingNotifications({ state, nowMs: nowMs + 1, sendMac });
+  assert.equal(deliveries, 1);
+  for (let attempt = 1; attempt < 3; attempt += 1) {
+    await sendPendingNotifications({ state, nowMs: nowMs + attempt * 300_000, sendMac });
+  }
+  await sendPendingNotifications({ state, nowMs: nowMs + 3_600_000, sendMac });
+  assert.equal(deliveries, 3);
+  assert.equal(state.notificationOutbox.length, 1);
+  assert.equal(state.notificationOutbox[0].attempts, 3);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 3);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationStatus, "failed");
+  assert.equal((await planNotifications({ state, nowMs: nowMs + 3_600_000 })).pending.length, 0);
+  assert.equal(state.tasks[0].status, before.status);
+  assert.equal(state.tasks[0].assignedAgentRole, before.assignedAgentRole);
+  assert.equal(state.tasks[0].stateVersion, before.stateVersion);
+  assert.deepEqual(state.tasks[0].creditAdmissionPause.creditAdmission, before.creditAdmissionPause.creditAdmission);
+});
+
+test("budget notices respect filtering and recover an expired claim without owner acknowledgement", async () => {
+  const state = budgetPauseState();
+  const nowMs = Date.now();
+  let deliveries = 0;
+  const sendMac = async () => { deliveries += 1; };
+  state.projects[0].notificationPolicy.doNotDisturb = true;
+  await sendPendingNotifications({ state, nowMs, sendMac });
+  assert.equal(deliveries, 0);
+  assert.equal(state.notificationOutbox[0].attempts, 0);
+  state.projects[0].notificationPolicy.doNotDisturb = false;
+  const claim = claimNotificationOutboxInState(state, { nowMs, claimLeaseMs: 10_000 });
+  assert.equal(claim.length, 1);
+  await sendPendingNotifications({ state, nowMs: nowMs + 1, sendMac });
+  assert.equal(deliveries, 0);
+  await sendPendingNotifications({ state, nowMs: nowMs + 10_001, sendMac });
+  assert.equal(deliveries, 1);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 2);
+  assert.equal(escalateDueNotificationsInState(state, { nowMs: nowMs + 3 * 86_400_000 }).length, 0);
+  assert.equal(state.notificationOutbox[0].status, "delivered");
+});
+
+test("budget pause marks cannot overwrite a newer fingerprint and stop after three failures", async () => {
+  const state = qaReadyState();
+  state.tasks[0].creditAdmissionPause = {
+    active: true,
+    fingerprint: "pause:old",
+    creditAdmission: { tier: "critical" },
+  };
+  state.tasks[0].creditAdmissionPause.fingerprint = "pause:new";
+  const stale = await markBudgetPauseNotificationAttempt("task_1", "pause:old", {
+    notificationStatus: "sent",
+  }, { state, now: "2026-08-17T00:03:00.000Z" });
+  assert.equal(stale.applied, false);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationStatus, undefined);
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const marked = await markBudgetPauseNotificationAttempt("task_1", "pause:new", {
+      notificationStatus: "failed",
+      notificationError: "local adapter unavailable",
+    }, { state, nowMs: Date.now() - (attempt * 600_000) });
+    assert.equal(marked.applied, true);
+  }
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 3);
+  assert.equal(state.tasks[0].creditAdmissionPause.notificationRetryNotBefore, "");
+  assert.equal((await planNotifications({ state })).pending.length, 0);
+});
+
+test("budget pause copy excludes provider text, account identity, credentials, and local paths", () => {
+  const notification = notificationForBudgetPause({
+    projectKey: "account@example.invalid",
+    taskId: "/Users/private/task",
+    pause: {
+      ruleId: "Bearer abcdefghijklmnopqrstuvwxyz",
+      reasonCode: "token=secret-value",
+      creditAdmission: { tier: "critical" },
+    },
+  });
+  const copy = JSON.stringify(notification);
+  assert.doesNotMatch(copy, /account@example|\/Users\/private|abcdefghijklmnopqrstuvwxyz|secret-value/);
+  assert.match(notification.body, /Tier: critical/);
 });

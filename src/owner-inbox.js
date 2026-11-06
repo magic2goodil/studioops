@@ -81,6 +81,26 @@ function notificationSummary(run) {
   };
 }
 
+function pauseNotificationSummary(pause = {}) {
+  return {
+    status: pause.notificationStatus || "pending",
+    channel: pause.notificationChannel || "",
+    attemptedAt: pause.notificationSentAt || pause.notificationFailedAt || "",
+    error: pause.notificationError || "",
+  };
+}
+
+function boundedNumber(value) {
+  if ((typeof value !== "number" && typeof value !== "string") || String(value).trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function ownerAdmissionToken(value, fallback = "unclassified") {
+  const token = String(value || "").trim();
+  return /^[a-z0-9_.-]{1,120}$/i.test(token) ? token : fallback;
+}
+
 function checklistForTask(task) {
   const criteria = Array.isArray(task?.acceptanceCriteria) ? task.acceptanceCriteria : [];
   return criteria.map((text) => ({
@@ -375,6 +395,60 @@ function operationTaskItem(state, task, input = {}) {
     notification: notificationSummary(latestRunForTask(state, task.id)),
     diagnostic,
     diagnosticLabel: diagnostic ? "Non-production diagnostic" : "",
+  };
+}
+
+/** Read-only owner adapter for a budget-admission pause. */
+function creditAdmissionPauseItem(state, task, input = {}) {
+  const { record } = taskRecord(state, task, input);
+  const pause = task.creditAdmissionPause || {};
+  const admission = pause.creditAdmission || {};
+  const observed = admission.observedCounters || {};
+  const reason = ownerAdmissionToken(pause.reasonCode || admission.reasonCode || admission.code, "credit_admission_paused");
+  const telemetryPause = /^credit_snapshot_(?:unknown|stale)(?:_bounded)?$/.test(admission.code || reason);
+  return {
+    id: `task:${task.id}:credit-admission-pause`,
+    group: "operations",
+    classification: "budget_pause",
+    kind: "credit_admission_pause",
+    severity: "warning",
+    ...record,
+    status: "budget_paused",
+    previewUrl: "",
+    title: `${task.title} is budget paused`,
+    nextAction: telemetryPause
+      ? "StudioOps will retry automatically when fresh credit telemetry confirms admission is allowed; wait for the next telemetry check."
+      : "StudioOps will retry automatically when budget conditions allow credit admission; wait for the next budget check.",
+    primaryAction: {
+      type: "task",
+      label: "Open paused task",
+      href: record.taskUrl,
+      taskId: task.id,
+    },
+    blocker: null,
+    admission: {
+      tier: ownerAdmissionToken(admission.tier || admission.riskTier),
+      rule: ownerAdmissionToken(pause.ruleId || admission.ruleId),
+      reason,
+      retry: telemetryPause ? "Automatic telemetry retry" : "Automatic budget check",
+      maxConcurrentRuns: boundedNumber(admission.maxConcurrentRuns),
+      attemptsConsumed: boundedNumber(observed.attemptsConsumed),
+      maxAttempts: boundedNumber(admission.maxAttempts),
+      estimatedTokensPerRun: boundedNumber(admission.estimatedTokensPerRun),
+      maxInFlightEstimatedTokens: boundedNumber(admission.maxInFlightEstimatedTokens),
+    },
+    checklistLabel: "Automatic retry",
+    checklist: [{
+      taskId: task.id,
+      taskTitle: task.title,
+      text: telemetryPause
+        ? "This Operations record clears when fresh telemetry confirms credit admission is allowed."
+        : "This Operations record clears when budget conditions allow credit admission.",
+    }],
+    notification: pauseNotificationSummary(pause),
+    diagnostic: false,
+    diagnosticLabel: "",
+    updatedAt: pause.pausedAt || task.updatedAt || task.createdAt || "",
   };
 }
 
@@ -820,6 +894,9 @@ export function buildOwnerInbox(state, input = {}) {
 
   for (const task of state.tasks || []) {
     const project = findProject(state, task.projectId);
+    if (task.creditAdmissionPause?.active === true) {
+      groupedItems.operations.push(creditAdmissionPauseItem(state, task, input));
+    }
     const circuitBlocker = task.automationBlocker?.type === "circuit";
     const blocked = circuitBlocker
       ? taskAutomationCircuitIsCurrent(task)

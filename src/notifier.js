@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { mutateState, readState, findProject, findTask, taskAutomationCircuitIsCurrent } from "./store.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   assertCurrentOwnerQaPacket,
   assertOwnerQaPacket,
@@ -523,19 +523,24 @@ export async function enqueueReleaseCandidateNotifications(input = {}) {
   );
 }
 
+function outboxAttemptReady(item, nowMs) {
+  const staleAttempt = item.status === "attempted" && Date.parse(item.claimExpiresAt || "") <= nowMs;
+  if (!["queued", "failed"].includes(item.status) && !staleAttempt) return false;
+  if (Number(item.attempts || 0) >= Number(item.policy?.maxAttempts || MAX_NOTIFICATION_ATTEMPTS)) return false;
+  const retryAt = Date.parse(item.retryNotBefore || "");
+  return !Number.isFinite(retryAt) || retryAt <= nowMs;
+}
+
 export function claimNotificationOutboxInState(state, input = {}) {
   const nowMs = Number(input.nowMs || Date.now());
   const now = new Date(nowMs).toISOString();
   reconcileOwnerQaNotificationAuthorityInState(state, { now });
+  reconcileBudgetPauseNotificationsInState(state, { now });
   const limit = Math.max(1, Number(input.limit || 10));
   const selectedIds = new Set((input.ids || []).map(String));
   const claims = (state.notificationOutbox || []).filter((item) => {
     if (selectedIds.size && !selectedIds.has(item.id)) return false;
-    const staleAttempt = item.status === "attempted" && Date.parse(item.claimExpiresAt || "") <= nowMs;
-    if (!["queued", "failed"].includes(item.status) && !staleAttempt) return false;
-    if (Number(item.attempts || 0) >= Number(item.policy?.maxAttempts || MAX_NOTIFICATION_ATTEMPTS)) return false;
-    const retryAt = Date.parse(item.retryNotBefore || "");
-    return !Number.isFinite(retryAt) || retryAt <= nowMs;
+    return outboxAttemptReady(item, nowMs);
   }).slice(0, limit);
   for (const item of claims) {
     item.status = "attempted";
@@ -568,11 +573,20 @@ function updateNotificationOutboxInState(state, id, patch = {}, input = {}) {
   delete item.claimExpiresAt;
   if (status === "failed" && Number(item.attempts || 0) < Number(item.policy?.maxAttempts || MAX_NOTIFICATION_ATTEMPTS)) item.retryNotBefore = new Date(nowMs + NOTIFICATION_RETRY_MS).toISOString();
   if (status === "delivered") {
-    item.acknowledgementDueAt = new Date(nowMs + Number(item.policy?.acknowledgementTimeoutMs || 24 * 60 * 60 * 1000)).toISOString();
+    if (item.kind !== "budget_pause") {
+      item.acknowledgementDueAt = new Date(nowMs + Number(item.policy?.acknowledgementTimeoutMs || 24 * 60 * 60 * 1000)).toISOString();
+    }
     if (item.kind === "release_candidate") {
       const bundle = (state.qaBundles || []).find((entry) => entry.id === item.qaBundleId);
       if (bundle) bundle.promotionNotifiedAt = item.deliveredAt || item.updatedAt;
     }
+  }
+  if (item.kind === "budget_pause" && ["delivered", "failed"].includes(status)) {
+    markBudgetPauseNotificationAttemptInState(state, item.taskId, item.pauseFingerprint, {
+      notificationStatus: status === "delivered" ? "sent" : "failed",
+      notificationChannel: item.channel,
+      notificationError: item.deliveryError || "",
+    }, { ...input, expectedPausedAt: item.pauseStartedAt, notificationAttemptCount: item.attempts });
   }
   return structuredClone(item);
 }
@@ -611,6 +625,10 @@ export function authorizeNotificationOutboxDeliveryInState(state, input = {}) {
     const now = input.now || new Date(nowMs).toISOString();
     acknowledgeChangedOwnerQaAuthority(item, now);
     return { authorized: false, reason: "qa_authority_changed", item: structuredClone(item) };
+  }
+  if (item.kind === "budget_pause" && !currentBudgetPauseNotificationAuthority(state, item)) {
+    acknowledgeChangedBudgetPause(item, input.now || new Date(nowMs).toISOString());
+    return { authorized: false, reason: "pause_changed", item: structuredClone(item) };
   }
   const project = findProject(state, item.projectId);
   if (!configuredNotificationChannels(project, input).has(item.channel)) {
@@ -675,7 +693,7 @@ export function escalateDueNotificationsInState(state, input = {}) {
   reconcileOwnerQaNotificationAuthorityInState(state, { now, nowMs });
   const escalated = [];
   for (const item of state.notificationOutbox || []) {
-    if (item.status !== "delivered") continue;
+    if (item.status !== "delivered" || item.kind === "budget_pause") continue;
     const dueAt = Date.parse(item.acknowledgementDueAt || "");
     if (!Number.isFinite(dueAt) || dueAt > nowMs) continue;
     item.status = "escalated";
@@ -732,11 +750,119 @@ function needsNotification(run) {
   return false;
 }
 
-export function notificationRetryReady(item) {
+function activeCreditAdmissionPause(task) {
+  const pause = task?.creditAdmissionPause;
+  return pause?.active === true && typeof pause.fingerprint === "string" && pause.fingerprint.length > 0
+    ? pause
+    : null;
+}
+
+function safeNoticeToken(value, fallback = "unclassified") {
+  const token = String(value || "").trim();
+  return /^[a-z0-9_.-]{1,120}$/i.test(token) ? token : fallback;
+}
+
+function needsBudgetPauseNotification(pause, nowMs) {
+  return pause.notificationStatus !== "sent" && notificationRetryReady(pause, nowMs);
+}
+
+function budgetPauseNotificationKey(task, pause) {
+  return `budget_pause:${createHash("sha256").update(JSON.stringify([
+    task.id, pause.fingerprint, pause.pausedAt || "",
+  ])).digest("hex")}`;
+}
+
+function currentBudgetPauseNotificationAuthority(state, item) {
+  const pause = activeCreditAdmissionPause(findTask(state, item.taskId));
+  return Boolean(pause
+    && pause.fingerprint === item.pauseFingerprint
+    && String(pause.pausedAt || "") === String(item.pauseStartedAt || "")
+    && (pause.notificationStatus !== "sent" || item.status === "delivered"));
+}
+
+function acknowledgeChangedBudgetPause(item, now) {
+  item.status = "acknowledged";
+  item.acknowledgedAt = now;
+  item.acknowledgedBy = "budget_pause_reconciliation";
+  item.resolutionReason = "pause_changed";
+  item.resolvedAt = now;
+  item.updatedAt = now;
+  delete item.claimToken;
+  delete item.claimExpiresAt;
+  delete item.retryNotBefore;
+}
+
+function reconcileBudgetPauseNotificationsInState(state, input = {}) {
+  const now = input.now || new Date(Number(input.nowMs || Date.now())).toISOString();
+  for (const item of state.notificationOutbox || []) {
+    if (item.kind === "budget_pause" && item.status !== "acknowledged"
+      && !currentBudgetPauseNotificationAuthority(state, item)) {
+      acknowledgeChangedBudgetPause(item, now);
+    }
+  }
+}
+
+/** Budget banners share the existing durable outbox and its delivery claims. */
+export function enqueueBudgetPauseNotificationsInState(state, input = {}) {
+  state.notificationOutbox ||= [];
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  reconcileBudgetPauseNotificationsInState(state, { now });
+  const created = [];
+  for (const task of state.tasks || []) {
+    const pause = activeCreditAdmissionPause(task);
+    if (!pause || !needsBudgetPauseNotification(pause, nowMs)) continue;
+    const project = findProject(state, task.projectId);
+    if (!projectAllowed(task, project, input) || !configuredNotificationChannels(project, input).has("macos")) continue;
+    const idempotencyKey = budgetPauseNotificationKey(task, pause);
+    if (state.notificationOutbox.some((item) => item.kind === "budget_pause" && item.idempotencyKey === idempotencyKey)) continue;
+    const admission = pause.creditAdmission || {};
+    const item = {
+      id: `notification_${randomUUID()}`,
+      idempotencyKey,
+      kind: "budget_pause",
+      projectId: task.projectId,
+      taskId: task.id,
+      pauseFingerprint: pause.fingerprint,
+      pauseStartedAt: String(pause.pausedAt || ""),
+      channel: "macos",
+      status: pause.notificationStatus === "failed" ? "failed" : "queued",
+      attempts: Math.min(MAX_NOTIFICATION_ATTEMPTS, Math.max(0, Math.trunc(Number(pause.notificationAttempts) || 0))),
+      retryNotBefore: pause.notificationRetryNotBefore || "",
+      packet: {
+        projectKey: safeNoticeToken(project?.key || task.projectId, "StudioOps"),
+        taskId: safeNoticeToken(task.id, "task"),
+        pause: {
+          ruleId: safeNoticeToken(pause.ruleId || admission.ruleId),
+          reasonCode: safeNoticeToken(pause.reasonCode || admission.reasonCode || admission.code, "credit_admission_paused"),
+          creditAdmission: {
+            tier: safeNoticeToken(admission.tier || admission.riskTier),
+            code: safeNoticeToken(admission.code || pause.reasonCode || admission.reasonCode, "credit_admission_paused"),
+          },
+        },
+      },
+      policy: { ...policyFor(project, input), maxAttempts: MAX_NOTIFICATION_ATTEMPTS },
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.notificationOutbox.push(item);
+    created.push(structuredClone(item));
+  }
+  return created;
+}
+
+async function enqueueBudgetPauseNotifications(input = {}) {
+  if (input.state) return enqueueBudgetPauseNotificationsInState(input.state, input);
+  return mutateState((state) => enqueueBudgetPauseNotificationsInState(state, input), {
+    operationName: "notification.enqueue_budget_pauses",
+  });
+}
+
+export function notificationRetryReady(item, nowMs = Date.now()) {
   if (item.notificationStatus !== "failed") return true;
   if (Number(item.notificationAttempts || 0) >= MAX_NOTIFICATION_ATTEMPTS) return false;
   const retryAt = Date.parse(item.notificationRetryNotBefore || "");
-  return !Number.isFinite(retryAt) || retryAt <= Date.now();
+  return !Number.isFinite(retryAt) || retryAt <= nowMs;
 }
 
 function notificationFor(state, run) {
@@ -812,7 +938,22 @@ export function notificationForFailureCircuit(item = {}) {
   };
 }
 
+export function notificationForBudgetPause(item = {}) {
+  const pause = item.pause || item.creditAdmissionPause || item;
+  const admission = pause.creditAdmission || {};
+  const tier = safeNoticeToken(admission.tier || admission.riskTier);
+  const rule = safeNoticeToken(pause.ruleId || admission.ruleId);
+  const reason = safeNoticeToken(pause.reasonCode || admission.reasonCode || admission.code, "credit_admission_paused");
+  const telemetryPause = /^credit_snapshot_(?:unknown|stale)(?:_bounded)?$/.test(admission.code || reason);
+  return {
+    title: "StudioOps budget pause",
+    subtitle: `${safeNoticeToken(item.projectKey || item.projectId || "StudioOps", "StudioOps")} · ${safeNoticeToken(item.taskId || "task", "task")}`,
+    body: `Credit admission is paused. StudioOps will retry automatically when budget conditions allow.${telemetryPause ? " Waiting for fresh credit telemetry." : ""} Tier: ${tier}. Rule: ${rule}. Reason: ${reason}.`,
+  };
+}
+
 function notificationForOutboxItem(item) {
+  if (item.kind === "budget_pause") return notificationForBudgetPause(item.packet);
   if (item.kind === "pipeline_stall") return notificationForPipelineStall(item);
   if (item.kind === "failure_circuit") return notificationForFailureCircuit(item);
   if (item.kind === "release_candidate") {
@@ -868,11 +1009,12 @@ export async function sendMacNotification(notification) {
 export async function planNotifications(input = {}) {
   const state = input.state || await readState();
   enqueueFailureCircuitNotificationsInState(state, input);
+  enqueueBudgetPauseNotificationsInState(state, input);
   const pending = [];
   const skipped = [];
   const limit = Math.max(1, Number(input.limit || input.maxNotifications || 10));
   for (const item of state.notificationOutbox || []) {
-    if (!["queued", "failed"].includes(item.status) || !notificationRetryReady(item)) continue;
+    if (!outboxAttemptReady(item, Number(input.nowMs || Date.now()))) continue;
     if (!currentOwnerQaNotificationAuthority(state, item)) {
       skipped.push({ notificationId: item.id, reason: "qa_authority_changed" });
       continue;
@@ -883,7 +1025,10 @@ export async function planNotifications(input = {}) {
       skipped.push({ notificationId: item.id, reason: "notification_channel_disabled" });
       continue;
     }
-    if (item.policy?.doNotDisturb && !input.ignoreDoNotDisturb) continue;
+    const doNotDisturb = item.kind === "budget_pause"
+      ? policyFor(project, input).doNotDisturb
+      : item.policy?.doNotDisturb;
+    if (doNotDisturb && !input.ignoreDoNotDisturb) continue;
     if (pending.length >= limit) break;
     pending.push({
       ...item,
@@ -1010,21 +1155,60 @@ export async function markNotificationAttempt(itemId, statusPatch, notificationT
   }, { operationName: "notification.record_attempt" });
 }
 
+/** A completed outbox attempt may only annotate its original pause episode. */
+function markBudgetPauseNotificationAttemptInState(state, taskId, expectedFingerprint, statusPatch = {}, input = {}) {
+  const task = findTask(state, taskId);
+  const pause = activeCreditAdmissionPause(task);
+  if (!pause || pause.fingerprint !== expectedFingerprint
+    || String(pause.pausedAt || "") !== String(input.expectedPausedAt || "")) {
+    return { applied: false, reason: "pause_changed", pause: pause ? structuredClone(pause) : null };
+  }
+  const nowMs = Number(input.nowMs || Date.now());
+  const now = input.now || new Date(nowMs).toISOString();
+  const status = statusPatch.notificationStatus === "sent" ? "sent" : "failed";
+  pause.notificationStatus = status;
+  pause.notificationChannel = String(statusPatch.notificationChannel || "macos").slice(0, 32);
+  pause.notificationError = String(statusPatch.notificationError || "").slice(0, 240);
+  pause.notificationAttempts = Number.isSafeInteger(input.notificationAttemptCount)
+    ? input.notificationAttemptCount
+    : Number(pause.notificationAttempts || 0) + 1;
+  if (status === "sent") {
+    pause.notificationSentAt = now;
+    pause.notificationRetryNotBefore = "";
+  } else {
+    pause.notificationFailedAt = now;
+    if (pause.notificationAttempts < MAX_NOTIFICATION_ATTEMPTS) {
+      pause.notificationRetryNotBefore = new Date(nowMs + NOTIFICATION_RETRY_MS).toISOString();
+    } else {
+      pause.notificationRetryNotBefore = "";
+    }
+  }
+  return { applied: true, pause: structuredClone(pause) };
+}
+
+/** Records notification evidence without changing admission or workflow state. */
+export async function markBudgetPauseNotificationAttempt(taskId, expectedFingerprint, statusPatch = {}, input = {}) {
+  const mark = (state) => markBudgetPauseNotificationAttemptInState(state, taskId, expectedFingerprint, statusPatch, input);
+  if (input.state) return mark(input.state);
+  return mutateState(mark, { operationName: "notification.record_budget_pause_attempt" });
+}
+
 export async function sendPendingNotifications(input = {}) {
   if (!input.dryRun) {
     await escalateDueNotifications(input);
     await enqueueReleaseCandidateNotifications(input);
     await enqueueFailureCircuitNotifications(input);
+    await enqueueBudgetPauseNotifications(input);
   }
   const plan = await planNotifications(input);
   const outboxItems = plan.pending.filter((item) => item.notificationType === "outbox");
   const claimed = input.dryRun
     ? outboxItems
-    : await claimNotificationOutbox({
+    : outboxItems.length ? await claimNotificationOutbox({
       ...input,
       ids: outboxItems.map((item) => item.id),
-      limit: outboxItems.length || 1,
-    });
+      limit: outboxItems.length,
+    }) : [];
   const sent = [];
   for (const item of plan.pending.filter((entry) => entry.notificationType !== "outbox")) {
     if (input.dryRun) continue;

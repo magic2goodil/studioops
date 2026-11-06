@@ -685,6 +685,25 @@ function inboxSecondaryActions(item) {
   return links.join("");
 }
 
+function admissionSummary(item) {
+  if (item.classification !== "budget_pause" || !item.admission) return "";
+  const admission = item.admission;
+  const limit = (current, maximum, label) => {
+    if (maximum === null || maximum === undefined) return "";
+    return `<div><dt>${escapeHtml(label)}</dt><dd>${current === null || current === undefined ? "" : `${escapeHtml(current)} of `}${escapeHtml(maximum)}</dd></div>`;
+  };
+  return `
+    <dl class="admission-summary" aria-label="Bounded credit admission summary">
+      <div><dt>Tier</dt><dd>${escapeHtml(admission.tier || "unclassified")}</dd></div>
+      <div><dt>Reason</dt><dd>${escapeHtml(admission.reason || "credit admission paused")}</dd></div>
+      <div><dt>Retry</dt><dd>${escapeHtml(admission.retry || "Automatic telemetry retry")}</dd></div>
+      ${limit(null, admission.maxConcurrentRuns, "Concurrency")}
+      ${limit(admission.attemptsConsumed, admission.maxAttempts, "Attempts")}
+      ${limit(admission.estimatedTokensPerRun, admission.maxInFlightEstimatedTokens, "Estimated tokens")}
+    </dl>
+  `;
+}
+
 function inboxItemMarkup(item) {
   const identity = item.taskId || item.bundleId || "project";
   const showTaskLinks = item.tasks?.length
@@ -693,6 +712,8 @@ function inboxItemMarkup(item) {
     ? `<span class="inbox-label diagnostic">${escapeHtml(item.diagnosticLabel || "Non-production diagnostic")}</span>`
     : "";
   const stale = item.stale ? `<span class="inbox-label stale">Stale record</span>` : "";
+  const budgetPaused = item.classification === "budget_pause"
+    ? `<span class="inbox-label budget-paused">Budget paused</span>` : "";
   return `
     <article class="owner-inbox-item ${escapeHtml(item.severity || "action")}">
       <div class="owner-inbox-item-heading">
@@ -708,6 +729,7 @@ function inboxItemMarkup(item) {
         </div>
         <div class="inbox-labels">
           ${diagnostic}
+          ${budgetPaused}
           ${stale}
           <span class="inbox-status">${escapeHtml(String(item.status || "").replaceAll("_", " "))}</span>
         </div>
@@ -719,6 +741,7 @@ function inboxItemMarkup(item) {
           ${item.blocker.attempts ? `<span>${escapeHtml(item.blocker.attempts)} attempt${item.blocker.attempts === 1 ? "" : "s"} consumed${item.blocker.maxAttempts ? ` of ${escapeHtml(item.blocker.maxAttempts)}` : ""}</span>` : ""}
         </div>
       ` : ""}
+      ${admissionSummary(item)}
       ${inboxChecklist(item)}
       <div class="owner-inbox-actions">
         ${inboxPrimaryAction(item)}
