@@ -501,6 +501,37 @@ test("active credit admission pauses are warning Operations records and recover 
   assert.equal(group(buildOwnerInbox(state), "operations").count, 0);
 });
 
+test("budget Operations copy distinguishes known exhaustion from unavailable telemetry", () => {
+  for (const [code, reasonCode, snapshotStatus, telemetryPause] of [
+    ["rate_limit_reached", "rate_limit_reached", "available", false],
+    ["insufficient_credit_balance", "insufficient_credit_balance", "available", false],
+    ["insufficient_quota_headroom", "insufficient_quota_headroom", "available", false],
+    ["rate_limit_reached", "rate_limit_reached", "unknown", false],
+    ["insufficient_credit_balance", "insufficient_credit_balance", "stale", false],
+    ["credit_snapshot_unknown", "explicit_fail_closed_label", "unknown", true],
+    ["credit_snapshot_stale", "configured_fail_closed_rule", "stale", true],
+  ]) {
+    const state = fixtureState();
+    Object.assign(state.tasks[0], {
+      status: "in_progress", assignedAgentRole: "builder",
+      creditAdmissionPause: { active: true, fingerprint: `pause:${code}`, reasonCode,
+        creditAdmission: sanitizedCreditAdmission({ allowed: false, tier: "critical", code, reasonCode, snapshotStatus }) },
+    });
+    const before = structuredClone(state);
+    const inbox = buildOwnerInbox(state);
+    const operation = group(inbox, "operations").items[0];
+    assert.equal(inbox.count, 0);
+    assert.equal(operation.classification, "budget_pause");
+    assert.equal(operation.admission.reason, reasonCode);
+    assert.equal(operation.admission.retry, telemetryPause ? "Automatic telemetry retry" : "Automatic budget check");
+    assert.match(operation.nextAction, /retry automatically/);
+    assert.match(operation.nextAction, telemetryPause ? /fresh credit telemetry confirms admission is allowed/ : /budget conditions allow credit admission/);
+    assert.equal(operation.checklist[0].text.includes("fresh telemetry"), telemetryPause);
+    assert.doesNotMatch(operation.nextAction, /circuit-reset/i);
+    assert.deepEqual(state, before);
+  }
+});
+
 test("a credit pause preserves an independent current execution-circuit recovery", () => {
   const state = fixtureState();
   Object.assign(state.tasks[0], {

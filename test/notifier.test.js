@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import test from "node:test";
 import { promisify } from "node:util";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
+import { sanitizedCreditAdmission } from "../src/credit-admission-evidence.js";
 import {
   authorizeNotificationOutboxDeliveryInState,
   claimNotificationOutboxInState,
@@ -889,6 +890,34 @@ test("budget pauses plan one safe local notification and retain only delivery ev
   assert.equal(state.tasks[0].creditAdmissionPause.notificationAttempts, 1);
   assert.equal(state.tasks[0].creditAdmissionPause.notificationSentAt.length > 0, true);
   assert.deepEqual(state.tasks[0].creditAdmissionPause.creditAdmission, taskBefore.creditAdmissionPause.creditAdmission);
+});
+
+test("budget notification copy distinguishes canonical exhaustion from unknown or stale telemetry", async () => {
+  for (const [code, reasonCode, snapshotStatus, telemetryPause] of [
+    ["rate_limit_reached", "rate_limit_reached", "available", false],
+    ["insufficient_credit_balance", "insufficient_credit_balance", "available", false],
+    ["insufficient_quota_headroom", "insufficient_quota_headroom", "available", false],
+    ["rate_limit_reached", "rate_limit_reached", "unknown", false],
+    ["insufficient_credit_balance", "insufficient_credit_balance", "stale", false],
+    ["credit_snapshot_unknown", "explicit_fail_closed_label", "unknown", true],
+    ["credit_snapshot_stale", "configured_fail_closed_rule", "stale", true],
+  ]) {
+    const state = budgetPauseState();
+    Object.assign(state.tasks[0].creditAdmissionPause, {
+      reasonCode,
+      creditAdmission: sanitizedCreditAdmission({ allowed: false, tier: "critical", code, reasonCode, snapshotStatus }),
+    });
+    const before = structuredClone(state.tasks[0]);
+    const planned = await planNotifications({ state });
+    assert.equal(planned.pending.length, 1, code);
+    const { notification } = planned.pending[0];
+    assert.match(notification.body, /Credit admission is paused/);
+    assert.match(notification.body, /retry automatically when budget conditions allow/);
+    assert.doesNotMatch(notification.body, /Credit telemetry is unavailable/);
+    assert.equal(notification.body.includes("Waiting for fresh credit telemetry."), telemetryPause, code);
+    assert.equal(planned.pending[0].packet.pause.creditAdmission.code, code);
+    assert.deepEqual(state.tasks[0], before);
+  }
 });
 
 test("concurrent budget-pause notifier passes share one delivery claim", async () => {

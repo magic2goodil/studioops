@@ -398,12 +398,14 @@ function operationTaskItem(state, task, input = {}) {
   };
 }
 
-/** Read-only owner adapter for a transient, telemetry-driven admission pause. */
+/** Read-only owner adapter for a budget-admission pause. */
 function creditAdmissionPauseItem(state, task, input = {}) {
   const { record } = taskRecord(state, task, input);
   const pause = task.creditAdmissionPause || {};
   const admission = pause.creditAdmission || {};
   const observed = admission.observedCounters || {};
+  const reason = ownerAdmissionToken(pause.reasonCode || admission.reasonCode || admission.code, "credit_admission_paused");
+  const telemetryPause = /^credit_snapshot_(?:unknown|stale)(?:_bounded)?$/.test(admission.code || reason);
   return {
     id: `task:${task.id}:credit-admission-pause`,
     group: "operations",
@@ -414,7 +416,9 @@ function creditAdmissionPauseItem(state, task, input = {}) {
     status: "budget_paused",
     previewUrl: "",
     title: `${task.title} is budget paused`,
-    nextAction: "StudioOps will retry automatically when fresh credit telemetry is available; wait for the next telemetry check.",
+    nextAction: telemetryPause
+      ? "StudioOps will retry automatically when fresh credit telemetry confirms admission is allowed; wait for the next telemetry check."
+      : "StudioOps will retry automatically when budget conditions allow credit admission; wait for the next budget check.",
     primaryAction: {
       type: "task",
       label: "Open paused task",
@@ -425,11 +429,8 @@ function creditAdmissionPauseItem(state, task, input = {}) {
     admission: {
       tier: ownerAdmissionToken(admission.tier || admission.riskTier),
       rule: ownerAdmissionToken(pause.ruleId || admission.ruleId),
-      reason: ownerAdmissionToken(
-        pause.reasonCode || admission.reasonCode || admission.code,
-        "credit_admission_paused",
-      ),
-      retry: "Automatic telemetry retry",
+      reason,
+      retry: telemetryPause ? "Automatic telemetry retry" : "Automatic budget check",
       maxConcurrentRuns: boundedNumber(admission.maxConcurrentRuns),
       attemptsConsumed: boundedNumber(observed.attemptsConsumed),
       maxAttempts: boundedNumber(admission.maxAttempts),
@@ -440,7 +441,9 @@ function creditAdmissionPauseItem(state, task, input = {}) {
     checklist: [{
       taskId: task.id,
       taskTitle: task.title,
-      text: "Fresh telemetry will remove this Operations record when admission recovers.",
+      text: telemetryPause
+        ? "This Operations record clears when fresh telemetry confirms credit admission is allowed."
+        : "This Operations record clears when budget conditions allow credit admission.",
     }],
     notification: pauseNotificationSummary(pause),
     diagnostic: false,

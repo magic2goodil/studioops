@@ -835,7 +835,10 @@ export function enqueueBudgetPauseNotificationsInState(state, input = {}) {
         pause: {
           ruleId: safeNoticeToken(pause.ruleId || admission.ruleId),
           reasonCode: safeNoticeToken(pause.reasonCode || admission.reasonCode || admission.code, "credit_admission_paused"),
-          creditAdmission: { tier: safeNoticeToken(admission.tier || admission.riskTier) },
+          creditAdmission: {
+            tier: safeNoticeToken(admission.tier || admission.riskTier),
+            code: safeNoticeToken(admission.code || pause.reasonCode || admission.reasonCode, "credit_admission_paused"),
+          },
         },
       },
       policy: { ...policyFor(project, input), maxAttempts: MAX_NOTIFICATION_ATTEMPTS },
@@ -941,10 +944,11 @@ export function notificationForBudgetPause(item = {}) {
   const tier = safeNoticeToken(admission.tier || admission.riskTier);
   const rule = safeNoticeToken(pause.ruleId || admission.ruleId);
   const reason = safeNoticeToken(pause.reasonCode || admission.reasonCode || admission.code, "credit_admission_paused");
+  const telemetryPause = /^credit_snapshot_(?:unknown|stale)(?:_bounded)?$/.test(admission.code || reason);
   return {
     title: "StudioOps budget pause",
     subtitle: `${safeNoticeToken(item.projectKey || item.projectId || "StudioOps", "StudioOps")} · ${safeNoticeToken(item.taskId || "task", "task")}`,
-    body: `Credit telemetry is unavailable. StudioOps will retry automatically. Tier: ${tier}. Rule: ${rule}. Reason: ${reason}.`,
+    body: `Credit admission is paused. StudioOps will retry automatically when budget conditions allow.${telemetryPause ? " Waiting for fresh credit telemetry." : ""} Tier: ${tier}. Rule: ${rule}. Reason: ${reason}.`,
   };
 }
 
