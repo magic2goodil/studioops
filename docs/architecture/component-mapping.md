@@ -51,6 +51,39 @@ hashed local verification receipts, matching versions, completed dependencies an
 no unresolved incident. Closure is an administrative disposition, never QA or
 feature acceptance, and is atomic with intake. Arbitrary prose is insufficient.
 
+One stale failure pointer may be reconciled at this same boundary: its exact
+durable ancestor must be superseded by the immediate current generation of the
+same task/fingerprint/reason after changed evidence and a successful allowlisted
+cheap probe. The successor must have zero paid attempts, one passed cheap probe,
+no repair/backoff/open state, and no other unresolved current task fault. The
+native runner's minimal failure pointer is recognized by its exact schema and
+task/reason/resource/incident binding; generation and evidence come from the
+canonical stored ancestor. Supplied conflicting fields or unknown shapes fail.
+
+An active row can also be admission bookkeeping after a verified repair. Only a
+repaired provider-unavailable generation with one native paid admission may be
+corroborated by the task's retained failure/run references and an unambiguous
+persisted native terminal run that ended in the blocked output failure. Exact
+task/project/provider/action/candidate/repository/map bindings, replayed repair
+and admission history, terminal claim, raw failure and probe result are required.
+The overwritten prior provider claim is not reconstructed. Unknown, overlapping
+or later runs, another active group, new proof, exhaustion, backoff or open state
+reject recovery. Known native CLI cancellations with no start or paid claim and
+an exhausted queued-attempt reason may precede that run only when their actual
+creation/completion interval ended before the linked start and admission. No
+missing start is inferred. The entire run inventory is digest-bound. This narrow
+classification does not reset an admission counter.
+
+Preparation reads the authoritative ledger and supporting run rows; the final
+SQL transaction rechecks all normalized lineage and run digests alongside task
+CAS and live ownership fences. Supporting runs cannot change in the adoption
+proposal. Ledger-only or run-only races fail
+closed even without a task-version change. The exact old pointer and recovery
+digests are retained in an immutable disposition while the prerequisite closes
+and the reviewed child is adopted, with no intermediate queue. Generic writers
+cannot create or rewrite that disposition. Historical incidents and counters
+are never reset, and a successful ledger probe alone does not close a task.
+
 Successful intake creates a real source-bound review cycle and a truthful
 `source=operator` receipt, without a builder run or credit/cost fiction. Existing
 failures and attempt counters remain. Exact replay is read-only; unchanged failed
