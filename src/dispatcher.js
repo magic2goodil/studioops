@@ -8,6 +8,7 @@ import {
   findTask,
   generatePrompt,
   mutateState,
+  mutateScopeDispatchState,
   readState,
   readStateReadOnly,
   resetAutomationCircuitInState,
@@ -491,6 +492,11 @@ async function claimCreditTelemetryProbe(input, policy) {
 }
 
 function preCreditDispatchSafetyReason(state, task, action, options) {
+  if (task.operatorIntake) {
+    if (task.automationBlocker || (task.dependsOnTaskIds || []).some((id) => !state.tasks.some((item) => item.id === id && ["done", "closed", "merged", "deployed", "approved"].includes(item.status)))) return "operator_candidate_waiting";
+    if (action.type === "start_builder" && task.status !== "needs_changes") return "operator_candidate_stale_builder";
+    if (action.type.startsWith("start_") && action.taskStatus && action.taskStatus !== task.status) return "operator_candidate_stale_action";
+  }
   const group = runGroupFor(action);
   if (group === "owner") return "";
   if (
@@ -1248,7 +1254,7 @@ export async function dispatchSupervisorActions(actions, input = {}) {
   }
   const mutate = input.state
     ? async (mutator) => mutator(input.state)
-    : mutateState;
+    : mutateScopeDispatchState;
   return mutate(async (state) => {
     state.runs = state.runs || [];
     state.comments = state.comments || [];

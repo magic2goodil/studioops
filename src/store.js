@@ -1,3 +1,5 @@
+import { sha256Digest, projectRepositoryIdentity, loadProjectComponentImpactMapAtCommit } from "./component-impact-map.js";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { sanitizedCreditAdmission } from "./credit-admission-evidence.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -39,6 +41,7 @@ import { activeSelfUpdateLease } from "./self-update-lease.js";
 import {
   CANONICAL_LIFECYCLE_STATUSES,
   evaluateLifecycleTransition,
+  createOperatorAdoptionLifecycleContext,
   lifecycleEvidenceChanged,
   positiveStateVersion,
 } from "./lifecycle-policy.js";
@@ -48,6 +51,8 @@ import {
   ensureStateDatabase,
   mutateCandidateQaDecisionState,
   mutateDatabaseState,
+  mutateOperatorCandidateState,
+  mutateScopeDispatchState as mutateScopeDispatchDatabaseState,
   mutateHostedRcAggregate,
   readHostedRcAggregate,
   mutateQaRevocationIntentState,
@@ -72,6 +77,9 @@ import {
   assertImpactPlanProjectBinding,
   exactCandidateChangedFiles,
   verifyAdoptionCandidate,
+  verifyScopedBuilderHandoff,
+  normalizeOperatorAdoptionRequest,
+  impactScopeDigest,
   remapTaskImpactScope,
   resolveProjectImpactPlan,
 } from "./impact-planner.js";
@@ -801,6 +809,9 @@ export async function writeState(state) {
   state.meta.storageBackend = "sqlite";
   await writeDatabaseState(state);
 }
+
+/** Scheduling composition root is the sole native initial-scope writer. */
+export const mutateScopeDispatchState = (mutator, options = {}) => mutateScopeDispatchDatabaseState(mutator, { idempotent: true, ...options });
 
 export async function mutateState(mutator, options = {}) {
   // This public state-transform API is retry-safe by contract. Callers that
@@ -2220,6 +2231,7 @@ export async function addTask(input) {
   }, { operationName: "task.add" });
 }
 
+const OPERATOR_ADOPTION_LIFECYCLE = Symbol("studioops.operator-adoption-lifecycle");
 const PROMOTION_WORKER_LIFECYCLE = Symbol("studioops.promotion-worker-lifecycle");
 
 function exactPromotionWorkerLifecycleAuthority(state, candidate, decision, options = {}) {
@@ -2364,7 +2376,8 @@ function applyLifecycleTransitionWithCapability(state, command, input = {}, capa
   const completionEvidence = command.action === "finish_task"
     ? completionEvidenceForTask(state, task)
     : null;
-  const result = evaluateLifecycleTransition(command, task, {
+  if (command.action === "adopt_operator_candidate" && capability !== OPERATOR_ADOPTION_LIFECYCLE) throw new Error("adoption_executable_authority_required");
+  const lifecycleContext = {
     runs: state.runs || [],
     candidates: state.candidates || [],
     promotionAttemptClaims: state.meta?.promotionAttemptClaims || {},
@@ -2378,7 +2391,9 @@ function applyLifecycleTransitionWithCapability(state, command, input = {}, capa
     ),
     now: input.now,
     nowMs: input.nowMs,
-  });
+  };
+  const result = evaluateLifecycleTransition(command, task, capability === OPERATOR_ADOPTION_LIFECYCLE
+    ? createOperatorAdoptionLifecycleContext(lifecycleContext) : lifecycleContext);
   const lifecycleOptions = capability === PROMOTION_WORKER_LIFECYCLE
     ? { promotionWorkerLifecycleCapability: capability }
     : {};
@@ -2518,60 +2533,134 @@ export async function repairLegacyTaskStatus(taskId, status, input = {}) {
   }, { repairTaskId: taskId, operationName: "task.repair_legacy_status" });
 }
 
-export async function adoptCandidate(taskId, request = {}, options = {}) {
-  const requestDigest = String(request.requestDigest || "").trim();
-  if (!/^sha256:[0-9a-f]{64}$/i.test(requestDigest)) throw new Error("Adoption requestDigest must be a SHA-256 digest of the exact request.");
-  if (request.confirmation !== "ADOPT_CANDIDATE_V1") throw new Error("Owner confirmation is required for candidate adoption.");
-  const actor = request.actorContext;
-  if (!actor || actor.trusted !== true || actor.actorType !== "owner" || actor.role !== "owner") throw new Error("Candidate adoption requires a trusted owner actor.");
-  if (Object.prototype.hasOwnProperty.call(request, "runId") || Object.prototype.hasOwnProperty.call(request, "cycle") || Object.prototype.hasOwnProperty.call(request, "plan") || Object.prototype.hasOwnProperty.call(request, "provenance")) throw new Error("Adoption does not accept worker run, cycle, plan, or provenance injection.");
-  const state = await readStateReadOnly();
-  const initialTask = findTask(state, taskId);
-  const initialProject = initialTask && findProject(state, initialTask.projectId);
-  if (!initialTask || !initialProject) throw new Error(`Unknown adoption task: ${taskId}`);
-  const verified = verifyAdoptionCandidate(initialProject, request.candidate, { cwd: options.cwd || initialProject.sourceRepoPath || initialProject.repoPath });
-  const unresolved = (initialTask.dependsOnTaskIds || []).filter((dependencyId) => {
-    const dependency = findTask(state, dependencyId);
-    return !dependency || !["done", "closed", "merged", "deployed"].includes(dependency.status);
-  });
-  const preview = {
-    taskId, requestDigest, stateVersion: positiveStateVersion(initialTask.stateVersion),
-    candidate: { baseSha: verified.baseSha, commitSha: verified.commitSha, treeSha: verified.treeSha, branch: verified.branch, manifestDigest: verified.manifestDigest },
-    reviewedFiles: verified.changedFiles, unresolvedDependencies: unresolved,
-    held: unresolved.length > 0, status: "builder_review",
-  };
-  if (options.preview === true) return preview;
-  return mutateState(async (currentState) => {
-    const task = findTask(currentState, taskId);
-    const project = task && findProject(currentState, task.projectId);
-    if (!task || !project) throw new Error(`Unknown adoption task: ${taskId}`);
-    if (Number(request.expectedStateVersion) !== positiveStateVersion(task.stateVersion)) throw new Error("Adoption expectedStateVersion is stale.");
-    if (!["ready", "queued", "blocked", "needs_changes"].includes(task.status)) throw new Error("Only ready, queued, blocked, or needs_changes tasks may be adopted.");
-    if (task.workflowLease || (currentState.runs || []).some((run) => run.taskId === taskId && ["queued", "running"].includes(run.status))) throw new Error("Active builder claims or leases block adoption.");
-    if (task.operatorIntake?.requestDigest) {
-      if (task.operatorIntake.requestDigest === requestDigest && task.candidateIdentity?.commitSha === verified.commitSha) return task;
-      throw new Error("A different adoption request already owns this task; remap or resolve it explicitly.");
+function adoptionError(code) { const error = new Error(code); error.code = code; throw error; }
+function adoptionSnapshotConflicts(state, taskIds) {
+  const ids = new Set(taskIds);
+  if ((state.runs || []).some((run) => ids.has(run.taskId) && ["queued", "running"].includes(run.status))) adoptionError("adoption_active_run");
+  for (const task of state.tasks.filter((item) => ids.has(item.id))) {
+    if (task.workflowLease && Date.parse(task.workflowLease.expiresAt) > Date.now()) adoptionError("adoption_active_lease");
+    if (task.assignmentClaim && Date.parse(task.assignmentClaim.expiresAt) > Date.now()) adoptionError("adoption_active_assignment");
+  }
+}
+function adoptionFailedMaterial(state, task, candidate) {
+  const failures = (state.runs || []).filter((run) => run.taskId === task.id && run.status === "failed");
+  if (failures.some((run) => run.candidateIdentity?.treeSha === candidate.treeSha
+    || (run.candidateIdentity?.commitSha === candidate.commitSha && !run.candidateIdentity?.treeSha))) adoptionError("adoption_unchanged_failed_material");
+}
+async function verifiedPrerequisiteDispositions(state, task, request, project, candidate) {
+  const result = [];
+  for (const item of request.prerequisites) {
+    const prerequisite = findTask(state, item.taskId);
+    if (!prerequisite || prerequisite.projectId !== task.projectId || !(task.dependsOnTaskIds || []).includes(item.taskId)) adoptionError("adoption_prerequisite_not_direct");
+    if (positiveStateVersion(prerequisite.stateVersion) !== item.expectedStateVersion) adoptionError("adoption_prerequisite_stale");
+    if (["in_progress", "builder_review", "backend_review", "frontend_review", "regression_review", "lead_review", "qa_review", "legacy_untrusted"].includes(prerequisite.status)) adoptionError("adoption_prerequisite_active");
+    if (prerequisite.automationBlocker || prerequisite.automationCircuit?.state === "open") adoptionError("adoption_prerequisite_unresolved_incident");
+    if (incompleteDependencies(state, prerequisite).length) adoptionError("adoption_prerequisite_dependencies_incomplete");
+    const merge = prerequisite.mergeEvidence;
+    const verification = prerequisite.verificationEvidence;
+    if (merge?.kind !== "preexisting_merged_artifact" || verification?.kind !== "existing_current_inventory_verification"
+      || !/^[a-f0-9]{40}$/.test(merge.sourceSha || "") || verification.subjectSha !== merge.sourceSha
+      || merge.sourceSha !== candidate.baseSha || !Array.isArray(verification.evidenceRefs)
+      || !verification.evidenceRefs.length || verification.evidenceRefs.length > 8
+      || sha256Digest({ merge, verification }) !== item.evidenceDigest) adoptionError("adoption_prerequisite_evidence_invalid");
+    const loaded = loadProjectComponentImpactMapAtCommit(project, merge.sourceSha, { repoRoot: candidate.repoRoot });
+    if (!loaded.coverage?.complete || loaded.digest !== verification.mapDigest) adoptionError("adoption_prerequisite_map_mismatch");
+    for (const ref of verification.evidenceRefs) {
+      if (typeof ref.path !== "string" || !path.isAbsolute(ref.path) || !/^[a-f0-9]{64}$/.test(ref.sha256 || "")) adoptionError("adoption_prerequisite_receipt_invalid");
+      const file = lstatSync(ref.path);
+      if (!file.isFile() || file.isSymbolicLink() || file.size > 1_048_576) adoptionError("adoption_prerequisite_receipt_invalid");
+      if (createHash("sha256").update(await readFile(ref.path)).digest("hex") !== ref.sha256) adoptionError("adoption_prerequisite_receipt_changed");
     }
+    result.push({ taskId: prerequisite.id, expectedStateVersion: item.expectedStateVersion, evidenceDigest: item.evidenceDigest,
+      reason: item.reason, sourceSha: merge.sourceSha });
+  }
+  return result;
+}
+
+/** Trusted executable owner/conflict ports are composition-root inputs, never request JSON. */
+export async function adoptOperatorCandidate(taskId, input, authority = {}, options = {}) {
+  const request = normalizeOperatorAdoptionRequest(input);
+  const requestDigest = sha256Digest(request);
+  if (typeof authority.assertNoConflicts !== "function" || (options.preview !== true && typeof authority.confirm !== "function")) adoptionError("adoption_executable_authority_required");
+  const prepare = async (state) => {
+    const task = findTask(state, taskId);
+    const project = task && findProject(state, task.projectId);
+    if (!project || request.projectId !== project.id || request.repository !== projectRepositoryIdentity(project)) adoptionError("adoption_project_mismatch");
+    const prPrefix = `${request.repository}/pull/`;
+    if (!projectUsesLocalWorkflow(project) && (!(task.prUrl || "").startsWith(prPrefix) || !/^[1-9][0-9]*$/.test(task.prUrl.slice(prPrefix.length)))) adoptionError("adoption_github_pr_required");
+    const replay = task.operatorIntake?.requestDigest === requestDigest;
+    if (!replay && request.expectedStateVersion !== positiveStateVersion(task.stateVersion)) adoptionError("adoption_task_stale");
+    if (!replay && !["ready", "queued", "blocked", "needs_changes"].includes(task.status)) adoptionError("adoption_task_state_invalid");
+    if (task.architectureRequired && !architectureIsCompleteInState(state, task)) adoptionError("adoption_architecture_incomplete");
+    const ids = [taskId, ...request.prerequisites.map((item) => item.taskId)];
+    adoptionSnapshotConflicts(state, ids);
+    const conflictTaskIds = (await authority.assertNoConflicts(state, task, request.reviewedFiles, ids)) || [];
+    if (!Array.isArray(conflictTaskIds) || conflictTaskIds.length > 4096) adoptionError("adoption_conflict_set_invalid");
+    const candidate = verifyAdoptionCandidate(project, request.candidate, { reviewedFiles: request.reviewedFiles, expectedMapDigest: request.mapDigest });
+    if (task.operatorIntake && !replay && (task.operatorIntake.candidate?.treeSha === candidate.treeSha || task.operatorIntake.materialDigest === sha256Digest({ treeSha: candidate.treeSha }))) adoptionError("adoption_unchanged_material");
+    if (replay && (task.candidateIdentity?.commitSha !== candidate.commitSha || task.candidateIdentity?.treeSha !== candidate.treeSha)) adoptionError("adoption_replay_binding_changed");
+    if (!replay) {
+      adoptionFailedMaterial(state, task, candidate);
+      if ((state.events || []).some((event) => event.taskId === taskId && event.type === "operator_candidate_adopted" && event.candidate?.treeSha === candidate.treeSha)) adoptionError("adoption_unchanged_material");
+    }
+    const dispositions = replay ? [] : await verifiedPrerequisiteDispositions(state, task, request, project, candidate);
+    const existingScope = task.impactScopePlan || task.impactPlan;
+    const classification = resolveProjectImpactPlan({ project, task, loadedMap: candidate.loadedMap, sourceCommit: candidate.commitSha,
+      changedFiles: candidate.changedFiles, repoRoot: candidate.repoRoot });
+    if (classification.discovery?.required || !classification.coverage?.complete) adoptionError("adoption_classification_incomplete");
+    if (existingScope) {
+      assertImpactPlanProjectBinding(existingScope, project);
+      assertChangedFilesWithinImpactPlan(existingScope, candidate.changedFiles);
+    }
+    const frozenScopePlan = existingScope || { ...classification, allowedFileScope: [...candidate.changedFiles], supportingFileScope: [] };
+    const scopeDigest = impactScopeDigest(frozenScopePlan);
+    const incomplete = incompleteDependencies(state, task).filter((item) => !dispositions.some((disposition) => disposition.taskId === item.id));
+    return { taskId, requestDigest, candidate: { baseSha: candidate.baseSha, commitSha: candidate.commitSha, treeSha: candidate.treeSha, branch: candidate.branch },
+      scopeDigest, frozenScopePlan, classification, replay, conflictTaskIds, dispositionTaskIds: dispositions.map((item) => item.taskId), dispositions,
+      preview: { schemaVersion: 1, taskId, requestDigest, expectedStateVersion: request.expectedStateVersion,
+        candidate: request.candidate, mapDigest: candidate.manifestDigest, scopeDigest, reviewedFiles: candidate.changedFiles,
+        unresolvedDependencies: incomplete.map((item) => item.id), held: incomplete.length > 0 || Boolean(task.automationBlocker), status: "builder_review" } };
+  };
+  const initial = await prepare(await readStateReadOnly());
+  if (options.preview === true) return initial.preview;
+  if (initial.replay) return { ...initial.preview, replay: true };
+  const principal = await authority.confirm(Object.freeze(structuredClone(initial.preview)));
+  if (typeof principal !== "string" || !principal || principal.length > 160 || /[\x00-\x1f\x7f]/.test(principal)) adoptionError("adoption_owner_confirmation_invalid");
+  return mutateOperatorCandidateState(prepare, async (state, verified) => {
+    const task = findTask(state, taskId);
+    if (verified.replay) return { ...verified.preview, replay: true };
     const now = new Date().toISOString();
-    const cycle = Math.max(Number(task.reviewCycle || 0) + 1, Number(task.reviewSubjectCycle || 0) + 1, 1);
-    const decision = applyLifecycleTransitionInState(currentState, {
-      action: "adopt_candidate", taskId, expectedStateVersion: positiveStateVersion(task.stateVersion),
-      actorContext: { actorId: "operator-adoption", actorType: "system", role: "workflow-engine", trusted: true },
-      evidence: { candidateCycle: cycle, subjectSha: verified.commitSha },
-    });
-    Object.assign(task, decision.task, {
-      branchName: verified.branch,
-      reviewSubjectSha: verified.commitSha,
-      reviewSubjectCycle: cycle,
-      reviewCycle: cycle,
-      candidateIdentity: { baseSha: verified.baseSha, commitSha: verified.commitSha, treeSha: verified.treeSha, branch: verified.branch, candidateCycle: cycle, impactEvidence: { changedFiles: verified.changedFiles } },
-      reviewedFiles: verified.changedFiles,
-      operatorIntake: { schemaVersion: 1, requestDigest, actorId: actor.actorId, adoptedAt: now, candidate: verified, unresolvedDependencies: unresolved },
-      adoptionHeld: unresolved.length > 0,
-    });
-    currentState.events.push({ id: nextId(currentState.events, "event"), type: "operator_candidate_adopted", projectId: task.projectId, taskId, message: "Verified operator candidate adopted into builder_review.", createdAt: now, requestDigest, reviewedFiles: verified.changedFiles, held: unresolved.length > 0 });
-    return task;
-  }, { operationName: "task.adopt_candidate" });
+    if (task.operatorIntake) {
+      state.events.push({ id: nextId(state.events, "event"), type: "operator_candidate_superseded", projectId: task.projectId,
+        taskId, previousOperatorIntake: structuredClone(task.operatorIntake), replacementRequestDigest: requestDigest,
+        message: "A genuinely changed operator candidate superseded the prior intake; its exact receipt remains preserved.", createdAt: now });
+    }
+    for (const item of verified.dispositions) {
+      const prerequisite = findTask(state, item.taskId);
+      applyStoreLifecycleTransition(state, prerequisite, "closed");
+      prerequisite.preexistingWorkDisposition = { schemaVersion: 1, ...item, principal, recordedAt: now, kind: "preexisting_work_verified" };
+    }
+    const cycle = Math.max(Number(task.reviewCycle || 0), Number(task.reviewSubjectCycle || 0)) + 1;
+    // Initialize exact edit authority only here; preserve existing/legacy scope byte for byte.
+    if (!task.impactScopePlan && !task.impactPlan) task.impactScopePlan = structuredClone(verified.frozenScopePlan);
+    applyLifecycleTransitionWithCapability(state, { action: "adopt_operator_candidate", taskId,
+      expectedStateVersion: positiveStateVersion(task.stateVersion),
+      actorContext: { actorId: principal, actorType: "system", role: "workflow-engine", trusted: true },
+      evidence: { candidateCycle: cycle, subjectSha: verified.candidate.commitSha } }, {}, OPERATOR_ADOPTION_LIFECYCLE);
+    const impactEvidence = normalizedImpactEvidence({ changedFiles: request.reviewedFiles,
+      classifications: verified.classification.selectedComponents.map((component) => component.id), unknown: false, backendRequired: true });
+    Object.assign(task, { branchName: verified.candidate.branch, assignedAgentRole: "", reviewerThreadId: "", impactEvidence,
+      candidateIdentity: normalizeCandidateIdentity({ ...verified.candidate, candidateCycle: cycle, impactEvidence }),
+      operatorIntake: { schemaVersion: 1, source: "operator", requestDigest, materialDigest: sha256Digest({ treeSha: verified.candidate.treeSha }),
+        originalStateVersion: request.expectedStateVersion, principal, reason: request.reason, recordedAt: now,
+        candidate: verified.candidate, mapDigest: request.mapDigest, scopeDigest: verified.scopeDigest,
+        reviewedFiles: request.reviewedFiles, dispositions: verified.dispositions },
+      adoptionHeld: verified.preview.held });
+    state.events.push({ id: nextId(state.events, "event"), type: "operator_candidate_adopted", projectId: task.projectId, taskId,
+      message: "Verified operator source entered normal candidate review intake.", createdAt: now,
+      requestDigest, principal, candidate: verified.candidate, scopeDigest: verified.scopeDigest, held: verified.preview.held });
+    return verified.preview;
+  }, { operationName: "task.adopt_operator_candidate", idempotent: true });
 }
 
 export async function updateTask(taskId, patch) {
@@ -2579,7 +2668,8 @@ export async function updateTask(taskId, patch) {
     && typeof patch.status === "string"
     && patch.status.trim()
     && VALID_STATUSES.has(patch.status.trim());
-  return mutateState(async (state) => {
+  const mutateTask = patch.impactRemap ? mutateScopeDispatchState : mutateState;
+  return mutateTask(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
     const project = findProject(state, task.projectId);
@@ -2838,6 +2928,7 @@ export async function updateTask(taskId, patch) {
       reviewSubjectSha: patchedSubjectSha,
     });
     const approvedImpactScope = aggregateBeforePatch.impactScopePlan || aggregateBeforePatch.impactPlan;
+    if (requestedStatus === "builder_review" && !approvedImpactScope) throw new Error("builder_handoff_frozen_scope_required");
     if (requestedStatus === "builder_review" && approvedImpactScope
       && (["mapped", "unclassified"].includes(approvedImpactScope.status) || approvedImpactScope.allowedFileScope?.length)) {
       const impactEvidence = Object.prototype.hasOwnProperty.call(patch, "impactEvidence")
@@ -2846,9 +2937,10 @@ export async function updateTask(taskId, patch) {
       if (!impactEvidence.changedFiles.length) {
         throw new Error("Mapped builder handoff requires exact changed-file evidence for component-scope verification.");
       }
-      const actualChangedFiles = exactCandidateChangedFiles(project, candidateIdentityAfterPatch, {
-        cwd: process.cwd(),
-      });
+      const verifiedHandoff = verifyScopedBuilderHandoff(project, {
+        ...task, reviewSubjectSha: candidateIdentityAfterPatch.commitSha, candidateIdentity: candidateIdentityAfterPatch, impactEvidence,
+      }, approvedImpactScope, { persistedRuns: state.runs || [] });
+      const actualChangedFiles = verifiedHandoff.changedFiles;
       assertChangedFileEvidenceMatches(actualChangedFiles, impactEvidence.changedFiles);
       assertImpactPlanProjectBinding(approvedImpactScope, project);
       assertChangedFilesWithinImpactPlan(approvedImpactScope, actualChangedFiles);
@@ -2862,7 +2954,8 @@ export async function updateTask(taskId, patch) {
           },
           impactEvidence,
         },
-        repoRoot: project.sourceRepoPath || project.repoPath,
+        repoRoot: verifiedHandoff.repoRoot,
+        ...(verifiedHandoff.loadedMap ? { loadedMap: verifiedHandoff.loadedMap } : {}),
         sourceCommit: candidateIdentityAfterPatch.commitSha,
         changedFiles: actualChangedFiles,
       });
@@ -5781,6 +5874,8 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
   if (task.type === "epic" || hasChildren) return actions;
 
+  if (task.operatorIntake && (incompleteDependencies(state, task).length || task.automationBlocker)) return actions;
+  if (task.operatorIntake && task.adoptionHeld) task.adoptionHeld = false;
   const missingDependencies = incompleteDependencies(state, task);
   if (missingDependencies.length) {
     if (["ready", "queued", "in_progress"].includes(task.status)) {

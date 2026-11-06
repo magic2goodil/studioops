@@ -24,10 +24,14 @@ import {
   resolveProjectImpactPlan,
   remapTaskImpactScope,
   selectImpactValidationCommands,
+  verifyAdoptionCandidate,
+  verifyScopedBuilderHandoff,
   writeBoundedDiscoveryArtifact,
 } from "../src/impact-planner.js";
 import { dispatchSupervisorActions } from "../src/dispatcher.js";
-import { addProject, addTask, mutateState, readState, updateTask } from "../src/store.js";
+import { persistRunWorkspace } from "../src/runner.js";
+import { addProject, addTask, mutateState, readState, updateRun, updateTask } from "../src/store.js";
+import { materializeLocalCandidate } from "../src/workspace.js";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const studioOpsProject = {
@@ -70,6 +74,94 @@ function manifest(key, repository, componentPath = "src/catalog.js") {
 async function writeManifest(root, value) {
   await mkdir(path.join(root, "docs", "architecture"), { recursive: true });
   await writeFile(path.join(root, "docs", "architecture", "components.json"), `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function repositoryAuthorityFixture(t, { local = false, isolated = false } = {}) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-handoff-authority-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const git = (cwd, ...args) => execFileSync("/usr/bin/git", ["-C", cwd, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const key = path.basename(root).toLowerCase();
+  const repository = local ? `local:${key}` : "https://github.com/example/scoped-candidate";
+  const seed = path.join(root, isolated ? "seed" : "registered");
+  await mkdir(seed);
+  git(seed, "init", "-b", "main");
+  git(seed, "config", "user.name", "Fixture Author");
+  git(seed, "config", "user.email", "fixture@example.invalid");
+  await mkdir(path.join(seed, "src"));
+  await mkdir(path.join(seed, "test"));
+  await writeFile(path.join(seed, "src/catalog.js"), "export const catalog = 1;\n");
+  await writeFile(path.join(seed, "src/catalog-api.js"), "export const query = () => [];\n");
+  await writeFile(path.join(seed, "test/catalog.test.js"), "// Generic component ownership fixture.\n");
+  await writeManifest(seed, manifest(key, repository));
+  git(seed, "add", ".");
+  git(seed, "commit", "-m", "Generic repository authority base");
+  const baseSha = git(seed, "rev-parse", "HEAD");
+  const source = isolated ? path.join(root, "registered") : seed;
+  if (isolated) {
+    git(root, "clone", "--no-hardlinks", seed, source);
+    git(source, "remote", "set-url", "origin", repository);
+  }
+  let baseOnlyRepo = "";
+  if (local) {
+    baseOnlyRepo = path.join(root, "base-only");
+    git(root, "clone", "--no-hardlinks", source, baseOnlyRepo);
+    git(baseOnlyRepo, "remote", "remove", "origin");
+  }
+  const project = await addProject({
+    key, name: "Generic repository authority fixture", repoPath: source, sourceRepoPath: source,
+    repoUrl: local ? "" : repository, workflowMode: local ? "local" : "github", defaultBranch: "main",
+  });
+  const branch = "feature/scoped-candidate";
+  const nativeTask = await addTask({
+    project: project.id, title: "Verify exact catalog candidate", type: "bug", architectureRequired: false, status: "ready",
+    description: "Verify repository authority for a real mapped candidate.", userStory: "As a reviewer I need exact committed source authority.",
+    expectedOutcome: "Only registered source and persisted native workspaces authorize a handoff.",
+    acceptanceCriteria: ["Unrelated repository paths never grant source authority."], workAreas: ["src/catalog.js"],
+    affectedSurfaces: ["src/catalog.js"], validationPlan: ["node --test test/catalog.test.js"], riskClassification: "low",
+    privacyNotes: "Generic synthetic source only; no personal data.", securityNotes: "No provider or network request is used.",
+    branchName: branch, candidateIdentity: { baseSha },
+  });
+  const dispatch = await dispatchSupervisorActions([{
+    id: `${nativeTask.id}:start_builder`, type: "start_builder", role: "builder", taskId: nativeTask.id, projectId: project.id,
+    taskStatus: "ready", nextStatus: "in_progress", branchName: branch,
+  }], { failureIncidents: [], creditPolicy: { enabled: false } });
+  assert.equal(dispatch.runs.length, 1, JSON.stringify(dispatch.skipped));
+  const workspaceRoot = path.join(root, "workspaces");
+  const workspacePath = isolated ? path.join(workspaceRoot, key, `${dispatch.runs[0].id}-scoped-candidate`) : "";
+  const executionRepo = workspacePath || source;
+  if (isolated) {
+    await mkdir(path.dirname(workspacePath), { recursive: true });
+    git(root, "clone", "--no-hardlinks", source, workspacePath);
+    git(workspacePath, "remote", "set-url", "origin", repository);
+  }
+  git(executionRepo, "config", "user.name", "Fixture Author");
+  git(executionRepo, "config", "user.email", "fixture@example.invalid");
+  git(executionRepo, "checkout", "-b", branch);
+  await writeFile(path.join(executionRepo, "src/catalog.js"), "export const catalog = 2;\n");
+  git(executionRepo, "add", "src/catalog.js");
+  git(executionRepo, "commit", "-m", "Generic scoped candidate");
+  const candidate = { baseSha, commitSha: git(executionRepo, "rev-parse", "HEAD"),
+    treeSha: git(executionRepo, "rev-parse", "HEAD^{tree}"), branch, candidateCycle: 1 };
+  if (isolated) {
+    await persistRunWorkspace(dispatch.runs[0], {
+      workspacePath, executionRepoPath: workspacePath, strategy: "clone",
+    });
+  }
+  await updateRun(dispatch.runs[0].id, {
+    status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch.",
+  });
+  await updateTask(nativeTask.id, { status: "in_progress" });
+  const persisted = await readState();
+  const storedTask = persisted.tasks.find((item) => item.id === nativeTask.id);
+  const scope = storedTask.impactScopePlan;
+  assert.equal(scope.status, "mapped");
+  assert.equal(scope.sourceCommit, baseSha);
+  const task = { ...storedTask, reviewSubjectSha: candidate.commitSha, reviewSubjectCycle: 1,
+    candidateIdentity: candidate, impactEvidence: { changedFiles: ["src/catalog.js"], unknown: false, backendRequired: true } };
+  return { root, source, baseOnlyRepo, workspaceRoot, workspacePath, project, task, scope, candidate, git,
+    run: persisted.runs.find((item) => item.id === dispatch.runs[0].id) };
 }
 
 test("component maps are canonical, validated, and content addressed", () => {
@@ -428,6 +520,146 @@ test("changed-file evidence is recomputed from the exact local Git candidate", a
   }
 });
 
+test("registered origin-less local repositories authorize real handoffs and adoption without trusting cwd", async (t) => {
+  const f = await repositoryAuthorityFixture(t, { local: true });
+  assert.equal(f.git(f.source, "remote"), "");
+  const loaded = loadProjectComponentImpactMapAtCommit(f.project, f.candidate.commitSha);
+  assert.equal(loaded.manifest.project.repository, `local:${f.project.key}`);
+  assert.equal(loaded.coverage.complete, true);
+  const verified = verifyScopedBuilderHandoff(f.project, f.task, f.scope);
+  assert.equal(verified.repoRoot, f.source);
+  assert.deepEqual(verified.changedFiles, ["src/catalog.js"]);
+  const adoptionOptions = { reviewedFiles: ["src/catalog.js"], expectedMapDigest: loaded.digest };
+  assert.equal(verifyAdoptionCandidate(f.project, f.candidate, adoptionOptions).repoRoot, f.source);
+
+  // This equally mapped registered clone lacks the candidate. An arbitrary
+  // caller cwd containing it must not replace the registered repository.
+  const wrongRegistration = { ...f.project, repoPath: f.baseOnlyRepo, sourceRepoPath: f.baseOnlyRepo };
+  assert.throws(() => verifyScopedBuilderHandoff(wrongRegistration, f.task, f.scope, { cwd: f.source }));
+  assert.throws(() => verifyAdoptionCandidate(wrongRegistration, f.candidate, { ...adoptionOptions, cwd: f.source }));
+  await updateTask(f.task.id, { status: "builder_review", subjectSha: f.candidate.commitSha,
+    branchName: f.candidate.branch, candidateIdentity: f.candidate, impactEvidence: f.task.impactEvidence });
+  const stored = (await readState()).tasks.find((task) => task.id === f.task.id);
+  assert.equal(stored.status, "builder_review");
+  assert.equal(stored.reviewSubjectSha, f.candidate.commitSha);
+  assert.deepEqual(stored.impactScopePlan, f.scope);
+});
+
+test("isolated clone handoffs require matching persisted builder authority and preserve local tracking transport", async (t) => {
+  const f = await repositoryAuthorityFixture(t, { isolated: true });
+  assert.equal(f.git(f.source, "rev-parse", "--is-inside-work-tree"), "true");
+  assert.equal(f.git(f.workspacePath, "rev-parse", "--is-inside-work-tree"), "true");
+  assert.throws(() => f.git(f.source, "cat-file", "-e", `${f.candidate.commitSha}^{commit}`));
+  assert.throws(() => f.git(f.source, "rev-parse", "--verify", `refs/heads/${f.candidate.branch}`));
+  assert.equal(f.run.workspacePath, f.workspacePath);
+  assert.equal(f.run.executionRepoPath, f.workspacePath);
+  assert.equal(f.run.workspaceProvenanceUntrusted, false);
+  await assert.rejects(mutateState((state) => {
+    const run = state.runs.find((item) => item.id === f.run.id);
+    run.workspacePath = f.source;
+    run.executionRepoPath = f.source;
+    run.workspaceStrategy = "source-checkout";
+  }, { operationName: "test.reject_generic_workspace_rewrite" }), (error) => (
+    error.code === "native_workspace_verified_writer_required"
+  ));
+  assert.deepEqual((await readState()).runs.find((run) => run.id === f.run.id), f.run);
+  const verify = (options) => verifyScopedBuilderHandoff(f.project, f.task, f.scope, options);
+  assert.equal(verify({ persistedRuns: [f.run] }).repoRoot, f.workspacePath);
+  assert.throws(() => verify({}));
+  assert.throws(() => verify({ cwd: f.workspacePath }));
+  for (const patch of [
+    { taskId: "task_unrelated" }, { projectId: "project_unrelated" }, { branchName: "feature/unrelated" },
+    { role: "lead-reviewer", group: "reviewer" }, { status: "invented" }, { executionRepoPath: f.source },
+    { workspaceProvenanceUntrusted: true },
+  ]) {
+    assert.throws(() => verify({ persistedRuns: [{ ...f.run, ...patch }], cwd: f.workspacePath }), JSON.stringify(patch));
+  }
+  const alias = path.join(f.root, "workspace-alias");
+  await symlink(f.workspacePath, alias);
+  assert.throws(() => verify({ persistedRuns: [{ ...f.run, workspacePath: alias, executionRepoPath: alias }] }));
+  f.git(f.workspacePath, "remote", "set-url", "origin", "https://github.com/example/unrelated");
+  assert.throws(() => verify({ persistedRuns: [f.run] }));
+  f.git(f.workspacePath, "remote", "set-url", "origin", f.project.repoUrl);
+  await updateTask(f.task.id, { status: "builder_review", subjectSha: f.candidate.commitSha,
+    branchName: f.candidate.branch, candidateIdentity: f.candidate, impactEvidence: f.task.impactEvidence });
+  assert.equal((await readState()).tasks.find((task) => task.id === f.task.id).reviewSubjectSha, f.candidate.commitSha);
+
+  // Transport only the object and origin tracking ref. The old local branch
+  // remains checked out in a preserved worktree, with neither HEAD moved.
+  const preserved = path.join(f.root, "preserved-worktree");
+  f.git(f.source, "branch", f.candidate.branch, f.candidate.baseSha);
+  f.git(f.source, "worktree", "add", preserved, f.candidate.branch);
+  const sourceHead = f.git(f.source, "rev-parse", "HEAD");
+  const preservedHead = f.git(preserved, "rev-parse", "HEAD");
+  f.git(f.source, "fetch", f.workspacePath, `refs/heads/${f.candidate.branch}:refs/remotes/origin/${f.candidate.branch}`);
+  assert.equal(f.git(f.source, "rev-parse", "HEAD"), sourceHead);
+  assert.equal(f.git(preserved, "rev-parse", "HEAD"), preservedHead);
+  assert.equal(f.git(f.source, "rev-parse", `refs/heads/${f.candidate.branch}`), f.candidate.baseSha);
+  assert.equal(f.git(f.source, "rev-parse", `refs/remotes/origin/${f.candidate.branch}`), f.candidate.commitSha);
+  assert.equal(verify({}).repoRoot, f.source);
+});
+
+test("origin-less managed bare handoffs require a typed artifact reference and its prior builder run", async (t) => {
+  const f = await repositoryAuthorityFixture(t, { isolated: true });
+  const identity = await materializeLocalCandidate({ workspacePath: f.workspacePath, root: f.workspaceRoot,
+    taskId: f.task.id, branch: f.candidate.branch, identity: { candidateCycle: 1 } });
+  const task = { ...f.task, candidateIdentity: identity };
+  const artifact = path.join(f.workspaceRoot, identity.operationalLocalArtifactRef);
+  assert.equal(f.git(artifact, "rev-parse", "--is-bare-repository"), "true");
+  assert.equal(f.git(artifact, "remote"), "");
+  // Retain the recorded physical workspace while removing its Git metadata:
+  // the exact candidate can now be verified only through the managed artifact.
+  await rm(path.join(f.workspacePath, ".git"), { recursive: true });
+  const verify = (nextTask = task, options = { persistedRuns: [f.run] }) => (
+    verifyScopedBuilderHandoff(f.project, nextTask, f.scope, options)
+  );
+  assert.equal(verify().repoRoot, artifact);
+  assert.throws(() => verify(task, {}));
+  assert.throws(() => verify(task, { cwd: artifact }));
+  assert.throws(() => verify(task, { persistedRuns: [{ ...f.run, taskId: "task_unrelated" }] }));
+  assert.throws(() => verify(task, { persistedRuns: [{ ...f.run, projectId: "project_unrelated" }] }));
+  const noTypedRef = { ...task, operationalLocalArtifactRef: identity.operationalLocalArtifactRef,
+    candidateIdentity: { ...identity } };
+  delete noTypedRef.candidateIdentity.operationalLocalArtifactRef;
+  assert.throws(() => verify(noTypedRef));
+  for (const ref of ["", artifact, `../${identity.operationalLocalArtifactRef}`,
+    `candidates/task_unrelated/1-${identity.commitSha}.git`, `candidates/${f.task.id}/2-${identity.commitSha}.git`]) {
+    assert.throws(() => verify({ ...task, candidateIdentity: { ...identity, operationalLocalArtifactRef: ref } }), ref);
+  }
+  assert.throws(() => loadProjectComponentImpactMapAtCommit(f.project, identity.commitSha, {
+    repoRoot: artifact, verifyManagedRepository: true,
+  }), ComponentMapIsolationError);
+  f.git(artifact, "remote", "add", "origin", "https://github.com/example/unrelated");
+  assert.throws(() => verify());
+  assert.throws(() => loadProjectComponentImpactMapAtCommit(f.project, identity.commitSha, {
+    repoRoot: artifact, verifyManagedRepository: () => true,
+  }), ComponentMapIsolationError);
+  f.git(artifact, "remote", "remove", "origin");
+  const savedArtifact = `${artifact}.saved`;
+  await rename(artifact, savedArtifact);
+  await symlink(savedArtifact, artifact);
+  assert.throws(() => verify());
+  await rm(artifact);
+  await rename(savedArtifact, artifact);
+  await rename(artifact, savedArtifact);
+  f.git(f.root, "clone", "--no-hardlinks", savedArtifact, artifact);
+  f.git(artifact, "remote", "remove", "origin");
+  assert.equal(f.git(artifact, "rev-parse", "--is-bare-repository"), "false");
+  assert.throws(() => verify());
+  await rm(artifact, { recursive: true });
+  await rename(savedArtifact, artifact);
+  const wrongTree = f.git(f.source, "rev-parse", `${identity.baseSha}^{tree}`);
+  assert.throws(() => verify({ ...task, candidateIdentity: { ...identity, treeSha: wrongTree } }));
+  f.git(artifact, "update-ref", `refs/heads/${identity.branch}`, identity.baseSha);
+  assert.throws(() => verify());
+  f.git(artifact, "update-ref", `refs/heads/${identity.branch}`, identity.commitSha);
+  assert.equal(verify().repoRoot, artifact);
+  await updateTask(task.id, { status: "builder_review", subjectSha: identity.commitSha,
+    branchName: identity.branch, candidateIdentity: identity, impactEvidence: task.impactEvidence });
+  assert.equal((await readState()).tasks.find((item) => item.id === task.id).candidateIdentity.operationalLocalArtifactRef,
+    identity.operationalLocalArtifactRef);
+});
+
 test("immutable diff includes deletion, both rename paths, and file type changes", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-all-diff-statuses-"));
   const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
@@ -510,11 +742,23 @@ test("builder cannot silently widen its dispatched scope; explicit remap is dura
     await writeFile(path.join(root, "src/payments.js"), "export const value = 2;\n");
     git("add", "."); git("commit", "-qm", "candidate"); const commitSha = git("rev-parse", "HEAD");
     const project = await addProject({ key: "remap-handoff", name: "Remap handoff", repoUrl, repoPath: root, workflowMode: "local" });
-    const task = await addTask({ project: project.id, title: "Adjust catalog display", type: "bug", status: "in_progress", architectureRequired: false, workAreas: ["src/catalog.js"] });
-    const original = resolveProjectImpactPlan({ project, task });
-    await mutateState((state) => { const current = state.tasks.find((item) => item.id === task.id); current.impactPlan = original; current.impactScopePlan = original; });
+    const branch = git("rev-parse", "--abbrev-ref", "HEAD");
+    const task = await addTask({ project: project.id, title: "Adjust catalog display", type: "bug", status: "ready", architectureRequired: false,
+      description: "Preserve a native catalog edit boundary during an explicit adjacent-component remap.",
+      userStory: "As a reviewer I need widening to require an explicit remap.", expectedOutcome: "The original frozen scope rejects undeclared files.",
+      acceptanceCriteria: ["Only the explicit CAS remap authorizes the second component."], workAreas: ["src/catalog.js"],
+      affectedSurfaces: ["src/catalog.js"], validationPlan: ["node --test test/catalog.test.js"], riskClassification: "low",
+      privacyNotes: "Generic synthetic source only.", securityNotes: "No executor or network request is used.", branchName: branch, candidateIdentity: { baseSha } });
+    const dispatch = await dispatchSupervisorActions([{
+      id: `${task.id}:start_builder`, type: "start_builder", role: "builder", taskId: task.id, projectId: project.id,
+      taskStatus: "ready", nextStatus: "in_progress", branchName: branch,
+    }], { failureIncidents: [], creditPolicy: { enabled: false } });
+    assert.equal(dispatch.runs.length, 1, JSON.stringify(dispatch.skipped));
+    await updateRun(dispatch.runs[0].id, { status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch." });
+    await updateTask(task.id, { status: "in_progress" });
+    const original = (await readState()).tasks.find((item) => item.id === task.id).impactScopePlan;
     const submission = { status: "builder_review", subjectSha: commitSha, branchName: git("rev-parse", "--abbrev-ref", "HEAD"),
-      candidateIdentity: { baseSha, commitSha, treeSha: git("rev-parse", "HEAD^{tree}") }, impactEvidence: { changedFiles: ["src/catalog.js", "src/payments.js"] } };
+      candidateIdentity: { baseSha, commitSha, treeSha: git("rev-parse", "HEAD^{tree}"), branch, candidateCycle: 1 }, impactEvidence: { changedFiles: ["src/catalog.js", "src/payments.js"] } };
     await assert.rejects(updateTask(task.id, submission), /outside the approved component scope/);
     const remap = { reason: "Catalog fix requires the adjacent payments adapter contract update.", workAreas: ["src/catalog.js", "src/payments.js"], expectedPlanDigest: impactScopeDigest(original) };
     assert.throws(() => remapTaskImpactScope(project, { ...task, impactScopePlan: original }, { ...remap, expectedPlanDigest: "stale" }), /digest is stale/);

@@ -24,26 +24,56 @@ needed; a dependency does not require reading every supporting file.
 
 ## Guarded operator candidate adoption
 
-The local-only v1 operator surface is `adopt-candidate TASK_ID
---request-file FILE [--preview]`. A request contains an exact
-`expectedStateVersion` and immutable `{baseSha, commitSha, treeSha, branch}`;
-the CLI computes and records a SHA-256 digest of the canonical request. Commit
-mode additionally requires interactive `--confirm ADOPT_CANDIDATE_V1`; request
-files cannot supply actor context, plans, provenance, runs, or review cycles.
-The store accepts only a trusted owner adapter, verifies origin, branch/ref,
-tree, ancestry, NUL-delimited literal diff, and the head-committed complete
-component map before one SQLite CAS mutation. Preview and
-`adoption-status TASK_ID` are read-only.
+`adopt-candidate TASK_ID --request-file FILE --preview` verifies a real committed
+candidate without writes. Omit `--preview` only in an owner terminal. Commit
+mode rejects managed-worker and noninteractive invocations, binds confirmation
+to the printed request digest, and derives its audit principal from the OS owner
+of the control-plane database. No HTTP adoption route or caller actor flag exists.
+`adoption-status TASK_ID` inspects current version, scope and intake.
 
-Adoption records one truthful operator intake and enters existing
-`builder_review`; it never creates a builder run, cost, credit, or queued
-window. `reviewedFiles` is the exact immutable literal diff and cannot expand
-from component globs. Unresolved dependencies retain the adopted candidate in
-the held state; no partial prerequisite closure is attempted. Stale versions,
-active claims/leases, repository conflicts, ambiguous/renamed/type-unsafe
-paths, incomplete ownership, and forged authority fail closed with rollback.
-An exact replay is idempotent; a different request for the same task requires
-an explicit scope remap and leaves prior failure/history records intact.
+Request v1 accepts only `schemaVersion`, `expectedStateVersion`, `projectId`,
+`repository`, `candidate` (`baseSha`, `commitSha`, `treeSha`, `branch`), `mapDigest`,
+sorted unique literal `reviewedFiles`, a substantive `reason`, and optional
+`prerequisites`. JSON is data; executable confirmation/conflict and persistence
+ports remain outside it. Unknown fields, actor/provenance/run/cycle injection,
+globs, escaping paths, stale versions, moved refs, wrong trees/origins/maps and
+incomplete ownership fail closed. Requests are capped at64KiB,256paths and32direct
+prerequisite dispositions. Git output retains its2MiB bound. Version1 rejects
+renames, deletions, symlinks and gitlinks; use the normal governed workflow for
+those changes. It does not fetch missing objects or follow mutable branch refs.
+
+Initial authoring scope freezes the exact verified changed paths. Existing frozen
+or legacy scopes remain authoritative and unchanged; wider work requires the
+separate explicit CAS remap. The transaction re-verifies immutable evidence on
+optimistic replay and checks live coordination leases at its final SQL fence.
+Optional direct prerequisite closures require recorded immutable Git/map and
+hashed local verification receipts, matching versions, completed dependencies and
+no unresolved incident. Closure is an administrative disposition, never QA or
+feature acceptance, and is atomic with intake. Arbitrary prose is insufficient.
+
+Successful intake creates a real source-bound review cycle and a truthful
+`source=operator` receipt, without a builder run or credit/cost fiction. Existing
+failures and attempt counters remain. Exact replay is read-only; unchanged failed
+material cannot gain a retry by changing labels, source metadata or provenance.
+Unfinished dependencies retain the candidate at review intake with a visible
+waiting reason. Workflow, supervisor and dispatcher reject held or stale actions;
+no intervening builder queue is exposed. Normal independent review, hosted RC and
+human project release gates still apply. Native handoff also accepts a candidate
+from its persisted same-task/branch workspace or typed managed bare artifact;
+caller cwd never grants authority. Workspace path/identity metadata can change
+only through the existing runner preparation producer and private writer. Cold
+JSON imports retain path history as untrusted until that producer revalidates it.
+A controller may import exact objects into an origin-tracking ref without moving
+a preserved checked-out worktree. Repository identity, commit/tree/base, branch,
+committed map and actual scoped diff are checked again at persistence ingress. Generic status/transition/persistence
+adapters cannot mint adoption authority or submit absent-scope handoffs.
+
+Stable `adoption_*` reasons identify the failed binding: refresh state for stale
+CAS, obtain missing immutable objects through the trusted repository workflow,
+apply a reviewed scope remap for wider files, or repair the recorded incident.
+Do not blindly retry or reset history. Rollback must retain additive intake
+receipts and hold their tasks if the older scheduler cannot honor waiting states.
+
 
 A legitimate expansion has its own operation, before builder handoff:
 

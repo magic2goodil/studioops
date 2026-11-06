@@ -31,6 +31,7 @@ import {
 } from "./promotion-remote-observation.js";
 import { assertPromotionMergeAncestryObservation } from "./promotion-ancestry-observation.js";
 import { lifecycleEvidenceChanged, positiveStateVersion } from "./lifecycle-policy.js";
+import { verifyScopedBuilderHandoff } from "./impact-planner.js";
 import {
   assertCurrentIsolatedTestAuthority,
   consumeIsolatedTestAuthority,
@@ -81,6 +82,12 @@ const CANDIDATE_PROMOTION_WRITE = Symbol("studioops.candidate-promotion-write");
 const PROMOTION_CLAIM_WRITE = Symbol("studioops.promotion-claim-write");
 const MERGED_PROMOTION_RECOVERY_WRITE = Symbol("studioops.merged-promotion-recovery-write");
 const STATE_INTEGRITY_MIGRATION_WRITE = Symbol("studioops.state-integrity-migration-write");
+const OPERATOR_CANDIDATE_WRITE = Symbol("studioops.operator-candidate-write");
+const SCOPED_DISPATCH_WRITE = Symbol("studioops.scoped-dispatch-write");
+const NATIVE_WORKSPACE_WRITE = Symbol("studioops.native-workspace-write");
+const NATIVE_WORKSPACE_FIELDS = ["workspacePath", "executionRepoPath", "workspaceStrategy", "gitHooksPath"];
+const NATIVE_WORKSPACE_AUTHORITY_FIELDS = [...NATIVE_WORKSPACE_FIELDS, "workspaceProvenanceUntrusted"];
+const NATIVE_WORKSPACE_IDENTITY_FIELDS = ["taskId", "projectId", "role", "group", "branchName"];
 const TEST_FIXTURE_LEGACY_AUTHORITY_BOOTSTRAP = (() => {
   if (process.env.STUDIOOPS_TEST_TRUST_LEGACY_AUTHORITY_BOOTSTRAP !== "1") return null;
   if (process.env.NODE_ENV !== "test" || process.env.STUDIOOPS_TEST_ISOLATION !== "1") {
@@ -1117,6 +1124,159 @@ function mutationSnapshot(state) {
     }
   }
   return snapshot;
+}
+
+function operatorCandidateError(code) {
+  const error = new Error(code);
+  error.code = code;
+  throw error;
+}
+
+function freezeOperatorVerification(input) {
+  const sha = /^[a-f0-9]{40,64}$/;
+  const digest = /^sha256:[a-f0-9]{64}$/;
+  if (!input || typeof input !== "object" || Array.isArray(input)
+    || typeof input.taskId !== "string" || !input.taskId
+    || !digest.test(input.requestDigest) || !digest.test(input.scopeDigest)
+    || !input.candidate || !["baseSha", "commitSha", "treeSha"].every((key) => sha.test(input.candidate[key]))
+    || typeof input.candidate.branch !== "string" || !input.candidate.branch
+    || !input.frozenScopePlan || typeof input.frozenScopePlan !== "object"
+    || !Array.isArray(input.frozenScopePlan.allowedFileScope) || !input.frozenScopePlan.allowedFileScope.length
+    || !Array.isArray(input.dispositionTaskIds) || input.dispositionTaskIds.length > 32
+    || input.dispositionTaskIds.some((id) => typeof id !== "string" || !id || id === input.taskId)
+    || new Set(input.dispositionTaskIds).size !== input.dispositionTaskIds.length
+    || (input.conflictTaskIds !== undefined && (!Array.isArray(input.conflictTaskIds) || input.conflictTaskIds.length > 4096
+      || input.conflictTaskIds.some((id) => typeof id !== "string" || !id)
+      || new Set(input.conflictTaskIds).size !== input.conflictTaskIds.length))) {
+    operatorCandidateError("operator_candidate_verification_invalid");
+  }
+  const verification = structuredClone(input);
+  const freeze = (value) => {
+    if (!value || typeof value !== "object") return value;
+    for (const item of Object.values(value)) freeze(item);
+    return Object.freeze(value);
+  };
+  return freeze(verification);
+}
+
+function assertOperatorCandidateIdle(state, verification, nowMs = Date.now()) {
+  const ids = new Set([verification.taskId, ...verification.dispositionTaskIds, ...(verification.conflictTaskIds || [])]);
+  if ((state.runs || []).some((run) => ids.has(run.taskId) && ["queued", "running"].includes(run.status))) {
+    operatorCandidateError("operator_candidate_active_run");
+  }
+  const tasks = new Map((state.tasks || []).map((task) => [task.id, task]));
+  for (const id of ids) {
+    const task = tasks.get(id);
+    if (!task) operatorCandidateError("operator_candidate_task_missing");
+    for (const claim of [task.workflowLease, task.assignmentClaim]) {
+      if (claim && (!Number.isFinite(Date.parse(claim.expiresAt)) || Date.parse(claim.expiresAt) > nowMs)) {
+        operatorCandidateError("operator_candidate_active_ownership");
+      }
+    }
+  }
+}
+
+function assertNativeWorkspaceIngress(state, snapshot, options = {}) {
+  for (const run of state.runs || []) {
+    const prior = snapshot.tables.runs.get(run.id)?.payload;
+    const previous = prior ? JSON.parse(prior) : null;
+    const workspaceChanged = NATIVE_WORKSPACE_AUTHORITY_FIELDS.some((field) => JSON.stringify(previous?.[field]) !== JSON.stringify(run[field]));
+    const hadWorkspace = previous && NATIVE_WORKSPACE_AUTHORITY_FIELDS.some((field) => Object.hasOwn(previous, field));
+    if ((hadWorkspace || workspaceChanged) && previous
+      && NATIVE_WORKSPACE_IDENTITY_FIELDS.some((field) => previous[field] !== run[field])) {
+      operatorCandidateError("native_workspace_run_identity_immutable");
+    }
+    if (workspaceChanged && (!previous || options.nativeWorkspaceCapability !== NATIVE_WORKSPACE_WRITE
+      || options.nativeWorkspaceRunId !== run.id)) {
+      operatorCandidateError("native_workspace_verified_writer_required");
+    }
+  }
+}
+
+function assertOperatorCandidateIngress(state, snapshot, options = {}, verifyOrdinaryHandoff = false) {
+  const verification = options.operatorCandidateCapability === OPERATOR_CANDIDATE_WRITE
+    ? options.operatorCandidateVerification : null;
+  const tasks = new Map((state.tasks || []).map((task) => [task.id, task]));
+  let persistedRuns;
+  for (const [id, prior] of snapshot.tables.tasks) {
+    const previous = JSON.parse(prior.payload);
+    if (previous.operatorIntake && !tasks.has(id)) operatorCandidateError("operator_intake_history_immutable");
+  }
+  for (const task of state.tasks || []) {
+    const prior = snapshot.tables.tasks.get(task.id)?.payload;
+    const previous = prior ? JSON.parse(prior) : null;
+    const oldScope = previous?.impactScopePlan || previous?.impactPlan;
+    const nextScope = task.impactScopePlan || task.impactPlan;
+    const scopeAuthorityChanged = JSON.stringify(oldScope) !== JSON.stringify(nextScope)
+      || (previous?.impactScopePlan && JSON.stringify(previous.impactScopePlan) !== JSON.stringify(task.impactScopePlan));
+    const adoptionAuthorized = verification?.taskId === task.id;
+    const intakeChanged = JSON.stringify(previous?.operatorIntake) !== JSON.stringify(task.operatorIntake);
+    if (intakeChanged) {
+      if (!adoptionAuthorized) operatorCandidateError(previous?.operatorIntake ? "operator_intake_history_immutable" : "operator_intake_verified_writer_required");
+      if (previous?.operatorIntake) {
+        if (previous.operatorIntake.candidate?.treeSha === verification.candidate.treeSha) {
+          operatorCandidateError("operator_candidate_unchanged_material");
+        }
+        const receipt = (state.events || []).find((event) => !snapshot.tables.events.has(event.id)
+          && event.type === "operator_candidate_superseded" && event.taskId === task.id
+          && event.replacementRequestDigest === verification.requestDigest
+          && JSON.stringify(event.previousOperatorIntake) === JSON.stringify(previous.operatorIntake));
+        if (!receipt) operatorCandidateError("operator_intake_history_receipt_required");
+      }
+      const intake = task.operatorIntake;
+      if (!intake || intake.requestDigest !== verification.requestDigest || intake.scopeDigest !== verification.scopeDigest
+        || canonicalJson(intake.candidate) !== canonicalJson(verification.candidate)
+        || !["baseSha", "commitSha", "treeSha", "branch"].every((key) => task.candidateIdentity?.[key] === verification.candidate[key])
+        || task.status !== "builder_review" || task.reviewSubjectSha !== verification.candidate.commitSha) {
+        operatorCandidateError("operator_candidate_binding_mismatch");
+      }
+      const scope = task.impactScopePlan || task.impactPlan;
+      if (JSON.stringify(scope) !== JSON.stringify(verification.frozenScopePlan)
+        || (oldScope && (JSON.stringify(previous.impactScopePlan) !== JSON.stringify(task.impactScopePlan)
+          || JSON.stringify(previous.impactPlan) !== JSON.stringify(task.impactPlan)))) {
+        operatorCandidateError("operator_candidate_frozen_scope_mismatch");
+      }
+    }
+    if (scopeAuthorityChanged && options.scopedDispatchCapability !== SCOPED_DISPATCH_WRITE && !adoptionAuthorized) {
+      operatorCandidateError("frozen_scope_verified_writer_required");
+    }
+    const candidateChanged = !previous || previous.reviewSubjectSha !== task.reviewSubjectSha
+      || Number(previous.reviewSubjectCycle || 0) !== Number(task.reviewSubjectCycle || 0)
+      || canonicalJson(previous.candidateIdentity || {}) !== canonicalJson(task.candidateIdentity || {})
+      || canonicalJson(previous.impactEvidence || {}) !== canonicalJson(task.impactEvidence || {});
+    const reviewCandidateChanged = ["backend_review", "frontend_review", "accessibility_review", "regression_review", "lead_review", "qa_review", "user_review"]
+      .includes(task.status) && task.reviewSubjectSha && candidateChanged;
+    const handoff = reviewCandidateChanged || (task.status === "builder_review" && (!previous || previous.status !== task.status
+      || previous.reviewSubjectSha !== task.reviewSubjectSha
+      || Number(previous.reviewSubjectCycle || 0) !== Number(task.reviewSubjectCycle || 0)
+      || candidateChanged));
+    if (handoff && !(adoptionAuthorized && intakeChanged)) {
+      if (!oldScope) operatorCandidateError("builder_handoff_frozen_scope_required");
+      if (!verifyOrdinaryHandoff) operatorCandidateError("builder_handoff_verified_mutation_required");
+      const project = (state.projects || []).find((item) => item.id === task.projectId);
+      if (!project) operatorCandidateError("builder_handoff_project_missing");
+      // New or edited run rows in this proposal cannot authorize another source
+      // root. Only the prior persisted snapshot supplies native run provenance.
+      persistedRuns ||= [...snapshot.tables.runs.values()].map((run) => JSON.parse(run.payload));
+      verifyScopedBuilderHandoff(project, task, oldScope, { persistedRuns });
+    }
+  }
+}
+
+// Coordination writers do not all change the global state version. Recheck
+// their authoritative rows while holding the final SQLite transaction lock.
+function assertOperatorCandidateCommitFence(db, verification) {
+  if (!verification) return;
+  const ids = [...new Set([verification.taskId, ...verification.dispositionTaskIds, ...(verification.conflictTaskIds || [])])];
+  const nowMs = Date.now();
+  const placeholders = ids.map(() => "?").join(", ");
+  const leases = db.prepare(`SELECT expires_at FROM coordination_leases WHERE aggregate_id IN (${placeholders}) AND status = 'active'`).all(...ids);
+  if (leases.some((lease) => !Number.isFinite(Date.parse(lease.expires_at)) || Date.parse(lease.expires_at) > nowMs)) {
+    operatorCandidateError("operator_candidate_coordination_lease_active");
+  }
+  const tasks = db.prepare(`SELECT payload FROM tasks WHERE id IN (${placeholders})`).all(...ids).map((row) => parsePayload(row.payload, {}));
+  const runs = db.prepare(`SELECT payload FROM runs WHERE task_id IN (${placeholders}) AND status IN ('queued', 'running')`).all(...ids).map((row) => parsePayload(row.payload, {}));
+  assertOperatorCandidateIdle({ tasks, runs }, verification, nowMs);
 }
 
 function normalizeTaskStateVersions(state, snapshot) {
@@ -2503,6 +2663,14 @@ async function initializeStateDatabase() {
     db.exec("BEGIN IMMEDIATE");
     try {
       if (!stateDatabaseInitialized(db)) {
+        if ((state.tasks || []).some((task) => task.operatorIntake !== undefined)) {
+          operatorCandidateError("operator_intake_verified_writer_required");
+        }
+        // Serialized legacy paths remain audit data, but a cold import cannot
+        // manufacture native workspace authority. The producer must revalidate.
+        for (const run of state.runs || []) {
+          if (NATIVE_WORKSPACE_FIELDS.some((field) => Object.hasOwn(run, field))) run.workspaceProvenanceUntrusted = true;
+        }
         writeStateToOpenDatabase(db, state, {
           testFixtureLegacyAuthorityCapability:
             TEST_FIXTURE_LEGACY_AUTHORITY_BOOTSTRAP?.databaseCapability || null,
@@ -2692,6 +2860,8 @@ export async function writeDatabaseState(state) {
       const previousState = readStateFromOpenDatabase(db);
       assertMaintenanceWriteAllowed(previousState);
       const snapshot = mutationSnapshot(previousState);
+      assertNativeWorkspaceIngress(state, snapshot);
+      assertOperatorCandidateIngress(state, snapshot);
       assertProposedQaAuthorityPreserved(state, snapshot);
       reconcileStateIntegrity(state);
       normalizeTaskStateVersions(state, snapshot);
@@ -2721,6 +2891,8 @@ async function prepareDatabaseMutation(state, mutator, options) {
   // Mutators must only transform the supplied snapshot or perform retry-safe
   // reads. External writes belong in the fenced operation-intent workflow.
   const result = await mutator(state);
+  assertNativeWorkspaceIngress(state, snapshot, options);
+  assertOperatorCandidateIngress(state, snapshot, options, true);
   assertProposedQaAuthorityPreserved(state, snapshot, options);
   reconcileStateIntegrity(state);
   state.meta = state.meta || {};
@@ -2736,7 +2908,9 @@ async function prepareDatabaseMutation(state, mutator, options) {
     plan.updatedAt = now;
     plan.metaPayload = JSON.stringify(state.meta);
   }
-  return { result, plan, archiveRows };
+  const operatorVerification = options.operatorCandidateCapability === OPERATOR_CANDIDATE_WRITE
+    ? options.operatorCandidateVerification : null;
+  return { result, plan, archiveRows, operatorVerification };
 }
 
 export async function mutateDatabaseState(mutator, options = {}) {
@@ -2786,6 +2960,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
             {},
           );
           assertMaintenanceWriteAllowed({ meta: currentMeta });
+          assertOperatorCandidateCommitFence(db, prepared.operatorVerification);
           writeArchiveRows(db, archiveRows);
           applyMutationWrite(db, plan);
           recordContentionEvent(db, {
@@ -2840,6 +3015,54 @@ export async function mutateDatabaseState(mutator, options = {}) {
       await sleep(delayMs);
     }
   }
+}
+
+/** Executable, replayed verification is required before any operator intake. */
+export async function mutateOperatorCandidateState(verifySnapshot, mutator, options = {}) {
+  if (typeof verifySnapshot !== "function" || typeof mutator !== "function") {
+    throw new Error("Operator candidate writer requires executable verification and mutation callbacks.");
+  }
+  let verification = null;
+  return mutateDatabaseState(async (state) => {
+    verification = freezeOperatorVerification(await verifySnapshot(state));
+    assertOperatorCandidateIdle(state, verification);
+    return mutator(state, verification);
+  }, {
+    idempotent: true,
+    ...options,
+    operatorCandidateCapability: OPERATOR_CANDIDATE_WRITE,
+    get operatorCandidateVerification() { return verification; },
+  });
+}
+
+/** Trusted native dispatch/remap adapter; serialized options cannot mint it. */
+export async function mutateScopeDispatchState(mutator, options = {}) {
+  if (typeof mutator !== "function") throw new Error("Scoped dispatch writer requires a mutation callback.");
+  return mutateDatabaseState(mutator, { ...options, scopedDispatchCapability: SCOPED_DISPATCH_WRITE });
+}
+
+/** Only the native workspace producer may bind an existing run to prepared Git. */
+export async function mutateNativeWorkspaceState(runId, mutator, options = {}) {
+  const id = typeof runId === "string" ? runId.trim() : "";
+  if (!id || typeof mutator !== "function") throw new Error("Native workspace writer requires an existing run ID and mutation callback.");
+  return mutateDatabaseState(async (state) => {
+    const previous = (state.runs || []).find((run) => run.id === id);
+    if (!previous) operatorCandidateError("native_workspace_persisted_run_required");
+    const runIds = (state.runs || []).map((run) => run.id);
+    const nonWorkspaceFields = (run) => Object.fromEntries(Object.entries(run)
+      .filter(([key]) => ![...NATIVE_WORKSPACE_AUTHORITY_FIELDS, "updatedAt"].includes(key)));
+    const binding = canonicalJson(nonWorkspaceFields(previous));
+    const result = await mutator(state);
+    if (canonicalJson((state.runs || []).map((run) => run.id)) !== canonicalJson(runIds)) operatorCandidateError("native_workspace_run_set_immutable");
+    const current = (state.runs || []).find((run) => run.id === id);
+    if (canonicalJson(nonWorkspaceFields(current)) !== binding) operatorCandidateError("native_workspace_run_record_immutable");
+    return result;
+  }, {
+    idempotent: true,
+    ...options,
+    nativeWorkspaceCapability: NATIVE_WORKSPACE_WRITE,
+    nativeWorkspaceRunId: id,
+  });
 }
 
 /** Narrow writer for the first owner QA decision on an immutable candidate. */

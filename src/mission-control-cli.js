@@ -4,13 +4,15 @@ import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { readFile } from "node:fs/promises";
+import { readFile, stat, open } from "node:fs/promises";
+import os from "node:os";
+import { laneProfile, laneProfilesConflict, repositoryConflictIdentity } from "./work-lanes.js";
 import {
   addComment,
   adoptDefaultProjectStandards,
   addProject,
   addTask,
-  adoptCandidate,
+  adoptOperatorCandidate,
   automationTick,
   completeArchitecture,
   generatePrompt,
@@ -727,31 +729,77 @@ Automation:
 
   if (command === "adoption-status") {
     const taskId = args._[1];
-    if (!taskId) throw new Error("Usage: adoption-status TASK_ID");
     const state = await readStateReadOnly();
     const task = state.tasks.find((item) => item.id === taskId);
-    if (!task) throw new Error(`Unknown task: ${taskId}`);
-    console.log(JSON.stringify({ taskId, stateVersion: task.stateVersion || 1, status: task.status, scope: task.reviewedFiles || [], intake: task.operatorIntake || null, held: task.adoptionHeld === true }, null, 2));
+    if (!task) throw new Error("adoption_task_unknown");
+    console.log(JSON.stringify({ taskId, stateVersion: task.stateVersion, status: task.status,
+      scope: task.impactScopePlan || task.impactPlan || null, intake: task.operatorIntake || null,
+      unresolvedDependencies: (task.dependsOnTaskIds || []).filter((id) => !state.tasks.some((item) => item.id === id && ["done", "closed", "merged", "deployed"].includes(item.status))) }, null, 2));
     return;
   }
 
   if (command === "adopt-candidate") {
+    if (Object.keys(args).some((key) => !["_", "request-file", "preview"].includes(key)) || args._.length !== 2) throw new Error("adoption_cli_arguments_invalid");
     const taskId = args._[1];
-    const requestFile = String(args["request-file"] || "").trim();
-    if (!taskId || !requestFile) throw new Error("Usage: adopt-candidate TASK_ID --request-file FILE [--preview]");
-    if (!args.preview && args.confirm !== "ADOPT_CANDIDATE_V1") throw new Error("Commit adoption requires --confirm ADOPT_CANDIDATE_V1 and an interactive owner invocation.");
-    const parsed = JSON.parse(await readFile(requestFile, "utf8"));
-    if (parsed.actorContext !== undefined) throw new Error("Request files may not inject actorContext.");
-    const request = { ...parsed };
-    delete request.requestDigest;
-    const digest = adoptionRequestDigest(request);
-    const result = await adoptCandidate(taskId, {
-      ...request,
-      requestDigest: digest,
-      confirmation: args.confirm || request.confirmation,
-      actorContext: { actorId: String(args["actor-id"] || "local-owner").trim(), actorType: "owner", role: "owner", trusted: true },
-    }, { preview: Boolean(args.preview) });
-    console.log(JSON.stringify({ ...result, requestDigest: digest }, null, 2));
+    const requestFile = args["request-file"];
+    if (!taskId || typeof requestFile !== "string") throw new Error("Usage: adopt-candidate TASK_ID --request-file FILE [--preview]");
+    const file = await open(requestFile, "r");
+    let request;
+    try {
+      const metadata = await file.stat();
+      if (!metadata.isFile() || metadata.size > 65_536) throw new Error("adoption_request_too_large");
+      // A bounded read also handles a request file growing after stat.
+      const bytes = Buffer.alloc(65_537);
+      const read = await file.read(bytes, 0, bytes.length, 0);
+      if (read.bytesRead > 65_536) throw new Error("adoption_request_too_large");
+      request = JSON.parse(bytes.subarray(0, read.bytesRead).toString("utf8"));
+    } finally { await file.close(); }
+    const authority = {
+      assertNoConflicts(state, task, files, ids) {
+        const project = state.projects.find((item) => item.id === task.projectId);
+        const profile = { ...laneProfile(task, { role: "builder", fileScope: files, fileScopeExplicit: true }),
+          ...repositoryConflictIdentity(project), projectId: project.id };
+        const conflictTaskIds = state.tasks.filter((other) => {
+          if (other.id === task.id) return false;
+          const otherProject = state.projects.find((item) => item.id === other.projectId);
+          if (!otherProject) return true;
+          return laneProfilesConflict(profile, { ...laneProfile(other, { role: "builder" }),
+            ...repositoryConflictIdentity(otherProject), projectId: otherProject.id });
+        }).map((item) => item.id);
+        for (const run of state.runs || []) {
+          if (!["queued", "running"].includes(run.status)) continue;
+          if (ids.includes(run.taskId)) throw new Error("adoption_active_run");
+          const other = state.tasks.find((item) => item.id === run.taskId);
+          const otherProject = state.projects.find((item) => item.id === (other?.projectId || run.projectId));
+          if (!otherProject || !other) throw new Error("adoption_conflict_unknown");
+          const otherProfile = { ...laneProfile(other, { role: run.role || "builder" }),
+            ...repositoryConflictIdentity(otherProject), projectId: otherProject.id };
+          if (laneProfilesConflict(profile, otherProfile)) throw new Error("adoption_repository_conflict");
+        }
+        return conflictTaskIds;
+      },
+      async confirm(preview) {
+        if (process.env.MISSION_CONTROL_RUN_ID || process.env.MISSION_CONTROL_RUNNER_PATH || !input.isTTY || !output.isTTY) throw new Error("adoption_interactive_owner_required");
+        const tty = await open("/dev/tty", "r+");
+        try {
+          const ttyMetadata = await tty.stat();
+          if (!ttyMetadata.isCharacterDevice()) throw new Error("adoption_controlling_terminal_required");
+          const owner = os.userInfo();
+          const databaseOwner = await stat((await import("./state-database.js")).DATABASE_FILE);
+          if (databaseOwner.uid !== owner.uid || owner.uid !== process.geteuid()) throw new Error("adoption_os_owner_mismatch");
+          const terminal = readline.createInterface({ input, output });
+          try {
+            console.log(JSON.stringify(preview, null, 2));
+            const expected = `ADOPT ${preview.requestDigest}`;
+            const answer = await terminal.question(`Confirm this exact local candidate by typing ${expected}: `);
+            if (answer !== expected) throw new Error("adoption_confirmation_cancelled");
+          } finally { terminal.close(); }
+          return `local-os:${owner.uid}:${owner.username}`;
+        } finally { await tty.close(); }
+      },
+    };
+    const result = await adoptOperatorCandidate(taskId, request, authority, { preview: args.preview === true });
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
 

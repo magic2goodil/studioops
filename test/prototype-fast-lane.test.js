@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   addProject,
@@ -9,10 +13,52 @@ import {
   candidateIdentityIsComplete,
   normalizeDeliveryPolicy,
   readState,
+  updateRun,
   updateTask,
 } from "../src/store.js";
-import { planDispatches } from "../src/dispatcher.js";
+import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+
+async function scopedCandidateFixture(t, key, file) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "fast-lane-candidate-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("/usr/bin/git", ["-C", root, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const repository = `https://github.com/example/${key}`;
+  git("init", "-b", "main"); git("config", "user.name", "Fixture Author"); git("config", "user.email", "fixture@example.invalid");
+  git("remote", "add", "origin", repository);
+  await mkdir(path.dirname(path.join(root, file)), { recursive: true });
+  await mkdir(path.join(root, "test")); await mkdir(path.join(root, "docs/architecture"), { recursive: true });
+  await writeFile(path.join(root, file), "export const version = 1;\n");
+  await writeFile(path.join(root, "test/candidate.test.js"), "// Generic candidate fixture.\n");
+  await writeFile(path.join(root, "docs/architecture/components.json"), JSON.stringify({ schemaVersion: 1, project: { key, repository },
+    aggregateCommand: "npm run check", components: { candidate: { owner: "fixture-engineering", paths: [file, "test/candidate.test.js"],
+      publicContracts: ["candidate value"], services: ["candidate module"], dependsOn: [],
+      tests: [{ command: "node --test test/candidate.test.js", layer: "unit" }], reviewOwners: ["lead-reviewer"], rollback: "Restore the prior fixture commit." } } }));
+  git("add", "."); git("commit", "-m", "Generic candidate base");
+  const baseSha = git("rev-parse", "HEAD");
+  const branch = `feature/${key}`;
+  git("switch", "-c", branch);
+  const project = await addProject({ key, name: "Generic fast-lane fixture", workflowMode: "github", repoPath: root, sourceRepoPath: root, repoUrl: repository,
+    deliveryPolicy: { profile: "prototype-fast-lane" } });
+  const task = await addTask({ project: project.id, title: "Review real candidate metadata", type: "bug", architectureRequired: false, status: "ready",
+    description: "Validate real candidate identity with native frozen edit scope.", userStory: "As a reviewer I need exact candidate metadata.",
+    expectedOutcome: "Candidate review cycles retain their intended semantics.", acceptanceCriteria: ["Candidate identity remains exact."], workAreas: [file], branchName: branch,
+    affectedSurfaces: [file], validationPlan: ["node --test test/candidate.test.js"], riskClassification: "low",
+    privacyNotes: "Generic synthetic source only; no personal data.", securityNotes: "No network access or external executor is used." });
+  // Native dispatch freezes the mapped edit authority. The isolated queued run
+  // is cancelled before any executor starts; no scope record is injected.
+  const report = await dispatchSupervisorActions([{ id: `${task.id}:start_builder`, type: "start_builder", role: "builder", taskId: task.id, projectId: project.id,
+    taskStatus: "ready", nextStatus: "in_progress" }], { failureIncidents: [], creditPolicy: { enabled: false } });
+  assert.equal(report.runs.length, 1, JSON.stringify(report.skipped));
+  await updateRun(report.runs[0].id, { status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch." });
+  await updateTask(task.id, { status: "in_progress" });
+  const commit = async (version) => {
+    await writeFile(path.join(root, file), `export const version = ${version};\n`);
+    git("add", file); git("commit", "-m", `Candidate version ${version}`);
+    return { commitSha: git("rev-parse", "HEAD"), treeSha: git("rev-parse", "HEAD^{tree}"), baseSha, branch, candidateCycle: 1 };
+  };
+  return { task, project, git, commit };
+}
 
 test("delivery policy fails closed and never enables merge or deployment", () => {
   assert.equal(normalizeDeliveryPolicy({ profile: "ambiguous" }).profile, "standard");
@@ -148,31 +194,14 @@ test("custom backend stages are skipped by their actual identity and cannot also
   assert.equal(plan.skipped[0].reason, "review_stage_unknown");
 });
 
-test("current impact evidence refreshes identity and unchanged-tree metadata repair keeps both cycles stable", async () => {
-  const firstSha = "d".repeat(40);
-  const metadataSha = "e".repeat(40);
-  const treeSha = "f".repeat(40);
-  const baseSha = "1".repeat(40);
+test("current impact evidence refreshes identity and unchanged-tree metadata repair keeps both cycles stable", async (t) => {
+  const fixture = await scopedCandidateFixture(t, "fast-lane-cycle-stability", "src/App.jsx");
+  const { task, git } = fixture;
+  const coordinates = await fixture.commit(2);
+  const firstSha = coordinates.commitSha;
   const impactEvidence = { changedFiles: ["src/App.jsx"], impact: ["frontend"] };
-  const project = await addProject({
-    key: "fast-lane-cycle-stability",
-    name: "Fast lane cycle stability",
-    workflowMode: "github",
-    deliveryPolicy: { profile: "prototype-fast-lane" },
-  });
-  const task = await addTask({
-    project: project.id,
-    title: "Metadata-only repair",
-    status: "in_progress",
-    branchName: "feature/metadata-only",
-    impactEvidence,
-  });
   const identity = {
-    commitSha: firstSha,
-    treeSha,
-    baseSha,
-    branch: "feature/metadata-only",
-    candidateCycle: 1,
+    ...coordinates,
     impactEvidence: { changedFiles: ["stale/old.jsx"] },
   };
 
@@ -191,6 +220,9 @@ test("current impact evidence refreshes identity and unchanged-tree metadata rep
   assert.equal(current.reviewSubjectCycle, 1);
 
   await updateTask(task.id, { status: "needs_changes" });
+  git("commit", "--allow-empty", "-m", "Metadata-only candidate repair");
+  const metadataSha = git("rev-parse", "HEAD");
+  assert.equal(git("rev-parse", "HEAD^{tree}"), coordinates.treeSha);
   await updateTask(task.id, {
     status: "builder_review",
     subjectSha: metadataSha,
@@ -205,27 +237,13 @@ test("current impact evidence refreshes identity and unchanged-tree metadata rep
   assert.deepEqual(current.candidateIdentity.impactEvidence.changedFiles, ["src/App.jsx"]);
 });
 
-test("an atomic builder handoff replaces stale candidate coordinates without an intermediate review restart", async () => {
-  const originalSha = "6".repeat(40);
-  const correctedSha = "7".repeat(40);
-  const project = await addProject({
-    key: "atomic-candidate-handoff",
-    name: "Atomic candidate handoff",
-    workflowMode: "github",
-    deliveryPolicy: { profile: "prototype-fast-lane" },
-  });
-  const task = await addTask({
-    project: project.id,
-    title: "Reviewer correction",
-    status: "in_progress",
-    branchName: "feature/atomic-handoff",
-  });
+test("an atomic builder handoff replaces stale candidate coordinates without an intermediate review restart", async (t) => {
+  const fixture = await scopedCandidateFixture(t, "atomic-candidate-handoff", "src/store.js");
+  const { task } = fixture;
+  const original = await fixture.commit(2);
+  const originalSha = original.commitSha;
   const identity = {
-    commitSha: originalSha,
-    treeSha: "8".repeat(40),
-    baseSha: "9".repeat(40),
-    branch: "feature/atomic-handoff",
-    candidateCycle: 1,
+    ...original,
     impactEvidence: { changedFiles: ["src/store.js"] },
   };
 
@@ -236,14 +254,15 @@ test("an atomic builder handoff replaces stale candidate coordinates without an 
     candidateIdentity: identity,
   });
   await updateTask(task.id, { status: "in_progress" });
+  const corrected = await fixture.commit(3);
+  const correctedSha = corrected.commitSha;
   await updateTask(task.id, {
     status: "builder_review",
     subjectSha: correctedSha,
     impactEvidence: identity.impactEvidence,
     candidateIdentity: {
       ...identity,
-      commitSha: correctedSha,
-      treeSha: "a".repeat(40),
+      ...corrected,
       candidateCycle: 2,
     },
   });
@@ -255,41 +274,27 @@ test("an atomic builder handoff replaces stale candidate coordinates without an 
   assert.equal(current.reviewSubjectCycle, 2);
   assert.equal(current.reviewSubjectSha, correctedSha);
   assert.equal(current.candidateIdentity.commitSha, correctedSha);
-  assert.equal(current.candidateIdentity.treeSha, "a".repeat(40));
+  assert.equal(current.candidateIdentity.treeSha, corrected.treeSha);
   assert.equal(
     state.events.some((event) => event.taskId === task.id && event.type === "review_subject_changed"),
     false,
   );
 });
 
-test("material impact changes invalidate same-SHA capability skips and start a new candidate cycle", async () => {
-  const sha = "2".repeat(40);
-  const project = await addProject({
-    key: "fast-lane-impact-reclassification",
-    name: "Fast lane impact reclassification",
-    workflowMode: "github",
-    deliveryPolicy: { profile: "prototype-fast-lane" },
-  });
-  const task = await addTask({
-    project: project.id,
-    title: "Reclassify candidate impact",
-    status: "in_progress",
-    branchName: "feature/reclassification",
-    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
-  });
+test("material impact changes invalidate same-SHA capability skips and start a new candidate cycle", async (t) => {
+  const fixture = await scopedCandidateFixture(t, "fast-lane-impact-reclassification", "src/App.jsx");
+  const { task } = fixture;
+  const identity = await fixture.commit(2);
+  const sha = identity.commitSha;
 
   await updateTask(task.id, {
     status: "builder_review",
-    branchName: "feature/reclassification",
+    branchName: identity.branch,
     prUrl: "https://github.com/example/demo/pull/3",
     subjectSha: sha,
     impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
     candidateIdentity: {
-      commitSha: sha,
-      treeSha: "3".repeat(40),
-      baseSha: "4".repeat(40),
-      branch: "feature/reclassification",
-      candidateCycle: 1,
+      ...identity,
       impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["frontend"] },
     },
   });
@@ -301,7 +306,7 @@ test("material impact changes invalidate same-SHA capability skips and start a n
   assert.equal(state.reviews.find((review) => review.taskId === task.id && review.stageKey === "backend")?.outcome, "skipped");
 
   await updateTask(task.id, {
-    impactEvidence: { changedFiles: ["src/store.js"], impact: ["backend"] },
+    impactEvidence: { changedFiles: ["src/App.jsx"], impact: ["backend"] },
   });
   state = await readState();
   current = state.tasks.find((item) => item.id === task.id);
@@ -310,7 +315,7 @@ test("material impact changes invalidate same-SHA capability skips and start a n
   assert.equal(current.reviewSubjectCycle, 2);
   assert.equal(current.status, "backend_review");
   assert.equal(current.assignedAgentRole, "backend-reviewer");
-  assert.deepEqual(current.candidateIdentity.impactEvidence.changedFiles, ["src/store.js"]);
+  assert.deepEqual(current.candidateIdentity.impactEvidence.changedFiles, ["src/App.jsx"]);
   assert.equal(
     state.reviews.some((review) => (
       review.taskId === task.id
