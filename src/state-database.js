@@ -394,7 +394,7 @@ function safeMutationFailureCode(error) {
   return new Set([
     "STUDIOOPS_STATE_CONFLICT", "STUDIOOPS_SERIALIZED_REPLAY_TIMEOUT",
     "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT", "STUDIOOPS_DATABASE_TRANSACTION_REENTRY",
-    "STUDIOOPS_MAINTENANCE",
+    "STUDIOOPS_MAINTENANCE", "STUDIOOPS_TASK_RECORDING_TIMEOUT",
   ]).has(error?.code) ? error.code : "MUTATION_FAILED";
 }
 
@@ -3239,6 +3239,274 @@ export async function mutateDatabaseState(mutator, options = {}) {
       );
       await sleep(delayMs);
     }
+  }
+}
+
+
+// Closed workflow-state recording operations. No caller callback or serialized
+// purity/role flag can execute work while the SQLite writer is held.
+const TASK_RECORDING_UNSUPPORTED = Symbol("task-recording-unsupported");
+const TASK_RECORDING_TRANSACTION_MS = 1000;
+const TASK_RECORDING_MAX_ROWS = 50000;
+
+function recordingTaskById(state, taskId) {
+  return state.tasks.find((task) => task.id === taskId) || null;
+}
+
+export function dependencyGraphErrorsInState(state = { tasks: [] }, task = {}) {
+  const errors = [];
+  const tasks = task.id
+    ? [...(state.tasks || []).filter((item) => item.id !== task.id), task]
+    : state.tasks || [];
+  const byId = new Map(tasks.map((item) => [item.id, item]));
+  const visiting = new Set();
+  const visited = new Set();
+  function visit(id, path = []) {
+    if (visiting.has(id)) {
+      errors.push(`Dependency cycle detected: ${[...path, id].join(" -> ")}`);
+      return;
+    }
+    if (visited.has(id)) return;
+    const current = byId.get(id);
+    if (!current) {
+      errors.push(`Unknown dependency task: ${id}`);
+      return;
+    }
+    visiting.add(id);
+    for (const dependencyId of current.dependsOnTaskIds || []) {
+      const dependency = byId.get(dependencyId);
+      if (dependency && current.projectId !== dependency.projectId) {
+        errors.push(`Cross-project dependency is not allowed: ${current.id} -> ${dependency.id}`);
+      }
+      visit(dependencyId, [...path, id]);
+    }
+    visiting.delete(id);
+    visited.add(id);
+  }
+  visit(task.id, []);
+  return [...new Set(errors)];
+}
+
+export function validateTaskRelationshipsInState(state, taskId, parentTaskId, dependsOnTaskIds) {
+  if (parentTaskId) {
+    if (parentTaskId === taskId) throw new Error("A task cannot be its own parent.");
+    if (!recordingTaskById(state, parentTaskId)) throw new Error(`Unknown parent task: ${parentTaskId}`);
+    const seen = new Set([taskId]);
+    let currentParentId = parentTaskId;
+    while (currentParentId) {
+      if (seen.has(currentParentId)) throw new Error("Task parent relationship would create a cycle.");
+      seen.add(currentParentId);
+      currentParentId = recordingTaskById(state, currentParentId)?.parentTaskId || "";
+    }
+  }
+  for (const dependencyId of dependsOnTaskIds || []) {
+    if (dependencyId === taskId) throw new Error("A task cannot depend on itself.");
+    const dependency = recordingTaskById(state, dependencyId);
+    if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
+    const task = taskId ? recordingTaskById(state, taskId) : null;
+    if (task && task.projectId !== dependency.projectId) {
+      throw new Error(`Cross-project dependency is not allowed: ${taskId} -> ${dependencyId}`);
+    }
+  }
+  if (taskId) {
+    const errors = dependencyGraphErrorsInState(state, {
+      ...recordingTaskById(state, taskId),
+      dependsOnTaskIds,
+    });
+    if (errors.length) throw new Error(errors[0]);
+  }
+}
+
+function taskRecordingInput(input) {
+  if (!input || ![Object.prototype, null].includes(Object.getPrototypeOf(input))) throw new TypeError("Invalid task recording operation.");
+  const properties = Object.getOwnPropertyDescriptors(input);
+  const keys = Reflect.ownKeys(properties);
+  if (keys.some((key) => typeof key !== "string" || !Object.hasOwn(properties[key], "value"))) throw new TypeError("Task recording requires inert data values.");
+  const value = Object.fromEntries(keys.map((key) => [key, properties[key].value]));
+  const allowed = value.kind === "add_comment" ? ["kind", "taskId", "body", "author"]
+    : value.kind === "set_pr_url" ? ["kind", "taskId", "prUrl"] : [];
+  if (keys.length !== allowed.length || keys.some((key) => !allowed.includes(key))
+    || typeof value.taskId !== "string" || value.taskId.length > 1024
+    || (value.kind === "add_comment" && (typeof value.body !== "string" || value.body.length > 65536
+      || value.body !== value.body.trim() || typeof value.author !== "string" || value.author.length > 1024))
+    || (value.kind === "set_pr_url" && (typeof value.prUrl !== "string" || value.prUrl.length > 8192))) {
+    throw new TypeError("Invalid task recording operation.");
+  }
+  if (value.kind === "set_pr_url") value.prUrl = value.prUrl.trim();
+  return value;
+}
+
+function recordingDeadline(deadlineAt, operationName) {
+  if (Date.now() < deadlineAt) return;
+  const error = new Error(`Bounded task recording exceeded its transaction deadline during ${operationName}.`);
+  error.code = "STUDIOOPS_TASK_RECORDING_TIMEOUT";
+  throw error;
+}
+
+function recordingNextId(db, table, prefix, check) {
+  // Match nextId's active-namespace Number(id.split('_')[1]) semantics exactly.
+  // Historical archive IDs are not an authorization to change ID policy.
+  const rows = db.prepare(`SELECT id FROM ${table} LIMIT ?`).all(TASK_RECORDING_MAX_ROWS + 1);
+  if (rows.length > TASK_RECORDING_MAX_ROWS) throw TASK_RECORDING_UNSUPPORTED;
+  let highest = 0;
+  for (const row of rows) {
+    check();
+    const id = String(row.id || "");
+    if (!id.startsWith(`${prefix}_`)) continue;
+    const value = Number(id.split("_")[1]);
+    if (Number.isFinite(value)) highest = Math.max(highest, value);
+  }
+  return `${prefix}_${highest + 1}`;
+}
+
+function recordingRelationships(db, task, check) {
+  const rows = new Map([[task.id, task]]);
+  const read = (id) => {
+    check();
+    if (typeof id !== "string") throw TASK_RECORDING_UNSUPPORTED;
+    if (!rows.has(id)) {
+      if (rows.size >= 1024) throw TASK_RECORDING_UNSUPPORTED;
+      const row = db.prepare("SELECT id, project_id, payload FROM tasks WHERE id = ?").get(id);
+      const value = row ? parsePayload(row.payload, null) : null;
+      if (value && (value.id !== row.id || value.projectId !== row.project_id)) throw TASK_RECORDING_UNSUPPORTED;
+      rows.set(id, value);
+    }
+    return rows.get(id);
+  };
+  const parents = new Set();
+  let parent = task.parentTaskId;
+  while (parent && !parents.has(parent)) {
+    parents.add(parent); parent = read(parent)?.parentTaskId;
+  }
+  const pending = [task], seen = new Set();
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current || seen.has(current.id)) continue;
+    seen.add(current.id);
+    if (current.dependsOnTaskIds !== undefined && !Array.isArray(current.dependsOnTaskIds)) throw TASK_RECORDING_UNSUPPORTED;
+    for (const id of current.dependsOnTaskIds || []) {
+      if (typeof id !== "string") throw TASK_RECORDING_UNSUPPORTED;
+      pending.push(read(id));
+    }
+  }
+  const state = { tasks: [...rows.values()].filter(Boolean) };
+  validateTaskRelationshipsInState(state, task.id, task.parentTaskId, task.dependsOnTaskIds || []);
+}
+
+function currentPrUrlRecordingEligible(task) {
+  const identity = task.candidateIdentity || {};
+  return ["idea", "ready", "queued", "blocked", "needs_changes"].includes(task.status)
+    && Number(task.reviewCycle || 0) === 0 && Number(task.reviewSubjectCycle || 0) === 0
+    && !task.reviewSubjectSha && !task.candidateId && !task.qaBundleId && !task.operatorIntake
+    && !task.branchName && !task.operationalLocalArtifactRef && !task.workflowLease && !task.assignmentClaim
+    && !task.automationCircuit && task.automationBlocker?.type !== "circuit"
+    && !identity.commitSha && !identity.treeSha && !identity.baseSha && !identity.branch && Number(identity.candidateCycle || 0) === 0;
+}
+
+function retainRecordedEventGroup(db, event, meta, now, check) {
+  const rows = db.prepare("SELECT id, payload FROM events WHERE task_id = ? AND type = ? ORDER BY sequence LIMIT ?")
+    .all(event.taskId, event.type, TASK_RECORDING_MAX_ROWS + 1);
+  if (rows.length > TASK_RECORDING_MAX_ROWS) throw TASK_RECORDING_UNSUPPORTED;
+  const group = rows.map((row) => {
+    check();
+    const value = parsePayload(row.payload, null);
+    if (!value || value.id !== row.id) throw TASK_RECORDING_UNSUPPORTED;
+    return value;
+  }).filter((value) => value.machineGenerated !== false && !value.executionKey && !value.attemptKey && !value.dispatchKey);
+  const archived = group.slice(0, Math.max(0, group.length - ACTIVE_QA_EVENTS_PER_TASK));
+  if (!archived.length) return;
+  archiveOperationalHistory(db, { comments: [], events: archived, runs: [] }, now);
+  const remove = db.prepare("DELETE FROM events WHERE id = ?");
+  for (const value of archived) { check(); remove.run(value.id); }
+  recordOperationalArchiveMetadata({ meta }, { comments: [], events: archived, runs: [] }, now);
+}
+
+/** Two audited current-row operations; all generic/async/Git work remains off-lock. */
+export async function recordCurrentTaskOperation(input) {
+  const operation = taskRecordingInput(input);
+  const operationName = operation.kind === "add_comment" ? "task.add_comment" : "task.update";
+  const startedAt = Date.now(), lockDeadlineAt = startedAt + SERIALIZED_REPLAY_LOCK_DEADLINE_MS;
+  let retryCount = 0, lockWaitMs = 0;
+  try {
+    while (true) {
+      const lockStartedAt = Date.now();
+      let acquired = false;
+      try {
+        const result = await withStateDatabaseConnection((db) => {
+          let transactionStarted = false;
+          try {
+            beginSerializedReplayTransaction(db, operationName, lockDeadlineAt, retryCount);
+            transactionStarted = true; acquired = true; lockWaitMs += Date.now() - lockStartedAt;
+            const deadlineAt = Date.now() + TASK_RECORDING_TRANSACTION_MS;
+            const check = () => recordingDeadline(deadlineAt, operationName);
+            const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+            assertMaintenanceWriteAllowed({ meta }); check();
+            const row = db.prepare("SELECT * FROM tasks WHERE id = ?").get(operation.taskId);
+            if (!row) throw new Error(`Unknown task: ${operation.taskId}`);
+            const task = parsePayload(row.payload, null);
+            if (!task || task.id !== row.id || task.projectId !== row.project_id || task.status !== row.status
+              || task.stateVersion !== row.state_version || !VALID_TASK_STATUSES.has(task.status)
+              || typeof task.title !== "string") throw TASK_RECORDING_UNSUPPORTED;
+            const projectRow = db.prepare("SELECT id, payload FROM projects WHERE id = ?").get(task.projectId);
+            const project = projectRow ? parsePayload(projectRow.payload, null) : null;
+            if (!project || project.id !== projectRow.id) throw TASK_RECORDING_UNSUPPORTED;
+            if (operation.kind === "set_pr_url") {
+              if (!currentPrUrlRecordingEligible(task)) throw TASK_RECORDING_UNSUPPORTED;
+              recordingRelationships(db, task, check);
+            } else if (QA_COMMENT_AUTHORS.has(operation.author) && /^QA integration\b/.test(operation.body)) {
+              throw TASK_RECORDING_UNSUPPORTED;
+            }
+            if (operation.kind === "add_comment" && !operation.body) throw new Error("Comment body is required.");
+            check();
+            const now = new Date().toISOString();
+            const event = { id: recordingNextId(db, "events", "event", check),
+              type: operation.kind === "add_comment" ? "comment_created" : "task_updated",
+              projectId: task.projectId, taskId: task.id,
+              message: operation.kind === "add_comment" ? `Comment added to ${task.title}` : `Task updated: ${task.title}`,
+              createdAt: now };
+            let value;
+            if (operation.kind === "add_comment") {
+              value = { id: recordingNextId(db, "comments", "comment", check), taskId: task.id,
+                author: operation.author, body: operation.body, createdAt: now };
+              const sequence = Number(db.prepare("SELECT COALESCE(MAX(sequence), -1) + 1 AS value FROM comments").get().value);
+              db.prepare("INSERT INTO comments(id, sequence, task_id, created_at, payload) VALUES (?, ?, ?, ?, ?)")
+                .run(value.id, sequence, task.id, now, JSON.stringify(value));
+            } else {
+              task.prUrl = operation.prUrl; task.updatedAt = now; value = task;
+              // prUrl is not lifecycle evidence: preserve the current task version.
+              db.prepare("UPDATE tasks SET updated_at = ?, payload = ? WHERE id = ?")
+                .run(now, JSON.stringify(task), task.id);
+            }
+            check();
+            const sequence = Number(db.prepare("SELECT COALESCE(MAX(sequence), -1) + 1 AS value FROM events").get().value);
+            db.prepare("INSERT INTO events(id, sequence, project_id, task_id, type, created_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)")
+              .run(event.id, sequence, task.projectId, task.id, event.type, now, JSON.stringify(event));
+            retainRecordedEventGroup(db, event, meta, now, check); check();
+            meta.updatedAt = now; meta.storageBackend = "sqlite";
+            db.prepare("UPDATE state_meta SET payload = ?, version = version + 1, updated_at = ? WHERE singleton_id = 1")
+              .run(JSON.stringify(meta), now);
+            check();
+            recordContentionEvent(db, { operationName, outcome: "current_record_committed", waitMs: lockWaitMs,
+              durationMs: Date.now() - startedAt, retryCount });
+            check(); db.exec("COMMIT"); transactionStarted = false; cachedReadSnapshot = null;
+            return { handled: true, value };
+          } catch (error) {
+            if (transactionStarted) db.exec("ROLLBACK");
+            if (error === TASK_RECORDING_UNSUPPORTED) return { handled: false };
+            throw error;
+          }
+        }, { operationName, deadlineAt: lockDeadlineAt }).finally(() => { if (!acquired) lockWaitMs += Date.now() - lockStartedAt; });
+        await secureStoragePaths(); return result;
+      } catch (error) {
+        if (!isSqliteBusy(error) || Date.now() >= lockDeadlineAt) throw error;
+        retryCount += 1;
+        await sleep(Math.min(retryDelayMs(retryCount), Math.max(1, lockDeadlineAt - Date.now())));
+      }
+    }
+  } catch (error) {
+    error.operationName = operationName; error.retryCount = retryCount;
+    await recordFailedContentionEvent({ operationName, waitMs: lockWaitMs, durationMs: Date.now() - startedAt, retryCount }, error);
+    throw error;
   }
 }
 

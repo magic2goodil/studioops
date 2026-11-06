@@ -1634,6 +1634,332 @@ test("same-process asynchronous mutations retain every update through optimistic
   }
 });
 
+test("default empty candidate identity remains eligible for exact PR URL recording", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-empty-candidate-record-"));
+  try {
+    const initial = baseState();
+    initial.tasks[0] = { ...initial.tasks[0], status: "blocked", stateVersion: 3,
+      reviewCycle: 0, reviewSubjectCycle: 0, reviewSubjectSha: "", branchName: "",
+      candidateIdentity: { commitSha: "", treeSha: "", baseSha: "", branch: "", candidateCycle: 0,
+        impactEvidence: { changedFiles: [], classifications: [], unknown: true,
+          backendRequired: true, frontend: false, accessibility: false }, operationalLocalArtifactRef: "" } };
+    await writeLegacyState(root, initial);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { addComment, updateTask, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      const before = (await readState()).tasks[0];
+      const task = await updateTask("task_1", {prUrl: " https://example.invalid/example/project/pull/12 "});
+      assert.equal(task.prUrl, "https://example.invalid/example/project/pull/12");
+      assert.deepEqual(task, {...before, prUrl: task.prUrl, updatedAt: task.updatedAt});
+      assert.equal(task.stateVersion, 3);
+      await addComment("task_1", "Recorded against the held prerequisite");
+      assert.deepEqual((await readState()).tasks[0], task);
+      await withStateDatabaseConnection(db => {
+        const rows = db.prepare("SELECT outcome FROM database_contention_events WHERE operation_name IN ('task.add_comment', 'task.update')").all();
+        assert.equal(rows.length, 2);
+        assert.ok(rows.every(row => row.outcome === "current_record_committed"));
+      });
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("five public recording writers commit every comment and exact PR URL against current rows", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-current-record-writers-"));
+  try {
+    const initial = baseState();
+    initial.meta.recordingFixture = { unrelated: "preserved", nested: [1, 2, 3] };
+    for (let index = 0; index < 5; index += 1) {
+      initial.tasks.push({ id: `task_writer_${index}`, projectId: "project_1", title: `Writer ${index}`,
+        status: "blocked", reviewCycle: 0, stateVersion: 3, dependsOnTaskIds: ["task_1"],
+        automationBlocker: { type: "configuration", reason: "Retained prerequisite" } });
+    }
+    for (let index = 0; index < 1000; index += 1) {
+      initial.tasks.push({ id: `task_history_${index}`, projectId: "project_1", title: `History ${index}`,
+        status: "ready", description: "Unrelated task metadata", stateVersion: 2 });
+      initial.comments.push({ id: `comment_${index + 1}`, taskId: `task_history_${index}`,
+        author: "Fixture", body: `Retained comment ${index}`, createdAt: "2026-01-01T00:00:00.000Z" });
+    }
+    for (let index = 0; index < 1200; index += 1) {
+      initial.events.push({ id: `event_${index + 1}`, projectId: "project_1", taskId: "task_1",
+        type: `retained_${index}`, message: "Unrelated history", createdAt: "2026-01-01T00:00:00.000Z" });
+    }
+    for (const id of ["comment_1500_extra", "comment_0x600", "comment_2e3_extra"]) {
+      initial.comments.push({ id, taskId: "task_1", author: "Fixture", body: "Active ID semantics" });
+    }
+    await writeLegacyState(root, initial);
+    await runStoreScript(root, `
+      import { readState } from ${JSON.stringify(storeModuleUrl)};
+      import { withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      await withStateDatabaseConnection(db => {
+        const insert = db.prepare("INSERT INTO operational_archive(entity_type, entity_id, project_id, task_id, created_at, archived_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        for (const [kind, id] of [["comments", "comment_99999999"], ["events", "event_99999999"]])
+          insert.run(kind, id, "project_1", "task_1", "", "", JSON.stringify({id, retained: true}));
+      });
+    `);
+    const before = readPersistedState(root);
+    const databasePath = path.join(root, "data", "mission-control.sqlite3");
+    const beforeDb = new DatabaseSync(databasePath, { readOnly: true });
+    const beforeVersion = beforeDb.prepare("SELECT version FROM state_meta").get().version;
+    beforeDb.close();
+    const results = await Promise.all(Array.from({ length: 5 }, (_, worker) => runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { addComment, updateTask } from ${JSON.stringify(storeModuleUrl)};
+      const ids = [];
+      for (let index = 0; index < 10; index += 1) {
+        const result = await addComment("task_1", " writer-${worker}-" + index + " ", "Recording test");
+        assert.equal(result.body, "writer-${worker}-" + index);
+        ids.push(result.id);
+        const task = await updateTask("task_writer_${worker}", { prUrl: " https://example.invalid/pull/${worker}-" + index + " " });
+        assert.equal(task.prUrl, "https://example.invalid/pull/${worker}-" + index);
+        assert.equal(task.stateVersion, 3);
+      }
+      process.stdout.write(JSON.stringify(ids));
+    `)));
+    const ids = results.flatMap(({ stdout }) => JSON.parse(stdout));
+    assert.equal(new Set(ids).size, 50);
+    assert.deepEqual(ids.map(id => Number(id.split("_")[1])).sort((a, b) => a - b),
+      Array.from({ length: 50 }, (_, index) => 2001 + index));
+    const after = readPersistedState(root);
+    assert.deepEqual(after.tasks.filter(item => item.id.startsWith("task_history_")),
+      before.tasks.filter(item => item.id.startsWith("task_history_")));
+    assert.deepEqual(after.tasks.find(item => item.id === "task_1"), before.tasks.find(item => item.id === "task_1"));
+    assert.deepEqual(after.comments.filter(item => !ids.includes(item.id)), before.comments);
+    assert.deepEqual(after.meta.recordingFixture, before.meta.recordingFixture);
+    assert.deepEqual(after.runs, before.runs);
+    assert.deepEqual(after.reviews, before.reviews);
+    assert.deepEqual(after.qaBundles, before.qaBundles);
+    assert.equal(after.comments.length, before.comments.length + 50);
+    for (let worker = 0; worker < 5; worker += 1) {
+      const task = after.tasks.find(item => item.id === `task_writer_${worker}`);
+      const expected = { ...before.tasks.find(item => item.id === task.id), prUrl: `https://example.invalid/pull/${worker}-9`, updatedAt: task.updatedAt };
+      assert.deepEqual(task, expected);
+      for (let index = 0; index < 10; index += 1)
+        assert.equal(after.comments.filter(item => item.body === `writer-${worker}-${index}`).length, 1);
+    }
+    const db = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT version FROM state_meta").get().version, beforeVersion + 100);
+      const events = db.prepare("SELECT payload FROM events UNION ALL SELECT payload FROM operational_archive WHERE entity_type = 'events'")
+        .all().map(row => JSON.parse(row.payload));
+      assert.equal(events.filter(item => item.type === "comment_created").length, 50);
+      assert.equal(events.filter(item => item.type === "task_updated").length, 50);
+      assert.equal(after.events.filter(item => item.type === "comment_created").length, 40);
+      assert.equal(after.meta.operationalArchive.events, 10);
+      assert.equal(db.prepare("SELECT count(*) count FROM operational_archive WHERE entity_id = 'comment_99999999'").get().count, 1);
+      assert.equal(db.prepare("SELECT count(*) count FROM operational_archive WHERE entity_id = 'event_99999999'").get().count, 1);
+      const timings = db.prepare("SELECT outcome FROM database_contention_events WHERE operation_name IN ('task.add_comment', 'task.update')").all();
+      assert.equal(timings.length, 100);
+      assert.ok(timings.every(item => item.outcome === "current_record_committed"));
+    } finally { db.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("current recording refreshes task and metadata after connection ownership is granted", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-current-record-refresh-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { addComment, updateTask, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { withStateDatabaseConnection, readDatabaseStateCached } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      const first = await readDatabaseStateCached();
+      let entered, resume;
+      const ready = new Promise(resolve => { entered = resolve; });
+      const pause = new Promise(resolve => { resume = resolve; });
+      const owner = withStateDatabaseConnection(async db => {
+        entered(); await pause;
+        db.exec("BEGIN IMMEDIATE");
+        const row = db.prepare("SELECT payload FROM tasks WHERE id = 'task_1'").get();
+        const task = JSON.parse(row.payload);
+        task.title = "Current title";
+        task.description = "Committed while the recorder waited";
+        task.stateVersion += 1;
+        db.prepare("UPDATE tasks SET payload = ?, state_version = ? WHERE id = ?").run(JSON.stringify(task), task.stateVersion, task.id);
+        const meta = JSON.parse(db.prepare("SELECT payload FROM state_meta").get().payload);
+        meta.concurrentMarker = { retained: true };
+        db.prepare("UPDATE state_meta SET payload = ?, version = version + 1").run(JSON.stringify(meta));
+        db.exec("COMMIT");
+      });
+      await ready;
+      const pending = addComment("task_1", "Current record", "Recording test");
+      resume(); await owner; await pending;
+      const task = await updateTask("task_1", {prUrl: " https://example.invalid/pull/1 "});
+      assert.equal(task.title, "Current title");
+      assert.equal(task.description, "Committed while the recorder waited");
+      assert.equal(task.stateVersion, first.tasks[0].stateVersion + 1);
+      assert.equal(task.prUrl, "https://example.invalid/pull/1");
+      const second = await readDatabaseStateCached();
+      assert.notEqual(second, first);
+      assert.equal(second.meta.concurrentMarker.retained, true);
+      assert.equal(second.events.find(event => event.type === "comment_created").message, "Comment added to Current title");
+      await updateTask("task_1", {prUrl: task.prUrl});
+      assert.equal((await readState()).events.filter(event => event.type === "task_updated").length, 2,
+        "a repeated metadata request keeps the existing task_updated semantics");
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("current recording rechecks a newly acquired maintenance lease and rolls back both operations", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-current-record-maintenance-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { addComment, updateTask, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      let entered, resume;
+      const ready = new Promise(resolve => { entered = resolve; });
+      const pause = new Promise(resolve => { resume = resolve; });
+      const owner = withStateDatabaseConnection(async db => {
+        entered(); await pause;
+        db.exec("BEGIN IMMEDIATE");
+        const meta = JSON.parse(db.prepare("SELECT payload FROM state_meta").get().payload);
+        meta.selfUpdateLease = {id: "maintenance_recording", ownerPid: "other", expiresAt: new Date(Date.now()+60000).toISOString()};
+        db.prepare("UPDATE state_meta SET payload = ?, version = version + 1").run(JSON.stringify(meta));
+        db.exec("COMMIT");
+      });
+      await ready;
+      const comment = assert.rejects(addComment("task_1", "Not committed", "Recording test"), {code: "STUDIOOPS_MAINTENANCE"});
+      const patch = assert.rejects(updateTask("task_1", {prUrl: "https://example.invalid/pull/1"}), {code: "STUDIOOPS_MAINTENANCE"});
+      resume(); await Promise.all([owner, comment, patch]);
+      const after = await readState();
+      assert.equal(after.comments.length, 0);
+      assert.equal(after.events.length, 0);
+      assert.equal(after.tasks[0].prUrl, undefined);
+      assert.equal(after.meta.selfUpdateLease.id, "maintenance_recording");
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("recording accepts only closed inert operations and preserves off-lock generic patch preparation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-current-record-input-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { DatabaseSync } from "node:sqlite";
+      import { addComment, updateTask, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { DATABASE_FILE, recordCurrentTaskOperation, withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      let getterCalls = 0;
+      for (const operation of [
+        {kind: "add_comment", taskId: "task_1", body: "Test", author: "Fixture", callback() {}},
+        {kind: "set_pr_url", taskId: "task_1", prUrl: "url", pure: true},
+        {kind: "set_pr_url", taskId: "task_1", prUrl: "url", status: "done"},
+        {kind: "other", taskId: "task_1"},
+        Object.defineProperty({kind: "set_pr_url", taskId: "task_1"}, "prUrl", {enumerable: true, get() { getterCalls++; return "url"; }}),
+        Promise.resolve({kind: "set_pr_url", taskId: "task_1", prUrl: "url"}),
+      ]) await assert.rejects(recordCurrentTaskOperation(operation), TypeError);
+      assert.equal(getterCalls, 0);
+      assert.equal((await readState()).events.length, 0);
+      const probe = new DatabaseSync(DATABASE_FILE);
+      probe.exec("PRAGMA busy_timeout = 1");
+      try {
+        const patch = Object.defineProperty({}, "prUrl", {enumerable: true, get() {
+          probe.exec("BEGIN IMMEDIATE"); probe.exec("ROLLBACK"); getterCalls++;
+          return " https://example.invalid/pull/2 ";
+        }});
+        assert.equal((await updateTask("task_1", patch)).prUrl, "https://example.invalid/pull/2");
+        assert.ok(getterCalls > 0, "an accessor patch stays on off-lock generic preparation");
+        await updateTask("task_1", {prUrl: "https://example.invalid/pull/3", description: "Mixed patch"});
+        const outcomes = probe.prepare("SELECT outcome FROM database_contention_events WHERE operation_name = 'task.update'").all();
+        assert.equal(outcomes.length, 2);
+        assert.ok(outcomes.every(event => event.outcome === "committed"));
+        const body = {toString() { probe.exec("BEGIN IMMEDIATE"); probe.exec("ROLLBACK"); return "Generic converted body"; }};
+        assert.equal((await addComment("task_1", body)).body, "Generic converted body");
+      } finally { probe.close(); }
+      await assert.rejects(withStateDatabaseConnection(() => addComment("task_1", "Nested")), {code: "STUDIOOPS_DATABASE_TRANSACTION_REENTRY"});
+      await assert.rejects(addComment("missing", ""), /Unknown task: missing/);
+      await assert.rejects(addComment("task_1", "   "), /Comment body is required/);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("exact PR URL recording validates current relationships and defers native candidate writes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-current-record-policy-"));
+  try {
+    const initial = baseState();
+    initial.tasks.push({id: "task_2", projectId: "project_1", title: "Dependency", status: "ready"});
+    await writeLegacyState(root, initial);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { updateTask, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { recordCurrentTaskOperation, withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      await withStateDatabaseConnection(db => {
+        const task = JSON.parse(db.prepare("SELECT payload FROM tasks WHERE id = 'task_1'").get().payload);
+        task.dependsOnTaskIds = ["missing"];
+        db.prepare("UPDATE tasks SET payload = ? WHERE id = ?").run(JSON.stringify(task), task.id);
+      });
+      await assert.rejects(updateTask("task_1", {prUrl: "https://example.invalid/pull/1"}), /Unknown dependency task: missing/);
+      assert.equal((await readState()).events.length, 0);
+      await withStateDatabaseConnection(db => {
+        const task = JSON.parse(db.prepare("SELECT payload FROM tasks WHERE id = 'task_1'").get().payload);
+        task.dependsOnTaskIds = ["task_2"];
+        task.reviewCycle = task.reviewSubjectCycle = 1;
+        task.reviewSubjectSha = "a".repeat(40);
+        task.candidateIdentity = {commitSha: task.reviewSubjectSha, candidateCycle: 1};
+        db.prepare("UPDATE tasks SET payload = ? WHERE id = ?").run(JSON.stringify(task), task.id);
+      });
+      const before = await readState();
+      assert.deepEqual(await recordCurrentTaskOperation({kind: "set_pr_url", taskId: "task_1", prUrl: "https://example.invalid/pull/2"}), {handled: false});
+      assert.deepEqual(await readState(), before, "unsupported native authority is never rewritten by the narrow port");
+      await updateTask("task_1", {prUrl: " https://example.invalid/pull/2 "});
+      const after = await readState();
+      assert.equal(after.tasks[0].prUrl, "https://example.invalid/pull/2");
+      assert.deepEqual(after.tasks[0].candidateIdentity, before.tasks[0].candidateIdentity);
+      assert.equal(after.tasks[0].reviewSubjectSha, before.tasks[0].reviewSubjectSha);
+      await withStateDatabaseConnection(db => {
+        const outcome = db.prepare("SELECT outcome FROM database_contention_events WHERE operation_name = 'task.update'").get();
+        assert.equal(outcome.outcome, "committed", "native writes retain generic validation");
+      });
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("current recording rolls back late SQL failures and its finite execution deadline", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-current-record-rollback-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { addComment, updateTask, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { withStateDatabaseConnection, databaseContentionHealth } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      const before = await readState();
+      let version;
+      await withStateDatabaseConnection(db => {
+        version = db.prepare("SELECT version FROM state_meta").get().version;
+        db.exec("CREATE TRIGGER reject_recorded_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'synthetic late event rejection'); END");
+      });
+      await assert.rejects(addComment("task_1", "Rolled back comment"), /synthetic late event rejection/);
+      await assert.rejects(updateTask("task_1", {prUrl: "https://example.invalid/pull/1"}), /synthetic late event rejection/);
+      assert.deepEqual(await readState(), before);
+      await withStateDatabaseConnection(db => {
+        assert.equal(db.prepare("SELECT version FROM state_meta").get().version, version);
+        db.exec("DROP TRIGGER reject_recorded_event");
+        db.function("pause_recording", () => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1050); return 0; });
+        db.exec("CREATE TRIGGER delay_recorded_comment AFTER INSERT ON comments BEGIN SELECT pause_recording(); END");
+      });
+      await assert.rejects(addComment("task_1", "Deadline payload remains private"), {code: "STUDIOOPS_TASK_RECORDING_TIMEOUT"});
+      assert.deepEqual(await readState(), before);
+      const health = await databaseContentionHealth();
+      assert.ok(health.recent.some(item => item.failureCode === "STUDIOOPS_TASK_RECORDING_TIMEOUT"));
+      assert.equal(JSON.stringify(health).includes("Deadline payload"), false);
+      await withStateDatabaseConnection(db => {
+        assert.equal(db.prepare("SELECT version FROM state_meta").get().version, version);
+        assert.equal(db.prepare("SELECT count(*) count FROM comments").get().count, 0);
+        db.exec("DROP TRIGGER delay_recorded_comment");
+      });
+      assert.equal((await addComment("task_1", "Later valid request")).id, "comment_1");
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("slow replay leaves the writer free and rebases after unrelated commits", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-replay-consumers-"));
   try {

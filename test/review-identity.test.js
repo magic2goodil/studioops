@@ -12,8 +12,11 @@ import {
   recordReview,
   updateRun,
   updateTask,
+  updateProject,
 } from "../src/store.js";
-import { dispatchSupervisorActions } from "../src/dispatcher.js";
+import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
+import { createSupervisorReport } from "../src/supervisor.js";
+import { successfulHandoffFailure } from "../src/runner.js";
 
 async function reviewCandidateFixture(t, key, reviewPipeline) {
   const root = await mkdtemp(path.join(os.tmpdir(), "review-identity-"));
@@ -269,4 +272,68 @@ test("reviewer commits restart required lanes without consuming a builder review
     evidence.reviews.map((review) => review.stageKey),
     ["backend", "frontend", "accessibility", "lead"],
   );
+});
+
+
+for (const outcome of ["approved", "changes_requested"]) {
+  test("persistent cycle-limit lead " + outcome + " preserves specialist rejection and stable owner triage", async (t) => {
+    const pipeline = [
+      { key: "backend", label: "Backend", role: "backend-reviewer", status: "backend_review", required: true },
+      { key: "lead", label: "Lead", role: "lead-reviewer", status: "lead_review", required: true },
+    ];
+    const f = await reviewCandidateFixture(t, "final-lead-" + outcome.replaceAll("_", "-"), pipeline);
+    await updateProject(f.project.id, { reviewPolicy: { maxBuilderReviewCycles: 1, leadOwnsFinalDecisionAtLimit: true } });
+    await recordReview(f.task.id, { stage: "backend", outcome: "changes_requested", candidateCycle: 1,
+      subjectSha: f.identity.commitSha, body: "A concrete specialist concern remains unresolved." });
+    let state = await readState();
+    let task = state.tasks.find(item => item.id === f.task.id);
+    assert.equal(task.status, "lead_review");
+    assert.equal(task.assignedAgentRole, "lead-reviewer");
+    await recordReview(f.task.id, { stage: "lead", outcome, candidateCycle: 1,
+      subjectSha: f.identity.commitSha, body: "Explicit final decision for human triage." });
+    state = await readState(); task = state.tasks.find(item => item.id === f.task.id);
+    assert.equal(task.status, "user_review");
+    assert.equal(task.assignedAgentRole, "owner");
+    const reviews = state.reviews.filter(item => item.taskId === task.id);
+    assert.equal(reviews.length, 2);
+    assert.equal(reviews.find(item => item.stageKey === "backend").outcome, "changes_requested");
+    assert.equal(reviews.find(item => item.stageKey === "lead").outcome, outcome);
+    assert.equal(candidateReviewEvidenceForTask(state, task).ok, false);
+    const report = createSupervisorReport(state);
+    const actions = report.actions.filter(action => action.taskId === task.id);
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].type, "notify_owner");
+    const options = { failureIncidents: [], creditPolicy: { enabled: false } };
+    assert.equal(planDispatches(state, actions, options).selected.length, 1);
+    const qa = planDispatches(state, [{ ...actions[0], id: task.id + ":notify_qa_review", type: "notify_qa_review" }], options);
+    assert.equal(qa.selected.length, 0);
+    assert.match(qa.skipped[0].reason, /earlier_review_incomplete:backend/);
+    for (const patch of [{ reviewSubjectCycle: 2 }, { reviewSubjectSha: "f".repeat(40) }, { assignedAgentRole: "builder" }]) {
+      const changed = structuredClone(state);
+      Object.assign(changed.tasks.find(item => item.id === task.id), patch);
+      assert.equal(planDispatches(changed, [{ ...actions[0] }], options).selected.length, 0);
+    }
+  });
+}
+
+
+test("supported owner changes revoke a matching review without inventing another candidate cycle", async (t) => {
+  const f = await reviewCandidateFixture(t, "owner-revokes-review", [
+    { key: "backend", status: "backend_review", role: "backend-reviewer", required: true },
+    { key: "lead", status: "lead_review", role: "lead-reviewer", required: true },
+  ]);
+  const run = { id: "synthetic_pending_review_completion", taskId: f.task.id, group: "reviewer", role: "backend-reviewer",
+    reviewStageKey: "backend", reviewStageStatus: "backend_review", candidateCycle: 1,
+    reviewSubjectSha: f.identity.commitSha, startedAt: new Date(Date.now() - 1000).toISOString() };
+  await recordReview(f.task.id, { stage: "backend", outcome: "approved", candidateCycle: 1,
+    subjectSha: f.identity.commitSha, body: "Current stage evidence before owner changes." });
+  let state = await readState();
+  let task = state.tasks.find(item => item.id === f.task.id);
+  assert.equal(successfulHandoffFailure(state, run, task), "");
+  await updateTask(f.task.id, { status: "needs_changes" });
+  state = await readState(); task = state.tasks.find(item => item.id === f.task.id);
+  assert.equal(task.reviewSubjectCycle, run.candidateCycle);
+  assert.equal(task.reviewSubjectSha, run.reviewSubjectSha);
+  assert.equal(successfulHandoffFailure(state, run, task), "review_outcome_missing");
+  assert.equal(candidateReviewEvidenceForTask(state, task).ok, false);
 });

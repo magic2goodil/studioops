@@ -59,6 +59,9 @@ import {
   mutateQaRevocationSettlementState,
   readDatabaseState,
   readDatabaseStateReadOnly,
+  recordCurrentTaskOperation,
+  dependencyGraphErrorsInState,
+  validateTaskRelationshipsInState,
   readPrerequisiteFailureRecovery,
   writeDatabaseState,
 } from "./state-database.js";
@@ -219,38 +222,8 @@ export function evaluateTaskReadiness(task = {}, state = null) {
   };
 }
 
-export function dependencyGraphErrors(state = { tasks: [] }, task = {}) {
-  const errors = [];
-  const tasks = task.id
-    ? [...(state.tasks || []).filter((item) => item.id !== task.id), task]
-    : state.tasks || [];
-  const byId = new Map(tasks.map((item) => [item.id, item]));
-  const visiting = new Set();
-  const visited = new Set();
-  function visit(id, path = []) {
-    if (visiting.has(id)) {
-      errors.push(`Dependency cycle detected: ${[...path, id].join(" -> ")}`);
-      return;
-    }
-    if (visited.has(id)) return;
-    const current = byId.get(id);
-    if (!current) {
-      errors.push(`Unknown dependency task: ${id}`);
-      return;
-    }
-    visiting.add(id);
-    for (const dependencyId of current.dependsOnTaskIds || []) {
-      const dependency = byId.get(dependencyId);
-      if (dependency && current.projectId !== dependency.projectId) {
-        errors.push(`Cross-project dependency is not allowed: ${current.id} -> ${dependency.id}`);
-      }
-      visit(dependencyId, [...path, id]);
-    }
-    visiting.delete(id);
-    visited.add(id);
-  }
-  visit(task.id, []);
-  return [...new Set(errors)];
+export function dependencyGraphErrors(state, task) {
+  return dependencyGraphErrorsInState(state, task);
 }
 
 export function completionEvidenceForTask(state, task = {}) {
@@ -2674,6 +2647,18 @@ export async function adoptOperatorCandidate(taskId, input, authority = {}, opti
 }
 
 export async function updateTask(taskId, patch) {
+  // Only an inert, exact one-field patch is eligible. Current native/lifecycle
+  // applicability is checked again by the fixed persistence operation.
+  if (patch && [Object.prototype, null].includes(Object.getPrototypeOf(patch))) {
+    const keys = Reflect.ownKeys(patch);
+    const descriptor = Object.getOwnPropertyDescriptor(patch, "prUrl");
+    if (keys.length === 1 && keys[0] === "prUrl" && descriptor
+      && Object.hasOwn(descriptor, "value") && typeof descriptor.value === "string"
+      && descriptor.value.length <= 8192 && typeof taskId === "string" && taskId.length <= 1024) {
+      const recording = await recordCurrentTaskOperation({ kind: "set_pr_url", taskId, prUrl: descriptor.value });
+      if (recording.handled) return recording.value;
+    }
+  }
   const ownsValidStatus = Object.prototype.hasOwnProperty.call(patch, "status")
     && typeof patch.status === "string"
     && patch.status.trim()
@@ -4314,6 +4299,15 @@ export async function recordQaBundleDecision(bundleId, input = {}, testDependenc
 }
 
 export async function addComment(taskId, body, author = "user") {
+  if (typeof taskId === "string" && taskId.length <= 1024 && typeof author === "string" && author.length <= 1024
+    && (typeof body === "string" || body == null)) {
+    const normalizedBody = String(body || "").trim();
+    if (normalizedBody.length <= 65536 && !(new Set(["Mission Control QA Integration", "StudioOps QA Integration"]).has(author)
+      && /^QA integration\b/.test(normalizedBody))) {
+      const recording = await recordCurrentTaskOperation({ kind: "add_comment", taskId, body: normalizedBody, author });
+      if (recording.handled) return recording.value;
+    }
+  }
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
@@ -4375,7 +4369,7 @@ export function recordReviewInState(state, taskId, input = {}) {
     if (
       earliestRequiredStage
       && stageIndex > earliestRequiredIndex
-      && !cycleLimitLeadReviewApplies(state, project, task, stage)
+      && !cycleLimitLeadReviewApplies(state, project, task, stage, { recording: true })
     ) {
       throw new Error(
         `${earliestRequiredStage.label || earliestRequiredStage.key} must approve candidate cycle ${candidateCycle} at ${subjectSha} before ${stage.label || stage.key} can continue.`,
@@ -5367,33 +5361,7 @@ export function findTask(state, taskId) {
 }
 
 function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds) {
-  if (parentTaskId) {
-    if (parentTaskId === taskId) throw new Error("A task cannot be its own parent.");
-    if (!findTask(state, parentTaskId)) throw new Error(`Unknown parent task: ${parentTaskId}`);
-    const seen = new Set([taskId]);
-    let currentParentId = parentTaskId;
-    while (currentParentId) {
-      if (seen.has(currentParentId)) throw new Error("Task parent relationship would create a cycle.");
-      seen.add(currentParentId);
-      currentParentId = findTask(state, currentParentId)?.parentTaskId || "";
-    }
-  }
-  for (const dependencyId of dependsOnTaskIds || []) {
-    if (dependencyId === taskId) throw new Error("A task cannot depend on itself.");
-    const dependency = findTask(state, dependencyId);
-    if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
-    const task = taskId ? findTask(state, taskId) : null;
-    if (task && task.projectId !== dependency.projectId) {
-      throw new Error(`Cross-project dependency is not allowed: ${taskId} -> ${dependencyId}`);
-    }
-  }
-  if (taskId) {
-    const errors = dependencyGraphErrors(state, {
-      ...findTask(state, taskId),
-      dependsOnTaskIds,
-    });
-    if (errors.length) throw new Error(errors[0]);
-  }
+  return validateTaskRelationshipsInState(state, taskId, parentTaskId, dependsOnTaskIds);
 }
 
 function stageSearchText(stage) {
@@ -5503,21 +5471,33 @@ export function earliestIncompleteRequiredReviewStage(state, project, task) {
     }) || null;
 }
 
-export function cycleLimitLeadReviewApplies(state, project, task, targetStage) {
+export function cycleLimitLeadReviewApplies(state, project, task, targetStage, options = {}) {
   const policy = reviewPolicyForProject(project);
   const stages = reviewStagesForTask(project, task);
   const leadStage = stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
-  if (
-    !policy.leadOwnsFinalDecisionAtLimit
-    || !leadStage
-    || !targetStage
+  if (!policy.leadOwnsFinalDecisionAtLimit || !leadStage || !targetStage
     || targetStage.key !== leadStage.key
     || currentReviewCycle(task) < policy.maxBuilderReviewCycles
-  ) {
-    return false;
-  }
-  return stages
-    .filter((stage) => stage.key !== leadStage.key)
+    || (options.recording && (task.status !== leadStage.status || task.assignedAgentRole !== leadStage.role))) return false;
+  return stages.slice(0, stages.indexOf(leadStage))
+    .filter((stage) => stage.required !== false)
+    .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested");
+}
+
+// Owner triage is not QA approval. Its exact final decision must survive a
+// supervisor sweep without minting a replacement specialist or paid builder.
+export function cycleLimitOwnerReviewApplies(state, project, task) {
+  const policy = reviewPolicyForProject(project);
+  if (task.status !== "user_review" || task.assignedAgentRole !== "owner"
+    || !policy.leadOwnsFinalDecisionAtLimit
+    || currentReviewCycle(task) < policy.maxBuilderReviewCycles) return false;
+  const stages = reviewStagesForTask(project, task);
+  const lead = stages.find(isLeadReviewStage) || stages[stages.length - 1];
+  if (!lead) return false;
+  const finalReview = latestCurrentReviewForStage(state, task, lead);
+  if (finalReview?.outcome === "changes_requested") return true;
+  return finalReview?.outcome === "approved" && stages.slice(0, stages.indexOf(lead))
+    .filter((stage) => stage.required !== false)
     .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested");
 }
 
@@ -5753,11 +5733,21 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
 
 function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLabel = "ready for owner review", transitionOptions = {}) {
   if (task.status !== "user_review" || task.assignedAgentRole !== "owner") {
-    setTaskWorkflowState(state, task, {
-      status: "user_review",
-      assignedAgentRole: "owner",
-      reviewerThreadId: "",
-    }, now, transitionOptions);
+    if (transitionOptions.action === "escalate_cycle_limit_owner_review") {
+      // Validate the exact final lead and its current assignment before the
+      // destination owner assignment is applied, in this same transaction.
+      applyStoreLifecycleTransition(state, task, "user_review", {
+        ...transitionOptions, now,
+        evidence: { ...(transitionOptions.evidence || {}), targetStatus: "user_review" },
+      });
+      Object.assign(task, { assignedAgentRole: "owner", reviewerThreadId: "", updatedAt: now });
+    } else {
+      setTaskWorkflowState(state, task, {
+        status: "user_review",
+        assignedAgentRole: "owner",
+        reviewerThreadId: "",
+      }, now, transitionOptions);
+    }
   }
   addAutomationComment(state, task, body, now, author);
   state.events.push({
@@ -5831,7 +5821,7 @@ function routeChangesRequestedInState(state, task, project, stage, now, author, 
 
   if (policy.leadOwnsFinalDecisionAtLimit && reviewCycleAtLimit(project, task)) {
     const leadStage = leadReviewStageForProject(project, task);
-    if (leadStage && !isLeadReviewStage(stage)) {
+    if (leadStage && !isLeadReviewStage(stage) && stage.required !== false) {
       setTaskWorkflowState(state, task, {
         status: leadStage.status,
         assignedAgentRole: leadStage.role,
@@ -6010,18 +6000,17 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
   }
   if (
     project
+    && reviewPolicyForProject(project).leadOwnsFinalDecisionAtLimit
     && reviewCycleAtLimit(project, task)
-    && changeRequestedReviewsForCycle(state, task).length
     && leadReviewCompleteForCycle(state, task, project)
+    && stages.filter((stage) => stage.required !== false && !isLeadReviewStage(stage))
+      .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested")
   ) {
-    return moveTaskAfterReviewsComplete(
-      state,
-      task,
-      project,
-      now,
-      author,
-      "Lead review finalized this task after the configured review-cycle limit. Residual risk should be captured in review comments.",
-      actions,
+    return moveTaskToOwnerReview(
+      state, task, now, author,
+      "Lead finalized the cycle-limit decision while required specialist changes remain unresolved. Owner triage is required; no QA or release approval was granted.",
+      actions, "lead requested owner triage for unresolved required review evidence",
+      { action: "escalate_cycle_limit_owner_review" },
     );
   }
 

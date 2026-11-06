@@ -2155,3 +2155,24 @@ test("estimated task cost budgets fail closed before model launch", async () => 
   assert.equal(state.tasks[0].automationBlocker.type, "circuit");
   assert.equal(state.tasks[0].automationCircuit.reasonCode, "task_cost_budget_insufficient");
 });
+
+
+test("review dispatch snapshots its configured lane independently of shared role and command text", async () => {
+  const state = fixtureState();
+  state.projects[0].reviewPipeline = [
+    { key: "backend", status: "backend_review", role: "qa-reviewer", required: true },
+    { key: "regression", status: "regression_review", role: "qa-reviewer", required: true },
+  ];
+  state.tasks = [{ id: "task_1", projectId: "project_1", title: "Shared-role exact review",
+    status: "backend_review", assignedAgentRole: "qa-reviewer", reviewCycle: 1,
+    reviewSubjectCycle: 1, reviewSubjectSha: "a".repeat(40) }];
+  const report = await dispatchSupervisorActions([{ id: "task_1:continue_review", type: "continue_review",
+    taskId: "task_1", projectId: "project_1", taskStatus: "backend_review", role: "qa-reviewer",
+    reviewStageKey: "regression", reviewCommand: "ignored --stage regression" }],
+    { state, failureIncidents: [], creditPolicy: { enabled: false } });
+  assert.equal(report.runs.length, 1, JSON.stringify(report.skipped));
+  assert.equal(report.runs[0].reviewStageKey, "backend");
+  assert.equal(report.runs[0].reviewStageStatus, "backend_review");
+  assert.equal(report.runs[0].candidateCycle, 1);
+  assert.equal(report.runs[0].reviewSubjectSha, "a".repeat(40));
+});

@@ -238,13 +238,20 @@ function assertReviewGates(action, aggregate, evidence = {}, context = {}) {
         : true
     ));
   const currentReviews = (context.reviews || []).filter((review) => reviewIsCurrent(review, aggregate));
+  const latestForStage = (stage) => currentReviews.filter((review) => (
+    review.stageKey ? review.stageKey === stage.key : review.status === stage.status
+  )).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0];
+  const leadStage = stages.find((stage) => stage.key === "lead" || stage.status === "lead_review" || stage.role === "lead-reviewer") || stages[stages.length - 1];
+  const requiredRejection = stages.slice(0, stages.indexOf(leadStage))
+    .filter((stage) => stage.required !== false)
+    .some((stage) => latestForStage(stage)?.outcome === "changes_requested");
   if (action === "escalate_cycle_limit_owner_review") {
-    const currentLeadChange = currentReviews.some((review) => (
-      review.outcome === "changes_requested"
-      && (review.stageKey === "lead" || review.status === "lead_review" || review.role === "lead-reviewer")
-    ));
-    if (!context.allowCycleLimitLeadReview || !currentLeadChange) {
-      throw new Error("Cycle-limit owner escalation requires a current lead changes-requested decision.");
+    const finalLead = latestForStage(leadStage);
+    const validFinalDecision = finalLead?.outcome === "changes_requested"
+      || (finalLead?.outcome === "approved" && requiredRejection);
+    if (!context.allowCycleLimitLeadReview || !validFinalDecision
+      || aggregate.status !== leadStage.status || aggregate.assignedAgentRole !== leadStage.role) {
+      throw new Error("Cycle-limit owner escalation requires the assigned current lead's exact final decision and unresolved review evidence.");
     }
     return;
   }
@@ -257,7 +264,7 @@ function assertReviewGates(action, aggregate, evidence = {}, context = {}) {
     && evidence.gateOverride === "cycle_limit_lead_decision"
     && stages[reviewStageIndex]?.role === "lead-reviewer"
     && context.allowCycleLimitLeadReview === true
-    && currentReviews.some((review) => review.outcome === "changes_requested");
+    && requiredRejection;
   if (!cycleLimitOverride) {
     throw new Error(`${missing.label || missing.key || missing.status} must be complete for the exact current candidate before ${action}.`);
   }
