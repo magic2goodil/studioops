@@ -755,6 +755,81 @@ test("verified writer rejects mismatched candidate, scope and another task's int
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("audited adoption delta rejects unrelated writes and rolls back late SQL failure or deadline", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-adoption-rollback-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      import { commitOperatorCandidateAdoption, withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      const commit = async (extra = () => {}) => commitOperatorCandidateAdoption("task_1", async () => verification, async (state, verified) => {
+        adopt(state, verified);
+        state.events.push({id: "event_prepared", taskId: "task_1", projectId: "project_1", type: "operator_candidate_adopted", requestDigest: verified.requestDigest, candidate: verified.candidate});
+        await extra(state);
+      });
+      const before = await readDatabaseState();
+      await assert.rejects(commit(state => { state.meta.unrelatedOverride = true; }), /adoption_delta_invalid/);
+      await assert.rejects(commit(state => { state.comments.push({id: "comment_injected", taskId: "task_1", body: "Unrelated effect"}); }), /adoption_delta_invalid/);
+      assert.deepEqual(await readDatabaseState(), before);
+      let version;
+      await withStateDatabaseConnection(db => {
+        version = db.prepare("SELECT version FROM state_meta").get().version;
+        db.exec("CREATE TRIGGER reject_adoption_event BEFORE INSERT ON events WHEN NEW.type = 'operator_candidate_adopted' BEGIN SELECT RAISE(ABORT, 'late adoption event rejection'); END");
+      });
+      await assert.rejects(commit(), /late adoption event rejection/);
+      assert.deepEqual(await readDatabaseState(), before);
+      await withStateDatabaseConnection(db => {
+        assert.equal(db.prepare("SELECT version FROM state_meta").get().version, version);
+        db.exec("DROP TRIGGER reject_adoption_event");
+        db.function("delay_adoption", () => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1050); return 0; });
+        db.exec("CREATE TRIGGER delay_adoption_event AFTER INSERT ON events BEGIN SELECT delay_adoption(); END");
+      });
+      await assert.rejects(commit(), {code: "STUDIOOPS_TASK_RECORDING_TIMEOUT"});
+      assert.deepEqual(await readDatabaseState(), before);
+      await withStateDatabaseConnection(db => { assert.equal(db.prepare("SELECT version FROM state_meta").get().version, version); db.exec("DROP TRIGGER delay_adoption_event"); });
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("adoption preimage bounds use actual UTF-8 bytes and preserve all records on rejection", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-adoption-byte-bound-"));
+  try {
+    const initial = baseState();
+    // Below the character bound, above the byte bound. No content leaves this
+    // disposable fixture and no truncated directory is accepted as complete.
+    initial.tasks.push({ id: "task_large", projectId: "project_1", title: "Large neutral metadata", status: "ready", description: "é".repeat(34_000_000) });
+    await writeLegacyState(root, initial);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      import { commitOperatorCandidateAdoption } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await assert.rejects(commitOperatorCandidateAdoption("task_1", async () => verification, (state, verified) => {
+        adopt(state, verified); state.events.push({id: "event_prepared", taskId: "task_1", projectId: "project_1", type: "operator_candidate_adopted", candidate: verified.candidate});
+      }), {code: "adoption_preimage_bound_exceeded"});
+      const after = await readDatabaseState();
+      assert.equal(after.tasks[0].operatorIntake, undefined);
+      assert.equal(after.tasks.find(item => item.id === "task_large").description.length, 34_000_000);
+      assert.equal(after.events.some(event => event.type === "operator_candidate_adopted"), false);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("legacy operator global CAS exhausts after five unrelated off-lock writes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-global-loss-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      let attempts = 0;
+      await assert.rejects(mutateOperatorCandidateState(async state => {
+        attempts++;
+        await mutateDatabaseState(current => { current.meta.unrelatedCounter = (current.meta.unrelatedCounter || 0) + 1; });
+        return verification;
+      }, (state, verified) => adopt(state, verified)), error => error.code === "STUDIOOPS_STATE_CONFLICT");
+      assert.equal(attempts, 5);
+      const after = await readDatabaseState();
+      assert.equal(after.meta.unrelatedCounter, 5);
+      assert.equal(after.tasks[0].operatorIntake, undefined);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("operator verification reruns on optimistic replay against the fresh snapshot", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-replay-"));
   try {
