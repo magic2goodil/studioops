@@ -59,6 +59,9 @@ import {
   mutateQaRevocationSettlementState,
   readDatabaseState,
   readDatabaseStateReadOnly,
+  recordCurrentTaskOperation,
+  dependencyGraphErrorsInState,
+  validateTaskRelationshipsInState,
   readPrerequisiteFailureRecovery,
   writeDatabaseState,
 } from "./state-database.js";
@@ -219,38 +222,8 @@ export function evaluateTaskReadiness(task = {}, state = null) {
   };
 }
 
-export function dependencyGraphErrors(state = { tasks: [] }, task = {}) {
-  const errors = [];
-  const tasks = task.id
-    ? [...(state.tasks || []).filter((item) => item.id !== task.id), task]
-    : state.tasks || [];
-  const byId = new Map(tasks.map((item) => [item.id, item]));
-  const visiting = new Set();
-  const visited = new Set();
-  function visit(id, path = []) {
-    if (visiting.has(id)) {
-      errors.push(`Dependency cycle detected: ${[...path, id].join(" -> ")}`);
-      return;
-    }
-    if (visited.has(id)) return;
-    const current = byId.get(id);
-    if (!current) {
-      errors.push(`Unknown dependency task: ${id}`);
-      return;
-    }
-    visiting.add(id);
-    for (const dependencyId of current.dependsOnTaskIds || []) {
-      const dependency = byId.get(dependencyId);
-      if (dependency && current.projectId !== dependency.projectId) {
-        errors.push(`Cross-project dependency is not allowed: ${current.id} -> ${dependency.id}`);
-      }
-      visit(dependencyId, [...path, id]);
-    }
-    visiting.delete(id);
-    visited.add(id);
-  }
-  visit(task.id, []);
-  return [...new Set(errors)];
+export function dependencyGraphErrors(state, task) {
+  return dependencyGraphErrorsInState(state, task);
 }
 
 export function completionEvidenceForTask(state, task = {}) {
@@ -2674,6 +2647,18 @@ export async function adoptOperatorCandidate(taskId, input, authority = {}, opti
 }
 
 export async function updateTask(taskId, patch) {
+  // Only an inert, exact one-field patch is eligible. Current native/lifecycle
+  // applicability is checked again by the fixed persistence operation.
+  if (patch && [Object.prototype, null].includes(Object.getPrototypeOf(patch))) {
+    const keys = Reflect.ownKeys(patch);
+    const descriptor = Object.getOwnPropertyDescriptor(patch, "prUrl");
+    if (keys.length === 1 && keys[0] === "prUrl" && descriptor
+      && Object.hasOwn(descriptor, "value") && typeof descriptor.value === "string"
+      && descriptor.value.length <= 8192 && typeof taskId === "string" && taskId.length <= 1024) {
+      const recording = await recordCurrentTaskOperation({ kind: "set_pr_url", taskId, prUrl: descriptor.value });
+      if (recording.handled) return recording.value;
+    }
+  }
   const ownsValidStatus = Object.prototype.hasOwnProperty.call(patch, "status")
     && typeof patch.status === "string"
     && patch.status.trim()
@@ -4314,6 +4299,15 @@ export async function recordQaBundleDecision(bundleId, input = {}, testDependenc
 }
 
 export async function addComment(taskId, body, author = "user") {
+  if (typeof taskId === "string" && taskId.length <= 1024 && typeof author === "string" && author.length <= 1024
+    && (typeof body === "string" || body == null)) {
+    const normalizedBody = String(body || "").trim();
+    if (normalizedBody.length <= 65536 && !(new Set(["Mission Control QA Integration", "StudioOps QA Integration"]).has(author)
+      && /^QA integration\b/.test(normalizedBody))) {
+      const recording = await recordCurrentTaskOperation({ kind: "add_comment", taskId, body: normalizedBody, author });
+      if (recording.handled) return recording.value;
+    }
+  }
   return mutateState(async (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
@@ -5367,33 +5361,7 @@ export function findTask(state, taskId) {
 }
 
 function validateTaskRelationships(state, taskId, parentTaskId, dependsOnTaskIds) {
-  if (parentTaskId) {
-    if (parentTaskId === taskId) throw new Error("A task cannot be its own parent.");
-    if (!findTask(state, parentTaskId)) throw new Error(`Unknown parent task: ${parentTaskId}`);
-    const seen = new Set([taskId]);
-    let currentParentId = parentTaskId;
-    while (currentParentId) {
-      if (seen.has(currentParentId)) throw new Error("Task parent relationship would create a cycle.");
-      seen.add(currentParentId);
-      currentParentId = findTask(state, currentParentId)?.parentTaskId || "";
-    }
-  }
-  for (const dependencyId of dependsOnTaskIds || []) {
-    if (dependencyId === taskId) throw new Error("A task cannot depend on itself.");
-    const dependency = findTask(state, dependencyId);
-    if (!dependency) throw new Error(`Unknown dependency task: ${dependencyId}`);
-    const task = taskId ? findTask(state, taskId) : null;
-    if (task && task.projectId !== dependency.projectId) {
-      throw new Error(`Cross-project dependency is not allowed: ${taskId} -> ${dependencyId}`);
-    }
-  }
-  if (taskId) {
-    const errors = dependencyGraphErrors(state, {
-      ...findTask(state, taskId),
-      dependsOnTaskIds,
-    });
-    if (errors.length) throw new Error(errors[0]);
-  }
+  return validateTaskRelationshipsInState(state, taskId, parentTaskId, dependsOnTaskIds);
 }
 
 function stageSearchText(stage) {
