@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { createCandidateEnvelope, invalidateCandidate } from "../src/candidate-manifest.js";
 import { buildOwnerQaPacket } from "../src/owner-qa-packet.js";
@@ -14,18 +18,23 @@ test.after(async () => qaTestEnvironment.cleanup());
 
 const {
   createQaDecisionTestDependencies,
+  addProject,
+  addTask,
   adoptDefaultProjectStandards,
   mutateState,
   qaDecisionCoordinatesForState,
   readState,
+  recordReview,
   reconcilePendingQaRevocations,
   recordQaBundleDecision,
   recordQaDecision,
   transitionTask,
   updateProject,
+  updateRun,
   updateTask,
   writeState,
 } = await import(`../src/store.js?qa-decision-auth=${Date.now()}`);
+const { dispatchSupervisorActions } = await import("../src/dispatcher.js");
 const {
   DATABASE_FILE,
   mutateCandidatePromotionState,
@@ -47,17 +56,16 @@ const {
 } = await import("./support/promotion-authority-harness.js");
 
 const BASE_SHA = "a".repeat(40);
-const SOURCE_SHA = "b".repeat(40);
-const INTEGRATION_SHA = "c".repeat(40);
 const REPOSITORY_URL = "https://github.com/example/private-demo";
 const PROMOTION_POLICY_DIGEST = `sha256:${"9".repeat(64)}`;
 
 function fixtureState(options = {}) {
   const suffix = String(options.suffix || "1");
-  const projectId = `project_${suffix}`;
+  const { baseSha, sourceSha, integrationSha } = options;
+  const projectId = options.nativeProject?.id || `project_${suffix}`;
   const candidateId = `candidate_${suffix}`;
   const qaBundleId = `qa_bundle_${suffix}`;
-  const taskIds = Array.from({ length: Number(options.taskCount || 1) }, (_, index) => (
+  const taskIds = options.nativeTasks?.map((task) => task.id) || Array.from({ length: Number(options.taskCount || 1) }, (_, index) => (
     index === 0 ? `task_${suffix}` : `task_${suffix}_${index + 1}`
   ));
   const dependencyTaskId = options.withDependency ? `dependency_${suffix}` : "";
@@ -66,40 +74,32 @@ function fixtureState(options = {}) {
     manifest: {
       candidateId,
       projectId,
-      base: { branch: "main", sha: BASE_SHA },
+      base: { branch: "main", sha: baseSha },
       sources: taskIds.map((taskId, index) => ({
         taskId,
-        sourceRef: `refs/heads/feature/task-${index + 1}`,
-        headSha: SOURCE_SHA,
+        sourceRef: `refs/heads/${options.nativeTasks[index].branchName}`,
+        headSha: sourceSha,
         candidateCycle: 1,
-        reviews: [{
-          id: `review_${suffix}_${index + 1}`,
-          stageKey: "lead",
-          role: "lead-reviewer",
-          outcome: "approved",
-          subjectSha: SOURCE_SHA,
-          candidateCycle: 1,
-          reviewedAt: "2026-09-03T12:00:00.000Z",
-        }],
+        reviews: options.nativeReviews.filter((review) => review.taskId === taskId),
       })),
-      integration: { branch: "qa/demo", sha: INTEGRATION_SHA },
+      integration: { branch: "qa/demo", sha: integrationSha },
       checks: [{
         id: `check_${suffix}`,
         kind: "local-validation",
-        name: "npm test",
+        name: "node --test test/catalog.test.js",
         outcome: "passed",
-        subjectSha: INTEGRATION_SHA,
-        evidenceDigest: `sha256:${"d".repeat(64)}`,
+        subjectSha: integrationSha,
+        evidenceDigest: options.validationEvidenceDigest,
       }],
       preview: {
         url: "http://127.0.0.1:4393/",
         status: "healthy",
-        commitSha: INTEGRATION_SHA,
+        commitSha: integrationSha,
         verifiedAt: "2026-09-03T12:05:00.000Z",
         attestation: {
           kind: "json",
           key: "commitSha",
-          observedSha: INTEGRATION_SHA,
+          observedSha: integrationSha,
         },
       },
       assembly: {
@@ -118,7 +118,7 @@ function fixtureState(options = {}) {
       outcome: "passed",
       candidateId: candidate.id,
       manifestDigest: candidate.manifestDigest,
-      integrationSha: INTEGRATION_SHA,
+      integrationSha: integrationSha,
       taskIds,
       repositoryVerifiedAt: "2026-09-03T12:06:00.000Z",
       author: "Owner QA",
@@ -130,7 +130,7 @@ function fixtureState(options = {}) {
     candidate.promotion = {
       branch: "qa/promotion-private-demo",
       prUrl: "https://github.com/example/private-demo/pull/42",
-      commitSha: INTEGRATION_SHA,
+      commitSha: integrationSha,
       manifestDigest: candidate.manifestDigest,
       readyAt: "2026-09-03T12:15:00.000Z",
     };
@@ -148,8 +148,10 @@ function fixtureState(options = {}) {
       repoUrl: options.repoUrl || REPOSITORY_URL,
       defaultBranch: "main",
       workflowMode: "github",
+      ...options.nativeProject,
     }],
-    tasks: taskIds.map((taskId) => ({
+    tasks: taskIds.map((taskId, index) => ({
+      ...options.nativeTasks?.[index],
       id: taskId,
       projectId,
       title: "Exact owner QA",
@@ -157,11 +159,11 @@ function fixtureState(options = {}) {
       assignedAgentRole: candidate.status === "frozen"
         ? "owner"
         : candidate.status === "qa_passed" ? "promotion-worker" : "owner",
-      stateVersion: 7,
-      reviewSubjectSha: SOURCE_SHA,
+      stateVersion: options.nativeTasks[index].stateVersion,
+      reviewSubjectSha: sourceSha,
       reviewSubjectCycle: 1,
       integrationStatus: "ready",
-      integrationCommit: INTEGRATION_SHA,
+      integrationCommit: integrationSha,
       candidateManifestDigest: candidate.manifestDigest,
       candidateId: candidate.id,
       qaBundleId,
@@ -185,7 +187,7 @@ function fixtureState(options = {}) {
       candidateId: candidate.id,
       manifestDigest: candidate.manifestDigest,
       integrationBranch: "qa/demo",
-      integrationCommit: INTEGRATION_SHA,
+      integrationCommit: integrationSha,
       previewUrl: "http://127.0.0.1:4393/",
       status: candidate.status === "release_candidate_ready"
         ? "release_candidate_ready"
@@ -225,7 +227,7 @@ function decisionInput(state, candidate, outcome = "passed") {
     notes: "Reviewed exact candidate.",
     candidateId: candidate.id,
     manifestDigest: candidate.manifestDigest,
-    integrationSha: INTEGRATION_SHA,
+    integrationSha: candidate.manifest.integration.sha,
     ownerQaPacketDigest: qaDecisionCoordinatesForState(state).tasks[state.tasks[0].id],
   };
 }
@@ -237,7 +239,7 @@ function bundleDecisionInput(state, candidate, outcome = "failed") {
     notes: "Reviewed exact candidate bundle.",
     candidateId: candidate.id,
     manifestDigest: candidate.manifestDigest,
-    integrationSha: INTEGRATION_SHA,
+    integrationSha: candidate.manifest.integration.sha,
     taskIds: candidate.manifest.sources.map((source) => source.taskId),
     ownerQaPacketDigest: qaDecisionCoordinatesForState(state).bundles[candidate.qaBundleId],
   };
@@ -349,20 +351,29 @@ function createOpenPromotionObservation(state, candidate, claim, promotion) {
 }
 
 async function installFixtureState(options = {}) {
+  const native = options.nativeFixture || await nativeQaFixture(options);
   const current = await readState();
   const suffix = (current.candidates || []).length + 1;
   const requestedCandidateStatus = options.candidateStatus || "frozen";
   const state = fixtureState({
     ...options,
+    ...native,
     suffix,
     candidateStatus: "frozen",
     taskStatus: "qa_review",
   });
   state.meta = structuredClone(current.meta || {});
-  state.projects.push(...structuredClone(current.projects || []));
+  state.projects.push(...structuredClone((current.projects || []).filter((project) => (
+    !state.projects.some((item) => item.id === project.id)
+  ))));
   state.candidates.push(...structuredClone(current.candidates || []));
   state.qaBundles.push(...structuredClone(current.qaBundles || []));
-  state.tasks.push(...structuredClone(current.tasks || []));
+  state.tasks.push(...structuredClone((current.tasks || []).filter((task) => (
+    !state.tasks.some((item) => item.id === task.id)
+  ))));
+  for (const collection of ["runs", "reviews", "comments", "events"]) {
+    state[collection].push(...structuredClone(current[collection] || []));
+  }
   await writeState(state);
   let persisted = await readState();
   if (requestedCandidateStatus === "frozen") return persisted;
@@ -443,6 +454,132 @@ async function installFixtureState(options = {}) {
     promotionRemoteObservation,
   });
   return readState();
+}
+
+async function nativeQaFixture(options) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "qa-auth-candidate-"));
+  options.testContext.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("/usr/bin/git", ["-C", root, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const key = `qa-auth-${path.basename(root).toLowerCase()}`;
+  const repository = options.repoUrl || REPOSITORY_URL;
+  git("init", "-b", "main");
+  git("config", "user.name", "Fixture Author");
+  git("config", "user.email", "fixture@example.invalid");
+  git("remote", "add", "origin", repository);
+  await mkdir(path.join(root, "src"));
+  await mkdir(path.join(root, "test"));
+  await mkdir(path.join(root, "docs/architecture"), { recursive: true });
+  await writeFile(path.join(root, "src/catalog.js"), "export const version = 1;\n");
+  await writeFile(path.join(root, "test/catalog.test.js"), 'import assert from "node:assert/strict";\nimport { version } from "../src/catalog.js";\nassert.ok(Number.isSafeInteger(version) && version > 0);\n');
+  await writeFile(path.join(root, "docs/architecture/components.json"), JSON.stringify({
+    schemaVersion: 1, project: { key, repository }, aggregateCommand: "node --test",
+    components: { catalog: {
+      owner: "fixture-engineering", paths: ["src/catalog.js", "test/catalog.test.js"],
+      publicContracts: ["catalog value"], services: ["catalog module"], dependsOn: [],
+      tests: [{ command: "node --test test/catalog.test.js", layer: "unit" }],
+      reviewOwners: ["backend-reviewer", "lead-reviewer"], rollback: "Restore the prior fixture commit.",
+    } },
+  }));
+  git("add", ".");
+  git("commit", "-m", "Generic QA candidate base");
+  const baseSha = git("rev-parse", "HEAD");
+  const nativeProject = await addProject({
+    key, name: "Private Demo", workflowMode: "github", defaultBranch: "main",
+    repoPath: root, sourceRepoPath: root, repoUrl: repository,
+    reviewPipeline: [
+      { key: "backend", label: "Backend Review", role: "backend-reviewer", status: "backend_review", required: true },
+      { key: "lead", label: "Primary Lead Review", role: "lead-reviewer", status: "lead_review", required: true },
+    ],
+  });
+  const taskIds = [];
+  const branches = [];
+  for (let index = 0; index < Number(options.taskCount || 1); index += 1) {
+    const branch = `feature/task-${index + 1}`;
+    branches.push(branch);
+    git("branch", branch, baseSha);
+    const task = await addTask({
+      project: nativeProject.id, title: "Exact owner QA", type: "bug", status: "ready", architectureRequired: false,
+      description: "Review a real candidate under native frozen edit authority.",
+      userStory: "As an owner I need exact QA decisions and immutable audit evidence.",
+      expectedOutcome: "QA authority remains bound to the exact candidate.",
+      acceptanceCriteria: ["Candidate QA decisions remain immutable."], workAreas: ["src/catalog.js"], branchName: branch,
+      candidateIdentity: { baseSha },
+      affectedSurfaces: ["src/catalog.js"], validationPlan: ["node --test test/catalog.test.js"], riskClassification: "low",
+      privacyNotes: "Generic synthetic source only; no personal data.", securityNotes: "No external executor or network request is used.",
+    });
+    // Native dispatch freezes the scope. Cancel before any executor starts.
+    const dispatch = await dispatchSupervisorActions([{
+      id: `${task.id}:start_builder`, type: "start_builder", role: "builder", taskId: task.id,
+      projectId: nativeProject.id, taskStatus: "ready", nextStatus: "in_progress",
+    }], { failureIncidents: [], creditPolicy: { enabled: false } });
+    assert.equal(dispatch.runs.length, 1, JSON.stringify(dispatch.skipped));
+    await updateRun(dispatch.runs[0].id, {
+      status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch.",
+    });
+    await updateTask(task.id, { status: "in_progress" });
+    taskIds.push(task.id);
+  }
+  git("checkout", branches[0]);
+  await writeFile(path.join(root, "src/catalog.js"), "export const version = 2;\n");
+  git("add", "src/catalog.js");
+  git("commit", "-m", "Generic exact QA source");
+  const sourceSha = git("rev-parse", "HEAD");
+  const treeSha = git("rev-parse", "HEAD^{tree}");
+  const impactEvidence = { changedFiles: ["src/catalog.js"], unknown: false, backendRequired: true };
+  for (const [index, taskId] of taskIds.entries()) {
+    git("checkout", branches[index]);
+    git("merge", "--ff-only", sourceSha);
+    await updateTask(taskId, {
+      status: "builder_review", subjectSha: sourceSha, branchName: branches[index],
+      prUrl: `${REPOSITORY_URL}/pull/${index + 1}`,
+      candidateIdentity: { commitSha: sourceSha, treeSha, baseSha, branch: branches[index], candidateCycle: 1 }, impactEvidence,
+    });
+    for (const stage of nativeProject.reviewPipeline.filter((item) => item.required)) {
+      await recordReview(taskId, {
+        stage: stage.key, outcome: "approved", subjectSha: sourceSha, candidateCycle: 1,
+        author: "Fixture Reviewer", body: "Reviewed the exact generic fixture commit.",
+      });
+    }
+  }
+  git("branch", "qa/demo", sourceSha);
+  const validationEnv = { ...process.env };
+  delete validationEnv.NODE_TEST_CONTEXT;
+  const validationOutput = execFileSync(process.execPath, ["--test", "test/catalog.test.js"], {
+    cwd: root, env: validationEnv, stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.match(validationOutput.toString(), /# pass 1\b/);
+  const frozen = await readState();
+  const nativeTasks = taskIds.map((id) => frozen.tasks.find((task) => task.id === id));
+  for (const task of nativeTasks) {
+    assert.equal(task.impactScopePlan.status, "mapped");
+    assert.equal(task.impactScopePlan.sourceCommit, baseSha);
+    assert.equal(task.reviewSubjectSha, sourceSha);
+  }
+  return {
+    nativeProject, nativeTasks, baseSha, sourceSha, integrationSha: sourceSha,
+    nativeReviews: frozen.reviews.filter((review) => taskIds.includes(review.taskId)),
+    validationEvidenceDigest: `sha256:${createHash("sha256").update(validationOutput).digest("hex")}`,
+    handoff: async (index) => {
+      git("checkout", branches[index]);
+      await writeFile(path.join(root, "src/catalog.js"), `export const version = ${index + 3};\n`);
+      git("add", "src/catalog.js");
+      git("commit", "-m", `Generic sibling ${index + 1} remediation`);
+      const commitSha = git("rev-parse", "HEAD");
+      return {
+        status: "builder_review", subjectSha: commitSha, branchName: branches[index],
+        candidateIdentity: { commitSha, treeSha: git("rev-parse", "HEAD^{tree}"), baseSha, branch: branches[index], candidateCycle: 2 },
+        impactEvidence,
+      };
+    },
+  };
+}
+
+async function scopedSiblingResubmissionFixture(t) {
+  const native = await nativeQaFixture({ taskCount: 2, testContext: t });
+  const initial = await installFixtureState({ nativeFixture: native });
+  return { initial, handoff: native.handoff };
 }
 
 function forceLegacyStalePostMergeResult(taskId) {
@@ -572,8 +709,8 @@ function createMergedRecoveryObservation(state, candidate) {
   }, { nowMs: Date.parse("2026-09-03T12:16:03.000Z") });
 }
 
-test("durable candidate-status gates stop a three-transaction generic-writer recovery bounce", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+test("durable candidate-status gates stop a three-transaction generic-writer recovery bounce", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const candidateId = initial.candidates[0].id;
   const taskId = initial.candidates[0].manifest.sources[0].taskId;
   forceLegacyStalePostMergeResult(taskId);
@@ -636,8 +773,8 @@ test("durable candidate-status gates stop a three-transaction generic-writer rec
   }
 });
 
-test("an exact merged legacy PR restores stranded reconciliation admission through the narrow writer", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+test("an exact merged legacy PR restores stranded reconciliation admission through the narrow writer", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const candidateId = initial.candidates[0].id;
   const taskId = initial.candidates[0].manifest.sources[0].taskId;
   forceLegacyStalePostMergeResult(taskId);
@@ -692,8 +829,8 @@ test("an exact merged legacy PR restores stranded reconciliation admission throu
   );
 });
 
-test("private owner QA uses only narrow read-verification auth outside the state mutation", async () => {
-  const initial = await installFixtureState();
+test("private owner QA uses only narrow read-verification auth outside the state mutation", async (t) => {
+  const initial = await installFixtureState({ testContext: t });
   const calls = [];
   const auth = {
     role: "qa-reviewer",
@@ -758,8 +895,8 @@ test("private owner QA uses only narrow read-verification auth outside the state
   assert.equal((await readState()).tasks[0].status, "approved_for_main");
 });
 
-test("a task QA request missing exact candidate coordinates fails before repository access", async () => {
-  const initial = await installFixtureState();
+test("a task QA request missing exact candidate coordinates fails before repository access", async (t) => {
+  const initial = await installFixtureState({ testContext: t });
   let verificationCalls = 0;
   const dependencies = createQaDecisionTestDependencies({
     verifyCandidateRepositoryState: async () => {
@@ -775,15 +912,15 @@ test("a task QA request missing exact candidate coordinates fails before reposit
       notes: "Missing exact coordinates.",
       candidateId: "",
       manifestDigest: initial.candidates[0].manifestDigest,
-      integrationSha: INTEGRATION_SHA,
+      integrationSha: initial.candidates[0].manifest.integration.sha,
     }, dependencies),
     /candidate ID does not match/i,
   );
   assert.equal(verificationCalls, 0);
 });
 
-test("owner QA becomes non-actionable when a frozen source is reassigned", async () => {
-  const initial = await installFixtureState({ taskCount: 2 });
+test("owner QA becomes non-actionable when a frozen source is reassigned", async (t) => {
+  const initial = await installFixtureState({ testContext: t, taskCount: 2 });
   const candidate = initial.candidates[0];
   const input = bundleDecisionInput(initial, candidate, "passed");
   let verificationCalls = 0;
@@ -807,8 +944,8 @@ test("owner QA becomes non-actionable when a frozen source is reassigned", async
   assert.equal(verificationCalls, 0);
 });
 
-test("owner QA rejects noncanonical repository authority before minting a token", async () => {
-  const initial = await installFixtureState({ repoUrl: `${REPOSITORY_URL}.git` });
+test("owner QA rejects noncanonical repository authority before minting a token", async (t) => {
+  const initial = await installFixtureState({ testContext: t, repoUrl: `${REPOSITORY_URL}.git` });
   let authCalls = 0;
   const dependencies = createQaDecisionTestDependencies({
     verifyCandidateRepositoryState: async () => ({
@@ -833,8 +970,8 @@ test("owner QA rejects noncanonical repository authority before minting a token"
   assert.equal(authCalls, 0);
 });
 
-test("a state or repository binding change after verification cannot commit QA authority", async () => {
-  const initial = await installFixtureState();
+test("a state or repository binding change after verification cannot commit QA authority", async (t) => {
+  const initial = await installFixtureState({ testContext: t });
   const dependencies = createQaDecisionTestDependencies({
     verifyCandidateRepositoryState: async () => {
       await mutateState((state) => {
@@ -859,8 +996,8 @@ test("a state or repository binding change after verification cannot commit QA a
   assert.equal(state.projects[0].repoUrl, "https://github.com/example/private-demo");
 });
 
-test("a negative owner QA decision is exact-bound but does not require remote availability", async () => {
-  const initial = await installFixtureState();
+test("a negative owner QA decision is exact-bound but does not require remote availability", async (t) => {
+  const initial = await installFixtureState({ testContext: t });
   let verificationCalls = 0;
   const dependencies = createQaDecisionTestDependencies({
     verifyCandidateRepositoryState: async () => {
@@ -880,8 +1017,8 @@ test("a negative owner QA decision is exact-bound but does not require remote av
   assert.equal(result.candidate.qaDecision.repositoryVerifiedAt, "");
 });
 
-test("private owner QA fails closed and redacts scoped credentials", async () => {
-  const initial = await installFixtureState();
+test("private owner QA fails closed and redacts scoped credentials", async (t) => {
+  const initial = await installFixtureState({ testContext: t });
   const token = "ghs_should_never_appear_in_error";
   let cleaned = false;
   const dependencies = createQaDecisionTestDependencies({
@@ -915,9 +1052,9 @@ test("private owner QA fails closed and redacts scoped credentials", async () =>
   assert.equal(state.candidates[0].status, "frozen");
 });
 
-test("persistence rejects corrupt frozen task and bundle links before they can reach QA", async () => {
+test("persistence rejects corrupt frozen task and bundle links before they can reach QA", async (t) => {
   for (const corruption of ["task", "bundle"]) {
-    const initial = await installFixtureState({ taskCount: corruption === "bundle" ? 2 : 1 });
+    const initial = await installFixtureState({ testContext: t, taskCount: corruption === "bundle" ? 2 : 1 });
     const candidate = initial.candidates[0];
     await assert.rejects(
       () => mutateState((state) => {
@@ -935,8 +1072,8 @@ test("persistence rejects corrupt frozen task and bundle links before they can r
   }
 });
 
-test("a QA pass followed by a task-definition edit atomically revokes promotion authority", async () => {
-  const initial = await installFixtureState({ taskCount: 2 });
+test("a QA pass followed by a task-definition edit atomically revokes promotion authority", async (t) => {
+  const initial = await installFixtureState({ testContext: t, taskCount: 2 });
   const candidate = initial.candidates[0];
   await recordQaBundleDecision(
     candidate.qaBundleId,
@@ -961,8 +1098,8 @@ test("a QA pass followed by a task-definition edit atomically revokes promotion 
   assert.ok(storedTasks.every((task) => !task.promotionStatus));
 });
 
-test("recording a QA decision atomically terminalizes stale queued and claimed notifications", async () => {
-  const initial = await installFixtureState();
+test("recording a QA decision atomically terminalizes stale queued and claimed notifications", async (t) => {
+  const initial = await installFixtureState({ testContext: t });
   const candidate = initial.candidates[0];
   await mutateState((state) => {
     state.notificationOutbox = ["queued", "attempted"].map((status, index) => ({
@@ -997,8 +1134,8 @@ test("recording a QA decision atomically terminalizes stale queued and claimed n
   assert.ok(state.notificationOutbox.every((item) => !item.claimToken && !item.claimExpiresAt));
 });
 
-test("a frozen packet edit invalidates every candidate task before a stale owner click", async () => {
-  const initial = await installFixtureState({ taskCount: 2 });
+test("a frozen packet edit invalidates every candidate task before a stale owner click", async (t) => {
+  const initial = await installFixtureState({ testContext: t, taskCount: 2 });
   const candidate = initial.candidates[0];
   const staleInput = bundleDecisionInput(initial, candidate, "passed");
   await updateTask(initial.tasks[0].id, { title: "Fresh requirements" });
@@ -1022,8 +1159,8 @@ test("a frozen packet edit invalidates every candidate task before a stale owner
   )));
 });
 
-test("project authority changes invalidate frozen QA, while active release candidates require explicit revocation", async () => {
-  const frozen = await installFixtureState({ taskCount: 2 });
+test("project authority changes invalidate frozen QA, while active release candidates require explicit revocation", async (t) => {
+  const frozen = await installFixtureState({ testContext: t, taskCount: 2 });
   const frozenCandidate = frozen.candidates[0];
   await updateProject(frozenCandidate.projectId, { description: "Changed safety context" });
   let state = await readState();
@@ -1032,7 +1169,7 @@ test("project authority changes invalidate frozen QA, while active release candi
     state.tasks.find((task) => task.id === source.taskId).status === "needs_changes"
   )));
 
-  const release = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+  const release = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const releaseCandidate = release.candidates[0];
   await assert.rejects(
     updateProject(releaseCandidate.projectId, { description: "Unsafe in-place release edit" }),
@@ -1093,9 +1230,9 @@ test("project authority changes invalidate frozen QA, while active release candi
   assert.equal(state.tasks.find((task) => task.id === release.tasks[0].id).status, "user_review");
 });
 
-test("dependency definition edits invalidate frozen and passed packets but fence active release PRs", async () => {
+test("dependency definition edits invalidate frozen and passed packets but fence active release PRs", async (t) => {
   for (const candidateStatus of ["frozen", "qa_passed", "release_candidate_ready"]) {
-    const initial = await installFixtureState({ candidateStatus, withDependency: true });
+    const initial = await installFixtureState({ testContext: t, candidateStatus, withDependency: true });
     const candidate = initial.candidates[0];
     const sourceTaskId = candidate.manifest.sources[0].taskId;
     const dependency = initial.tasks.find((task) => task.id.startsWith("dependency_"));
@@ -1121,8 +1258,9 @@ test("dependency definition edits invalidate frozen and passed packets but fence
   }
 });
 
-test("failed multi-task QA permits sequential sibling submissions without rewriting its authority audit", async () => {
-  const initial = await installFixtureState({ taskCount: 2 });
+test("failed multi-task QA permits sequential sibling submissions without rewriting its authority audit", async (t) => {
+  const fixture = await scopedSiblingResubmissionFixture(t);
+  const { initial } = fixture;
   const candidate = initial.candidates[0];
   const [firstTaskId, secondTaskId] = candidate.manifest.sources.map((source) => source.taskId);
   await recordQaBundleDecision(
@@ -1135,7 +1273,7 @@ test("failed multi-task QA permits sequential sibling submissions without rewrit
   const originalTaskMirror = structuredClone(failed.tasks.find((task) => task.id === secondTaskId).qaDecision);
   assert.equal(originalDecision.outcome, "failed");
 
-  await updateTask(firstTaskId, { status: "builder_review", subjectSha: "e".repeat(40) });
+  await updateTask(firstTaskId, await fixture.handoff(0));
   const firstSubmitted = await readState();
   const invalidated = firstSubmitted.candidates.find((item) => item.id === candidate.id);
   assert.equal(invalidated.status, "invalidated");
@@ -1144,7 +1282,7 @@ test("failed multi-task QA permits sequential sibling submissions without rewrit
   assert.equal(secondBefore.candidateId, candidate.id);
   assert.deepEqual(secondBefore.qaDecision, originalTaskMirror);
 
-  await updateTask(secondTaskId, { status: "builder_review", subjectSha: "f".repeat(40) });
+  await updateTask(secondTaskId, await fixture.handoff(1));
   const submitted = await readState();
   const storedCandidate = submitted.candidates.find((item) => item.id === candidate.id);
   assert.deepEqual(storedCandidate.qaDecision, originalDecision);
@@ -1162,8 +1300,8 @@ test("failed multi-task QA permits sequential sibling submissions without rewrit
   }), /qaDecision record is append-only/i);
 });
 
-test("a live approved candidate still forbids clearing or rewriting its task QA mirror", async () => {
-  const initial = await installFixtureState({ candidateStatus: "qa_passed" });
+test("a live approved candidate still forbids clearing or rewriting its task QA mirror", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "qa_passed" });
   const candidate = initial.candidates[0];
   const taskId = candidate.manifest.sources[0].taskId;
   for (const rewrite of ["decision", "detach"]) {
@@ -1182,8 +1320,8 @@ test("a live approved candidate still forbids clearing or rewriting its task QA 
   assert.equal(current.tasks.find((item) => item.id === taskId).candidateId, candidate.id);
 });
 
-test("multi-task QA revocation is atomic and preserves the original signed approval audit", async () => {
-  const initial = await installFixtureState({ candidateStatus: "qa_passed", taskCount: 2 });
+test("multi-task QA revocation is atomic and preserves the original signed approval audit", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "qa_passed", taskCount: 2 });
   const candidate = initial.candidates[0];
   const result = await recordQaBundleDecision(
     candidate.qaBundleId,
@@ -1218,8 +1356,8 @@ test("multi-task QA revocation is atomic and preserves the original signed appro
   );
 });
 
-test("release revocation uses promotion-worker auth, closes the PR, and persists settlement evidence", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready", taskCount: 2 });
+test("release revocation uses promotion-worker auth, closes the PR, and persists settlement evidence", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready", taskCount: 2 });
   const candidate = initial.candidates[0];
   const calls = [];
   const observedAt = "2026-09-03T12:31:00.000Z";
@@ -1259,8 +1397,8 @@ test("release revocation uses promotion-worker auth, closes the PR, and persists
   assert.equal(state.candidates.find((item) => item.id === candidate.id).status, "invalidated");
 });
 
-test("release revocation preserves an independently reconciled terminal task while clearing stale candidate authority", async () => {
-  const initial = await installFixtureState({
+test("release revocation preserves an independently reconciled terminal task while clearing stale candidate authority", async (t) => {
+  const initial = await installFixtureState({ testContext: t,
     candidateStatus: "release_candidate_ready",
     terminalTaskStatus: "merged",
   });
@@ -1300,8 +1438,8 @@ test("release revocation preserves an independently reconciled terminal task whi
   );
 });
 
-test("a merged release PR refuses revocation without changing local QA authority", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+test("a merged release PR refuses revocation without changing local QA authority", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const candidate = initial.candidates[0];
   const dependencies = releaseRevocationDependencies(async () => ({
     status: "merged",
@@ -1324,8 +1462,8 @@ test("a merged release PR refuses revocation without changing local QA authority
   assert.equal(state.qaBundles.find((item) => item.id === candidate.qaBundleId).status, "release_candidate_ready");
 });
 
-test("durable revocation intent survives benign state drift after remote PR closure", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+test("durable revocation intent survives benign state drift after remote PR closure", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const candidate = initial.candidates[0];
   const dependencies = releaseRevocationDependencies(async () => {
     await mutateState((state) => {
@@ -1347,8 +1485,8 @@ test("durable revocation intent survives benign state drift after remote PR clos
   assert.equal(state.candidates.find((item) => item.id === candidate.id).qaRevocationSettlement.status, "closed");
 });
 
-test("a durable pending revocation is autonomously reconciled on a later sweep", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+test("a durable pending revocation is autonomously reconciled on a later sweep", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const candidate = initial.candidates[0];
   const unavailable = releaseRevocationDependencies(async () => ({
     status: "unavailable",
@@ -1380,8 +1518,8 @@ test("a durable pending revocation is autonomously reconciled on a later sweep",
   assert.equal(state.tasks.find((item) => item.id === initial.tasks[0].id).status, "needs_changes");
 });
 
-test("QA-passed absence waits for an active promotion claim and settles after its lease", async () => {
-  const initial = await installFixtureState({ candidateStatus: "qa_passed" });
+test("QA-passed absence waits for an active promotion claim and settles after its lease", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "qa_passed" });
   const candidate = initial.candidates[0];
   await installActivePromotionClaim(candidate.id, "qa-revocation-lease");
   const absent = releaseRevocationDependencies(async () => ({
@@ -1410,9 +1548,9 @@ test("QA-passed absence waits for an active promotion claim and settles after it
   assert.equal(storedCandidate.qaRevocationSettlement.status, "absent");
 });
 
-test("generic state writers cannot plant an exact QA revocation intent or trigger reconciliation", async () => {
+test("generic state writers cannot plant an exact QA revocation intent or trigger reconciliation", async (t) => {
   for (const candidateStatus of ["qa_passed", "release_candidate_ready"]) {
-    const initial = await installFixtureState({ candidateStatus });
+    const initial = await installFixtureState({ testContext: t, candidateStatus });
     const candidate = initial.candidates[0];
     const taskId = candidate.manifest.sources[0].taskId;
     const forgedIntent = {
@@ -1460,8 +1598,8 @@ test("generic state writers cannot plant an exact QA revocation intent or trigge
   }
 });
 
-test("generic and directly imported writers cannot forge remote revocation settlement", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+test("generic and directly imported writers cannot forge remote revocation settlement", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const candidate = initial.candidates[0];
   await assert.rejects(
     recordQaBundleDecision(
@@ -1508,8 +1646,8 @@ test("generic and directly imported writers cannot forge remote revocation settl
   assert.equal(state.candidates.find((item) => item.id === candidate.id).qaRevocationSettlement, undefined);
 });
 
-test("raw state writers cannot strand a release candidate outside reconciliation", async () => {
-  const initial = await installFixtureState({ candidateStatus: "release_candidate_ready" });
+test("raw state writers cannot strand a release candidate outside reconciliation", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "release_candidate_ready" });
   const candidate = initial.candidates[0];
   const taskId = initial.tasks[0].id;
 
@@ -1533,8 +1671,8 @@ test("raw state writers cannot strand a release candidate outside reconciliation
   assert.equal(state.tasks.find((item) => item.id === taskId).status, "user_review");
 });
 
-test("raw state writers cannot strand a QA-passed candidate with an active promotion claim", async () => {
-  const initial = await installFixtureState({ candidateStatus: "qa_passed" });
+test("raw state writers cannot strand a QA-passed candidate with an active promotion claim", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "qa_passed" });
   const candidate = initial.candidates[0];
   const taskId = initial.tasks[0].id;
   await installActivePromotionClaim(candidate.id, "raw-writer-active");
@@ -1579,8 +1717,8 @@ test("raw state writers cannot strand a QA-passed candidate with an active promo
   assert.equal(state.qaBundles.find((item) => item.id === candidate.qaBundleId).status, "passed");
 });
 
-test("terminal promotion claims keep QA-passed retry authority reconciliation-safe", async () => {
-  const initial = await installFixtureState({ candidateStatus: "qa_passed" });
+test("terminal promotion claims keep QA-passed retry authority reconciliation-safe", async (t) => {
+  const initial = await installFixtureState({ testContext: t, candidateStatus: "qa_passed" });
   const candidate = initial.candidates[0];
   const taskId = initial.tasks[0].id;
   const activeClaim = await installActivePromotionClaim(candidate.id, "raw-writer-terminal");

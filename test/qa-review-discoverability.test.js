@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,53 +16,180 @@ Object.assign(process.env, qaReviewEnvironment.env);
 test.after(async () => qaReviewEnvironment.cleanup());
 const OUTER_VALIDATION_SANDBOX = Boolean(process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX);
 
-const { writeState } = await import(`../src/store.js?qa-review-discoverability=${Date.now()}`);
+const { writeState, readState, addProject, addTask, updateTask, updateRun, recordReview } = await import(`../src/store.js?qa-review-discoverability=${Date.now()}`);
 const { createStudioOpsServer } = await import(`../src/server.js?qa-review-discoverability=${Date.now()}`);
 const { buildQaReviewList } = await import(`../src/qa-review-list.js?qa-review-discoverability=${Date.now()}`);
+
+const { dispatchSupervisorActions } = await import("../src/dispatcher.js");
+const REPOSITORY_URL = "https://github.com/example/demo";
+
+async function nativeQaFixture(options) {
+  const root = await mkdtemp(path.join(options.tempParent || os.tmpdir(), "qa-auth-candidate-"));
+  options.testContext.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("/usr/bin/git", ["-C", root, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const key = options.projectKey || `qa-auth-${path.basename(root).toLowerCase()}`;
+  const repository = options.repoUrl || REPOSITORY_URL;
+  git("init", "-b", "main");
+  git("config", "user.name", "Fixture Author");
+  git("config", "user.email", "fixture@example.invalid");
+  git("remote", "add", "origin", repository);
+  await mkdir(path.join(root, "src"));
+  await mkdir(path.join(root, "test"));
+  await mkdir(path.join(root, "docs/architecture"), { recursive: true });
+  await writeFile(path.join(root, "src/catalog.js"), "export const version = 1;\n");
+  await writeFile(path.join(root, "test/catalog.test.js"), 'import assert from "node:assert/strict";\nimport { version } from "../src/catalog.js";\nassert.ok(Number.isSafeInteger(version) && version > 0);\n');
+  await writeFile(path.join(root, "docs/architecture/components.json"), JSON.stringify({
+    schemaVersion: 1, project: { key, repository }, aggregateCommand: "node --test",
+    components: { catalog: {
+      owner: "fixture-engineering", paths: ["src/catalog.js", "test/catalog.test.js"],
+      publicContracts: ["catalog value"], services: ["catalog module"], dependsOn: [],
+      tests: [{ command: "node --test test/catalog.test.js", layer: "unit" }],
+      reviewOwners: ["backend-reviewer", "lead-reviewer"], rollback: "Restore the prior fixture commit.",
+    } },
+  }));
+  git("add", ".");
+  git("commit", "-m", "Generic QA candidate base");
+  const baseSha = git("rev-parse", "HEAD");
+  const nativeProject = await addProject({
+    key, name: options.projectName || "Demo", workflowMode: "github", defaultBranch: "main",
+    repoPath: root, sourceRepoPath: root, repoUrl: repository,
+    reviewPipeline: [
+      { key: "backend", label: "Backend Review", role: "backend-reviewer", status: "backend_review", required: true },
+      { key: "lead", label: "Primary Lead Review", role: "lead-reviewer", status: "lead_review", required: true },
+    ],
+  });
+  const taskIds = [];
+  const branches = [];
+  for (let index = 0; index < Number(options.taskCount || 1); index += 1) {
+    const branch = `feature/task-${index + 1}`;
+    branches.push(branch);
+    git("branch", branch, baseSha);
+    const task = await addTask({
+      project: nativeProject.id, title: options.taskTitle || "Exact owner QA", type: "bug", status: "ready", architectureRequired: false,
+      description: "Review a real candidate under native frozen edit authority.",
+      userStory: "As an owner I need exact QA decisions and immutable audit evidence.",
+      expectedOutcome: "QA authority remains bound to the exact candidate.",
+      acceptanceCriteria: ["Candidate QA decisions remain immutable."], workAreas: ["src/catalog.js"], branchName: branch,
+      candidateIdentity: { baseSha },
+      affectedSurfaces: ["src/catalog.js"], validationPlan: ["node --test test/catalog.test.js"], riskClassification: "low",
+      privacyNotes: "Generic synthetic source only; no personal data.", securityNotes: "No external executor or network request is used.",
+    });
+    // Native dispatch freezes the scope. Cancel before any executor starts.
+    const dispatch = await dispatchSupervisorActions([{
+      id: `${task.id}:start_builder`, type: "start_builder", role: "builder", taskId: task.id,
+      projectId: nativeProject.id, taskStatus: "ready", nextStatus: "in_progress",
+    }], { failureIncidents: [], creditPolicy: { enabled: false } });
+    assert.equal(dispatch.runs.length, 1, JSON.stringify(dispatch.skipped));
+    await updateRun(dispatch.runs[0].id, {
+      status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch.",
+    });
+    await updateTask(task.id, { status: "in_progress" });
+    taskIds.push(task.id);
+  }
+  git("checkout", branches[0]);
+  await writeFile(path.join(root, "src/catalog.js"), "export const version = 2;\n");
+  git("add", "src/catalog.js");
+  git("commit", "-m", "Generic exact QA source");
+  const sourceSha = git("rev-parse", "HEAD");
+  const treeSha = git("rev-parse", "HEAD^{tree}");
+  const impactEvidence = { changedFiles: ["src/catalog.js"], unknown: false, backendRequired: true };
+  for (const [index, taskId] of taskIds.entries()) {
+    git("checkout", branches[index]);
+    git("merge", "--ff-only", sourceSha);
+    await updateTask(taskId, {
+      status: "builder_review", subjectSha: sourceSha, branchName: branches[index],
+      prUrl: `${REPOSITORY_URL}/pull/${index + 1}`,
+      candidateIdentity: { commitSha: sourceSha, treeSha, baseSha, branch: branches[index], candidateCycle: 1 }, impactEvidence,
+    });
+    for (const stage of nativeProject.reviewPipeline.filter((item) => item.required)) {
+      await recordReview(taskId, {
+        stage: stage.key, outcome: "approved", subjectSha: sourceSha, candidateCycle: 1,
+        author: "Fixture Reviewer", body: "Reviewed the exact generic fixture commit.",
+      });
+    }
+  }
+  git("branch", "qa/demo", sourceSha);
+  const validationEnv = { ...process.env };
+  delete validationEnv.NODE_TEST_CONTEXT;
+  const validationOutput = execFileSync(process.execPath, ["--test", "test/catalog.test.js"], {
+    cwd: root, env: validationEnv, stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.match(validationOutput.toString(), /# pass 1\b/);
+  const frozen = await readState();
+  const nativeTasks = taskIds.map((id) => frozen.tasks.find((task) => task.id === id));
+  for (const task of nativeTasks) {
+    assert.equal(task.impactScopePlan.status, "mapped");
+    assert.equal(task.impactScopePlan.sourceCommit, baseSha);
+    assert.equal(task.reviewSubjectSha, sourceSha);
+  }
+  return {
+    nativeProject, nativeTasks, nativeState: frozen, baseSha, sourceSha, integrationSha: sourceSha,
+    nativeReviews: frozen.reviews.filter((review) => taskIds.includes(review.taskId)),
+    validationEvidenceDigest: `sha256:${createHash("sha256").update(validationOutput).digest("hex")}`,
+    handoff: async (index) => {
+      git("checkout", branches[index]);
+      await writeFile(path.join(root, "src/catalog.js"), `export const version = ${index + 3};\n`);
+      git("add", "src/catalog.js");
+      git("commit", "-m", `Generic sibling ${index + 1} remediation`);
+      const commitSha = git("rev-parse", "HEAD");
+      return {
+        status: "builder_review", subjectSha: commitSha, branchName: branches[index],
+        candidateIdentity: { commitSha, treeSha: git("rev-parse", "HEAD^{tree}"), baseSha, branch: branches[index], candidateCycle: 2 },
+        impactEvidence,
+      };
+    },
+  };
+}
 
 const BASE_SHA = "a".repeat(40);
 const SOURCE_SHA = "b".repeat(40);
 const INTEGRATION_SHA = "c".repeat(40);
 
 function fixtureState(options = {}) {
+  const native = options.native;
+  const baseSha = native?.baseSha || BASE_SHA;
+  const sourceSha = native?.sourceSha || SOURCE_SHA;
+  const integrationSha = native?.integrationSha || INTEGRATION_SHA;
   const candidateStatus = options.candidateStatus || "frozen";
-  const taskIds = options.taskIds || ["task_1"];
+  const taskIds = options.taskIds || native?.nativeTasks.map((task) => task.id) || ["task_1"];
   const candidate = createCandidateEnvelope({
     qaBundleId: "qa_bundle_1",
     manifest: {
       candidateId: "candidate_1",
       projectId: "project_1",
-      base: { branch: "main", sha: BASE_SHA },
+      base: { branch: "main", sha: baseSha },
       sources: taskIds.map((taskId, index) => ({
         taskId,
-        sourceRef: `refs/heads/feature/${taskId}`,
-        headSha: SOURCE_SHA,
+        sourceRef: `refs/heads/${native ? native.nativeTasks[index].branchName : `feature/${taskId}`}`,
+        headSha: sourceSha,
         candidateCycle: 1,
-        reviews: [{
+        reviews: native ? native.nativeReviews.filter((review) => review.taskId === taskId) : [{
           id: `review_${index + 1}`,
           stageKey: "lead",
           role: "lead-reviewer",
           outcome: "approved",
-          subjectSha: SOURCE_SHA,
+          subjectSha: sourceSha,
           candidateCycle: 1,
           reviewedAt: "2026-09-03T12:00:00.000Z",
         }],
       })),
-      integration: { branch: "qa/demo", sha: INTEGRATION_SHA },
+      integration: { branch: "qa/demo", sha: integrationSha },
       checks: [{
         id: "check_1",
         kind: "local-validation",
-        name: "npm test",
+        name: native ? "node --test test/catalog.test.js" : "npm test",
         outcome: "passed",
-        subjectSha: INTEGRATION_SHA,
-        evidenceDigest: `sha256:${"d".repeat(64)}`,
+        subjectSha: integrationSha,
+        evidenceDigest: native?.validationEvidenceDigest || `sha256:${"d".repeat(64)}`,
       }],
       preview: {
         url: "http://127.0.0.1:4393/",
         status: "healthy",
-        commitSha: INTEGRATION_SHA,
+        commitSha: integrationSha,
         verifiedAt: "2026-09-03T12:05:00.000Z",
-        attestation: { kind: "json", key: "commitSha", observedSha: INTEGRATION_SHA },
+        attestation: { kind: "json", key: "commitSha", observedSha: integrationSha },
       },
       assembly: {
         mode: "atomic",
@@ -77,7 +206,7 @@ function fixtureState(options = {}) {
     candidate.promotion = {
       branch: "qa/promotion-demo",
       prUrl: "https://github.com/example/demo/pull/42",
-      commitSha: INTEGRATION_SHA,
+      commitSha: integrationSha,
       manifestDigest: candidate.manifestDigest,
       readyAt: "2026-09-03T12:15:00.000Z",
     };
@@ -92,7 +221,7 @@ function fixtureState(options = {}) {
     ? "release_candidate_ready"
     : candidateStatus === "qa_passed" ? "passed" : "ready";
   const state = {
-    meta: {},
+    meta: native?.nativeState.meta || {},
     projects: [{
       id: "project_1",
       key: "demo",
@@ -101,27 +230,29 @@ function fixtureState(options = {}) {
       repoUrl: "https://github.com/example/demo",
       defaultBranch: "main",
       workflowMode: "github",
+      ...native?.nativeProject,
     }],
-    tasks: taskIds.map((taskId) => ({
+    tasks: taskIds.map((taskId, index) => ({
+      ...native?.nativeTasks[index],
       id: taskId,
       projectId: "project_1",
-      title: "Discover exact owner QA coordinates",
+      title: native?.nativeTasks[index].title || "Discover exact owner QA coordinates",
       status: taskStatus,
       assignedAgentRole,
-      stateVersion: options.stateVersion || 7,
-      reviewSubjectSha: SOURCE_SHA,
+      stateVersion: native?.nativeTasks[index].stateVersion || options.stateVersion || 7,
+      reviewSubjectSha: sourceSha,
       reviewSubjectCycle: 1,
       integrationStatus: "ready",
       integrationBranch: "qa/demo",
-      integrationCommit: INTEGRATION_SHA,
+      integrationCommit: integrationSha,
       candidateManifestDigest: candidate.manifestDigest,
       candidateId: candidate.id,
       qaBundleId: "qa_bundle_1",
     })),
-    comments: [],
-    events: [],
-    reviews: [],
-    runs: [],
+    comments: native?.nativeState.comments || [],
+    events: native?.nativeState.events || [],
+    reviews: native?.nativeState.reviews || [],
+    runs: native?.nativeState.runs || [],
     qaBundles: [{
       id: "qa_bundle_1",
       projectId: "project_1",
@@ -130,7 +261,7 @@ function fixtureState(options = {}) {
       candidateId: candidate.id,
       manifestDigest: candidate.manifestDigest,
       integrationBranch: "qa/demo",
-      integrationCommit: INTEGRATION_SHA,
+      integrationCommit: integrationSha,
       previewUrl: "http://127.0.0.1:4393/",
       status: bundleStatus,
       ...(candidateStatus === "release_candidate_ready" ? {
@@ -140,9 +271,9 @@ function fixtureState(options = {}) {
         promotedTaskIds: taskIds,
       } : {}),
       updatedAt: "2026-09-03T12:05:00.000Z",
-      tasks: taskIds.map((taskId) => ({
+      tasks: taskIds.map((taskId, index) => ({
         id: taskId,
-        title: "Discover exact owner QA coordinates",
+        title: native?.nativeTasks[index].title || "Discover exact owner QA coordinates",
       })),
     }],
     candidates: [candidate],
@@ -159,7 +290,7 @@ function fixtureState(options = {}) {
       outcome: "passed",
       candidateId: candidate.id,
       manifestDigest: candidate.manifestDigest,
-      integrationSha: INTEGRATION_SHA,
+      integrationSha: integrationSha,
       ownerQaPacketDigest: candidate.qaPacket.packetDigest,
       taskIds,
       repositoryVerifiedAt: "2026-09-03T12:06:00.000Z",
@@ -190,7 +321,7 @@ function assertCoordinates(item, candidate) {
   assert.equal(item.actionable, true);
   assert.equal(item.candidateId, candidate.id);
   assert.equal(item.manifestDigest, candidate.manifestDigest);
-  assert.equal(item.integrationSha, INTEGRATION_SHA);
+  assert.equal(item.integrationSha, candidate.manifest.integration.sha);
   assert.equal(item.ownerQaPacketDigest, candidate.qaPacket.packetDigest);
 }
 
@@ -227,14 +358,18 @@ function bootstrapLifecycleFixture(state) {
   return initial;
 }
 
-async function reviewListsFromFreshLifecycleFixture(state) {
+async function reviewListsFromFreshLifecycleFixture(options) {
+  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "qa-review-child-"));
   const isolated = await createHermeticTestEnvironment({ tempParent: os.tmpdir() });
   try {
-    const initialState = bootstrapLifecycleFixture(state);
     const script = `
-      import { execFile } from "node:child_process";
+      import { execFile, execFileSync } from "node:child_process";
+      import { createHash } from "node:crypto";
+      import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+      import os from "node:os";
+      import path from "node:path";
       import { promisify } from "node:util";
-      import { readState, writeState } from ${JSON.stringify(new URL("../src/store.js", import.meta.url).href)};
+      import { readState, writeState, addProject, addTask, updateTask, updateRun, recordReview } from ${JSON.stringify(new URL("../src/store.js", import.meta.url).href)};
       import {
         mutateCandidatePromotionState,
         mutateCandidateQaDecisionState,
@@ -249,10 +384,19 @@ async function reviewListsFromFreshLifecycleFixture(state) {
       import { createPromotionRemoteTestObservation } from ${JSON.stringify(new URL("./support/promotion-authority-harness.js", import.meta.url).href)};
       import { createStudioOpsServer } from ${JSON.stringify(new URL("../src/server.js", import.meta.url).href)};
       const run = promisify(execFile);
-      const desiredState = ${JSON.stringify(state)};
+      const { dispatchSupervisorActions } = await import(${JSON.stringify(new URL("../src/dispatcher.js", import.meta.url).href)});
+      const { createCandidateEnvelope } = await import(${JSON.stringify(new URL("../src/candidate-manifest.js", import.meta.url).href)});
+      const { buildOwnerQaPacket } = await import(${JSON.stringify(new URL("../src/owner-qa-packet.js", import.meta.url).href)});
+      const REPOSITORY_URL = "https://github.com/example/demo";
+      const BASE_SHA = "a".repeat(40), SOURCE_SHA = "b".repeat(40), INTEGRATION_SHA = "c".repeat(40);
+      ${nativeQaFixture.toString()}
+      ${fixtureState.toString()}
+      ${bootstrapLifecycleFixture.toString()}
+      const native = await nativeQaFixture({ testContext: {after() {}}, projectKey: "demo", tempParent: ${JSON.stringify(fixtureRoot)} });
+      const desiredState = fixtureState({ ...${JSON.stringify(options)}, native });
       const desiredCandidate = desiredState.candidates[0];
       const desiredStatus = desiredCandidate.status;
-      await writeState(${JSON.stringify(initialState)});
+      await writeState(bootstrapLifecycleFixture(desiredState));
 
       if (desiredStatus !== "frozen") {
         let snapshot = await readState();
@@ -399,6 +543,7 @@ async function reviewListsFromFreshLifecycleFixture(state) {
           "--json",
         ], { cwd: ${JSON.stringify(process.cwd())}, env: process.env });
         result = {
+          candidate: desiredCandidate,
           apiStatus: response.status,
           apiReviewList,
           cliReviewList: JSON.parse(cliResult.stdout),
@@ -417,6 +562,7 @@ async function reviewListsFromFreshLifecycleFixture(state) {
     return JSON.parse(result.stdout);
   } finally {
     await isolated.cleanup();
+    await rm(fixtureRoot, {recursive: true, force: true});
   }
 }
 
@@ -425,7 +571,8 @@ test("owner QA review discovery returns exact canonical task and bundle coordina
     ? "The outer release sandbox intentionally prohibits every loopback listener; this API/CLI parity suite runs in builder validation."
     : false,
 }, async (t) => {
-  const state = fixtureState();
+  const native = await nativeQaFixture({ testContext: t, projectKey: "demo" });
+  const state = fixtureState({ native });
   await writeState(state);
   const candidate = state.candidates[0];
 
@@ -467,7 +614,7 @@ test("owner QA review discovery returns exact canonical task and bundle coordina
     "ownerQaPacketDigest",
     candidate.id,
     candidate.manifestDigest,
-    INTEGRATION_SHA,
+    candidate.manifest.integration.sha,
     candidate.qaPacket.packetDigest,
   ]) {
     assert.match(tableResult.stdout, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -493,16 +640,12 @@ test("passed and release-candidate QA rows retain exact revocation coordinates",
       stateVersion: 2,
     },
   ]) {
-    const state = fixtureState({
-      candidateStatus: lifecycle.candidateStatus,
-      stateVersion: lifecycle.stateVersion,
-    });
-    const candidate = state.candidates[0];
     const {
+      candidate,
       apiStatus,
       apiReviewList: reviewList,
       cliReviewList,
-    } = await reviewListsFromFreshLifecycleFixture(state);
+    } = await reviewListsFromFreshLifecycleFixture({ candidateStatus: lifecycle.candidateStatus, stateVersion: lifecycle.stateVersion });
 
     assert.equal(apiStatus, 200);
     assert.equal(reviewList.tasks.length, 1);

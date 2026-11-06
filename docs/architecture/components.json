@@ -124,7 +124,7 @@
       "capabilities": ["repository-scoped architecture index", "impact-scoped validation"],
       "paths": ["src/component-impact-map.js","src/impact-planner.js","docs/architecture/components.json","docs/architecture/*.components.json","test/component-impact-map.test.js","docs/architecture/component-mapping.md","src/repository-context-index.js","src/repository-context-extractor.js","src/task-context-retrieval.js","src/repository-context-packet.js","src/repository-context-service.js","src/mission-control-context.js","test/repository-context-index.test.js","test/task-context-retrieval.test.js","test/repository-context-service.test.js","test/repository-context-evaluation.test.js","test/fixtures/repository-context-evaluation.json","scripts/evaluate-repository-context.js","docs/architecture/repository-context-evaluation.md"],
       "services": ["component map loader","impact planner","prompt context-packet adapter","immutable structural index","advisory code retrieval"],
-      "publicContracts": ["repository-bound component manifest","content-addressed context packet","out-of-scope handoff rejection","commit-bound metadata-only repository context","bounded advisory retrieval packet"],
+      "publicContracts": ["repository-bound component manifest","content-addressed context packet","out-of-scope handoff rejection","commit-bound metadata-only repository context","bounded advisory retrieval packet", "strict operator request v1; immutable endpoint diff, literal ownership and map digest verification"],
       "workflows": ["dispatch planning", "builder handoff", "exact-SHA QA validation"],
       "tests": [
         {"command":"node scripts/run-tests.js --test-file test/component-impact-map.test.js","layer":"unit-contract"},
@@ -165,7 +165,7 @@
         "test/prototype-fast-lane.test.js"
       ],
       "data": ["projects", "tasks", "runs", "reviews", "events", "candidates", "projects.hostedRc additive policy history", "candidates.hostedRc fenced evidence qualification revocation history"],
-      "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle", "hosted RC policy/evidence/qualification append-read-revoke v1; expectedVersion CAS; <=50 summaries", "trusted executable qualification persistence port supplied by qa-release adapters"],
+      "publicContracts": ["fenced aggregate mutation", "canonical task lifecycle", "hosted RC policy/evidence/qualification append-read-revoke v1; expectedVersion CAS; <=50 summaries", "trusted executable qualification persistence port supplied by qa-release adapters", "verified operator source intake v1; exact task CAS and private executable persistence authority; retained failure history"],
       "events": ["release_qa_policy_recorded.v1", "hosted_rc_evidence_appended.v1", "release_qualification_recorded.v1", "release_qualification_revoked.v1"],
       "tests": [{ "command": "node scripts/run-tests.js --test-file test/accessibility-review.test.js --test-file test/architecture.test.js --test-file test/coordination.test.js --test-file test/delivery-policy-enforcement.test.js --test-file test/lifecycle-policy.test.js --test-file test/local-state-migration.test.js --test-file test/prototype-fast-lane.test.js --test-file test/regression-review-status.test.js --test-file test/resilience.test.js --test-file test/review-handoff.test.js --test-file test/review-identity.test.js --test-file test/state-database.test.js --test-file test/task-status-integrity.test.js", "layer": "persistence" }],
       "reviewOwners": ["backend-reviewer"],
@@ -205,7 +205,7 @@
         "test/work-lanes.test.js"
       ],
       "services": ["supervisor planner", "dispatcher admission"],
-      "publicContracts": ["bundled hosted RC default policy reference and CLI setup/collect/status presentation; policy semantics delegated to qa-release","dispatch admission decision", "lane-safe immutable run snapshot"],
+      "publicContracts": ["bundled hosted RC default policy reference and CLI setup/collect/status presentation; policy semantics delegated to qa-release","dispatch admission decision", "lane-safe immutable run snapshot", "interactive local-owner candidate adoption CLI; held dependency intake and stale dispatch rejection"],
       "workflows": ["architecture builder reviewer and owner dispatch"],
       "tests": [{ "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js --test-file test/work-lanes.test.js --test-file test/credit-reservations.test.js", "layer": "unit-contract" }],
       "reviewOwners": ["backend-reviewer"],
@@ -252,7 +252,7 @@
         "test/local-builder-review.test.js"
       ],
       "services": ["worker runner", "isolated git worktree", "validation adapter"],
-      "publicContracts": ["repository-confined worker launch", "atomic pre-provider failure-attempt claim", "bounded redacted validation evidence"],
+      "publicContracts": ["repository-confined worker launch", "atomic pre-provider failure-attempt claim", "bounded redacted validation evidence", "trusted native workspace preparation persistence bound to existing run identity; generic metadata writes confer no workspace authority"],
       "workflows": ["builder execution", "review execution"],
       "deploySurfaces": ["local LaunchAgent runner"],
       "tests": [{ "command": "node scripts/run-tests.js --test-file test/git-lock.test.js --test-file test/github-app-auth.test.js --test-file test/launch-agent-environment.test.js --test-file test/local-builder-review.test.js --test-file test/local-workspace-handoff.test.js --test-file test/project-validation-sandbox.test.js --test-file test/run-output-evidence.test.js --test-file test/runner.test.js --test-file test/runtime-paths.test.js", "layer": "adapter" }],

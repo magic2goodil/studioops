@@ -491,6 +491,332 @@ async function runStoreScript(root, source, options = {}) {
   });
 }
 
+function operatorCandidateTestScript() {
+  return `
+    import assert from "node:assert/strict";
+    import { mutateDatabaseState, mutateOperatorCandidateState, mutateScopeDispatchState, mutateNativeWorkspaceState, readDatabaseState, writeDatabaseState } from ${JSON.stringify(stateDatabaseModuleUrl)};
+    const candidate = { baseSha: "a".repeat(40), commitSha: "b".repeat(40), treeSha: "c".repeat(40), branch: "codex/fixture" };
+    const frozenScopePlan = { project: { id: "project_1", key: "demo" }, manifest: { digest: "sha256:" + "d".repeat(64) }, allowedFileScope: ["src/example.js"] };
+    const verification = { taskId: "task_1", candidate, scopeDigest: "sha256:" + "e".repeat(64), requestDigest: "sha256:" + "f".repeat(64), frozenScopePlan, dispositionTaskIds: [] };
+    function adopt(state, verified = verification) {
+      const task = state.tasks.find(item => item.id === verified.taskId);
+      task.status = "builder_review";
+      task.reviewSubjectSha = verified.candidate.commitSha;
+      task.reviewSubjectCycle = task.reviewCycle = 1;
+      task.candidateIdentity = { ...verified.candidate, candidateCycle: 1 };
+      task.impactScopePlan = structuredClone(verified.frozenScopePlan);
+      task.operatorIntake = { schemaVersion: 1, candidate: structuredClone(verified.candidate), requestDigest: verified.requestDigest, scopeDigest: verified.scopeDigest };
+    }
+    await readDatabaseState();
+  `;
+}
+
+test("persistence rejects serialized operator authority and absent-scope generic handoffs", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-ingress-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      await assert.rejects(mutateDatabaseState(state => adopt(state), {
+        operatorCandidateCapability: "studioops.operator-candidate-write", operatorCandidateVerification: verification,
+      }), /operator_intake_verified_writer_required/);
+      const replacement = await readDatabaseState(); adopt(replacement);
+      await assert.rejects(writeDatabaseState(replacement), /operator_intake_verified_writer_required/);
+      for (const addScope of [false, true]) {
+        await assert.rejects(mutateDatabaseState(state => {
+          const task = state.tasks[0]; task.status = "builder_review"; task.reviewSubjectSha = candidate.commitSha;
+          if (addScope) task.impactScopePlan = structuredClone(frozenScopePlan);
+        }), /builder_handoff_frozen_scope_required|frozen_scope_verified_writer_required/);
+      }
+      assert.equal((await readDatabaseState()).tasks[0].status, "ready");
+      assert.equal((await readDatabaseState()).tasks[0].operatorIntake, undefined);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("cold-start legacy JSON cannot bootstrap serialized operator intake authority", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-bootstrap-"));
+  try {
+    const state = baseState();
+    state.tasks[0].operatorIntake = { schemaVersion: 1, source: "operator", principal: "forged-json-owner" };
+    await writeLegacyState(root, state);
+    await assert.rejects(runStoreScript(root, `
+      import { readDatabaseState } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readDatabaseState();
+    `), /operator_intake_verified_writer_required/);
+    const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"), { readOnly: true });
+    try { assert.equal(db.prepare("SELECT count(*) AS count FROM tasks").get().count, 0); }
+    finally { db.close(); }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("verified intake is immutable historical evidence and exact scope is retained", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-history-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      await mutateOperatorCandidateState(async state => verification, (state, verified) => {
+        assert.equal(Object.isFrozen(verified.candidate), true);
+        assert.equal(Object.isFrozen(verified.frozenScopePlan.allowedFileScope), true);
+        adopt(state, verified);
+      });
+      const intake = structuredClone((await readDatabaseState()).tasks[0].operatorIntake);
+      await mutateDatabaseState(state => { state.meta.unrelated = true; });
+      assert.deepEqual((await readDatabaseState()).tasks[0].operatorIntake, intake);
+      for (const edit of [
+        state => { delete state.tasks[0].operatorIntake; },
+        state => { state.tasks[0].operatorIntake.requestDigest = "sha256:" + "0".repeat(64); },
+        state => { state.tasks = []; },
+      ]) await assert.rejects(mutateDatabaseState(edit), /operator_intake_history_immutable/);
+      const replacement = await readDatabaseState(); delete replacement.tasks[0].operatorIntake;
+      await assert.rejects(writeDatabaseState(replacement), /operator_intake_history_immutable/);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a genuine private replacement preserves the exact prior intake while unchanged material cannot start a cycle", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-replacement-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      await mutateOperatorCandidateState(async () => verification, adopt);
+      const previous = structuredClone((await readDatabaseState()).tasks[0].operatorIntake);
+      await mutateDatabaseState(state => { state.tasks[0].status = "needs_changes"; });
+      const replacement = { ...verification, requestDigest: "sha256:" + "1".repeat(64), candidate: { ...candidate, commitSha: "d".repeat(40), treeSha: "e".repeat(40) } };
+      const appendReceipt = state => state.events.push({ id: "event_replaced", type: "operator_candidate_superseded", taskId: "task_1",
+        previousOperatorIntake: structuredClone(previous), replacementRequestDigest: replacement.requestDigest });
+      await assert.rejects(mutateOperatorCandidateState(async () => ({ ...replacement, candidate: { ...replacement.candidate, treeSha: candidate.treeSha } }), (state, verified) => {
+        appendReceipt(state); adopt(state, verified);
+      }), /operator_candidate_unchanged_material/);
+      await assert.rejects(mutateOperatorCandidateState(async () => replacement, adopt), /operator_intake_history_receipt_required/);
+      await mutateOperatorCandidateState(async () => replacement, (state, verified) => { appendReceipt(state); adopt(state, verified); });
+      const after = await readDatabaseState();
+      assert.deepEqual(after.events.find(event => event.id === "event_replaced").previousOperatorIntake, previous);
+      assert.equal(after.tasks[0].operatorIntake.candidate.treeSha, replacement.candidate.treeSha);
+      await assert.rejects(mutateDatabaseState(state => { state.tasks[0].operatorIntake = previous; }), /operator_intake_history_immutable/);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a serialized scope or fake builder row cannot bootstrap authority and ordinary handoffs verify real Git", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-native-scope-ingress-"));
+  try {
+    await writeLegacyState(root);
+    const { stdout } = await runStoreScript(root, operatorCandidateTestScript() + `
+      for (const field of ["impactScopePlan", "impactPlan"]) {
+        await assert.rejects(mutateDatabaseState(state => {
+          state.tasks[0][field] = structuredClone(frozenScopePlan);
+          state.runs.push({ id: "run_forged", taskId: "task_1", group: "builder", role: "builder", status: "completed" });
+        }, { scopedDispatchCapability: "studioops.scoped-dispatch-write" }), /frozen_scope_verified_writer_required/);
+      }
+      import { execFileSync } from "node:child_process";
+      import { mkdir, writeFile } from "node:fs/promises";
+      import path from "node:path";
+      import { resolveProjectImpactPlan } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/impact-planner.js")).href)};
+      const source = path.join(process.cwd(), "source");
+      await mkdir(path.join(source, "src"), { recursive: true }); await mkdir(path.join(source, "test")); await mkdir(path.join(source, "docs/architecture"), { recursive: true });
+      const git = (...args) => execFileSync("/usr/bin/git", ["-C", source, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+      git("init", "-b", "main"); git("config", "user.name", "Fixture Author"); git("config", "user.email", "fixture@example.invalid");
+      git("remote", "add", "origin", "https://github.com/example/demo");
+      await writeFile(path.join(source, "src/catalog.js"), "export const version = 1;\\n");
+      await writeFile(path.join(source, "test/catalog.test.js"), "// Generic fixture.\\n");
+      await writeFile(path.join(source, "docs/architecture/components.json"), JSON.stringify({ schemaVersion: 1, project: { key: "demo", repository: "https://github.com/example/demo" }, aggregateCommand: "npm run check",
+        components: { catalog: { owner: "fixture-engineering", paths: ["src/catalog.js", "test/catalog.test.js"], publicContracts: ["catalog value"], services: ["catalog module"], dependsOn: [],
+          tests: [{ command: "node --test test/catalog.test.js", layer: "unit" }], reviewOwners: ["backend-reviewer"], rollback: "Restore prior fixture commit." } } }));
+      git("add", "."); git("commit", "-m", "Native scope base"); const baseSha = git("rev-parse", "HEAD");
+      git("switch", "-c", "feature/catalog");
+      await mutateDatabaseState(state => {
+        Object.assign(state.projects[0], { repoPath: source, sourceRepoPath: source, repoUrl: "https://github.com/example/demo" });
+        state.tasks[0].workAreas = ["src/catalog.js"];
+      });
+      await mutateScopeDispatchState(state => {
+        const scope = resolveProjectImpactPlan({ project: state.projects[0], task: state.tasks[0], repoRoot: source, sourceCommit: baseSha, changedFiles: ["src/catalog.js"] });
+        assert.equal(scope.status, "mapped"); state.tasks[0].impactPlan = scope;
+      });
+      await writeFile(path.join(source, "src/catalog.js"), "export const version = 2;\\n"); git("add", "."); git("commit", "-m", "Real native candidate");
+      const actual = { baseSha, commitSha: git("rev-parse", "HEAD"), treeSha: git("rev-parse", "HEAD^{tree}"), branch: "feature/catalog", candidateCycle: 1 };
+      const ordinaryHandoff = (state, coordinates) => {
+        state.tasks[0].impactScopePlan ||= structuredClone(state.tasks[0].impactPlan);
+        state.tasks[0].impactPlan = { ...state.tasks[0].impactPlan, classificationRefreshed: true };
+        Object.assign(state.tasks[0], { status: "builder_review", reviewSubjectSha: coordinates.commitSha, reviewSubjectCycle: 1, reviewCycle: 1,
+          branchName: coordinates.branch, candidateIdentity: coordinates, impactEvidence: { changedFiles: ["src/catalog.js"] } });
+      };
+      await assert.rejects(mutateDatabaseState(state => ordinaryHandoff(state, { ...actual, commitSha: "0".repeat(40) })), /builder_handoff_branch_mismatch/);
+      const replacementState = await readDatabaseState(); ordinaryHandoff(replacementState, actual);
+      await assert.rejects(writeDatabaseState(replacementState), /builder_handoff_verified_mutation_required/);
+      await mutateDatabaseState(state => ordinaryHandoff(state, actual));
+      assert.equal((await readDatabaseState()).tasks[0].reviewSubjectSha, actual.commitSha);
+      assert.equal((await readDatabaseState()).tasks[0].impactScopePlan.classificationRefreshed, undefined);
+      import { dispatchSupervisorActions } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/dispatcher.js")).href)};
+      await mutateDatabaseState(state => Object.assign(state.tasks[0], {
+        status: "needs_changes", type: "bug", architectureRequired: false, architectureStatus: "not_required",
+        description: "Validate a genuine native isolated builder workspace.", userStory: "As a reviewer I need the exact isolated commit.",
+        expectedOutcome: "The persisted native run authorizes only its actual prepared workspace.", acceptanceCriteria: ["Source identity stays exact."],
+        affectedSurfaces: ["src/catalog.js"], validationPlan: ["node --test test/catalog.test.js"], riskClassification: "low",
+        privacyNotes: "Synthetic source without personal data.", securityNotes: "No executor, network or paid API is invoked.",
+      }));
+      const dispatched = await dispatchSupervisorActions([{ id: "task_1:start_builder_fix", type: "start_builder_fix", role: "builder", taskId: "task_1", projectId: "project_1",
+        taskStatus: "needs_changes", nextStatus: "in_progress", branchName: actual.branch }], { failureIncidents: [], creditPolicy: { enabled: false } });
+      assert.equal(dispatched.runs.length, 1, JSON.stringify(dispatched.skipped));
+      const runId = dispatched.runs[0].id;
+      const workspace = path.join(process.cwd(), "isolated-source");
+      execFileSync("/usr/bin/git", ["clone", "--no-hardlinks", source, workspace], { stdio: ["ignore", "pipe", "pipe"] });
+      const workspaceGit = (...args) => execFileSync("/usr/bin/git", ["-C", workspace, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+      workspaceGit("config", "user.name", "Fixture Author"); workspaceGit("config", "user.email", "fixture@example.invalid");
+      workspaceGit("remote", "set-url", "origin", "https://github.com/example/demo");
+      await writeFile(path.join(workspace, "src/catalog.js"), "export const version = 3;\\n");
+      workspaceGit("add", "src/catalog.js"); workspaceGit("commit", "-m", "Native isolated candidate");
+      const isolated = { ...actual, commitSha: workspaceGit("rev-parse", "HEAD"), treeSha: workspaceGit("rev-parse", "HEAD^{tree}") };
+      const prepareWorkspaceRecord = state => Object.assign(state.runs.find(run => run.id === runId), {
+        status: "cancelled", completedAt: new Date().toISOString(), workspacePath: workspace, executionRepoPath: workspace,
+        notes: "Real fixture workspace prepared; queued executor cancelled before launch.",
+      });
+      await assert.rejects(mutateDatabaseState(state => {
+        prepareWorkspaceRecord(state); ordinaryHandoff(state, isolated);
+      }), /native_workspace_verified_writer_required/);
+      assert.equal((await readDatabaseState()).runs.find(run => run.id === runId).executionRepoPath, undefined);
+      await assert.rejects(mutateDatabaseState(prepareWorkspaceRecord), /native_workspace_verified_writer_required/);
+      await assert.rejects(mutateDatabaseState(state => state.runs.push({ id: "run_fake_native", taskId: "task_1", projectId: "project_1", group: "builder", role: "builder",
+        status: "failed", branchName: actual.branch, workspacePath: workspace, executionRepoPath: workspace })), /native_workspace_verified_writer_required/);
+      const replacementWithWorkspace = await readDatabaseState(); prepareWorkspaceRecord(replacementWithWorkspace);
+      await assert.rejects(writeDatabaseState(replacementWithWorkspace), /native_workspace_verified_writer_required/);
+      import { persistRunWorkspace } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/runner.js")).href)};
+      // Only the actual native workspace producer seals the prepared path onto
+      // the existing dispatched run; ordinary writes cannot manufacture it.
+      await persistRunWorkspace(dispatched.runs[0], { workspacePath: workspace, executionRepoPath: workspace, strategy: "clone" });
+      await mutateDatabaseState(state => { const run = state.runs.find(run => run.id === runId); run.status = "cancelled"; run.completedAt = new Date().toISOString(); });
+      await assert.rejects(mutateNativeWorkspaceState("run_nonexistent", state => state.runs.push({ id: "run_nonexistent" })), /native_workspace_persisted_run_required/);
+      await assert.rejects(mutateNativeWorkspaceState(runId, state => state.runs.push({ id: "run_invented" })), /native_workspace_run_set_immutable/);
+      await assert.rejects(mutateNativeWorkspaceState(runId, state => { state.runs.find(run => run.id === runId).status = "completed"; }), /native_workspace_run_record_immutable/);
+      for (const field of ["workspacePath", "executionRepoPath", "workspaceStrategy", "gitHooksPath", "workspaceProvenanceUntrusted"]) {
+        await assert.rejects(mutateDatabaseState(state => { state.runs.find(run => run.id === runId)[field] = "forged"; }), /native_workspace_verified_writer_required/);
+      }
+      for (const field of ["taskId", "projectId", "role", "group", "branchName"]) {
+        await assert.rejects(mutateDatabaseState(state => { state.runs.find(run => run.id === runId)[field] = "forged"; }), /native_workspace_run_identity_immutable/);
+      }
+      await mutateDatabaseState(state => ordinaryHandoff(state, isolated));
+      const after = await readDatabaseState();
+      assert.equal(after.tasks[0].reviewSubjectSha, isolated.commitSha);
+      console.log(JSON.stringify({ project: after.projects[0], task: after.tasks[0], run: after.runs.find(run => run.id === runId), isolated }));
+    `);
+    const prepared = JSON.parse(stdout.trim().split("\n").at(-1));
+    const coldRoot = path.join(root, "cold-import");
+    const coldState = baseState();
+    coldState.projects = [prepared.project];
+    coldState.tasks = [{ ...prepared.task, status: "in_progress" }];
+    coldState.runs = [{ ...prepared.run, workspaceProvenanceUntrusted: false }];
+    await writeLegacyState(coldRoot, coldState);
+    await runStoreScript(coldRoot, `
+      import assert from "node:assert/strict";
+      import { readDatabaseState, mutateDatabaseState, writeDatabaseState } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      import { persistRunWorkspace } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/runner.js")).href)};
+      const before = await readDatabaseState();
+      assert.equal(before.runs[0].workspaceProvenanceUntrusted, true);
+      assert.equal(before.runs[0].workspacePath, ${JSON.stringify(prepared.run.workspacePath)});
+      const handoff = state => { state.tasks[0].status = "builder_review"; };
+      await assert.rejects(mutateDatabaseState(handoff), /builder_handoff_branch_mismatch|builder_handoff_repository_unavailable/);
+      await assert.rejects(mutateDatabaseState(state => { delete state.runs[0].workspaceProvenanceUntrusted; }), /native_workspace_verified_writer_required/);
+      const replacement = await readDatabaseState(); replacement.runs[0].workspaceProvenanceUntrusted = false;
+      await assert.rejects(writeDatabaseState(replacement), /native_workspace_verified_writer_required/);
+      await persistRunWorkspace(before.runs[0], { workspacePath: before.runs[0].workspacePath, executionRepoPath: before.runs[0].executionRepoPath, strategy: before.runs[0].workspaceStrategy });
+      assert.equal((await readDatabaseState()).runs[0].workspaceProvenanceUntrusted, false);
+      await mutateDatabaseState(handoff);
+      assert.equal((await readDatabaseState()).tasks[0].reviewSubjectSha, ${JSON.stringify(prepared.isolated.commitSha)});
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("verified writer rejects mismatched candidate, scope and another task's intake", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-bindings-"));
+  try {
+    const state = baseState(); state.tasks.push({ ...state.tasks[0], id: "task_2" });
+    await writeLegacyState(root, state);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      await assert.rejects(mutateOperatorCandidateState(verification, adopt), /executable verification/);
+      for (const change of [
+        state => { state.tasks[0].candidateIdentity.treeSha = "0".repeat(40); },
+        state => { state.tasks[0].operatorIntake.requestDigest = "sha256:" + "0".repeat(64); },
+        state => { state.tasks[0].impactScopePlan.allowedFileScope.push("src/other.js"); },
+        state => { state.tasks[1].operatorIntake = { trusted: true }; },
+      ]) {
+        await assert.rejects(mutateOperatorCandidateState(async () => verification, (state, verified) => {
+          adopt(state, verified); change(state);
+        }), /operator_candidate_binding_mismatch|operator_candidate_frozen_scope_mismatch|operator_intake_verified_writer_required/);
+      }
+      for (const conflictTaskIds of [["task_2", "task_2"], [null], Array.from({ length: 4097 }, (_, i) => "task_" + i)]) {
+        await assert.rejects(mutateOperatorCandidateState(async () => ({ ...verification, conflictTaskIds }), adopt), /verification_invalid/);
+      }
+      await mutateScopeDispatchState(state => { state.tasks[0].impactPlan = structuredClone(frozenScopePlan); });
+      await assert.rejects(mutateOperatorCandidateState(async () => verification, (state, verified) => adopt(state, verified)), /frozen_scope_mismatch/);
+      await mutateOperatorCandidateState(async () => verification, (state, verified) => {
+        adopt(state, verified); delete state.tasks[0].impactScopePlan;
+      });
+      assert.deepEqual((await readDatabaseState()).tasks[0].impactPlan, frozenScopePlan);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("operator verification reruns on optimistic replay against the fresh snapshot", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-replay-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      let attempts = 0, entered, resume;
+      const started = new Promise(resolve => { entered = resolve; });
+      const pause = new Promise(resolve => { resume = resolve; });
+      const pending = mutateOperatorCandidateState(async state => {
+        attempts++;
+        if (attempts === 1) { entered(); await pause; }
+        else assert.equal(state.meta.concurrentChange, true);
+        return verification;
+      }, (state, verified) => adopt(state, verified), { operationName: "test.operator_replay" });
+      await started;
+      await mutateDatabaseState(state => { state.meta.concurrentChange = true; });
+      resume(); await pending;
+      assert.equal(attempts, 2);
+      assert.equal((await readDatabaseState()).meta.concurrentChange, true);
+      assert.equal((await readDatabaseState()).tasks[0].status, "builder_review");
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("operator final transaction fence catches a coordination lease racing without a state-version bump", async () => {
+  for (const leaseTaskId of ["task_1", "task_2", "task_3"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-lease-race-"));
+    try {
+      const state = baseState(); state.tasks.push({ ...state.tasks[0], id: "task_2" }, { ...state.tasks[0], id: "task_3" });
+      await writeLegacyState(root, state);
+      await runStoreScript(root, operatorCandidateTestScript() + `
+        import { claimResourceLease } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/coordination.js")).href)};
+        verification.dispositionTaskIds = ["task_2"];
+        verification.conflictTaskIds = ["task_3"];
+        await assert.rejects(mutateOperatorCandidateState(async () => verification, async (state, verified) => {
+          const task = state.tasks.find(item => item.id === ${JSON.stringify(leaseTaskId)});
+          const lease = await claimResourceLease({ resourceKey: "test:adoption-race", aggregateType: "task", aggregateId: task.id,
+            ownerProcessIdentity: "test:race-worker", expectedStateVersion: task.stateVersion, leaseTtlMs: 10000 });
+          assert.equal(lease.acquired, true);
+          adopt(state, verified);
+        }), /operator_candidate_coordination_lease_active/);
+        assert.equal((await readDatabaseState()).tasks[0].operatorIntake, undefined);
+      `);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("operator writer refuses queued or running ownership before invoking its mutator", async () => {
+  for (const status of ["queued", "running"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-operator-live-run-"));
+    try {
+      const state = baseState(); state.runs = [{ id: "run_owned", taskId: "task_1", role: "builder", status }];
+      await writeLegacyState(root, state);
+      await runStoreScript(root, operatorCandidateTestScript() + `
+        let called = false;
+        await assert.rejects(mutateOperatorCandidateState(async () => verification, () => { called = true; }), /operator_candidate_active_run/);
+        assert.equal(called, false);
+      `);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
 function mutatePersistedMeta(root, mutator) {
   const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"));
   try {

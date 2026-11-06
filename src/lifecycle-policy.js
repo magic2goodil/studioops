@@ -3,6 +3,19 @@ import { assertTerminalMergedPromotionClaimForTask } from "./promotion-attempt-c
 
 const SHA_PATTERN = /^[0-9a-f]{40,64}$/i;
 const REASON_CODE_PATTERN = /^[a-z][a-z0-9_-]{2,63}$/;
+const OPERATOR_ADOPTION_CONTEXTS = new WeakSet();
+const NEW_SUBJECT_ACTIONS = new Set(["submit_builder_review", "record_builder_handoff", "adopt_operator_candidate"]);
+
+// Authority is the identity of this executable adapter's result, never a JSON
+// flag. The store mints it only after its private adoption capability is checked.
+export function createOperatorAdoptionLifecycleContext(context = {}) {
+  if (!context || typeof context !== "object" || Array.isArray(context)) {
+    throw new Error("Operator adoption requires a lifecycle context object.");
+  }
+  const verified = Object.freeze({ ...context });
+  OPERATOR_ADOPTION_CONTEXTS.add(verified);
+  return verified;
+}
 
 export const CANONICAL_LIFECYCLE_STATUSES = Object.freeze([
   "idea", "architecture_pending", "architecture_in_progress", "architecture_ready",
@@ -58,6 +71,7 @@ export const LIFECYCLE_ACTION_MATRIX = Object.freeze({
   start_builder: rule(["queued", "needs_changes"], ["in_progress"], { actorTypes: ["worker"], roles: ["builder"], assignment: "required", activeRun: true, workflowLease: true }),
   submit_builder_review: rule(["in_progress", "needs_changes"], ["builder_review"], { actorTypes: ["worker"], roles: ["builder"], assignment: "required", activeRun: true, workflowLease: true, candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   record_builder_handoff: rule(["in_progress", "needs_changes"], ["builder_review"], { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
+  adopt_operator_candidate: rule(["ready", "queued", "blocked", "needs_changes"], ["builder_review"], { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   route_review: rule(reviewRoutingSources, REVIEW_STATUSES, { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", edges: forwardReviewEdges }),
   restart_review: rule([...REVIEW_STATUSES, "needs_changes"], REVIEW_STATUSES, { actorTypes: ["system"], roles: ["workflow-engine"], candidateCycle: true, subjectBinding: "sha", invalidates: ["reviews", "qa", "candidate", "promotion"] }),
   record_review_approval: rule(REVIEW_STATUSES, REVIEW_STATUSES, { actorTypes: ["worker"], roles: ["assigned-reviewer"], assignment: "required", activeRun: true, workflowLease: true, candidateCycle: true, subjectBinding: "sha", edges: REVIEW_STATUSES.map((status) => [status, status]) }),
@@ -331,7 +345,7 @@ function assertBoundEvidence(action, ruleValue, aggregate, evidence = {}, contex
       || candidateSource?.candidateCycle
       || 0
     );
-    const expected = ["submit_builder_review", "record_builder_handoff"].includes(action)
+    const expected = NEW_SUBJECT_ACTIONS.has(action)
       ? Math.max(Number(aggregate.reviewSubjectCycle || 0) + 1, Number(aggregate.reviewCycle || 0) + 1)
       : current;
     if (!Number.isSafeInteger(Number(evidence.candidateCycle)) || Number(evidence.candidateCycle) !== expected || expected < 1) {
@@ -354,7 +368,7 @@ function assertBoundEvidence(action, ruleValue, aggregate, evidence = {}, contex
   );
   if (["sha", "candidate_or_sha"].includes(ruleValue.subjectBinding)) {
     const shaMatches = SHA_PATTERN.test(exactSha)
-      && (["submit_builder_review", "record_builder_handoff"].includes(action) || exactSha === aggregateSha);
+      && (NEW_SUBJECT_ACTIONS.has(action) || exactSha === aggregateSha);
     if (!shaMatches && !(ruleValue.subjectBinding === "candidate_or_sha" && candidateMatches)) {
       throw new Error("Lifecycle evidence is not bound to the exact current subject SHA.");
     }
@@ -385,6 +399,9 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
   const taskId = String(command.taskId || "").trim();
   const ruleValue = LIFECYCLE_ACTION_MATRIX[action];
   if (!ruleValue) throw new Error(`Unknown lifecycle action: ${action || "(missing)"}`);
+  if (action === "adopt_operator_candidate" && !OPERATOR_ADOPTION_CONTEXTS.has(context)) {
+    throw new Error("Operator adoption requires verified executable lifecycle authority.");
+  }
   if (!taskId || taskId !== aggregate.id) throw new Error("Lifecycle command taskId does not match the aggregate.");
   const expectedStateVersion = Number(command.expectedStateVersion);
   const currentStateVersion = positiveStateVersion(aggregate.stateVersion);
@@ -432,7 +449,7 @@ export function evaluateLifecycleTransition(command = {}, aggregate = {}, contex
       stateVersion: currentStateVersion + 1,
       updatedAt: now,
   };
-  if (["submit_builder_review", "record_builder_handoff"].includes(action)) {
+  if (NEW_SUBJECT_ACTIONS.has(action)) {
     nextTask.reviewCycle = Number(command.evidence.candidateCycle);
     nextTask.reviewSubjectCycle = Number(command.evidence.candidateCycle);
     nextTask.reviewSubjectSha = String(command.evidence.subjectSha).trim().toLowerCase();

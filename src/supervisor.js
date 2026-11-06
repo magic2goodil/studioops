@@ -242,6 +242,9 @@ function taskActions(state, task, options = {}) {
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
 
   const missingDependencies = incompleteDependencies(state, task);
+  if (task.operatorIntake && (missingDependencies.length || task.automationBlocker)) {
+    return [actionBase(state, task, "waiting_operator_candidate", "", "Verified operator candidate is held for its existing dependencies or incident remediation.", options)];
+  }
   const retryNotBefore = Date.parse(task.retryNotBefore || "");
   if (Number.isFinite(retryNotBefore) && retryNotBefore > Date.now()) {
     return [actionBase(

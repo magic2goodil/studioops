@@ -168,3 +168,24 @@ test("supervisor tracks protected QA PRs and routes failed checks back to a buil
   assert.equal(requestedChanges.actions[0].type, "qa_integration_blocked");
   assert.equal(requestedChanges.actions[0].role, "builder");
 });
+
+
+test("adopted candidates wait for dependencies and stale builder plans fail closed", () => {
+  const state = trackingState();
+  const task = state.tasks.find((item) => item.id === "task_leaf");
+  task.status = "builder_review";
+  task.operatorIntake = { source: "operator", requestDigest: "sha256:fixture" };
+  task.dependsOnTaskIds = ["task_parent"];
+  const actions = createSupervisorReport(state).actions.filter((action) => action.taskId === task.id);
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].type, "waiting_operator_candidate");
+  const old = { id: "stale", taskId: task.id, projectId: task.projectId, type: "start_builder", role: "builder", taskStatus: "queued" };
+  let plan = planDispatches(state, [old], { provider: "codex-sdk", builderConcurrency: 2, maxDispatchesPerSweep: 2 });
+  assert.equal(plan.selected.length, 0);
+  assert.ok(plan.skipped.length > 0, JSON.stringify(plan));
+  task.dependsOnTaskIds = [];
+  task.status = "queued";
+  plan = planDispatches(state, [old], { provider: "codex-sdk", builderConcurrency: 2, maxDispatchesPerSweep: 2 });
+  assert.equal(plan.selected.length, 0);
+  assert.ok(plan.skipped.some((item) => item.reason === "operator_candidate_stale_builder"), JSON.stringify(plan.skipped));
+});

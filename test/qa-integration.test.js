@@ -419,62 +419,60 @@ function candidateForRepositoryFixture(fixture) {
   });
 }
 
-async function addReviewedQaTask(root, task, subjectSha) {
+async function recordNativeReviewedQaTask(root, taskInput, subjectSha, create) {
   const script = `
-    import { mutateState } from ${JSON.stringify(storeModuleUrl)};
-    await mutateState((state) => {
-      const task = ${JSON.stringify(task)};
-      task.reviewCycle = 1;
-      task.reviewSubjectSha = ${JSON.stringify(subjectSha)};
-      task.reviewSubjectCycle = 1;
-      state.tasks.push(task);
-      for (const stageKey of ["backend", "frontend", "accessibility", "lead"]) {
-        state.reviews.push({
-          id: "review_" + (state.reviews.length + 1),
-          taskId: task.id,
-          projectId: task.projectId,
-          cycle: 1,
-          candidateCycle: 1,
-          stageKey,
-          status: stageKey + "_review",
-          role: stageKey + "-reviewer",
-          outcome: "approved",
-          subjectSha: ${JSON.stringify(subjectSha)},
-          createdAt: "2026-07-25T12:00:00.000Z"
-        });
-      }
-    });
+    import { execFileSync } from "node:child_process";
+    import { addTask, readState, recordReview, updateRun, updateTask } from ${JSON.stringify(storeModuleUrl)};
+    import { dispatchSupervisorActions } from ${JSON.stringify(new URL("../src/dispatcher.js", import.meta.url).href)};
+    const input = ${JSON.stringify(taskInput)};
+    const snapshot = await readState();
+    const project = snapshot.projects.find(item => item.id === input.projectId || item.id === snapshot.tasks.find(task => task.id === input.id)?.projectId);
+    if (!project) throw new Error("Missing fixture project.");
+    const git = (...args) => execFileSync("/usr/bin/git", ["-C", project.repoPath, ...args], {encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]}).trim();
+    const baseSha = git("rev-parse", "refs/heads/main");
+    let task = snapshot.tasks.find(item => item.id === input.id);
+    const branch = input.branchName || task?.branchName;
+    const headSha = ${JSON.stringify(subjectSha)};
+    const prUrl = input.prUrl || task?.prUrl || ${JSON.stringify(GITHUB_REPO_URL)} + "/pull/" + Number(input.id.replace("task_", ""));
+    if (git("rev-parse", "refs/heads/" + branch) !== headSha) throw new Error("Fixture source branch moved.");
+    const changedFiles = git("diff", "--name-only", baseSha, headSha).split("\\n").filter(Boolean);
+    if (${JSON.stringify(create)}) {
+      task = await addTask({project: project.id, title: input.title, type: "bug", status: "ready", architectureRequired: false,
+        description: "Review an exact protected-integration fixture candidate.", userStory: "As an owner I need protected QA handoffs to retain their exact source authority.",
+        expectedOutcome: "Reviewed source and protected handoff audit remain exact.", acceptanceCriteria: ["Only the current reviewed source may replace a handoff."],
+        branchName: branch, candidateIdentity: {baseSha}, workAreas: changedFiles, affectedSurfaces: changedFiles,
+        validationPlan: project.validationCommands, riskClassification: "low", privacyNotes: "Synthetic fixture data only.", securityNotes: "Local Git and fake GitHub transport only."});
+      if (task.id !== input.id) throw new Error("Unexpected native fixture task identity.");
+    } else {
+      if (!task) throw new Error("Missing fixture task.");
+      if (task.status !== "needs_changes") await updateTask(task.id, {status: "needs_changes"});
+    }
+    const dispatch = await dispatchSupervisorActions([{id: task.id + ":native-review", type: ${JSON.stringify(create ? "start_builder" : "start_builder_fix")},
+      role: "builder", taskId: task.id, projectId: project.id, taskStatus: ${JSON.stringify(create ? "ready" : "needs_changes")}, nextStatus: "in_progress", branchName: branch}],
+      {failureIncidents: [], creditPolicy: {enabled: false}});
+    if (dispatch.runs.length !== 1) throw new Error("Native fixture dispatch refused: " + JSON.stringify(dispatch.skipped));
+    await updateRun(dispatch.runs[0].id, {status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch."});
+    await updateTask(task.id, {status: "in_progress"});
+    await updateTask(task.id, {status: "builder_review", subjectSha: headSha, branchName: branch, prUrl,
+      candidateIdentity: {baseSha, commitSha: headSha, treeSha: git("rev-parse", headSha + "^{tree}"), branch},
+      impactEvidence: {changedFiles, unknown: false, backendRequired: true}});
+    task = (await readState()).tasks.find(item => item.id === task.id);
+    for (const stage of project.reviewPipeline.filter(item => item.required)) {
+      await recordReview(task.id, {stage: stage.key, outcome: "approved", subjectSha: headSha, candidateCycle: task.reviewSubjectCycle,
+        author: "Fixture Reviewer", body: "Reviewed the exact real fixture source."});
+    }
+    task = (await readState()).tasks.find(item => item.id === task.id);
+    if (task.status !== "qa_review" || task.assignedAgentRole !== "owner") await updateTask(task.id, {status: "qa_review", assignedAgentRole: "owner"});
   `;
   await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
 }
 
+async function addReviewedQaTask(root, task, subjectSha) {
+  return recordNativeReviewedQaTask(root, task, subjectSha, true);
+}
+
 async function advanceReviewedQaTask(root, taskId, subjectSha) {
-  const script = `
-    import { mutateState } from ${JSON.stringify(storeModuleUrl)};
-    await mutateState((state) => {
-      const task = state.tasks.find((item) => item.id === ${JSON.stringify(taskId)});
-      if (!task) throw new Error("missing task");
-      task.reviewCycle = Number(task.reviewCycle || 0) + 1;
-      task.reviewSubjectSha = ${JSON.stringify(subjectSha)};
-      task.reviewSubjectCycle = task.reviewCycle;
-      for (const stageKey of ["backend", "frontend", "accessibility", "lead"]) {
-        state.reviews.push({
-          id: "review_" + (state.reviews.length + 1),
-          taskId: task.id,
-          projectId: task.projectId,
-          cycle: task.reviewCycle,
-          candidateCycle: task.reviewCycle,
-          stageKey,
-          status: stageKey + "_review",
-          role: stageKey + "-reviewer",
-          outcome: "approved",
-          subjectSha: ${JSON.stringify(subjectSha)},
-          createdAt: "2026-07-25T13:00:00.000Z"
-        });
-      }
-    });
-  `;
-  await run(process.execPath, ["--input-type=module", "-e", script], { cwd: root });
+  return recordNativeReviewedQaTask(root, {id: taskId}, subjectSha, false);
 }
 
 async function createProtectedBranchFixture(root) {
@@ -491,7 +489,16 @@ async function createProtectedBranchFixture(root) {
   await git(repoPath, ["config", "user.name", "StudioOps Test"]);
   await git(repoPath, ["checkout", "-b", "main"]);
   await writeFile(path.join(repoPath, "app.txt"), "base\n", "utf8");
-  await git(repoPath, ["add", "app.txt"]);
+  // Meaningful base values keep both feature paths inside the exact native map.
+  await writeFile(path.join(repoPath, "feature.txt"), "base first feature value\n");
+  await writeFile(path.join(repoPath, "feature-2.txt"), "base second feature value\n");
+  await mkdir(path.join(repoPath, "docs/architecture"), {recursive: true});
+  await writeFile(path.join(repoPath, "docs/architecture/components.json"), JSON.stringify({schemaVersion: 1,
+    project: {key: "demo", repository: GITHUB_REPO_URL}, aggregateCommand: "node -e \"process.exit(0)\"",
+    coverageRoots: ["app.txt", "feature.txt", "feature-2.txt"], components: {features: {owner: "fixture-engineering",
+      paths: ["app.txt", "feature.txt", "feature-2.txt"], publicContracts: ["fixture feature value"], services: ["fixture value module"], dependsOn: [],
+      tests: [{command: "node -e \"process.exit(0)\"", layer: "unit"}], reviewOwners: ["backend-reviewer", "lead-reviewer"], rollback: "Restore the previous fixture commit."}}}));
+  await git(repoPath, ["add", "."]);
   await git(repoPath, ["commit", "-m", "base"]);
   await git(repoPath, ["push", "origin", "main"]);
   await git(repoPath, ["push", "origin", "main:qa/integration"]);
@@ -625,6 +632,13 @@ process.exit(1);
       id: "project_1",
       key: "demo",
       name: "Demo",
+      workflowMode: "github",
+      reviewPipeline: [
+        {key: "backend", role: "backend-reviewer", status: "backend_review", required: true},
+        {key: "frontend", role: "frontend-reviewer", status: "frontend_review", required: true},
+        {key: "accessibility", role: "accessibility-reviewer", status: "accessibility_review", required: true},
+        {key: "lead", role: "lead-reviewer", status: "lead_review", required: true},
+      ],
       repoPath,
       repoUrl: "",
       defaultBranch: "main",
@@ -634,19 +648,15 @@ process.exit(1);
         integrationBranch: "qa/integration",
       },
     }],
-    tasks: [{
-      id: "task_1",
-      projectId: "project_1",
-      title: "Feature task",
-      status: "qa_review",
-      branchName: "feature/task",
-      prUrl: "",
-    }],
+    tasks: [],
     comments: [],
     events: [],
     reviews: [],
     runs: [],
   }), null, 2)}\n`, "utf8");
+
+  await addReviewedQaTask(root, {id: "task_1", projectId: "project_1", title: "Feature task", branchName: "feature/task", prUrl: ""},
+    await git(repoPath, ["rev-parse", "feature/task"]));
 
   return {
     remotePath,

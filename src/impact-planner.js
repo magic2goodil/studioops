@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, lstatSync } from "node:fs";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -128,6 +128,178 @@ export function exactCandidateChangedFiles(project = {}, candidate = {}, options
   const error = new Error(`Exact candidate diff is unavailable in the bound project repository${lastError?.message ? `: ${lastError.message}` : "."}`);
   error.code = "candidate_diff_unavailable";
   throw error;
+}
+
+const ADOPTION_REQUEST_KEYS = new Set(["schemaVersion", "expectedStateVersion", "projectId", "repository", "candidate", "mapDigest", "reviewedFiles", "reason", "prerequisites"]);
+function adoptionFailure(code) {
+  const error = new Error(code);
+  error.code = code;
+  throw error;
+}
+function exactAdoptionKeys(value, keys, code) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !keys.has(key))) adoptionFailure(code);
+}
+export function normalizeOperatorAdoptionRequest(value) {
+  if (Buffer.byteLength(JSON.stringify(value) || "") > 65_536) adoptionFailure("adoption_request_too_large");
+  exactAdoptionKeys(value, ADOPTION_REQUEST_KEYS, "adoption_request_fields_invalid");
+  if (value.schemaVersion !== 1 || !Number.isSafeInteger(value.expectedStateVersion) || value.expectedStateVersion < 1) adoptionFailure("adoption_request_version_invalid");
+  exactAdoptionKeys(value.candidate, new Set(["baseSha", "commitSha", "treeSha", "branch"]), "adoption_candidate_fields_invalid");
+  const candidate = { ...value.candidate };
+  for (const key of ["baseSha", "commitSha", "treeSha"]) {
+    if (!/^[a-f0-9]{40}$/.test(candidate[key] || "")) adoptionFailure("adoption_candidate_sha_invalid");
+  }
+  if (typeof candidate.branch !== "string" || candidate.branch.length > 160 || candidate.branch.trim() !== candidate.branch
+    || candidate.branch.startsWith("-") || candidate.branch.includes("@{") || /[\s\x00-\x1f\x7f]/.test(candidate.branch)) adoptionFailure("adoption_branch_invalid");
+  if (typeof value.projectId !== "string" || !value.projectId || value.projectId.length > 160
+    || typeof value.repository !== "string" || value.repository.length > 500
+    || !/^sha256:[a-f0-9]{64}$/.test(value.mapDigest || "")) adoptionFailure("adoption_project_binding_invalid");
+  if (typeof value.reason !== "string" || value.reason.trim().length < 12 || value.reason.length > 1000) adoptionFailure("adoption_reason_required");
+  if (!Array.isArray(value.reviewedFiles) || value.reviewedFiles.length < 1 || value.reviewedFiles.length > 256) adoptionFailure("adoption_reviewed_files_invalid");
+  const files = value.reviewedFiles;
+  for (const file of files) {
+    if (typeof file !== "string" || file.length > 500 || file.trim() !== file
+      || file.startsWith("/") || /[\\*?\[\]\x00-\x1f\x7f]/.test(file)
+      || file.split("/").some((part) => !part || part === "." || part === "..")) adoptionFailure("adoption_path_invalid");
+  }
+  if (new Set(files).size !== files.length || JSON.stringify(files) !== JSON.stringify([...files].sort())) adoptionFailure("adoption_paths_not_canonical");
+  const prerequisites = value.prerequisites || [];
+  if (!Array.isArray(prerequisites) || prerequisites.length > 32) adoptionFailure("adoption_prerequisites_invalid");
+  const ids = new Set();
+  for (const item of prerequisites) {
+    exactAdoptionKeys(item, new Set(["taskId", "expectedStateVersion", "evidenceDigest", "reason"]), "adoption_prerequisite_fields_invalid");
+    if (typeof item.taskId !== "string" || !item.taskId || ids.has(item.taskId)
+      || !Number.isSafeInteger(item.expectedStateVersion) || item.expectedStateVersion < 1
+      || !/^sha256:[a-f0-9]{64}$/.test(item.evidenceDigest || "")
+      || typeof item.reason !== "string" || item.reason.trim().length < 12 || item.reason.length > 1000) adoptionFailure("adoption_prerequisite_invalid");
+    ids.add(item.taskId);
+  }
+  return { schemaVersion: 1, expectedStateVersion: value.expectedStateVersion, projectId: value.projectId,
+    repository: value.repository, candidate, mapDigest: value.mapDigest, reviewedFiles: [...files], reason: value.reason.trim(),
+    prerequisites: prerequisites.map((item) => ({ ...item, reason: item.reason.trim() })) };
+}
+
+/** Verify immutable committed objects, never the mutable worktree or caller plans. */
+export function verifyAdoptionCandidate(project = {}, candidate = {}, options = {}) {
+  const { baseSha, commitSha, treeSha, branch } = candidate;
+  if (![baseSha, commitSha, treeSha].every((sha) => /^[a-f0-9]{40}$/.test(sha || ""))) adoptionFailure("adoption_candidate_sha_invalid");
+  const expectedRepository = projectRepositoryIdentity(project);
+  let lastError;
+  // Caller JSON has no repository path field. Only registered project paths are authority.
+  for (const repoRoot of candidateRepositoryRoots(project, "")) {
+    try {
+      trustedGit(repoRoot, ["check-ref-format", `refs/heads/${branch}`]);
+      if (!expectedRepository.startsWith("local:")) {
+        const remote = normalizeRepositoryIdentity(trustedGit(repoRoot, ["remote", "get-url", "origin"]).trim());
+        if (remote !== expectedRepository) adoptionFailure("adoption_repository_mismatch");
+      }
+      if (trustedGit(repoRoot, ["rev-parse", "--verify", `refs/heads/${branch}`]).trim() !== commitSha) adoptionFailure("adoption_branch_moved");
+      if (trustedGit(repoRoot, ["rev-parse", `${commitSha}^{tree}`]).trim() !== treeSha) adoptionFailure("adoption_tree_mismatch");
+      trustedGit(repoRoot, ["cat-file", "-e", `${baseSha}^{commit}`]);
+      trustedGit(repoRoot, ["merge-base", "--is-ancestor", baseSha, commitSha]);
+      const raw = trustedGit(repoRoot, ["--no-pager", "diff", "--no-ext-diff", "--find-renames", "--name-status", "-z", baseSha, commitSha, "--"]);
+      const parts = raw.split("\0");
+      if (parts.pop() !== "") adoptionFailure("adoption_diff_ambiguous");
+      const changedFiles = [];
+      for (let i = 0; i < parts.length; i += 2) {
+        // v1 does not adopt deletions or renames; native reviewed workflows remain available.
+        if (!["A", "M"].includes(parts[i]) || !parts[i + 1]) adoptionFailure("adoption_diff_type_unsupported");
+        const file = parts[i + 1];
+        const entry = trustedGit(repoRoot, ["ls-tree", "-z", commitSha, "--", file]).split("\0").filter(Boolean);
+        if (entry.length !== 1 || !/^100(?:644|755) blob [a-f0-9]{40}\t/.test(entry[0])) adoptionFailure("adoption_path_type_unsafe");
+        changedFiles.push(file);
+      }
+      changedFiles.sort();
+      if (!changedFiles.length || changedFiles.length > 256 || new Set(changedFiles).size !== changedFiles.length) adoptionFailure("adoption_diff_invalid");
+      if (JSON.stringify(changedFiles) !== JSON.stringify(options.reviewedFiles)) adoptionFailure("adoption_reviewed_diff_mismatch");
+      const loaded = loadProjectComponentImpactMapAtCommit(project, commitSha, { repoRoot });
+      if (loaded.status !== "mapped" || !loaded.coverage?.complete || loaded.digest !== options.expectedMapDigest) adoptionFailure("adoption_map_binding_invalid");
+      for (const file of changedFiles) {
+        if (Object.values(loaded.manifest.components).filter((component) => component.paths.some((scope) => pathMatchesImpactScope(file, scope))).length !== 1) adoptionFailure("adoption_owner_ambiguous");
+      }
+      return { baseSha, commitSha, treeSha, branch, changedFiles, manifestDigest: loaded.digest,
+        changedFilesDigest: sha256Digest(changedFiles), repoRoot, loadedMap: loaded };
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error("adoption_repository_unavailable");
+}
+
+function handoffBranchMatches(repoRoot, branch, commitSha) {
+  return [`refs/heads/${branch}`, `refs/remotes/origin/${branch}`].some((ref) => {
+    try { return trustedGit(repoRoot, ["rev-parse", "--verify", ref]).trim() === commitSha; } catch { return false; }
+  });
+}
+
+function handoffRepositoryDescriptors(project, task, persistedRuns = []) {
+  const roots = candidateRepositoryRoots(project, "").map((repoRoot) => ({ repoRoot, managedArtifact: false }));
+  const identity = task.candidateIdentity || {};
+  const safe = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 72);
+  for (const run of persistedRuns) {
+    if (run.workspaceProvenanceUntrusted === true || run.taskId !== task.id || run.projectId !== project.id || (run.role !== "builder" && run.group !== "builder")
+      || run.branchName !== identity.branch || !["queued", "running", "completed", "failed", "cancelled"].includes(run.status)
+      || !path.isAbsolute(run.workspacePath || "") || !path.isAbsolute(run.executionRepoPath || "")
+      || path.resolve(run.workspacePath) !== path.resolve(run.executionRepoPath)) continue;
+    const rawWorkspace = path.resolve(run.workspacePath);
+    if (existsSync(rawWorkspace)) {
+      const metadata = lstatSync(rawWorkspace);
+      if (metadata.isDirectory() && !metadata.isSymbolicLink()) roots.push({ repoRoot: realpathSync(rawWorkspace), managedArtifact: false });
+    }
+    const cycle = Number(identity.candidateCycle || task.reviewSubjectCycle || task.reviewCycle || 0);
+    const expectedRef = `candidates/${safe(task.id)}/${cycle}-${identity.commitSha}.git`;
+    const ref = identity.operationalLocalArtifactRef;
+    if (!Number.isSafeInteger(cycle) || cycle < 1 || ref !== expectedRef || !/^[a-f0-9]{40}$/.test(identity.commitSha || "")) continue;
+    let artifact = path.dirname(path.dirname(rawWorkspace));
+    let safePath = existsSync(artifact);
+    for (const part of expectedRef.split("/")) {
+      artifact = path.join(artifact, part);
+      if (!existsSync(artifact)) { safePath = false; break; }
+      const metadata = lstatSync(artifact);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) { safePath = false; break; }
+    }
+    if (safePath) roots.push({ repoRoot: realpathSync(artifact), managedArtifact: true });
+  }
+  return roots.filter((item, index) => roots.findIndex((other) => other.repoRoot === item.repoRoot && other.managedArtifact === item.managedArtifact) === index);
+}
+
+/** Persistence ingress re-verifies the ordinary immutable handoff outside SQL locks. */
+export function verifyScopedBuilderHandoff(project, task, scope, options = {}) {
+  assertImpactPlanProjectBinding(scope, project);
+  const candidate = task.candidateIdentity || {};
+  if (![candidate.baseSha, candidate.commitSha, candidate.treeSha].every((sha) => /^[a-f0-9]{40}$/.test(sha || ""))
+    || candidate.commitSha !== task.reviewSubjectSha || typeof candidate.branch !== "string" || !candidate.branch) adoptionFailure("builder_handoff_identity_incomplete");
+  const expectedRepository = projectRepositoryIdentity(project);
+  let lastError;
+  for (const { repoRoot, managedArtifact } of handoffRepositoryDescriptors(project, task, options.persistedRuns || [])) {
+    try {
+      let remote = "";
+      try { remote = normalizeRepositoryIdentity(trustedGit(repoRoot, ["remote", "get-url", "origin"]).trim()); } catch {}
+      if (!expectedRepository.startsWith("local:") && remote !== expectedRepository && !(managedArtifact && !remote)) adoptionFailure("builder_handoff_repository_mismatch");
+      if (managedArtifact && trustedGit(repoRoot, ["rev-parse", "--is-bare-repository"]).trim() !== "true") adoptionFailure("builder_handoff_artifact_invalid");
+      trustedGit(repoRoot, ["check-ref-format", `refs/heads/${candidate.branch}`]);
+      if (!handoffBranchMatches(repoRoot, candidate.branch, candidate.commitSha)) adoptionFailure("builder_handoff_branch_mismatch");
+      trustedGit(repoRoot, ["merge-base", "--is-ancestor", candidate.baseSha, candidate.commitSha]);
+      if (trustedGit(repoRoot, ["rev-parse", `${candidate.commitSha}^{tree}`]).trim() !== candidate.treeSha) adoptionFailure("builder_handoff_tree_mismatch");
+      const raw = trustedGit(repoRoot, ["--no-pager", "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", candidate.baseSha, candidate.commitSha, "--"]);
+      const changedFiles = [...new Set(raw.split("\0").filter(Boolean))].sort();
+      if (!changedFiles.length) adoptionFailure("builder_handoff_empty_diff");
+      if (changedFiles.some((file) => file !== file.trim() || /[\\\x00-\x1f\x7f]/.test(file))) adoptionFailure("builder_handoff_path_invalid");
+      assertChangedFileEvidenceMatches(changedFiles, task.impactEvidence?.changedFiles || candidate.impactEvidence?.changedFiles || []);
+      assertChangedFilesWithinImpactPlan(scope, changedFiles);
+      if (scope.status === "mapped") {
+        const loaded = loadProjectComponentImpactMapAtCommit(project, candidate.commitSha, { repoRoot,
+          verifyManagedRepository: managedArtifact ? (binding) => binding.repoRoot === repoRoot
+            && binding.commitSha === candidate.commitSha && binding.repository === expectedRepository : undefined });
+        if (loaded.status !== "mapped" || !loaded.coverage?.complete) adoptionFailure("builder_handoff_committed_map_invalid");
+        for (const file of changedFiles) {
+          if (Object.values(loaded.manifest.components).filter((component) => component.paths.some((pattern) => pathMatchesImpactScope(file, pattern))).length !== 1) adoptionFailure("builder_handoff_owner_ambiguous");
+        }
+        return { candidate, changedFiles, repoRoot, loadedMap: loaded, manifestDigest: loaded.digest };
+      }
+      if (!scope.fullRegression) adoptionFailure("builder_handoff_unknown_impact_requires_full_regression");
+      return { candidate, changedFiles, repoRoot };
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error("builder_handoff_repository_unavailable");
 }
 
 export function assertChangedFileEvidenceMatches(actualFiles = [], reportedFiles = []) {

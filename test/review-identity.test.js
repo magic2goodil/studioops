@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   addProject,
@@ -6,11 +10,50 @@ import {
   candidateReviewEvidenceForTask,
   readState,
   recordReview,
+  updateRun,
   updateTask,
 } from "../src/store.js";
+import { dispatchSupervisorActions } from "../src/dispatcher.js";
 
-const SUBJECT_SHA = "a".repeat(40);
-const REVIEWER_FIX_SHA = "b".repeat(40);
+async function reviewCandidateFixture(t, key, reviewPipeline) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "review-identity-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("/usr/bin/git", ["-C", root, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const repository = `https://github.com/example/${key}`;
+  git("init", "-b", "main"); git("config", "user.name", "Fixture Author"); git("config", "user.email", "fixture@example.invalid");
+  git("remote", "add", "origin", repository);
+  await mkdir(path.join(root, "src")); await mkdir(path.join(root, "test")); await mkdir(path.join(root, "docs/architecture"), { recursive: true });
+  await writeFile(path.join(root, "src/catalog.js"), "export const version = 1;\n");
+  await writeFile(path.join(root, "test/catalog.test.js"), "// Generic owned fixture.\n");
+  await writeFile(path.join(root, "docs/architecture/components.json"), JSON.stringify({ schemaVersion: 1, project: { key, repository }, aggregateCommand: "npm run check",
+    components: { catalog: { owner: "fixture-engineering", paths: ["src/catalog.js", "test/catalog.test.js"], publicContracts: ["shared client and server catalog value"], services: ["shared catalog module"],
+      dependsOn: [], tests: [{ command: "node --test test/catalog.test.js", layer: "unit" }], reviewOwners: ["backend-reviewer"], rollback: "Restore the prior fixture commit." } } }));
+  git("add", "."); git("commit", "-m", "Generic review base");
+  const baseSha = git("rev-parse", "HEAD"); const branch = `codex/${key}`;
+  git("switch", "-c", branch);
+  const project = await addProject({ key, name: "Generic review identity", workflowMode: "github", repoPath: root, sourceRepoPath: root, repoUrl: repository, reviewPipeline,
+    deliveryPolicy: { profile: "standard" } });
+  const task = await addTask({ project: project.id, title: "Commit-bound review", type: "bug", status: "ready", architectureRequired: false, branchName: branch,
+    description: "Review exact real candidate coordinates under native edit authority.", userStory: "As a reviewer I need commit-bound review evidence.",
+    expectedOutcome: "Stale candidate evidence never approves a new commit.", acceptanceCriteria: ["Reviews bind the exact candidate."], workAreas: ["src/catalog.js"],
+    affectedSurfaces: ["src/catalog.js"], validationPlan: ["node --test test/catalog.test.js"], riskClassification: "low",
+    privacyNotes: "Generic synthetic source only; no personal data.", securityNotes: "No network access or external executor is used." });
+  const dispatch = await dispatchSupervisorActions([{ id: `${task.id}:start_builder`, type: "start_builder", role: "builder", taskId: task.id, projectId: project.id,
+    taskStatus: "ready", nextStatus: "in_progress" }], { failureIncidents: [], creditPolicy: { enabled: false } });
+  assert.equal(dispatch.runs.length, 1, JSON.stringify(dispatch.skipped));
+  await updateRun(dispatch.runs[0].id, { status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch." });
+  await updateTask(task.id, { status: "in_progress" });
+  const commit = async version => {
+    await writeFile(path.join(root, "src/catalog.js"), `export const version = ${version};\n`);
+    git("add", "src/catalog.js"); git("commit", "-m", `Review candidate ${version}`);
+    return { commitSha: git("rev-parse", "HEAD"), treeSha: git("rev-parse", "HEAD^{tree}"), baseSha, branch, candidateCycle: 1,
+      impactEvidence: { changedFiles: ["src/catalog.js"], impact: ["backend", "frontend", "accessibility"] } };
+  };
+  const identity = await commit(2);
+  await updateTask(task.id, { status: "builder_review", branchName: branch, prUrl: `${repository}/pull/1`, subjectSha: identity.commitSha,
+    candidateIdentity: identity, impactEvidence: identity.impactEvidence });
+  return { project, task, identity, commit };
+}
 
 test("task labels persist through intake and updates for auditable tier routing", async () => {
   const project = await addProject({ key: "tier-routing", name: "Tier Routing" });
@@ -27,12 +70,8 @@ test("task labels persist through intake and updates for auditable tier routing"
   assert.deepEqual(state.tasks.find((item) => item.id === task.id)?.labels, ["ultra-review"]);
 });
 
-test("reviews require the exact current candidate cycle and subject SHA", async () => {
-  const project = await addProject({
-    key: "review-identity",
-    name: "Review identity",
-    repoPath: "/tmp/review-identity",
-    reviewPipeline: [
+test("reviews require the exact current candidate cycle and subject SHA", async (t) => {
+  const { project, task, identity } = await reviewCandidateFixture(t, "review-identity", [
       {
         key: "backend",
         label: "Backend Review",
@@ -40,25 +79,13 @@ test("reviews require the exact current candidate cycle and subject SHA", async 
         status: "backend_review",
         required: true,
       },
-    ],
-  });
+    ]);
+  const SUBJECT_SHA = identity.commitSha;
   assert.equal(project.reviewPipeline.some((stage) => (
     stage.key === "lead"
     && stage.role === "lead-reviewer"
     && stage.required === true
   )), true);
-  const task = await addTask({
-    project: project.id,
-    title: "Commit-bound review",
-    status: "in_progress",
-    type: "bug",
-  });
-  await updateTask(task.id, {
-    status: "builder_review",
-    branchName: "codex/review-identity",
-    prUrl: "https://github.com/example/review-identity/pull/1",
-    subjectSha: SUBJECT_SHA,
-  });
 
   await assert.rejects(
     recordReview(task.id, { stage: "backend", outcome: "approved", candidateCycle: 1 }),
@@ -115,12 +142,8 @@ test("reviews require the exact current candidate cycle and subject SHA", async 
   assert.ok(updated.stateVersion > 1, "review evidence mutations advance the aggregate version");
 });
 
-test("reviewer commits restart required lanes without consuming a builder review cycle", async () => {
-  const project = await addProject({
-    key: "reviewer-fix-identity",
-    name: "Reviewer fix identity",
-    repoPath: "/tmp/reviewer-fix-identity",
-    reviewPipeline: [
+test("reviewer commits restart required lanes without consuming a builder review cycle", async (t) => {
+  const fixture = await reviewCandidateFixture(t, "reviewer-fix-identity", [
       {
         key: "backend",
         label: "Backend Review",
@@ -149,20 +172,9 @@ test("reviewer commits restart required lanes without consuming a builder review
         status: "lead_review",
         required: true,
       },
-    ],
-  });
-  const task = await addTask({
-    project: project.id,
-    title: "Restart after reviewer commit",
-    status: "in_progress",
-    type: "bug",
-  });
-  await updateTask(task.id, {
-    status: "builder_review",
-    branchName: "codex/reviewer-fix-identity",
-    prUrl: "https://github.com/example/reviewer-fix-identity/pull/1",
-    subjectSha: SUBJECT_SHA,
-  });
+    ]);
+  const { task } = fixture;
+  const SUBJECT_SHA = fixture.identity.commitSha;
   await recordReview(task.id, {
     stage: "backend",
     outcome: "approved",
@@ -170,7 +182,9 @@ test("reviewer commits restart required lanes without consuming a builder review
     candidateCycle: 1,
   });
 
-  await updateTask(task.id, { subjectSha: REVIEWER_FIX_SHA });
+  const corrected = await fixture.commit(3);
+  const REVIEWER_FIX_SHA = corrected.commitSha;
+  await updateTask(task.id, { subjectSha: REVIEWER_FIX_SHA, candidateIdentity: corrected });
   let state = await readState();
   let updated = state.tasks.find((item) => item.id === task.id);
   assert.equal(updated.status, "backend_review");

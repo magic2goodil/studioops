@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   LIFECYCLE_ACTION_MATRIX,
+  createOperatorAdoptionLifecycleContext,
   evaluateLifecycleTransition,
 } from "../src/lifecycle-policy.js";
 import { createCandidateEnvelope } from "../src/candidate-manifest.js";
@@ -59,6 +60,40 @@ function builderFixture() {
   };
   return { task, run, command };
 }
+
+test("operator adoption is a new subject only with opaque executable lifecycle authority", () => {
+  const { task, command } = builderFixture();
+  task.status = "ready";
+  command.action = "adopt_operator_candidate";
+  command.actorContext = { actorId: "verified-owner", actorType: "system", role: "workflow-engine", trusted: true };
+  for (const forged of [{}, { operatorAdoptionVerified: true }, { trusted: true, operatorAdoptionCapability: "verified" }]) {
+    assert.throws(() => evaluateLifecycleTransition(command, task, forged), /executable lifecycle authority/);
+  }
+  const context = createOperatorAdoptionLifecycleContext({ candidates: [], runs: [], nowMs: NOW });
+  const result = evaluateLifecycleTransition(command, task, context);
+  assert.equal(result.task.status, "builder_review");
+  assert.equal(result.task.reviewCycle, 1);
+  assert.equal(result.task.reviewSubjectCycle, 1);
+  assert.equal(result.task.reviewSubjectSha, SHA);
+  assert.equal(result.task.stateVersion, 4);
+  assert.deepEqual(result.decision.invalidates, ["reviews", "qa", "candidate", "promotion"]);
+  for (const copy of [{ ...context }, JSON.parse(JSON.stringify(context)), structuredClone(context)]) {
+    assert.throws(() => evaluateLifecycleTransition(command, task, copy), /executable lifecycle authority/);
+  }
+  task.status = "needs_changes";
+  task.reviewCycle = 2;
+  task.reviewSubjectCycle = 3;
+  task.reviewSubjectSha = "b".repeat(40);
+  command.evidence.candidateCycle = 4;
+  assert.equal(evaluateLifecycleTransition(command, task, context).task.reviewSubjectSha, SHA);
+  command.evidence.candidateCycle = 3;
+  assert.throws(() => evaluateLifecycleTransition(command, task, context), /Candidate cycle/);
+  command.evidence.candidateCycle = 4;
+  task.status = "in_progress";
+  assert.throws(() => evaluateLifecycleTransition(command, task, context), /prohibits/);
+  command.action = "adopt_candidate";
+  assert.throws(() => evaluateLifecycleTransition(command, task, context), /Unknown lifecycle action/);
+});
 
 function candidateFixture() {
   return createCandidateEnvelope({

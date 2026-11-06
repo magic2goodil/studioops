@@ -392,7 +392,13 @@ export function loadProjectComponentImpactMapAtCommit(project = {}, commitSha, o
     try {
       observedRepository = normalizeRepositoryIdentity(trustedGit(repoRoot, ["remote", "get-url", "origin"]).trim());
     } catch {
-      throw new ComponentMapIsolationError("Candidate component-map repository origin is unavailable.");
+      // Only an executable persistence-proven managed-artifact port can attest
+      // an intentionally origin-less bare candidate. JSON/booleans cannot.
+      if (typeof options.verifyManagedRepository !== "function"
+        || options.verifyManagedRepository({ repoRoot, commitSha: sha, repository: expectedRepository }) !== true) {
+        throw new ComponentMapIsolationError("Candidate component-map repository origin is unavailable.");
+      }
+      observedRepository = expectedRepository;
     }
     if (observedRepository !== expectedRepository) {
       throw new ComponentMapIsolationError(`Candidate component-map repository ${observedRepository || "(missing)"} does not match ${expectedRepository}.`);

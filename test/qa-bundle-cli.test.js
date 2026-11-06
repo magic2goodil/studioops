@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -13,44 +15,156 @@ const environment = await createHermeticTestEnvironment({ tempParent: os.tmpdir(
 Object.assign(process.env, environment.env);
 test.after(async () => environment.cleanup());
 
-const { qaDecisionCoordinatesForState, readState, writeState } = await import(
+const { qaDecisionCoordinatesForState, readState, writeState, addProject, addTask, updateTask, updateRun, recordReview } = await import(
   `../src/store.js?qa-bundle-cli=${Date.now()}`
 );
 
-const BASE_SHA = "a".repeat(40);
-const SOURCE_SHA = "b".repeat(40);
-const INTEGRATION_SHA = "c".repeat(40);
+const REPOSITORY_URL = "https://github.com/example/demo";
+const { dispatchSupervisorActions } = await import("../src/dispatcher.js");
 
-function candidateFixture({ candidateId, bundleId, taskIds }) {
+async function nativeQaFixture(options) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "qa-auth-candidate-"));
+  options.testContext.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("/usr/bin/git", ["-C", root, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  const key = options.projectKey || `qa-auth-${path.basename(root).toLowerCase()}`;
+  const repository = options.repoUrl || REPOSITORY_URL;
+  git("init", "-b", "main");
+  git("config", "user.name", "Fixture Author");
+  git("config", "user.email", "fixture@example.invalid");
+  git("remote", "add", "origin", repository);
+  await mkdir(path.join(root, "src"));
+  await mkdir(path.join(root, "test"));
+  await mkdir(path.join(root, "docs/architecture"), { recursive: true });
+  await writeFile(path.join(root, "src/catalog.js"), "export const version = 1;\n");
+  await writeFile(path.join(root, "test/catalog.test.js"), 'import assert from "node:assert/strict";\nimport { version } from "../src/catalog.js";\nassert.ok(Number.isSafeInteger(version) && version > 0);\n');
+  await writeFile(path.join(root, "docs/architecture/components.json"), JSON.stringify({
+    schemaVersion: 1, project: { key, repository }, aggregateCommand: "node --test",
+    components: { catalog: {
+      owner: "fixture-engineering", paths: ["src/catalog.js", "test/catalog.test.js"],
+      publicContracts: ["catalog value"], services: ["catalog module"], dependsOn: [],
+      tests: [{ command: "node --test test/catalog.test.js", layer: "unit" }],
+      reviewOwners: ["backend-reviewer", "lead-reviewer"], rollback: "Restore the prior fixture commit.",
+    } },
+  }));
+  git("add", ".");
+  git("commit", "-m", "Generic QA candidate base");
+  const baseSha = git("rev-parse", "HEAD");
+  const nativeProject = await addProject({
+    key, name: options.projectName || "Demo", workflowMode: "github", defaultBranch: "main",
+    repoPath: root, sourceRepoPath: root, repoUrl: repository,
+    reviewPipeline: [
+      { key: "backend", label: "Backend Review", role: "backend-reviewer", status: "backend_review", required: true },
+      { key: "lead", label: "Primary Lead Review", role: "lead-reviewer", status: "lead_review", required: true },
+    ],
+  });
+  const taskIds = [];
+  const branches = [];
+  for (let index = 0; index < Number(options.taskCount || 1); index += 1) {
+    const branch = `feature/task-${index + 1}`;
+    branches.push(branch);
+    git("branch", branch, baseSha);
+    const task = await addTask({
+      project: nativeProject.id, title: options.taskTitle || "Exact owner QA", type: "bug", status: "ready", architectureRequired: false,
+      description: "Review a real candidate under native frozen edit authority.",
+      userStory: "As an owner I need exact QA decisions and immutable audit evidence.",
+      expectedOutcome: "QA authority remains bound to the exact candidate.",
+      acceptanceCriteria: ["Candidate QA decisions remain immutable."], workAreas: ["src/catalog.js"], branchName: branch,
+      candidateIdentity: { baseSha },
+      affectedSurfaces: ["src/catalog.js"], validationPlan: ["node --test test/catalog.test.js"], riskClassification: "low",
+      privacyNotes: "Generic synthetic source only; no personal data.", securityNotes: "No external executor or network request is used.",
+    });
+    // Native dispatch freezes the scope. Cancel before any executor starts.
+    const dispatch = await dispatchSupervisorActions([{
+      id: `${task.id}:start_builder`, type: "start_builder", role: "builder", taskId: task.id,
+      projectId: nativeProject.id, taskStatus: "ready", nextStatus: "in_progress",
+    }], { failureIncidents: [], creditPolicy: { enabled: false } });
+    assert.equal(dispatch.runs.length, 1, JSON.stringify(dispatch.skipped));
+    await updateRun(dispatch.runs[0].id, {
+      status: "cancelled", completedAt: new Date().toISOString(), notes: "Fixture cancelled before executor launch.",
+    });
+    await updateTask(task.id, { status: "in_progress" });
+    taskIds.push(task.id);
+  }
+  git("checkout", branches[0]);
+  await writeFile(path.join(root, "src/catalog.js"), "export const version = 2;\n");
+  git("add", "src/catalog.js");
+  git("commit", "-m", "Generic exact QA source");
+  const sourceSha = git("rev-parse", "HEAD");
+  const treeSha = git("rev-parse", "HEAD^{tree}");
+  const impactEvidence = { changedFiles: ["src/catalog.js"], unknown: false, backendRequired: true };
+  for (const [index, taskId] of taskIds.entries()) {
+    git("checkout", branches[index]);
+    git("merge", "--ff-only", sourceSha);
+    await updateTask(taskId, {
+      status: "builder_review", subjectSha: sourceSha, branchName: branches[index],
+      prUrl: `${REPOSITORY_URL}/pull/${index + 1}`,
+      candidateIdentity: { commitSha: sourceSha, treeSha, baseSha, branch: branches[index], candidateCycle: 1 }, impactEvidence,
+    });
+    for (const stage of nativeProject.reviewPipeline.filter((item) => item.required)) {
+      await recordReview(taskId, {
+        stage: stage.key, outcome: "approved", subjectSha: sourceSha, candidateCycle: 1,
+        author: "Fixture Reviewer", body: "Reviewed the exact generic fixture commit.",
+      });
+    }
+  }
+  git("branch", "qa/demo", sourceSha);
+  const validationEnv = { ...process.env };
+  delete validationEnv.NODE_TEST_CONTEXT;
+  const validationOutput = execFileSync(process.execPath, ["--test", "test/catalog.test.js"], {
+    cwd: root, env: validationEnv, stdio: ["ignore", "pipe", "pipe"],
+  });
+  assert.match(validationOutput.toString(), /# pass 1\b/);
+  const frozen = await readState();
+  const nativeTasks = taskIds.map((id) => frozen.tasks.find((task) => task.id === id));
+  for (const task of nativeTasks) {
+    assert.equal(task.impactScopePlan.status, "mapped");
+    assert.equal(task.impactScopePlan.sourceCommit, baseSha);
+    assert.equal(task.reviewSubjectSha, sourceSha);
+  }
+  return {
+    nativeProject, nativeTasks, nativeState: frozen, baseSha, sourceSha, integrationSha: sourceSha,
+    nativeReviews: frozen.reviews.filter((review) => taskIds.includes(review.taskId)),
+    validationEvidenceDigest: `sha256:${createHash("sha256").update(validationOutput).digest("hex")}`,
+    handoff: async (index) => {
+      git("checkout", branches[index]);
+      await writeFile(path.join(root, "src/catalog.js"), `export const version = ${index + 3};\n`);
+      git("add", "src/catalog.js");
+      git("commit", "-m", `Generic sibling ${index + 1} remediation`);
+      const commitSha = git("rev-parse", "HEAD");
+      return {
+        status: "builder_review", subjectSha: commitSha, branchName: branches[index],
+        candidateIdentity: { commitSha, treeSha: git("rev-parse", "HEAD^{tree}"), baseSha, branch: branches[index], candidateCycle: 2 },
+        impactEvidence,
+      };
+    },
+  };
+}
+
+function candidateFixture({ candidateId, bundleId, taskIds, native }) {
+  const { baseSha: BASE_SHA, sourceSha: SOURCE_SHA, integrationSha: INTEGRATION_SHA } = native;
   return createCandidateEnvelope({
     qaBundleId: bundleId,
     manifest: {
       candidateId,
-      projectId: "project_1",
+      projectId: native.nativeProject.id,
       base: { branch: "main", sha: BASE_SHA },
       sources: taskIds.map((taskId, index) => ({
         taskId,
-        sourceRef: `refs/heads/feature/${taskId}`,
+        sourceRef: `refs/heads/${native.nativeTasks.find((task) => task.id === taskId).branchName}`,
         headSha: SOURCE_SHA,
         candidateCycle: 1,
-        reviews: [{
-          id: `review_${candidateId}_${index + 1}`,
-          stageKey: "lead",
-          role: "lead-reviewer",
-          outcome: "approved",
-          subjectSha: SOURCE_SHA,
-          candidateCycle: 1,
-          reviewedAt: "2026-09-03T12:00:00.000Z",
-        }],
+        reviews: native.nativeReviews.filter((review) => review.taskId === taskId),
       })),
       integration: { branch: `qa/${candidateId}`, sha: INTEGRATION_SHA },
       checks: [{
         id: `check_${candidateId}`,
         kind: "local-validation",
-        name: "npm test",
+        name: "node --test test/catalog.test.js",
         outcome: "passed",
         subjectSha: INTEGRATION_SHA,
-        evidenceDigest: `sha256:${"d".repeat(64)}`,
+        evidenceDigest: native.validationEvidenceDigest,
       }],
       preview: {
         url: `http://127.0.0.1:4393/${candidateId}`,
@@ -70,14 +184,15 @@ function candidateFixture({ candidateId, bundleId, taskIds }) {
   });
 }
 
-function fixtureState() {
+function fixtureState(native) {
+  const { sourceSha: SOURCE_SHA, integrationSha: INTEGRATION_SHA } = native;
   const definitions = [
-    { candidateId: "candidate_single", bundleId: "qa_bundle_single", taskIds: ["task_single"] },
-    { candidateId: "candidate_multi", bundleId: "qa_bundle_multi", taskIds: ["task_multi_1", "task_multi_2"] },
+    { candidateId: "candidate_single", bundleId: "qa_bundle_single", taskIds: [native.nativeTasks[0].id] },
+    { candidateId: "candidate_multi", bundleId: "qa_bundle_multi", taskIds: native.nativeTasks.slice(1).map((task) => task.id) },
   ];
-  const candidates = definitions.map(candidateFixture);
+  const candidates = definitions.map((definition) => candidateFixture({ ...definition, native }));
   const state = {
-    meta: {},
+    meta: native.nativeState.meta,
     projects: [{
       id: "project_1",
       key: "demo",
@@ -86,16 +201,18 @@ function fixtureState() {
       repoUrl: "https://github.com/example/demo",
       defaultBranch: "main",
       workflowMode: "github",
+      ...native.nativeProject,
     }],
     tasks: definitions.flatMap((definition) => definition.taskIds.map((taskId) => {
       const candidate = candidates.find((item) => item.id === definition.candidateId);
       return {
+        ...native.nativeTasks.find((task) => task.id === taskId),
         id: taskId,
-        projectId: "project_1",
-        title: `Review ${taskId}`,
+        projectId: native.nativeProject.id,
+        title: native.nativeTasks.find((task) => task.id === taskId).title,
         status: "qa_review",
         assignedAgentRole: "owner",
-        stateVersion: 1,
+        stateVersion: native.nativeTasks.find((task) => task.id === taskId).stateVersion,
         reviewCycle: 1,
         reviewSubjectSha: SOURCE_SHA,
         reviewSubjectCycle: 1,
@@ -107,15 +224,15 @@ function fixtureState() {
         qaBundleId: definition.bundleId,
       };
     })),
-    comments: [],
-    events: [],
-    reviews: [],
-    runs: [],
+    comments: native.nativeState.comments,
+    events: native.nativeState.events,
+    reviews: native.nativeState.reviews,
+    runs: native.nativeState.runs,
     qaBundles: definitions.map((definition) => {
       const candidate = candidates.find((item) => item.id === definition.candidateId);
       return {
         id: definition.bundleId,
-        projectId: "project_1",
+        projectId: native.nativeProject.id,
         candidateId: candidate.id,
         manifestDigest: candidate.manifestDigest,
         integrationBranch: candidate.manifest.integration.branch,
@@ -150,8 +267,15 @@ function decisionArgs(coordinates, notes) {
   ];
 }
 
-test("QA CLI acts on bundle rows atomically and preserves positional task decisions", async () => {
-  const state = fixtureState();
+test("QA CLI acts on bundle rows atomically and preserves positional task decisions", async (t) => {
+  const native = await nativeQaFixture({ testContext: t, taskCount: 3, projectKey: "demo" });
+  for (const branch of ["qa/candidate_single", "qa/candidate_multi"]) {
+    execFileSync("/usr/bin/git", ["-C", native.nativeProject.repoPath, "branch", branch, native.integrationSha]);
+  }
+  const state = fixtureState(native);
+  const INTEGRATION_SHA = native.integrationSha;
+  const singleId = state.candidates[0].manifest.sources[0].taskId;
+  const multiIds = state.candidates[1].manifest.sources.map((source) => source.taskId);
   await writeState(state);
   const coordinates = qaDecisionCoordinatesForState(state);
   const cliPath = path.resolve("src/mission-control-cli.js");
@@ -170,7 +294,7 @@ test("QA CLI acts on bundle rows atomically and preserves positional task decisi
     run(process.execPath, [
       cliPath,
       "qa-fail",
-      "task_multi_1",
+      multiIds[0],
       "--bundle",
       "qa_bundle_multi",
       ...decisionArgs({
@@ -187,12 +311,12 @@ test("QA CLI acts on bundle rows atomically and preserves positional task decisi
   const singleResult = await run(process.execPath, [
     cliPath,
     "qa-fail",
-    "task_single",
+    singleId,
     ...decisionArgs({
       candidateId: "candidate_single",
       manifestDigest: state.candidates[0].manifestDigest,
       integrationSha: INTEGRATION_SHA,
-      ownerQaPacketDigest: coordinates.tasks.task_single,
+      ownerQaPacketDigest: coordinates.tasks[singleId],
     }, "Single-task QA still uses the positional selector."),
   ], common);
   assert.match(singleResult.stdout, /candidate_single: QA failed\. Status now qa_failed\./);
@@ -212,9 +336,9 @@ test("QA CLI acts on bundle rows atomically and preserves positional task decisi
   assert.match(bundleResult.stdout, /candidate_multi: QA failed\. Status now qa_failed\./);
 
   const persisted = await readState();
-  assert.equal(persisted.tasks.find((item) => item.id === "task_single").status, "needs_changes");
+  assert.equal(persisted.tasks.find((item) => item.id === singleId).status, "needs_changes");
   assert.deepEqual(
-    persisted.tasks.filter((item) => item.id.startsWith("task_multi_")).map((item) => item.status),
+    persisted.tasks.filter((item) => multiIds.includes(item.id)).map((item) => item.status),
     ["needs_changes", "needs_changes"],
   );
   assert.equal(persisted.candidates.find((item) => item.id === "candidate_multi").status, "qa_failed");

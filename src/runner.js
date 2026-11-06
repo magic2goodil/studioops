@@ -1,3 +1,4 @@
+import { mutateNativeWorkspaceState } from "./state-database.js";
 import { createWriteStream, existsSync } from "node:fs";
 import { chmod, mkdir, readFile, readdir, rm, lstat, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -1492,16 +1493,17 @@ async function safeRemoveWorkspace(workspacePath, workspaceRoot) {
   await rm(workspacePath, { recursive: true, force: true });
 }
 
-async function persistRunWorkspace(run, workspace) {
+export async function persistRunWorkspace(run, workspace) {
   run.executionRepoPath = workspace.executionRepoPath;
   run.workspacePath = workspace.workspacePath;
   run.workspaceStrategy = workspace.strategy;
-  await mutateState(async (state) => {
+  await mutateNativeWorkspaceState(run.id, async (state) => {
     const liveRun = (state.runs || []).find((item) => item.id === run.id);
     if (!liveRun) return;
     liveRun.executionRepoPath = workspace.executionRepoPath;
     liveRun.workspacePath = workspace.workspacePath;
     liveRun.workspaceStrategy = workspace.strategy;
+    liveRun.workspaceProvenanceUntrusted = false;
     liveRun.updatedAt = new Date().toISOString();
   }, { operationName: "runner.persist_workspace" });
 }

@@ -84,6 +84,43 @@ function builderReviewStatusState(workflowMode, prUrl) {
   };
 }
 
+async function installNativeBuilderFixture(root, workflowMode, prUrl) {
+  const repo = path.join(root, "source");
+  await mkdir(path.join(repo, "src"), { recursive: true }); await mkdir(path.join(repo, "test"));
+  await mkdir(path.join(repo, "docs/architecture"), { recursive: true });
+  const git = async (...args) => (await execFileAsync("/usr/bin/git", ["-C", repo, ...args])).stdout.trim();
+  await git("init", "-b", "main"); await git("config", "user.name", "Fixture Author"); await git("config", "user.email", "fixture@example.invalid");
+  await git("remote", "add", "origin", "https://github.com/example/demo");
+  await writeFile(path.join(repo, "src/store.js"), "export const value=1;\n");
+  await writeFile(path.join(repo, "test/store.test.js"), "// Generic immutable fixture test.\n");
+  await writeFile(path.join(repo, "docs/architecture/components.json"), JSON.stringify({ schemaVersion: 1,
+    project: { key: "demo", repository: "https://github.com/example/demo" }, aggregateCommand: "npm run check",
+    components: { example: { owner: "fixture-engineering", paths: ["src/store.js", "test/store.test.js"],
+      publicContracts: ["fixture value"], services: ["fixture module"], dependsOn: [],
+      tests: [{ command: "node --test test/store.test.js", layer: "unit" }], reviewOwners: ["backend-reviewer"], rollback: "Restore the prior fixture commit." } } }));
+  await git("add", "."); await git("commit", "-m", "Real fixture base"); const baseSha = await git("rev-parse", "HEAD");
+  const branch = "codex/demo-corrected"; await git("switch", "-c", branch);
+  const env = await environmentForTestControlRoot(root);
+  const store = path.resolve("src/store.js"), dispatcher = path.resolve("src/dispatcher.js");
+  const setup = await execFileAsync(process.execPath, ["--input-type=module", "-e", `
+    import assert from 'node:assert/strict';
+    import {addProject,addTask,updateTask,updateRun,readStateReadOnly} from ${JSON.stringify(store)};
+    import {dispatchSupervisorActions} from ${JSON.stringify(dispatcher)};
+    const project=await addProject({key:'demo',name:'Real candidate fixture',repoPath:${JSON.stringify(repo)},sourceRepoPath:${JSON.stringify(repo)},repoUrl:'https://github.com/example/demo',workflowMode:${JSON.stringify(workflowMode)},reviewPipeline:[{key:'backend',label:'Backend Review',role:'backend-reviewer',status:'backend_review',required:true}]});
+    const task=await addTask({project:project.id,title:'Real builder candidate',type:'bug',status:'ready',architectureRequired:false,branchName:${JSON.stringify(branch)},prUrl:${JSON.stringify(prUrl)},workAreas:['src/store.js','test/store.test.js'],description:'Validate atomic real candidate handoff.',userStory:'As a reviewer I need truthful source identity.',expectedOutcome:'The handoff is atomic.',acceptanceCriteria:['Exact source is retained.'],affectedSurfaces:['backend'],validationPlan:['node --test test/store.test.js'],riskClassification:'low',privacyNotes:'Generic fixture only.',securityNotes:'No executor or external network.'});
+    const report=await dispatchSupervisorActions([{id:task.id+':start_builder',type:'start_builder',role:'builder',taskId:task.id,projectId:project.id,taskStatus:'ready',nextStatus:'in_progress'}],{failureIncidents:[],creditPolicy:{enabled:false}});
+    assert.equal(report.runs.length,1,JSON.stringify(report.skipped));
+    await updateRun(report.runs[0].id,{status:'cancelled',completedAt:new Date().toISOString(),notes:'Fixture cancelled before execution.'});
+    await updateTask(task.id,{status:'in_progress'});
+    const current=(await readStateReadOnly()).tasks.find(t=>t.id===task.id);console.log(JSON.stringify({taskId:task.id,stateVersion:current.stateVersion}));
+  `], { cwd: root, env });
+  await writeFile(path.join(repo, "src/store.js"), "export const value=2;\n");
+  await writeFile(path.join(repo, "test/store.test.js"), "// Generic corrected immutable fixture test.\n");
+  await git("add", "."); await git("commit", "-m", "Real fixture implementation");
+  return { ...JSON.parse(setup.stdout), env, candidate: { baseSha, commitSha: await git("rev-parse", "HEAD"), treeSha: await git("rev-parse", "HEAD^{tree}"), branch },
+    handoffArgs: ["--tree-sha", await git("rev-parse", "HEAD^{tree}"), "--base-sha", baseSha, "--branch", branch, "--impact-files", "src/store.js,test/store.test.js"] };
+}
+
 async function readPersistedState(root, env) {
   const result = await execFileAsync(process.execPath, [
     "--input-type=module",
@@ -228,9 +265,9 @@ for (const [workflowMode, prUrl] of [
   test(`builder-review status atomically persists the exact SHA for ${workflowMode} workflow`, async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), `studioops-builder-review-${workflowMode}-`));
     try {
-      await writeLegacyState(root, builderReviewStatusState(workflowMode, prUrl));
-      const env = await environmentForTestControlRoot(root);
-      const subjectSha = "b".repeat(40);
+      const fixture = await installNativeBuilderFixture(root, workflowMode, prUrl);
+      const { env } = fixture;
+      const subjectSha = fixture.candidate.commitSha;
       await execFileAsync(process.execPath, [
         cliPath,
         "status",
@@ -239,6 +276,7 @@ for (const [workflowMode, prUrl] of [
         "builder_review",
         "--subject-sha",
         subjectSha,
+        ...fixture.handoffArgs,
       ], { cwd: root, env });
 
       const state = await readPersistedState(root, env);
@@ -247,11 +285,11 @@ for (const [workflowMode, prUrl] of [
       assert.equal(task.reviewSubjectSha, subjectSha);
       assert.equal(task.reviewCycle, 1);
       assert.equal(task.reviewSubjectCycle, 1);
-      assert.equal(task.stateVersion, 2);
-      const lifecycleEvent = state.events.find((event) => event.type === "lifecycle_transition");
+      assert.equal(task.stateVersion, fixture.stateVersion + 1);
+      const lifecycleEvent = state.events.find((event) => event.type === "lifecycle_transition" && event.action === "record_builder_handoff");
       assert.equal(lifecycleEvent?.action, "record_builder_handoff");
-      assert.equal(lifecycleEvent?.fromVersion, 1);
-      assert.equal(lifecycleEvent?.toVersion, 2);
+      assert.equal(lifecycleEvent?.fromVersion, fixture.stateVersion);
+      assert.equal(lifecycleEvent?.toVersion, fixture.stateVersion + 1);
       const report = createSupervisorReport(state);
       assert.equal(report.actions[0].type, "start_review");
       assert.equal(report.actions[0].reviewSubjectSha, subjectSha);
@@ -264,11 +302,9 @@ for (const [workflowMode, prUrl] of [
 test("builder-review status atomically persists complete immutable candidate evidence", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-builder-review-candidate-"));
   try {
-    await writeLegacyState(root, builderReviewStatusState("github", "https://github.com/example/demo/pull/1"));
-    const env = await environmentForTestControlRoot(root);
-    const subjectSha = "d".repeat(40);
-    const treeSha = "e".repeat(40);
-    const baseSha = "f".repeat(40);
+    const fixture = await installNativeBuilderFixture(root, "github", "https://github.com/example/demo/pull/1");
+    const { env } = fixture;
+    const { commitSha: subjectSha, treeSha, baseSha } = fixture.candidate;
     await execFileAsync(process.execPath, [
       cliPath,
       "status",
@@ -443,22 +479,22 @@ test("explicit repair atomically fixes one invalid task while preserving another
 test("a builder-review status repair preserves the current review subject and cycle", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "studioops-builder-review-repair-"));
   try {
-    await writeLegacyState(root, invalidStatusState());
-    const env = await environmentForTestControlRoot(root);
-    await execFileAsync(process.execPath, [
-      "--input-type=module",
-      "-e",
-      `import { repairLegacyTaskStatus } from ${JSON.stringify(path.resolve("src/store.js"))}; await repairLegacyTaskStatus("task_1", "builder_review");`,
-    ], { cwd: root, env });
-
+    const fixture = await installNativeBuilderFixture(root, "local", "");
+    const { env } = fixture;
+    await execFileAsync(process.execPath, [cliPath, "status", fixture.taskId, "--status", "builder_review", "--subject-sha", fixture.candidate.commitSha, ...fixture.handoffArgs], { cwd: root, env });
+    const before = (await readPersistedState(root, env)).tasks[0];
+    // Model an actually corrupted legacy status while retaining real source and scope.
+    await execFileAsync(process.execPath, ["--input-type=module", "-e", `
+      import {DatabaseSync} from 'node:sqlite';import {DATABASE_FILE} from ${JSON.stringify(path.resolve("src/state-database.js"))};
+      const db=new DatabaseSync(DATABASE_FILE);const row=db.prepare('SELECT payload FROM tasks WHERE id=?').get(${JSON.stringify(fixture.taskId)});const task=JSON.parse(row.payload);task.status='';db.prepare('UPDATE tasks SET payload=? WHERE id=?').run(JSON.stringify(task),task.id);db.close();
+    `], { cwd: root, env });
+    await execFileAsync(process.execPath, ["--input-type=module", "-e", `import {repairLegacyTaskStatus} from ${JSON.stringify(path.resolve("src/store.js"))};await repairLegacyTaskStatus(${JSON.stringify(fixture.taskId)},'builder_review');`], { cwd: root, env });
     const task = (await readPersistedState(root, env)).tasks[0];
     assert.equal(task.status, "builder_review");
-    assert.equal(task.reviewCycle, 2);
-    assert.equal(task.reviewSubjectCycle, 2);
-    assert.equal(task.reviewSubjectSha, "a".repeat(40));
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+    assert.equal(task.reviewCycle, before.reviewCycle);
+    assert.equal(task.reviewSubjectCycle, before.reviewSubjectCycle);
+    assert.equal(task.reviewSubjectSha, before.reviewSubjectSha);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("a recovered current-candidate backend approval routes to the next required lane", () => {
