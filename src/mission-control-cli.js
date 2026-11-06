@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { readFile } from "node:fs/promises";
 import {
   addComment,
   adoptDefaultProjectStandards,
   addProject,
   addTask,
+  adoptCandidate,
   automationTick,
   completeArchitecture,
   generatePrompt,
@@ -113,6 +116,16 @@ function normalizeList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function adoptionRequestDigest(request) {
+  const canonical = (value) => Array.isArray(value)
+    ? value.map(canonical)
+    : value && typeof value === "object"
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]))
+      : value;
+  const material = JSON.stringify(canonical(request));
+  return `sha256:${createHash("sha256").update(material).digest("hex")}`;
 }
 
 async function bestEffortCheck(command, args) {
@@ -433,6 +446,8 @@ Commands:
   projects                      List projects
   tasks                         List tasks, optionally --project key and --status value
   show-task TASK_ID             Read-only inspection of one task and its current review subject
+  adopt-candidate TASK_ID       Owner-authorized verified candidate adoption (--request-file FILE [--preview])
+  adoption-status TASK_ID       Read-only adoption stateVersion/scope/intake inspection
   add-project --key --name      Add a project
   update-project PROJECT        Update project settings and Trust Leads policy
   adopt-default-standards PROJECT|--all
@@ -707,6 +722,36 @@ Automation:
     };
     if (args.json) console.log(JSON.stringify(inspection, null, 2));
     else printTable([inspection], ["id", "project", "status", "assignedRole", "reviewCycle", "reviewSubjectSha", "branchName", "prUrl", "updatedAt"]);
+    return;
+  }
+
+  if (command === "adoption-status") {
+    const taskId = args._[1];
+    if (!taskId) throw new Error("Usage: adoption-status TASK_ID");
+    const state = await readStateReadOnly();
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (!task) throw new Error(`Unknown task: ${taskId}`);
+    console.log(JSON.stringify({ taskId, stateVersion: task.stateVersion || 1, status: task.status, scope: task.reviewedFiles || [], intake: task.operatorIntake || null, held: task.adoptionHeld === true }, null, 2));
+    return;
+  }
+
+  if (command === "adopt-candidate") {
+    const taskId = args._[1];
+    const requestFile = String(args["request-file"] || "").trim();
+    if (!taskId || !requestFile) throw new Error("Usage: adopt-candidate TASK_ID --request-file FILE [--preview]");
+    if (!args.preview && args.confirm !== "ADOPT_CANDIDATE_V1") throw new Error("Commit adoption requires --confirm ADOPT_CANDIDATE_V1 and an interactive owner invocation.");
+    const parsed = JSON.parse(await readFile(requestFile, "utf8"));
+    if (parsed.actorContext !== undefined) throw new Error("Request files may not inject actorContext.");
+    const request = { ...parsed };
+    delete request.requestDigest;
+    const digest = adoptionRequestDigest(request);
+    const result = await adoptCandidate(taskId, {
+      ...request,
+      requestDigest: digest,
+      confirmation: args.confirm || request.confirmation,
+      actorContext: { actorId: String(args["actor-id"] || "local-owner").trim(), actorType: "owner", role: "owner", trusted: true },
+    }, { preview: Boolean(args.preview) });
+    console.log(JSON.stringify({ ...result, requestDigest: digest }, null, 2));
     return;
   }
 

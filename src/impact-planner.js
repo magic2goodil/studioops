@@ -130,6 +130,53 @@ export function exactCandidateChangedFiles(project = {}, candidate = {}, options
   throw error;
 }
 
+/**
+ * Owner adoption is deliberately stricter than ordinary builder evidence.  It
+ * verifies the complete immutable Git identity before workflow state is
+ * touched.  The returned paths are literal paths from Git, never component
+ * globs.
+ */
+export function verifyAdoptionCandidate(project = {}, candidate = {}, options = {}) {
+  const baseSha = exactSha(candidate.baseSha);
+  const commitSha = exactSha(candidate.commitSha || candidate.headSha);
+  const treeSha = exactSha(candidate.treeSha);
+  const branch = String(candidate.branch || "").trim();
+  if (!baseSha || !commitSha || !treeSha || !branch) throw new Error("Adoption requires full base, head, tree, and branch identity.");
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.startsWith("-") || branch.includes("..")) throw new Error("Adoption branch is invalid.");
+  const expectedRepository = projectRepositoryIdentity(project);
+  let lastError;
+  for (const repoRoot of candidateRepositoryRoots(project, options.cwd)) {
+    try {
+      const remote = normalizeRepositoryIdentity(trustedGit(repoRoot, ["remote", "get-url", "origin"]).trim());
+      if (!expectedRepository.startsWith("local:") && remote !== expectedRepository) throw new Error("Repository origin does not match the bound project.");
+      const branchRef = trustedGit(repoRoot, ["rev-parse", "--verify", `refs/heads/${branch}`]).trim().toLowerCase();
+      if (branchRef !== commitSha) throw new Error("Candidate branch does not resolve to the immutable head.");
+      if (trustedGit(repoRoot, ["rev-parse", `${commitSha}^{tree}`]).trim().toLowerCase() !== treeSha) throw new Error("Candidate tree does not match the immutable head.");
+      trustedGit(repoRoot, ["cat-file", "-e", `${baseSha}^{commit}`]);
+      trustedGit(repoRoot, ["cat-file", "-e", `${commitSha}^{commit}`]);
+      try { trustedGit(repoRoot, ["merge-base", "--is-ancestor", baseSha, commitSha]); } catch { throw new Error("Candidate head is not based on the supplied base."); }
+      const raw = trustedGit(repoRoot, ["--no-pager", "diff", "--no-ext-diff", "--name-status", "-z", `${baseSha}...${commitSha}`, "--"]);
+      const parts = raw.split("\0").filter(Boolean);
+      const paths = [];
+      for (let index = 0; index < parts.length; index += 1) {
+        const status = parts[index];
+        if (!["A", "M", "D"].includes(status)) throw new Error(`Adoption rejects renamed, copied, or type-unsafe path status ${status}.`);
+        const file = parts[++index];
+        if (!file || file.includes("\0")) throw new Error("Adoption diff contains an ambiguous path.");
+        paths.push(file);
+      }
+      const changedFiles = [...new Set(paths)].sort();
+      if (changedFiles.length > 500) throw new Error("Adoption diff exceeds the 500-path limit.");
+      const loadedMap = loadProjectComponentImpactMapAtCommit(project, commitSha, { repoRoot });
+      if (!loadedMap.manifest || loadedMap.status !== "mapped" || !loadedMap.coverage?.complete) throw new Error("Adoption requires a complete committed component map.");
+      const owners = changedFiles.map((file) => Object.values(loadedMap.manifest.components).filter((component) => component.paths.some((scope) => pathMatchesImpactScope(file, scope))));
+      if (owners.some((matches) => matches.length !== 1)) throw new Error("Adoption requires complete unique ownership for every changed path.");
+      return { baseSha, commitSha, treeSha, branch, changedFiles, manifestDigest: loadedMap.digest, map: loadedMap.manifest };
+    } catch (error) { lastError = error; }
+  }
+  throw new Error(`Adoption candidate verification failed${lastError?.message ? `: ${lastError.message}` : "."}`);
+}
+
 export function assertChangedFileEvidenceMatches(actualFiles = [], reportedFiles = []) {
   const actual = list(actualFiles).sort();
   const reported = list(reportedFiles).sort();

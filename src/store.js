@@ -71,6 +71,7 @@ import {
   assertChangedFilesWithinImpactPlan,
   assertImpactPlanProjectBinding,
   exactCandidateChangedFiles,
+  verifyAdoptionCandidate,
   remapTaskImpactScope,
   resolveProjectImpactPlan,
 } from "./impact-planner.js";
@@ -2515,6 +2516,62 @@ export async function repairLegacyTaskStatus(taskId, status, input = {}) {
     });
     return result.task;
   }, { repairTaskId: taskId, operationName: "task.repair_legacy_status" });
+}
+
+export async function adoptCandidate(taskId, request = {}, options = {}) {
+  const requestDigest = String(request.requestDigest || "").trim();
+  if (!/^sha256:[0-9a-f]{64}$/i.test(requestDigest)) throw new Error("Adoption requestDigest must be a SHA-256 digest of the exact request.");
+  if (request.confirmation !== "ADOPT_CANDIDATE_V1") throw new Error("Owner confirmation is required for candidate adoption.");
+  const actor = request.actorContext;
+  if (!actor || actor.trusted !== true || actor.actorType !== "owner" || actor.role !== "owner") throw new Error("Candidate adoption requires a trusted owner actor.");
+  if (Object.prototype.hasOwnProperty.call(request, "runId") || Object.prototype.hasOwnProperty.call(request, "cycle") || Object.prototype.hasOwnProperty.call(request, "plan") || Object.prototype.hasOwnProperty.call(request, "provenance")) throw new Error("Adoption does not accept worker run, cycle, plan, or provenance injection.");
+  const state = await readStateReadOnly();
+  const initialTask = findTask(state, taskId);
+  const initialProject = initialTask && findProject(state, initialTask.projectId);
+  if (!initialTask || !initialProject) throw new Error(`Unknown adoption task: ${taskId}`);
+  const verified = verifyAdoptionCandidate(initialProject, request.candidate, { cwd: options.cwd || initialProject.sourceRepoPath || initialProject.repoPath });
+  const unresolved = (initialTask.dependsOnTaskIds || []).filter((dependencyId) => {
+    const dependency = findTask(state, dependencyId);
+    return !dependency || !["done", "closed", "merged", "deployed"].includes(dependency.status);
+  });
+  const preview = {
+    taskId, requestDigest, stateVersion: positiveStateVersion(initialTask.stateVersion),
+    candidate: { baseSha: verified.baseSha, commitSha: verified.commitSha, treeSha: verified.treeSha, branch: verified.branch, manifestDigest: verified.manifestDigest },
+    reviewedFiles: verified.changedFiles, unresolvedDependencies: unresolved,
+    held: unresolved.length > 0, status: "builder_review",
+  };
+  if (options.preview === true) return preview;
+  return mutateState(async (currentState) => {
+    const task = findTask(currentState, taskId);
+    const project = task && findProject(currentState, task.projectId);
+    if (!task || !project) throw new Error(`Unknown adoption task: ${taskId}`);
+    if (Number(request.expectedStateVersion) !== positiveStateVersion(task.stateVersion)) throw new Error("Adoption expectedStateVersion is stale.");
+    if (!["ready", "queued", "blocked", "needs_changes"].includes(task.status)) throw new Error("Only ready, queued, blocked, or needs_changes tasks may be adopted.");
+    if (task.workflowLease || (currentState.runs || []).some((run) => run.taskId === taskId && ["queued", "running"].includes(run.status))) throw new Error("Active builder claims or leases block adoption.");
+    if (task.operatorIntake?.requestDigest) {
+      if (task.operatorIntake.requestDigest === requestDigest && task.candidateIdentity?.commitSha === verified.commitSha) return task;
+      throw new Error("A different adoption request already owns this task; remap or resolve it explicitly.");
+    }
+    const now = new Date().toISOString();
+    const cycle = Math.max(Number(task.reviewCycle || 0) + 1, Number(task.reviewSubjectCycle || 0) + 1, 1);
+    const decision = applyLifecycleTransitionInState(currentState, {
+      action: "adopt_candidate", taskId, expectedStateVersion: positiveStateVersion(task.stateVersion),
+      actorContext: { actorId: "operator-adoption", actorType: "system", role: "workflow-engine", trusted: true },
+      evidence: { candidateCycle: cycle, subjectSha: verified.commitSha },
+    });
+    Object.assign(task, decision.task, {
+      branchName: verified.branch,
+      reviewSubjectSha: verified.commitSha,
+      reviewSubjectCycle: cycle,
+      reviewCycle: cycle,
+      candidateIdentity: { baseSha: verified.baseSha, commitSha: verified.commitSha, treeSha: verified.treeSha, branch: verified.branch, candidateCycle: cycle, impactEvidence: { changedFiles: verified.changedFiles } },
+      reviewedFiles: verified.changedFiles,
+      operatorIntake: { schemaVersion: 1, requestDigest, actorId: actor.actorId, adoptedAt: now, candidate: verified, unresolvedDependencies: unresolved },
+      adoptionHeld: unresolved.length > 0,
+    });
+    currentState.events.push({ id: nextId(currentState.events, "event"), type: "operator_candidate_adopted", projectId: task.projectId, taskId, message: "Verified operator candidate adopted into builder_review.", createdAt: now, requestDigest, reviewedFiles: verified.changedFiles, held: unresolved.length > 0 });
+    return task;
+  }, { operationName: "task.adopt_candidate" });
 }
 
 export async function updateTask(taskId, patch) {

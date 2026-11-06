@@ -22,6 +22,29 @@ needed; a dependency does not require reading every supporting file.
 
 ## Explicit remapping
 
+## Guarded operator candidate adoption
+
+The local-only v1 operator surface is `adopt-candidate TASK_ID
+--request-file FILE [--preview]`. A request contains an exact
+`expectedStateVersion` and immutable `{baseSha, commitSha, treeSha, branch}`;
+the CLI computes and records a SHA-256 digest of the canonical request. Commit
+mode additionally requires interactive `--confirm ADOPT_CANDIDATE_V1`; request
+files cannot supply actor context, plans, provenance, runs, or review cycles.
+The store accepts only a trusted owner adapter, verifies origin, branch/ref,
+tree, ancestry, NUL-delimited literal diff, and the head-committed complete
+component map before one SQLite CAS mutation. Preview and
+`adoption-status TASK_ID` are read-only.
+
+Adoption records one truthful operator intake and enters existing
+`builder_review`; it never creates a builder run, cost, credit, or queued
+window. `reviewedFiles` is the exact immutable literal diff and cannot expand
+from component globs. Unresolved dependencies retain the adopted candidate in
+the held state; no partial prerequisite closure is attempted. Stale versions,
+active claims/leases, repository conflicts, ambiguous/renamed/type-unsafe
+paths, incomplete ownership, and forged authority fail closed with rollback.
+An exact replay is idempotent; a different request for the same task requires
+an explicit scope remap and leaves prior failure/history records intact.
+
 A legitimate expansion has its own operation, before builder handoff:
 
 ```sh
