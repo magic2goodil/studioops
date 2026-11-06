@@ -2147,15 +2147,20 @@ test("review handoff requires the admitted stage, cycle and SHA even after the t
   const run = { id: "run_review_identity", taskId: "task_review_identity", group: "reviewer", role: "qa-reviewer",
     reviewStageKey: "backend", reviewStageStatus: "backend_review", candidateCycle: 2,
     reviewSubjectSha: "a".repeat(40), startedAt: "2026-11-06T10:00:00.000Z" };
-  const task = { id: run.taskId, status: "frontend_review", reviewSubjectCycle: 2 };
-  const review = { taskId: run.taskId, role: run.role, stageKey: "backend", status: "backend_review",
+  const task = { id: run.taskId, status: "frontend_review", reviewCycle: 2, reviewSubjectCycle: 2, reviewSubjectSha: run.reviewSubjectSha };
+  const review = { id: "review_admitted", taskId: run.taskId, role: run.role, stageKey: "backend", status: "backend_review", cycle: 2,
     candidateCycle: 2, subjectSha: run.reviewSubjectSha, outcome: "approved", createdAt: "2026-11-06T10:00:01.000Z" };
   assert.equal(successfulHandoffFailure({ reviews: [review] }, run, task), "");
   for (const patch of [
     { subjectSha: "b".repeat(40) }, { candidateCycle: 1 },
     { stageKey: "frontend", status: "frontend_review" }, { status: "regression_review" },
     { role: "other-reviewer" }, { outcome: "pending" }, { createdAt: "2026-11-06T09:59:00.000Z" },
+    { invalidatedAt: "2026-11-06T10:00:02.000Z" }, { invalidation: { action: "request_changes" } }, { cycle: 1 },
   ]) assert.equal(successfulHandoffFailure({ reviews: [{ ...review, ...patch }] }, run, task), "review_outcome_missing");
+  for (const patch of [{ reviewSubjectSha: "b".repeat(40) }, { reviewSubjectCycle: 1 }, { reviewCycle: 1 },
+    { evidenceInvalidations: [{ invalidationIds: [review.id] }] }]) {
+    assert.equal(successfulHandoffFailure({ reviews: [review] }, run, { ...task, ...patch }), "review_outcome_missing");
+  }
   for (const patch of [{ candidateCycle: 0 }, { reviewSubjectSha: "" }, { reviewStageKey: "" }, { reviewStageStatus: "" }, { startedAt: "" }]) {
     assert.equal(successfulHandoffFailure({ reviews: [review] }, { ...run, ...patch }, task), "review_outcome_missing");
   }

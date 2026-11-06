@@ -16,6 +16,7 @@ import {
 } from "../src/store.js";
 import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { successfulHandoffFailure } from "../src/runner.js";
 
 async function reviewCandidateFixture(t, key, reviewPipeline) {
   const root = await mkdtemp(path.join(os.tmpdir(), "review-identity-"));
@@ -314,3 +315,25 @@ for (const outcome of ["approved", "changes_requested"]) {
     }
   });
 }
+
+
+test("supported owner changes revoke a matching review without inventing another candidate cycle", async (t) => {
+  const f = await reviewCandidateFixture(t, "owner-revokes-review", [
+    { key: "backend", status: "backend_review", role: "backend-reviewer", required: true },
+    { key: "lead", status: "lead_review", role: "lead-reviewer", required: true },
+  ]);
+  const run = { id: "synthetic_pending_review_completion", taskId: f.task.id, group: "reviewer", role: "backend-reviewer",
+    reviewStageKey: "backend", reviewStageStatus: "backend_review", candidateCycle: 1,
+    reviewSubjectSha: f.identity.commitSha, startedAt: new Date(Date.now() - 1000).toISOString() };
+  await recordReview(f.task.id, { stage: "backend", outcome: "approved", candidateCycle: 1,
+    subjectSha: f.identity.commitSha, body: "Current stage evidence before owner changes." });
+  let state = await readState();
+  let task = state.tasks.find(item => item.id === f.task.id);
+  assert.equal(successfulHandoffFailure(state, run, task), "");
+  await updateTask(f.task.id, { status: "needs_changes" });
+  state = await readState(); task = state.tasks.find(item => item.id === f.task.id);
+  assert.equal(task.reviewSubjectCycle, run.candidateCycle);
+  assert.equal(task.reviewSubjectSha, run.reviewSubjectSha);
+  assert.equal(successfulHandoffFailure(state, run, task), "review_outcome_missing");
+  assert.equal(candidateReviewEvidenceForTask(state, task).ok, false);
+});
