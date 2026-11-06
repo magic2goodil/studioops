@@ -11,6 +11,7 @@ import {
   createCandidateEnvelope,
   manifestDigest,
 } from "../src/candidate-manifest.js";
+import { sanitizedCreditAdmission } from "../src/credit-admission-evidence.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const BASE_SHA = "b".repeat(40);
@@ -456,6 +457,8 @@ test("open circuits and operator pauses remain operational without becoming owne
 
 test("active credit admission pauses are warning Operations records and recover on refresh", () => {
   const state = fixtureState();
+  state.tasks[0].status = "in_progress";
+  state.tasks[0].assignedAgentRole = "builder";
   state.tasks[0].creditAdmissionPause = {
     active: true,
     fingerprint: "pause:critical:unknown",
@@ -496,6 +499,56 @@ test("active credit admission pauses are warning Operations records and recover 
 
   state.tasks[0].creditAdmissionPause.active = false;
   assert.equal(group(buildOwnerInbox(state), "operations").count, 0);
+});
+
+test("a credit pause preserves an independent current execution-circuit recovery", () => {
+  const state = fixtureState();
+  Object.assign(state.tasks[0], {
+    status: "blocked",
+    creditAdmissionPause: { active: true, fingerprint: "pause:unknown" },
+    automationBlocker: { type: "circuit", reason: "sdk_error", attempts: 2 },
+    automationCircuit: {
+      state: "open", normalizedReason: "Automatic attempts were exhausted.",
+      attemptsConsumed: 2, maxAttempts: 2,
+      resumeAction: "studioops circuit-reset --task task_7 --reason verified",
+    },
+  });
+  const before = structuredClone(state);
+  const operations = group(buildOwnerInbox(state), "operations").items;
+  assert.equal(operations.length, 2);
+  assert.equal(operations.some((item) => item.kind === "credit_admission_pause"), true);
+  const recovery = operations.find((item) => item.kind === "automation_blocked");
+  assert.equal(recovery.blocker.attempts, 2);
+  assert.match(recovery.nextAction, /circuit-reset/);
+  assert.deepEqual(state, before);
+});
+
+test("a credit pause does not replace an independently ready owner decision", () => {
+  const state = fixtureState();
+  const input = { now: "2026-07-23T15:03:00.000Z" };
+  const before = buildOwnerInbox(state, input);
+  assert.equal(before.count, 1);
+  state.tasks[0].creditAdmissionPause = { active: true, fingerprint: "pause:unknown" };
+  const inbox = buildOwnerInbox(state, input);
+  assert.deepEqual(group(inbox, "decisions").items, group(before, "decisions").items);
+  assert.equal(inbox.count, 1);
+  assert.equal(group(inbox, "operations").items[0].kind, "credit_admission_pause");
+});
+
+test("canonical unknown admission bounds remain null and a known zero remains zero", () => {
+  const state = fixtureState();
+  state.tasks[0].creditAdmissionPause = {
+    active: true, fingerprint: "pause:unknown",
+    creditAdmission: sanitizedCreditAdmission({ tier: "critical", code: "credit_snapshot_unknown" }),
+  };
+  const admission = group(buildOwnerInbox(state), "operations").items[0].admission;
+  for (const key of ["maxConcurrentRuns", "maxAttempts", "estimatedTokensPerRun", "maxInFlightEstimatedTokens"]) {
+    assert.equal(admission[key], null, key);
+  }
+  state.tasks[0].creditAdmissionPause.creditAdmission.maxConcurrentRuns = 0;
+  assert.equal(group(buildOwnerInbox(state), "operations").items[0].admission.maxConcurrentRuns, 0);
+  state.tasks[0].creditAdmissionPause.creditAdmission.maxConcurrentRuns = false;
+  assert.equal(group(buildOwnerInbox(state), "operations").items[0].admission.maxConcurrentRuns, null);
 });
 
 test("budget pause payloads retain only bounded, redacted owner evidence", () => {

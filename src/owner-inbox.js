@@ -91,6 +91,7 @@ function pauseNotificationSummary(pause = {}) {
 }
 
 function boundedNumber(value) {
+  if ((typeof value !== "number" && typeof value !== "string") || String(value).trim() === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
@@ -892,7 +893,6 @@ export function buildOwnerInbox(state, input = {}) {
     const project = findProject(state, task.projectId);
     if (task.creditAdmissionPause?.active === true) {
       groupedItems.operations.push(creditAdmissionPauseItem(state, task, input));
-      continue;
     }
     const circuitBlocker = task.automationBlocker?.type === "circuit";
     const blocked = circuitBlocker

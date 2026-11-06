@@ -233,6 +233,26 @@ test("budget-pause Operations cards expose bounded admission evidence without a 
   assert.doesNotMatch(app, /budget_pause[\s\S]{0,300}circuit-reset/);
 });
 
+test("budget-pause rendering omits unknown bounds and preserves known zero bounds", async () => {
+  const { app } = await uiSources();
+  const context = vm.createContext({});
+  vm.runInContext([
+    extractFunction(app, "escapeHtml"),
+    extractFunction(app, "admissionSummary"),
+  ].join("\n"), context);
+  const unknown = vm.runInContext(`admissionSummary({classification: "budget_pause", admission: {
+    maxConcurrentRuns: null, maxAttempts: null,
+    estimatedTokensPerRun: null, maxInFlightEstimatedTokens: null
+  }})`, context);
+  assert.doesNotMatch(unknown, /<dt>(?:Concurrency|Attempts|Estimated tokens)<\/dt>/);
+  assert.match(unknown, /Automatic telemetry retry/);
+  const zero = vm.runInContext(`admissionSummary({classification: "budget_pause", admission: {
+    maxConcurrentRuns: 0, attemptsConsumed: 0, maxAttempts: 3
+  }})`, context);
+  assert.match(zero, /<dt>Concurrency<\/dt><dd>0<\/dd>/);
+  assert.match(zero, /<dt>Attempts<\/dt><dd>0 of 3<\/dd>/);
+});
+
 test("inbox primary action text meets WCAG AA contrast across its gradient", async () => {
   const { css } = await uiSources();
   const rule = css.match(/\.owner-inbox-actions \.primary-action\s*\{([\s\S]*?)\}/)?.[1] || "";
