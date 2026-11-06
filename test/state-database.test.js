@@ -817,6 +817,247 @@ test("operator writer refuses queued or running ownership before invoking its mu
   }
 });
 
+function prerequisiteRecoveryTestScript() {
+  return operatorCandidateTestScript() + `
+    import { DatabaseSync } from 'node:sqlite';
+    import { DATABASE_FILE, claimFailureContainmentPaidAttempt, recordFailureContainmentActivity,
+      openFailureContainmentCircuit, scheduleFailureContainmentBackoff, readFailureIncidents,
+      readPrerequisiteFailureRecovery } from ${JSON.stringify(stateDatabaseModuleUrl)};
+    import { failureEvidence } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/failure-containment.js")).href)};
+    const fault = { taskId: 'task_2', action: 'start_builder', provider: 'codex', reasonCode: 'output_guard_exceeded',
+      evidence: { configurationDigest: 'sha256:' + '1'.repeat(64), policyDigest: 'sha256:' + '2'.repeat(64) } };
+    await claimFailureContainmentPaidAttempt(fault); await claimFailureContainmentPaidAttempt(fault);
+    const ancestor = (await claimFailureContainmentPaidAttempt(fault)).incident;
+    assert.equal(ancestor.state, 'open');
+    const blocker = { type: 'circuit', reason: ancestor.reasonCode, incidentId: ancestor.incidentId,
+      incidentGeneration: ancestor.generation, evidenceDigest: ancestor.evidenceDigest, attempts: ancestor.paidAttempts };
+    await mutateDatabaseState(state => { state.tasks.find(task => task.id === 'task_2').automationBlocker = blocker; });
+    const changed = { ...fault.evidence, policyDigest: 'sha256:' + '3'.repeat(64) };
+    const successor = await recordFailureContainmentActivity({ ...fault, evidence: changed, type: 'cheap_probe', outcome: 'passed',
+      verifier: { id: 'policy_probe', outcome: 'passed', evidenceDigest: failureEvidence(changed).digest } });
+    const prerequisite = (await readDatabaseState()).tasks.find(task => task.id === 'task_2');
+    const recovery = await readPrerequisiteFailureRecovery(prerequisite);
+    const disposition = { taskId: 'task_2', expectedStateVersion: prerequisite.stateVersion,
+      evidenceDigest: 'sha256:' + '4'.repeat(64), reason: 'Verified existing fixture prerequisite.',
+      sourceSha: candidate.baseSha, failureRecovery: recovery };
+    verification.dispositionTaskIds = ['task_2']; verification.dispositions = [disposition];
+    function dispose(state, verified) {
+      const task = state.tasks.find(task => task.id === 'task_2');
+      delete task.automationBlocker; task.status = 'closed';
+      task.preexistingWorkDisposition = { schemaVersion: 1, ...structuredClone(verified.dispositions[0]),
+        kind: 'preexisting_work_verified', principal: 'fixture-owner', recordedAt: new Date().toISOString() };
+    }
+    function version() { const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+      try { return db.prepare('SELECT version FROM state_meta WHERE singleton_id=1').get().version; } finally { db.close(); } }
+  `;
+}
+
+function nativePrerequisiteRecoveryTestScript() {
+  return operatorCandidateTestScript() + `
+    import { DatabaseSync } from 'node:sqlite';
+    import { DATABASE_FILE, claimFailureContainmentPaidAttempt, recordFailureContainmentActivity,
+      openFailureContainmentCircuit, scheduleFailureContainmentBackoff, readFailureIncidents,
+      readPrerequisiteFailureRecovery } from ${JSON.stringify(stateDatabaseModuleUrl)};
+    import { failureEvidence } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/failure-containment.js")).href)};
+    import { claimCurrentFailureAttempt, claimRuns, completeRun, failureEvidenceForRun } from ${JSON.stringify(pathToFileURL(path.join(process.cwd(), "src/runner.js")).href)};
+    import { reconcileAutomationStateInState } from ${JSON.stringify(storeModuleUrl)};
+    const now = offset => new Date(Date.now() + offset).toISOString();
+    const run = { id: 'run_prerequisite', taskId: 'task_2', projectId: 'project_1', group: 'builder', role: 'builder',
+      actionType: 'start_builder', provider: 'codex-sdk', status: 'running', executionCommitSha: candidate.baseSha,
+      candidateCycle: 0, startedAt: now(-100), impactPlan: { manifest: { digest: frozenScopePlan.manifest.digest } },
+      failureContainmentAdmission: { consulted: true, decision: 'admitted', authority: 'dispatcher_read_only',
+        claimBoundary: 'runner_pre_provider_launch', actionIdentity: 'start_builder', provider: 'codex' } };
+    const initialState = await readDatabaseState();
+    const evidence = failureEvidence(failureEvidenceForRun({ ...run, project: initialState.projects[0] }, initialState));
+    const fault = { taskId: 'task_2', action: 'start_builder', provider: 'codex', reasonCode: 'output_guard_exceeded',
+      candidateIdentity: { commitSha: candidate.baseSha }, evidence: evidence.value };
+    await claimFailureContainmentPaidAttempt({ ...fault, initiator: 'runner', transport: 'codex_sdk', now: now(-5000) });
+    const providerFault = { ...fault, reasonCode: 'provider_unavailable' };
+    await claimFailureContainmentPaidAttempt({ ...providerFault, initiator: 'runner', transport: 'codex_sdk', now: now(-4000) });
+    await recordFailureContainmentActivity({ ...providerFault, type: 'cheap_probe', outcome: 'failed',
+      verifier: { id: 'service_health_probe' }, now: now(-3500) });
+    await claimFailureContainmentPaidAttempt({ ...providerFault, initiator: 'runner', transport: 'codex_sdk', now: now(-3000) });
+    const repaired = failureEvidence({ ...evidence.value, configurationDigest: 'sha256:' + '5'.repeat(64) });
+    const providerSuccessor = await recordFailureContainmentActivity({ ...providerFault, evidence: repaired.value,
+      type: 'cheap_probe', outcome: 'passed', now: now(-1000),
+      verifier: { id: 'service_health_probe', outcome: 'passed', evidenceDigest: repaired.digest } });
+    const providerInput = { ...providerFault, evidence: repaired.value };
+    const cancelled = [1, 2].map(index => ({ id: 'run_queued_cancelled_' + index, taskId: run.taskId, projectId: run.projectId,
+      group: 'builder', role: 'builder', actionType: 'start_builder', provider: 'codex-cli', status: 'queued',
+      createdAt: now(-500 + index), attempt: 3, maxAttempts: 2, failureContainmentAdmission: structuredClone(run.failureContainmentAdmission) }));
+    assert.deepEqual(await claimRuns({ state: { meta: {}, projects: initialState.projects, tasks: initialState.tasks,
+      runs: cancelled, events: [], comments: [] } }), []);
+    for (const row of cancelled) { assert.equal(row.status, 'cancelled'); assert.equal(row.startedAt, undefined); assert.equal(row.failureContainmentClaim, undefined); }
+    run.startedAt = now(0);
+    await mutateDatabaseState(state => { state.runs.push(...structuredClone(cancelled), structuredClone(run)); });
+    assert.equal((await claimCurrentFailureAttempt(run)).incident.incidentId, providerSuccessor.incidentId);
+    const terminal = await completeRun(run.id, { status: 'failed', exitCode: 'command_output_budget_exceeded' });
+    assert.equal(terminal.failureContainmentError, undefined);
+    assert.equal(terminal.failureContainmentClaim.reasonCode, 'output_guard_exceeded');
+    await mutateDatabaseState(state => reconcileAutomationStateInState(state));
+    const ancestor = (await readFailureIncidents({ taskId: 'task_2' })).find(item => item.reasonCode === 'output_guard_exceeded');
+    const changed = { ...evidence.value, policyDigest: 'sha256:' + '3'.repeat(64) };
+    const successor = await recordFailureContainmentActivity({ ...fault, evidence: changed, type: 'cheap_probe', outcome: 'passed',
+      verifier: { id: 'policy_probe', outcome: 'passed', evidenceDigest: failureEvidence(changed).digest } });
+    const prerequisite = (await readDatabaseState()).tasks.find(task => task.id === 'task_2');
+    assert.equal(prerequisite.automationBlocker.incidentGeneration, undefined);
+    assert.equal(prerequisite.automationBlocker.evidenceDigest, undefined);
+    const recovery = await readPrerequisiteFailureRecovery(prerequisite);
+    assert.equal(recovery.supportingAdmissions[0].terminalRunId, run.id);
+    verification.dispositionTaskIds = ['task_2']; verification.dispositions = [{ taskId: 'task_2',
+      expectedStateVersion: prerequisite.stateVersion, evidenceDigest: 'sha256:' + '4'.repeat(64),
+      reason: 'Verified existing fixture prerequisite.', sourceSha: candidate.baseSha, failureRecovery: recovery }];
+    function dispose(state, verified) {
+      const task = state.tasks.find(task => task.id === 'task_2'); delete task.automationBlocker; task.status = 'closed';
+      task.preexistingWorkDisposition = { schemaVersion: 1, ...structuredClone(verified.dispositions[0]),
+        kind: 'preexisting_work_verified', principal: 'fixture-owner', recordedAt: new Date().toISOString() };
+    }
+    function version() { const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+      try { return db.prepare('SELECT version FROM state_meta WHERE singleton_id=1').get().version; } finally { db.close(); } }
+  `;
+}
+
+test("native historical admission proof cannot be forged by generic writes or changed in its adoption proposal", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-native-prerequisite-ingress-"));
+  try {
+    const state = baseState(); state.tasks.push({ id: "task_2", projectId: "project_1", title: "Verified prerequisite", status: "blocked" });
+    await writeLegacyState(root, state);
+    await runStoreScript(root, nativePrerequisiteRecoveryTestScript() + `
+      const before = await readDatabaseState(), stateVersion = version();
+      await assert.rejects(mutateDatabaseState(state => { dispose(state, verification); adopt(state, verification); },
+        { operatorCandidateVerification: verification }), /preexisting_work_disposition_verified_writer_required|operator_intake_verified_writer_required/);
+      const forged = structuredClone(verification);
+      forged.dispositions[0].failureRecovery.supportingAdmissions[0].terminalRunRecordDigest = 'sha256:' + '0'.repeat(64);
+      await assert.rejects(mutateOperatorCandidateState(async () => forged, (state, verified) => {
+        dispose(state, verified); adopt(state, verified);
+      }), /operator_prerequisite_failure_changed/);
+      for (const edit of [state => { state.runs[0].notes = 'Changed during adoption'; },
+        state => { state.runs.push({ ...state.runs[0], id: 'run_proposed_other' }); },
+        state => { state.runs = []; }]) {
+        await assert.rejects(mutateOperatorCandidateState(async () => verification, (state, verified) => {
+          edit(state); dispose(state, verified); adopt(state, verified);
+        }), /operator_prerequisite_run_changed/);
+      }
+      assert.deepEqual((await readDatabaseState()).tasks, before.tasks);
+      assert.deepEqual((await readDatabaseState()).runs, before.runs);
+      assert.equal(version(), stateVersion);
+      const ledger = await readFailureIncidents({ taskId: 'task_2' });
+      await mutateOperatorCandidateState(async () => verification, (state, verified) => { dispose(state, verified); adopt(state, verified); });
+      assert.equal((await readDatabaseState()).tasks[1].status, 'closed');
+      assert.deepEqual((await readDatabaseState()).runs, before.runs);
+      assert.deepEqual(await readFailureIncidents({ taskId: 'task_2' }), ledger);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("supporting native admission lineage and run races are rechecked inside the final SQL fence", async () => {
+  for (const race of ["open", "backoff", "paid", "probe", "generation", "run_claim", "run_material", "new_run", "old_run"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-native-prerequisite-race-"));
+    try {
+      const state = baseState(); state.tasks.push({ id: "task_2", projectId: "project_1", title: "Verified prerequisite", status: "blocked" });
+      await writeLegacyState(root, state);
+      await runStoreScript(root, nativePrerequisiteRecoveryTestScript() + `
+        const before = (await readDatabaseState()).tasks, stateVersion = version();
+        await assert.rejects(mutateOperatorCandidateState(async () => verification, async (state, verified) => {
+          const race = ${JSON.stringify(race)};
+          if (race === 'open') await openFailureContainmentCircuit(providerInput);
+          if (race === 'backoff') await scheduleFailureContainmentBackoff({ ...providerInput, delayMs: 60000 });
+          if (race === 'paid') await claimFailureContainmentPaidAttempt(providerInput);
+          if (race === 'probe') await recordFailureContainmentActivity({ ...providerInput, type: 'cheap_probe', outcome: 'passed', verifier: { id: 'service_health_probe' } });
+          if (race === 'generation') {
+            const next = failureEvidence({ ...providerInput.evidence, configurationDigest: 'sha256:' + '6'.repeat(64) });
+            await recordFailureContainmentActivity({ ...providerInput, evidence: next.value, type: 'cheap_probe', outcome: 'passed',
+              verifier: { id: 'service_health_probe', outcome: 'passed', evidenceDigest: next.digest } });
+          }
+          if (['run_claim', 'run_material', 'new_run', 'old_run'].includes(race)) {
+            const db = new DatabaseSync(DATABASE_FILE);
+            try {
+              db.exec('BEGIN IMMEDIATE');
+              const row = db.prepare('SELECT * FROM runs WHERE id = ?').get(run.id), saved = JSON.parse(row.payload);
+              if (race === 'new_run' || race === 'old_run') {
+                const other = { id: 'run_unrecognized_later', taskId: saved.taskId, projectId: saved.projectId, role: 'builder',
+                  status: 'failed', startedAt: race === 'old_run' ? now(-10000) : saved.completedAt,
+                  completedAt: race === 'old_run' ? now(-9000) : saved.completedAt };
+                db.prepare('INSERT INTO runs (id,sequence,project_id,task_id,status,role,updated_at,payload) VALUES (?,?,?,?,?,?,?,?)')
+                  .run(other.id, row.sequence + 1, other.projectId, other.taskId, other.status, other.role, '', JSON.stringify(other));
+              } else {
+                if (race === 'run_claim') saved.failureContainmentClaim.evidenceDigest = 'sha256:' + '0'.repeat(64);
+                if (race === 'run_material') saved.notes = 'Changed bound run record without changing task snapshot version';
+                db.prepare('UPDATE runs SET payload = ? WHERE id = ?').run(JSON.stringify(saved), run.id);
+              }
+              db.exec('COMMIT');
+            } finally { db.close(); }
+          }
+          assert.equal(version(), stateVersion, 'Independent ledger/run writes leave task CAS unchanged');
+          dispose(state, verified); adopt(state, verified);
+        }), /operator_prerequisite_failure_unresolved|operator_prerequisite_failure_changed/);
+        assert.deepEqual((await readDatabaseState()).tasks, before);
+        assert.equal(version(), stateVersion, 'Neither proposed task change committed');
+      `);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("prerequisite recovery receipts require the private writer and cannot be rewritten or imported", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-prerequisite-ingress-"));
+  try {
+    const state = baseState(); state.tasks.push({ id: "task_2", projectId: "project_1", title: "Verified prerequisite", status: "blocked" });
+    await writeLegacyState(root, state);
+    await runStoreScript(root, prerequisiteRecoveryTestScript() + `
+      const before = (await readDatabaseState()).tasks;
+      await assert.rejects(mutateDatabaseState(state => dispose(state, verification), {
+        operatorCandidateCapability: 'studioops.operator-candidate-write', operatorCandidateVerification: verification,
+      }), /preexisting_work_disposition_verified_writer_required/);
+      const replacement = await readDatabaseState(); dispose(replacement, verification);
+      await assert.rejects(writeDatabaseState(replacement), /preexisting_work_disposition_verified_writer_required/);
+      const forged = structuredClone(verification); forged.dispositions[0].failureRecovery.successorEvidenceDigest = 'sha256:' + '0'.repeat(64);
+      await assert.rejects(mutateOperatorCandidateState(async () => forged, (state, verified) => {
+        dispose(state, verified); adopt(state, verified);
+      }), /operator_prerequisite_failure_changed/);
+      assert.deepEqual((await readDatabaseState()).tasks, before);
+      await mutateOperatorCandidateState(async () => verification, (state, verified) => { dispose(state, verified); adopt(state, verified); });
+      const saved = await readDatabaseState();
+      for (const edit of [state => { delete state.tasks[1].preexistingWorkDisposition; },
+        state => { state.tasks[1].preexistingWorkDisposition.failureRecovery.outcome = 'forged'; },
+        state => { state.tasks = state.tasks.filter(task => task.id !== 'task_2'); }]) {
+        await assert.rejects(mutateDatabaseState(edit), /preexisting_work_disposition_immutable/);
+      }
+      assert.deepEqual((await readDatabaseState()).tasks, saved.tasks);
+      assert.equal((await readFailureIncidents({ taskId: 'task_2' })).find(item => item.incidentId === ancestor.incidentId).paidAttempts, 2);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("prerequisite failure ledger races are fenced at adoption commit without a task version change", async () => {
+  for (const race of ["open", "backoff", "paid", "new_fault", "changed_proof", "new_generation"]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "studioops-prerequisite-race-"));
+    try {
+      const state = baseState(); state.tasks.push({ id: "task_2", projectId: "project_1", title: "Verified prerequisite", status: "blocked" });
+      await writeLegacyState(root, state);
+      await runStoreScript(root, prerequisiteRecoveryTestScript() + `
+        const before = (await readDatabaseState()).tasks, stateVersion = version();
+        await assert.rejects(mutateOperatorCandidateState(async () => verification, async (state, verified) => {
+          const race = ${JSON.stringify(race)};
+          if (race === 'open') await openFailureContainmentCircuit({ ...fault, evidence: changed });
+          if (race === 'backoff') await scheduleFailureContainmentBackoff({ ...fault, evidence: changed, delayMs: 60000 });
+          if (race === 'paid') await claimFailureContainmentPaidAttempt({ ...fault, evidence: changed });
+          if (race === 'new_fault') await claimFailureContainmentPaidAttempt({ ...fault, reasonCode: 'service_unhealthy' });
+          if (race === 'changed_proof') await recordFailureContainmentActivity({ ...fault, evidence: changed, type: 'retry_avoided' });
+          if (race === 'new_generation') {
+            const next = { ...changed, policyDigest: 'sha256:' + '5'.repeat(64) };
+            await recordFailureContainmentActivity({ ...fault, evidence: next, type: 'cheap_probe', outcome: 'passed',
+              verifier: { id: 'policy_probe', outcome: 'passed', evidenceDigest: failureEvidence(next).digest } });
+          }
+          assert.equal(version(), stateVersion, 'Ledger transitions do not advance task snapshot CAS');
+          dispose(state, verified); adopt(state, verified);
+        }), /operator_prerequisite_failure_unresolved|operator_prerequisite_failure_changed/);
+        assert.deepEqual((await readDatabaseState()).tasks, before, 'Both tasks roll back, including the stale pointer');
+        assert.equal(version(), stateVersion);
+      `);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
 function mutatePersistedMeta(root, mutator) {
   const db = new DatabaseSync(path.join(root, "data", "mission-control.sqlite3"));
   try {

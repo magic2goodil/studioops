@@ -59,6 +59,7 @@ import {
   mutateQaRevocationSettlementState,
   readDatabaseState,
   readDatabaseStateReadOnly,
+  readPrerequisiteFailureRecovery,
   writeDatabaseState,
 } from "./state-database.js";
 import {
@@ -2554,7 +2555,10 @@ async function verifiedPrerequisiteDispositions(state, task, request, project, c
     if (!prerequisite || prerequisite.projectId !== task.projectId || !(task.dependsOnTaskIds || []).includes(item.taskId)) adoptionError("adoption_prerequisite_not_direct");
     if (positiveStateVersion(prerequisite.stateVersion) !== item.expectedStateVersion) adoptionError("adoption_prerequisite_stale");
     if (["in_progress", "builder_review", "backend_review", "frontend_review", "regression_review", "lead_review", "qa_review", "legacy_untrusted"].includes(prerequisite.status)) adoptionError("adoption_prerequisite_active");
-    if (prerequisite.automationBlocker || prerequisite.automationCircuit?.state === "open") adoptionError("adoption_prerequisite_unresolved_incident");
+    if (prerequisite.preexistingWorkDisposition) adoptionError("adoption_prerequisite_already_disposed");
+    let failureRecovery;
+    try { failureRecovery = await readPrerequisiteFailureRecovery(prerequisite); }
+    catch { adoptionError("adoption_prerequisite_unresolved_incident"); }
     if (incompleteDependencies(state, prerequisite).length) adoptionError("adoption_prerequisite_dependencies_incomplete");
     const merge = prerequisite.mergeEvidence;
     const verification = prerequisite.verificationEvidence;
@@ -2572,7 +2576,7 @@ async function verifiedPrerequisiteDispositions(state, task, request, project, c
       if (createHash("sha256").update(await readFile(ref.path)).digest("hex") !== ref.sha256) adoptionError("adoption_prerequisite_receipt_changed");
     }
     result.push({ taskId: prerequisite.id, expectedStateVersion: item.expectedStateVersion, evidenceDigest: item.evidenceDigest,
-      reason: item.reason, sourceSha: merge.sourceSha });
+      reason: item.reason, sourceSha: merge.sourceSha, ...(failureRecovery ? { failureRecovery } : {}) });
   }
   return result;
 }
@@ -2637,6 +2641,12 @@ export async function adoptOperatorCandidate(taskId, input, authority = {}, opti
     }
     for (const item of verified.dispositions) {
       const prerequisite = findTask(state, item.taskId);
+      if (item.failureRecovery) {
+        if (!isDeepStrictEqual(prerequisite.automationBlocker, item.failureRecovery.previousBlocker)) adoptionError("adoption_prerequisite_blocker_changed");
+        // Never release an intermediate queued prerequisite: this exact stale
+        // pointer is archived in the immutable disposition as we close/adopt.
+        delete prerequisite.automationBlocker;
+      }
       applyStoreLifecycleTransition(state, prerequisite, "closed");
       prerequisite.preexistingWorkDisposition = { schemaVersion: 1, ...item, principal, recordedAt: now, kind: "preexisting_work_verified" };
     }

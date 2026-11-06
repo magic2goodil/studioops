@@ -1,5 +1,5 @@
 import { backup, DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -43,8 +43,10 @@ import {
   createFailureIncident,
   failureEvidence,
   failureFingerprint,
+  failureWorkIdentity,
   FAILURE_CONTAINMENT_MIGRATION_VERSION,
   FAILURE_CONTAINMENT_SCHEMA_VERSION,
+  MAX_PAID_ATTEMPTS_PER_GENERATION,
   openFailureCircuit,
   recordFailureRecoveryActivity,
   scheduleFailureBackoff,
@@ -1132,6 +1134,193 @@ function operatorCandidateError(code) {
   throw error;
 }
 
+function prerequisiteRecordDigest(value) {
+  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+}
+
+function replayPrerequisiteRepair(ancestor, current, reject) {
+  const offset = current.paidAttempts === 1 ? 3 : 2;
+  const proof = current.history.at(-offset), activity = current.history.at(1 - offset);
+  if (ancestor.state !== "superseded" || current.generation !== ancestor.generation + 1
+    || canonicalJson(current.fingerprint) !== canonicalJson(ancestor.fingerprint)
+    || current.evidenceDigest === ancestor.evidenceDigest || current.state !== "active"
+    || current.cheapProbeAttempts !== 1 || current.repairAttempts !== 0 || current.backoffUntil || current.openedAt
+    || proof?.type !== "evidence_verified" || proof.priorEvidenceDigest !== ancestor.evidenceDigest
+    || proof.evidenceDigest !== current.evidenceDigest || activity?.type !== "cheap_probe" || activity.outcome !== "passed"
+    || proof.verifier !== activity.verifier || proof.recordedAt !== current.createdAt || activity.recordedAt !== current.createdAt) reject();
+  let expected;
+  try {
+    expected = recordFailureRecoveryActivity(ancestor, { evidence: current.evidence, type: "cheap_probe", outcome: "passed",
+      verifier: { id: proof.verifier, outcome: "passed", evidenceDigest: current.evidenceDigest }, now: current.createdAt });
+    if (current.paidAttempts === 1) {
+      const claim = current.history.at(-1);
+      if (claim?.type !== "paid_attempt_claimed" || claim.attempt !== 1
+        || claim.initiator !== "runner" || claim.transport !== "codex_sdk") reject();
+      expected = claimPaidFailureAttempt(expected, { evidence: current.evidence, initiator: claim.initiator,
+        transport: claim.transport, now: claim.recordedAt }).incident;
+    }
+  } catch { reject(); }
+  if (canonicalJson(expected) !== canonicalJson(current)) reject();
+  return proof;
+}
+
+function historicalPrerequisiteAdmission(db, task, incidents, ancestor, provider, reject) {
+  // The runner overwrites the admission claim when a different reason fails.
+  // Corroborate that historical admission; never invent a recovered claim link.
+  if (ancestor.reasonCode !== "output_guard_exceeded" || provider.reasonCode !== "provider_unavailable"
+    || provider.paidAttempts !== 1 || provider.fingerprint.action !== "start_builder"
+    || canonicalJson({ ...provider.fingerprint, reasonCode: ancestor.reasonCode }) !== canonicalJson(ancestor.fingerprint)
+    || canonicalJson(provider.evidence.repository) !== canonicalJson(ancestor.evidence.repository)
+    || provider.evidence.componentMapDigest !== ancestor.evidence.componentMapDigest) reject();
+  const prior = incidents.find((item) => item.fingerprintDigest === provider.fingerprintDigest
+    && item.generation === provider.generation - 1);
+  if (!prior) reject();
+  const proof = replayPrerequisiteRepair(prior, provider, reject);
+  const claim = provider.history.at(-1);
+  const rows = db.prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY sequence, id LIMIT 501").all(task.id);
+  if (rows.length > 500) reject();
+  const runs = rows.map((row) => {
+    const run = parsePayload(row.payload, null);
+    if (!run || run.id !== row.id || run.taskId !== row.task_id || run.projectId !== row.project_id
+      || run.status !== row.status || run.role !== row.role) reject();
+    return run;
+  });
+  const run = runs.find((item) => item.id === task.lastAutomationFailureRunId);
+  if (!run || task.lastAutomationFailure !== ancestor.reasonCode || task.automationCircuit?.snapshot?.runId !== run.id
+    || task.automationCircuit?.incidentId !== ancestor.incidentId || run.projectId !== task.projectId
+    || run.status !== "failed" || run.role !== "builder" || run.actionType !== "start_builder" || run.provider !== "codex-sdk"
+    || run.rawFailureCode !== "command_output_budget_exceeded" || run.exitCode !== ancestor.reasonCode
+    || run.failureContainmentError || canonicalJson(run.failureContainmentProbe) !== canonicalJson({ applicable: false, ok: true, code: "not_infrastructure" })) reject();
+  const nativeAdmission = (admission) => admission?.consulted === true && admission.decision === "admitted"
+    && admission.authority === "dispatcher_read_only" && admission.claimBoundary === "runner_pre_provider_launch"
+    && admission.actionIdentity === ancestor.action && admission.provider === ancestor.provider;
+  if (!nativeAdmission(run.failureContainmentAdmission)) reject();
+  const identity = run.candidateIdentity || {};
+  let fingerprint;
+  try {
+    fingerprint = failureFingerprint({ taskId: run.taskId, action: run.actionType, provider: run.provider, reasonCode: ancestor.reasonCode,
+      candidate: { candidateId: run.candidateId, commitSha: identity.commitSha || run.reviewSubjectSha || run.executionCommitSha,
+        treeSha: identity.treeSha, baseSha: identity.baseSha || run.preflightBaseCommit, manifestDigest: run.candidateManifestDigest,
+        candidateCycle: identity.candidateCycle || run.candidateCycle || 0 } }).value;
+  } catch { reject(); }
+  if (canonicalJson(fingerprint) !== canonicalJson(ancestor.fingerprint)) reject();
+  const terminal = run.failureContainmentClaim, lastAttempt = ancestor.history.at(-1);
+  if (!terminal || terminal.incidentId !== ancestor.incidentId || terminal.generation !== ancestor.generation
+    || terminal.fingerprintDigest !== ancestor.fingerprintDigest || terminal.evidenceDigest !== ancestor.evidenceDigest
+    || terminal.reasonCode !== ancestor.reasonCode || terminal.paidAttempt !== ancestor.paidAttempts
+    || lastAttempt?.type !== "paid_attempt_claimed" || lastAttempt.initiator !== "runner" || lastAttempt.transport !== "codex_sdk"
+    || terminal.claimedAt !== lastAttempt.recordedAt) reject();
+  const nativeTime = (value) => {
+    const parsed = typeof value === "string" ? Date.parse(value) : NaN;
+    return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : NaN;
+  };
+  const times = [proof.recordedAt, run.startedAt, claim.recordedAt, run.completedAt, terminal.claimedAt, ancestor.openedAt]
+    .map(nativeTime);
+  if (times.some((value) => !Number.isFinite(value)) || times.some((value, i) => i && value < times[i - 1])) reject();
+  // Unknown, overlapping or later work cannot be attributed to this admission.
+  for (const other of runs) {
+    if (other.id === run.id) continue;
+    const started = nativeTime(other.startedAt), completed = nativeTime(other.completedAt);
+    if (other.projectId !== task.projectId || !["failed", "completed", "cancelled"].includes(other.status)) reject();
+    if (!Object.hasOwn(other, "startedAt")) {
+      // Native queue admission can cancel an exhausted CLI attempt before any
+      // start or paid claim exists. Its actual lifetime bounds that absence.
+      const created = nativeTime(other.createdAt);
+      if (other.status !== "cancelled" || other.provider !== "codex-cli" || other.role !== "builder"
+        || other.actionType !== ancestor.action || other.exitCode !== "attempt_budget_exhausted"
+        || Object.hasOwn(other, "failureContainmentClaim") || !nativeAdmission(other.failureContainmentAdmission)
+        || !Number.isFinite(created) || !Number.isFinite(completed) || created > completed
+        || other.updatedAt !== other.completedAt || completed > times[1] || completed >= times[2]) reject();
+      continue;
+    }
+    if (!Number.isFinite(started) || !Number.isFinite(completed) || completed < started
+      || completed >= times[2] || started >= times[1]) reject();
+  }
+  return { reasonCode: provider.reasonCode, ancestorIncidentId: prior.incidentId, ancestorRecordDigest: prerequisiteRecordDigest(prior),
+    successorIncidentId: provider.incidentId, successorRecordDigest: prerequisiteRecordDigest(provider),
+    verifier: proof.verifier, verifiedAt: proof.recordedAt, admissionRecordedAt: claim.recordedAt,
+    terminalRunId: run.id, terminalRunRecordDigest: prerequisiteRecordDigest(run),
+    runInventoryRecordDigest: prerequisiteRecordDigest(runs),
+    taskRunBindingDigest: prerequisiteRecordDigest({ lastAutomationFailure: task.lastAutomationFailure,
+      lastAutomationFailureRunId: task.lastAutomationFailureRunId, circuit: task.automationCircuit }),
+    association: "corroborated_native_admission_with_overwritten_prior_claim" };
+}
+
+function prerequisiteFailureRecovery(db, task) {
+  const reject = () => operatorCandidateError("operator_prerequisite_failure_unresolved");
+  // These rows have an independent transaction/version. Never use a task JSON
+  // projection, supplied incident or an earlier read as commit authority.
+  const rows = db.prepare("SELECT * FROM failure_incidents WHERE task_id = ? ORDER BY generation DESC, incident_id LIMIT 501").all(task.id);
+  if (rows.length > 500 || task.automationCircuit?.state === "open") reject();
+  const incidents = rows.map((row) => {
+    const incident = failureIncidentFromRow(row);
+    if (incident.incidentId !== `failure_${incident.fingerprintDigest.slice(7, 31)}-g${incident.generation}`
+      || row.paid_attempts !== incident.paidAttempts || row.cheap_probe_attempts !== incident.cheapProbeAttempts
+      || row.repair_attempts !== incident.repairAttempts || row.avoided_retries !== incident.avoidedRetries
+      || row.backoff_until !== incident.backoffUntil || row.opened_at !== incident.openedAt
+      || row.updated_at !== incident.updatedAt) reject();
+    return incident;
+  });
+  const currentFaults = incidents.filter((incident) => !["closed", "superseded"].includes(incident.state));
+  const blocker = task.automationBlocker;
+  if (!blocker) {
+    if (currentFaults.length) reject();
+    return null;
+  }
+  if (!["circuit", "failure_containment"].includes(blocker.type)) reject();
+  const native = blocker.type === "failure_containment";
+  const keys = native ? ["type", "reason", "incidentId", "resource", "retryAt", "blockedAt", "incidentGeneration", "evidenceDigest"]
+    : ["type", "reason", "resumeStatus", "attempts", "retryAt", "incidentId", "incidentGeneration", "evidenceDigest"];
+  if (Object.keys(blocker).some((key) => !keys.includes(key))
+    || (native && (blocker.resource !== `${task.projectId}:${task.id}` || blocker.retryAt !== ""
+      || typeof blocker.blockedAt !== "string" || !Number.isFinite(Date.parse(blocker.blockedAt))
+      || new Date(blocker.blockedAt).toISOString() !== blocker.blockedAt))
+    || (!native && (!Object.hasOwn(blocker, "incidentGeneration") || !Object.hasOwn(blocker, "evidenceDigest")))) reject();
+  const ancestor = incidents.find((incident) => incident.incidentId === blocker.incidentId);
+  if (!ancestor || ancestor.state !== "superseded" || ancestor.taskId !== task.id
+    || ancestor.paidAttempts !== MAX_PAID_ATTEMPTS_PER_GENERATION || !ancestor.openedAt || !ancestor.circuitEventKey
+    || blocker.reason !== ancestor.reasonCode
+    || (Object.hasOwn(blocker, "incidentGeneration") && blocker.incidentGeneration !== ancestor.generation)
+    || (Object.hasOwn(blocker, "evidenceDigest") && blocker.evidenceDigest !== ancestor.evidenceDigest)) reject();
+  const current = incidents.filter((incident) => incident.fingerprintDigest === ancestor.fingerprintDigest)
+    .sort((a, b) => b.generation - a.generation)[0];
+  if (!current || current.generation !== ancestor.generation + 1 || current.state !== "active"
+    || current.taskId !== task.id || canonicalJson(current.fingerprint) !== canonicalJson(ancestor.fingerprint)
+    || current.evidenceDigest === ancestor.evidenceDigest || current.paidAttempts !== 0
+    || current.cheapProbeAttempts !== 1 || current.repairAttempts !== 0 || current.backoffUntil || current.openedAt) reject();
+  const proof = replayPrerequisiteRepair(ancestor, current, reject);
+  if (Date.parse(current.createdAt) < Date.parse(ancestor.openedAt)
+    || (native && (Date.parse(blocker.blockedAt) < Date.parse(ancestor.openedAt)
+      || Date.parse(blocker.blockedAt) > Date.parse(current.createdAt)))) reject();
+  const groups = new Map();
+  for (const incident of incidents) {
+    const key = canonicalJson(failureWorkIdentity(incident.fingerprint));
+    if (!groups.has(key)) groups.set(key, selectFailureIncident(incidents, incident.fingerprint));
+  }
+  const supportingAdmissions = [];
+  for (const group of groups.values()) {
+    if (!group) continue;
+    if (group.incident.incidentId === current.incidentId) {
+      if (group.paidAttempts !== 0) reject();
+    } else {
+      if (group.paidAttempts !== 1) reject();
+      supportingAdmissions.push(historicalPrerequisiteAdmission(db, task, incidents, ancestor, group.incident, reject));
+    }
+  }
+  if (supportingAdmissions.length > 1 || currentFaults.length !== 1 + supportingAdmissions.length) reject();
+  return { schemaVersion: 1, taskId: task.id, previousBlocker: structuredClone(blocker), fingerprintDigest: ancestor.fingerprintDigest,
+    ancestorIncidentId: ancestor.incidentId, ancestorGeneration: ancestor.generation, ancestorEvidenceDigest: ancestor.evidenceDigest,
+    ancestorRecordDigest: prerequisiteRecordDigest(ancestor), successorIncidentId: current.incidentId, successorGeneration: current.generation,
+    successorEvidenceDigest: current.evidenceDigest, successorRecordDigest: prerequisiteRecordDigest(current), verifier: proof.verifier,
+    ledgerRecordDigest: prerequisiteRecordDigest(incidents), supportingAdmissions,
+    verifiedAt: proof.recordedAt, outcome: "passed" };
+}
+
+/** Read-only preparation; the operator writer rechecks this binding under its SQL fence. */
+export async function readPrerequisiteFailureRecovery(task) {
+  return prerequisiteFailureRecovery(await ensureReadOnlyStateDatabase(), task);
+}
+
 function freezeOperatorVerification(input) {
   const sha = /^[a-f0-9]{40,64}$/;
   const digest = /^sha256:[a-f0-9]{64}$/;
@@ -1145,6 +1334,12 @@ function freezeOperatorVerification(input) {
     || !Array.isArray(input.dispositionTaskIds) || input.dispositionTaskIds.length > 32
     || input.dispositionTaskIds.some((id) => typeof id !== "string" || !id || id === input.taskId)
     || new Set(input.dispositionTaskIds).size !== input.dispositionTaskIds.length
+    || (input.dispositions !== undefined && (!Array.isArray(input.dispositions)
+      || input.dispositions.length !== input.dispositionTaskIds.length
+      || input.dispositions.some((item) => !item || !input.dispositionTaskIds.includes(item.taskId)
+        || !Number.isSafeInteger(item.expectedStateVersion) || item.expectedStateVersion < 1
+        || !digest.test(item.evidenceDigest) || !sha.test(item.sourceSha))
+      || new Set(input.dispositions.map((item) => item.taskId)).size !== input.dispositions.length))
     || (input.conflictTaskIds !== undefined && (!Array.isArray(input.conflictTaskIds) || input.conflictTaskIds.length > 4096
       || input.conflictTaskIds.some((id) => typeof id !== "string" || !id)
       || new Set(input.conflictTaskIds).size !== input.conflictTaskIds.length))) {
@@ -1197,10 +1392,19 @@ function assertOperatorCandidateIngress(state, snapshot, options = {}, verifyOrd
   const verification = options.operatorCandidateCapability === OPERATOR_CANDIDATE_WRITE
     ? options.operatorCandidateVerification : null;
   const tasks = new Map((state.tasks || []).map((task) => [task.id, task]));
+  for (const disposition of verification?.dispositions || []) {
+    if (!disposition.failureRecovery) continue;
+    const previousRuns = [...snapshot.tables.runs.values()].map((item) => JSON.parse(item.payload))
+      .filter((run) => run.taskId === disposition.taskId).sort((a, b) => a.id.localeCompare(b.id));
+    const proposedRuns = (state.runs || []).filter((run) => run.taskId === disposition.taskId)
+      .sort((a, b) => a.id.localeCompare(b.id));
+    if (canonicalJson(previousRuns) !== canonicalJson(proposedRuns)) operatorCandidateError("operator_prerequisite_run_changed");
+  }
   let persistedRuns;
   for (const [id, prior] of snapshot.tables.tasks) {
     const previous = JSON.parse(prior.payload);
     if (previous.operatorIntake && !tasks.has(id)) operatorCandidateError("operator_intake_history_immutable");
+    if (previous.preexistingWorkDisposition && !tasks.has(id)) operatorCandidateError("preexisting_work_disposition_immutable");
   }
   for (const task of state.tasks || []) {
     const prior = snapshot.tables.tasks.get(task.id)?.payload;
@@ -1210,6 +1414,17 @@ function assertOperatorCandidateIngress(state, snapshot, options = {}, verifyOrd
     const scopeAuthorityChanged = JSON.stringify(oldScope) !== JSON.stringify(nextScope)
       || (previous?.impactScopePlan && JSON.stringify(previous.impactScopePlan) !== JSON.stringify(task.impactScopePlan));
     const adoptionAuthorized = verification?.taskId === task.id;
+    if (canonicalJson(previous?.preexistingWorkDisposition || null) !== canonicalJson(task.preexistingWorkDisposition || null)) {
+      if (previous?.preexistingWorkDisposition) operatorCandidateError("preexisting_work_disposition_immutable");
+      const disposition = verification?.dispositions?.find((item) => item.taskId === task.id);
+      const receipt = task.preexistingWorkDisposition;
+      if (!disposition || !verification.dispositionTaskIds.includes(task.id) || task.status !== "closed"
+        || receipt?.kind !== "preexisting_work_verified" || receipt.schemaVersion !== 1
+        || Object.entries(disposition).some(([key, value]) => canonicalJson(receipt[key] ?? null) !== canonicalJson(value ?? null))
+        || (previous?.automationBlocker && !disposition.failureRecovery)) {
+        operatorCandidateError("preexisting_work_disposition_verified_writer_required");
+      }
+    }
     const intakeChanged = JSON.stringify(previous?.operatorIntake) !== JSON.stringify(task.operatorIntake);
     if (intakeChanged) {
       if (!adoptionAuthorized) operatorCandidateError(previous?.operatorIntake ? "operator_intake_history_immutable" : "operator_intake_verified_writer_required");
@@ -1277,6 +1492,16 @@ function assertOperatorCandidateCommitFence(db, verification) {
   const tasks = db.prepare(`SELECT payload FROM tasks WHERE id IN (${placeholders})`).all(...ids).map((row) => parsePayload(row.payload, {}));
   const runs = db.prepare(`SELECT payload FROM runs WHERE task_id IN (${placeholders}) AND status IN ('queued', 'running')`).all(...ids).map((row) => parsePayload(row.payload, {}));
   assertOperatorCandidateIdle({ tasks, runs }, verification, nowMs);
+  for (const disposition of verification.dispositions || []) {
+    const task = tasks.find((item) => item.id === disposition.taskId);
+    if (!task || positiveStateVersion(task.stateVersion) !== disposition.expectedStateVersion) {
+      operatorCandidateError("operator_prerequisite_state_changed");
+    }
+    const current = prerequisiteFailureRecovery(db, task);
+    if (canonicalJson(current) !== canonicalJson(disposition.failureRecovery || null)) {
+      operatorCandidateError("operator_prerequisite_failure_changed");
+    }
+  }
 }
 
 function normalizeTaskStateVersions(state, snapshot) {

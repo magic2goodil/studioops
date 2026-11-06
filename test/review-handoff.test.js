@@ -18,7 +18,9 @@ import {
   addProject,
   addTask,
   adoptOperatorCandidate,
+  applyFailureIncidentCompatibilityReadModelInState,
   readStateReadOnly,
+  reconcileAutomationStateInState,
   mutateState,
   transitionTask,
   generatePrompt,
@@ -29,6 +31,15 @@ import {
   updateTask,
   updateProject,
 } from "../src/store.js";
+import {
+  claimFailureContainmentPaidAttempt,
+  openFailureContainmentCircuit,
+  readFailureIncidents,
+  recordFailureContainmentActivity,
+  scheduleFailureContainmentBackoff,
+} from "../src/state-database.js";
+import { failureEvidence } from "../src/failure-containment.js";
+import { claimCurrentFailureAttempt, claimRuns, completeRun, failureEvidenceForRun } from "../src/runner.js";
 
 const SUBJECT_SHA = "a".repeat(40);
 const NEXT_SHA = "b".repeat(40);
@@ -395,6 +406,359 @@ test("verified prerequisite administrative disposition and adoption commit toget
   assert.equal(after.tasks.find((item) => item.id === dependency.id).preexistingWorkDisposition.kind, "preexisting_work_verified");
   assert.equal(after.tasks.find((item) => item.id === f.task.id).status, "builder_review");
   assert.equal(after.runs.filter((item) => [f.task.id, dependency.id].includes(item.taskId)).length, 0);
+});
+
+async function prerequisiteFailureFixture(t, options = {}) {
+  const f = await operatorFixture(t);
+  const dependency = await addTask({ projectId: f.project.id, title: "Existing verified prerequisite", description: "Previously produced inventory has immutable source verification.", type: "bug", status: "blocked", architectureRequired: false });
+  const loaded = loadProjectComponentImpactMapAtCommit(f.project, f.request.candidate.baseSha, { repoRoot: f.root });
+  const receiptPath = path.join(f.root, "prerequisite-verification.json");
+  const bytes = JSON.stringify({ sourceSha: f.request.candidate.baseSha, mapDigest: loaded.digest, scope: "Generic prerequisite inventory" });
+  await writeFile(receiptPath, bytes);
+  const merge = { kind: "preexisting_merged_artifact", sourceSha: f.request.candidate.baseSha };
+  const verification = { kind: "existing_current_inventory_verification", subjectSha: merge.sourceSha, mapDigest: loaded.digest,
+    evidenceRefs: [{ path: receiptPath, sha256: createHash("sha256").update(bytes).digest("hex") }] };
+  await updateTask(dependency.id, { mergeEvidence: merge, verificationEvidence: verification });
+  await updateTask(f.task.id, { dependsOnTaskIds: [dependency.id] });
+  const ledgerTask = options.wrongTask
+    ? await addTask({ projectId: f.project.id, title: "Unrelated failure owner", description: "A different task cannot authorize prerequisite recovery.", type: "bug", status: "blocked", architectureRequired: false })
+    : dependency;
+  const run = { id: `run_prerequisite_${dependency.id}`, taskId: ledgerTask.id, projectId: f.project.id,
+    group: "builder", role: "builder", actionType: "start_builder", provider: "codex-sdk", status: "running",
+    startedAt: new Date(Date.now() - 100).toISOString(), executionCommitSha: f.request.candidate.baseSha, candidateCycle: 0,
+    impactPlan: { manifest: { digest: loaded.digest } },
+    failureContainmentAdmission: { consulted: true, decision: "admitted", authority: "dispatcher_read_only",
+      claimBoundary: "runner_pre_provider_launch", actionIdentity: "start_builder", provider: "codex" } };
+  const evidence = options.native ? failureEvidence(failureEvidenceForRun({ ...run, project: f.project, task: dependency }, await readStateReadOnly()))
+    : failureEvidence({ repository: { branch: "main", commitSha: f.request.candidate.baseSha },
+    configurationDigest: `sha256:${"1".repeat(64)}`, policyDigest: `sha256:${"2".repeat(64)}`, componentMapDigest: loaded.digest });
+  const input = { taskId: ledgerTask.id, action: "start_builder", provider: "codex", reasonCode: "output_guard_exceeded",
+    candidateIdentity: { commitSha: f.request.candidate.baseSha }, evidence: evidence.value };
+  let ancestor, providerInput, providerSuccessor;
+  const time = (offset) => new Date(Date.now() + offset).toISOString();
+  assert.equal((await claimFailureContainmentPaidAttempt({ ...input, initiator: "runner", transport: "codex_sdk",
+    now: options.native ? time(-5000) : "2026-10-01T00:00:00.000Z" })).admitted, true);
+  if (options.native) {
+    if (options.twoReasons) {
+      providerInput = { ...input, reasonCode: "provider_unavailable" };
+      await claimFailureContainmentPaidAttempt({ ...providerInput, initiator: "runner", transport: "codex_sdk", now: time(-4000) });
+      await recordFailureContainmentActivity({ ...providerInput, type: "cheap_probe", outcome: "failed",
+        verifier: { id: "service_health_probe" }, now: time(-3500) });
+      await claimFailureContainmentPaidAttempt({ ...providerInput, initiator: "runner", transport: "codex_sdk", now: time(-3000) });
+      const repaired = failureEvidence({ ...evidence.value, configurationDigest: `sha256:${"5".repeat(64)}` });
+      providerSuccessor = await recordFailureContainmentActivity({ ...providerInput, evidence: repaired.value,
+        type: "cheap_probe", outcome: "passed", now: time(-1000),
+        verifier: { id: "service_health_probe", outcome: "passed", evidenceDigest: repaired.digest } });
+      providerInput = { ...providerInput, evidence: repaired.value };
+    }
+    const cancelled = options.twoReasons ? [1, 2].map((index) => ({ id: `${run.id}_queued_${index}`, taskId: ledgerTask.id,
+      projectId: f.project.id, group: "builder", role: "builder", actionType: "start_builder", provider: "codex-cli",
+      status: "queued", createdAt: time(-500 + index), attempt: 3, maxAttempts: 2,
+      failureContainmentAdmission: structuredClone(run.failureContainmentAdmission) })) : [];
+    if (cancelled.length) {
+      assert.deepEqual(await claimRuns({ state: { meta: {}, projects: [f.project], tasks: [dependency], runs: cancelled, events: [], comments: [] } }), []);
+      for (const row of cancelled) { assert.equal(row.status, "cancelled"); assert.equal(row.startedAt, undefined); assert.equal(row.failureContainmentClaim, undefined); }
+    }
+    run.startedAt = time(0);
+    await mutateState((state) => { state.runs.push(...structuredClone(cancelled), structuredClone(run)); });
+    if (options.twoReasons) {
+      const claimed = await claimCurrentFailureAttempt(run);
+      assert.equal(claimed.admitted, true);
+      assert.equal(claimed.incident.incidentId, providerSuccessor.incidentId);
+      assert.equal(run.failureContainmentClaim.reasonCode, "provider_unavailable");
+    }
+    const terminal = await completeRun(run.id, { status: "failed", exitCode: "command_output_budget_exceeded" });
+    assert.equal(terminal.failureContainmentError, undefined);
+    assert.equal(terminal.failureContainmentClaim.reasonCode, "output_guard_exceeded", "The native producer overwrites the prior admission claim");
+    ancestor = (await readFailureIncidents({ taskId: ledgerTask.id })).find((item) => item.reasonCode === "output_guard_exceeded");
+    await mutateState((state) => reconcileAutomationStateInState(state));
+    const task = (await readStateReadOnly()).tasks.find((item) => item.id === dependency.id);
+    assert.deepEqual(Object.keys(task.automationBlocker).sort(), ["type", "reason", "incidentId", "resource", "retryAt", "blockedAt"].sort());
+    assert.equal(task.automationBlocker.type, "failure_containment");
+    assert.equal(task.automationCircuit.state, "superseded");
+  } else {
+    assert.equal((await claimFailureContainmentPaidAttempt({ ...input, now: "2026-10-01T00:00:01.000Z" })).admitted, true);
+    ancestor = await openFailureContainmentCircuit({ ...input, now: "2026-10-01T00:00:02.000Z" });
+    await mutateState((state) => {
+    const task = state.tasks.find((item) => item.id === dependency.id);
+    const projected = { ...structuredClone(task), id: ledgerTask.id };
+    applyFailureIncidentCompatibilityReadModelInState({ events: [] }, projected, ancestor, { snapshot: { status: "blocked" } });
+    // Model the existing stale pointer, without manufacturing an independent
+    // open compatibility circuit or changing the authoritative ledger rows.
+    task.automationBlocker = structuredClone(projected.automationBlocker);
+    });
+  }
+  const changed = failureEvidence({ ...evidence.value, policyDigest: `sha256:${"3".repeat(64)}` });
+  async function recover(overrides = {}) {
+    return recordFailureContainmentActivity({ ...input, evidence: changed.value, type: "cheap_probe", outcome: "passed",
+      verifier: { id: "policy_probe", outcome: "passed", evidenceDigest: changed.digest },
+      now: options.native ? time(0) : "2026-10-01T00:01:00.000Z", ...overrides });
+  }
+  async function refreshRequestVersions() {
+    const state = await readStateReadOnly();
+    f.request.expectedStateVersion = state.tasks.find((item) => item.id === f.task.id).stateVersion;
+    f.request.prerequisites = [{ taskId: dependency.id, expectedStateVersion: state.tasks.find((item) => item.id === dependency.id).stateVersion,
+      evidenceDigest: sha256Digest({ merge, verification }), reason: "Close the already verified prerequisite during actual source adoption." }];
+  }
+  await refreshRequestVersions();
+  return { ...f, dependency, ledgerTask, ancestor, input, changed, recover, refreshRequestVersions,
+    run, providerInput, providerSuccessor };
+}
+
+async function prerequisiteTasksSnapshot(f) {
+  const state = await readStateReadOnly();
+  const ids = new Set([f.task.id, f.dependency.id]);
+  return { tasks: state.tasks.filter((item) => ids.has(item.id)), runs: state.runs.filter((item) => ids.has(item.taskId)),
+    events: state.events.filter((item) => ids.has(item.taskId)) };
+}
+
+test("actual native failure producer's minimal stale pointer closes atomically after verified recovery", async (t) => {
+  const f = await prerequisiteFailureFixture(t, { native: true });
+  await f.recover();
+  const before = await prerequisiteTasksSnapshot(f);
+  await adoptOperatorCandidate(f.task.id, f.request, f.authority);
+  const after = await prerequisiteTasksSnapshot(f), prerequisite = after.tasks.find((item) => item.id === f.dependency.id);
+  assert.equal(prerequisite.status, "closed");
+  assert.equal(prerequisite.automationBlocker, undefined);
+  assert.deepEqual(prerequisite.preexistingWorkDisposition.failureRecovery.previousBlocker,
+    before.tasks.find((item) => item.id === f.dependency.id).automationBlocker);
+  assert.equal(prerequisite.preexistingWorkDisposition.failureRecovery.ancestorGeneration, 1);
+  assert.deepEqual(after.runs, before.runs);
+});
+
+test("native stale-pointer recovery rejects unknown shape and supplied identity conflicts", async (t) => {
+  for (const scenario of ["wrong_resource", "wrong_reason", "wrong_incident", "supplied_generation", "supplied_evidence", "unknown_field", "unknown_type"]) {
+    await t.test(scenario, async (t) => {
+      const f = await prerequisiteFailureFixture(t, { native: true });
+      const successor = await f.recover();
+      await mutateState((state) => {
+        const blocker = state.tasks.find((item) => item.id === f.dependency.id).automationBlocker;
+        if (scenario === "wrong_resource") blocker.resource = `${f.project.id}:another-task`;
+        if (scenario === "wrong_reason") blocker.reason = "provider_unavailable";
+        if (scenario === "wrong_incident") blocker.incidentId = successor.incidentId;
+        if (scenario === "supplied_generation") blocker.incidentGeneration = 9;
+        if (scenario === "supplied_evidence") blocker.evidenceDigest = `sha256:${"0".repeat(64)}`;
+        if (scenario === "unknown_field") blocker.verified = true;
+        if (scenario === "unknown_type") blocker.type = "legacy_failure";
+      });
+      await f.refreshRequestVersions();
+      const before = await prerequisiteTasksSnapshot(f);
+      await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority), /adoption_prerequisite_unresolved_incident/);
+      assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
+    });
+  }
+});
+
+test("repaired provider admission followed by an actual different native output failure is historical bookkeeping", async (t) => {
+  const f = await prerequisiteFailureFixture(t, { native: true, twoReasons: true });
+  const successor = await f.recover();
+  const before = await prerequisiteTasksSnapshot(f), ledger = await readFailureIncidents({ taskId: f.dependency.id });
+  await adoptOperatorCandidate(f.task.id, f.request, f.authority);
+  const after = await prerequisiteTasksSnapshot(f), prerequisite = after.tasks.find((item) => item.id === f.dependency.id);
+  assert.equal(prerequisite.status, "closed");
+  assert.equal(after.tasks.find((item) => item.id === f.task.id).status, "builder_review");
+  const recovery = prerequisite.preexistingWorkDisposition.failureRecovery;
+  assert.equal(recovery.successorIncidentId, successor.incidentId);
+  assert.equal(recovery.supportingAdmissions.length, 1);
+  const support = recovery.supportingAdmissions[0];
+  assert.equal(support.successorIncidentId, f.providerSuccessor.incidentId);
+  assert.equal(support.terminalRunId, f.run.id);
+  assert.equal(support.association, "corroborated_native_admission_with_overwritten_prior_claim");
+  for (const field of ["ancestorRecordDigest", "successorRecordDigest", "terminalRunRecordDigest", "runInventoryRecordDigest", "taskRunBindingDigest"]) assert.match(support[field], /^sha256:[a-f0-9]{64}$/);
+  assert.equal(after.runs.filter((item) => item.status === "cancelled" && !Object.hasOwn(item, "startedAt")).length, 2);
+  assert.deepEqual(after.runs, before.runs);
+  assert.deepEqual(await readFailureIncidents({ taskId: f.dependency.id }), ledger, "No historical admission, failure or paid counter is rewritten");
+});
+
+test("historical admission requires complete native evidence and no conflicting subsequent work", async (t) => {
+  for (const scenario of ["open", "backoff", "exhausted", "changed_probe", "new_generation", "new_active_fault",
+    "missing_task_link", "wrong_candidate", "wrong_admission", "wrong_terminal_claim", "wrong_raw_failure", "missing_probe", "overlapping_run", "later_run", "unknown_run",
+    "cancelled_claim", "cancelled_open_end", "cancelled_later", "cancelled_unknown_reason"]) {
+    await t.test(scenario, async (t) => {
+      const f = await prerequisiteFailureFixture(t, { native: true, twoReasons: true });
+      await f.recover();
+      if (scenario === "open") await openFailureContainmentCircuit(f.providerInput);
+      if (scenario === "backoff") await scheduleFailureContainmentBackoff({ ...f.providerInput, delayMs: 1000 });
+      if (scenario === "exhausted") await claimFailureContainmentPaidAttempt(f.providerInput);
+      if (scenario === "changed_probe") await recordFailureContainmentActivity({ ...f.providerInput, type: "cheap_probe", outcome: "passed", verifier: { id: "service_health_probe" } });
+      if (scenario === "new_generation") {
+        const evidence = failureEvidence({ ...f.providerInput.evidence, configurationDigest: `sha256:${"6".repeat(64)}` });
+        await recordFailureContainmentActivity({ ...f.providerInput, evidence: evidence.value, type: "cheap_probe", outcome: "passed",
+          verifier: { id: "service_health_probe", outcome: "passed", evidenceDigest: evidence.digest } });
+      }
+      if (scenario === "new_active_fault") await claimFailureContainmentPaidAttempt({ ...f.input, reasonCode: "configuration_invalid" });
+      await mutateState((state) => {
+        const run = state.runs.find((item) => item.id === f.run.id), task = state.tasks.find((item) => item.id === f.dependency.id);
+        if (scenario === "missing_task_link") delete task.lastAutomationFailureRunId;
+        if (scenario === "wrong_candidate") run.executionCommitSha = "f".repeat(40);
+        if (scenario === "wrong_admission") run.failureContainmentAdmission.provider = "local";
+        if (scenario === "wrong_terminal_claim") run.failureContainmentClaim.incidentId = f.providerSuccessor.incidentId;
+        if (scenario === "wrong_raw_failure") run.rawFailureCode = "sdk_error";
+        if (scenario === "missing_probe") delete run.failureContainmentProbe;
+        const cancelled = state.runs.find((item) => item.id === `${f.run.id}_queued_1`);
+        if (scenario === "cancelled_claim") cancelled.failureContainmentClaim = structuredClone(run.failureContainmentClaim);
+        if (scenario === "cancelled_open_end") delete cancelled.completedAt;
+        if (scenario === "cancelled_later") cancelled.completedAt = cancelled.updatedAt = run.completedAt;
+        if (scenario === "cancelled_unknown_reason") cancelled.exitCode = "unknown_cancellation";
+        if (["overlapping_run", "later_run", "unknown_run"].includes(scenario)) state.runs.push({ id: `${f.run.id}_conflict`,
+          taskId: f.dependency.id, projectId: f.project.id, role: "builder", status: "failed",
+          ...(scenario === "unknown_run" ? {} : { startedAt: scenario === "overlapping_run" ? run.startedAt : run.completedAt,
+            completedAt: run.completedAt }) });
+      });
+      await f.refreshRequestVersions();
+      const before = await prerequisiteTasksSnapshot(f);
+      await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority), /adoption_prerequisite_unresolved_incident/);
+      assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
+    });
+  }
+});
+
+test("verified cheap-probe lineage resolves only its stale prerequisite pointer during real source adoption", async (t) => {
+  const f = await prerequisiteFailureFixture(t);
+  const successor = await f.recover();
+  const before = await prerequisiteTasksSnapshot(f);
+  const result = await adoptOperatorCandidate(f.task.id, f.request, f.authority);
+  const after = await prerequisiteTasksSnapshot(f);
+  const dependency = after.tasks.find((item) => item.id === f.dependency.id);
+  const child = after.tasks.find((item) => item.id === f.task.id);
+  assert.equal(result.held, false);
+  assert.equal(dependency.status, "closed");
+  assert.equal(dependency.automationBlocker, undefined);
+  assert.equal(dependency.preexistingWorkDisposition.kind, "preexisting_work_verified");
+  const recovery = dependency.preexistingWorkDisposition.failureRecovery;
+  assert.equal(recovery.taskId, dependency.id);
+  assert.equal(recovery.ancestorIncidentId, f.ancestor.incidentId);
+  assert.equal(recovery.ancestorGeneration, f.ancestor.generation);
+  assert.equal(recovery.ancestorEvidenceDigest, f.ancestor.evidenceDigest);
+  assert.equal(recovery.successorIncidentId, successor.incidentId);
+  assert.equal(recovery.successorGeneration, successor.generation);
+  assert.equal(recovery.successorEvidenceDigest, successor.evidenceDigest);
+  assert.equal(recovery.verifier, "policy_probe"); assert.equal(recovery.outcome, "passed");
+  assert.deepEqual(recovery.previousBlocker, before.tasks.find((item) => item.id === dependency.id).automationBlocker);
+  assert.match(recovery.ancestorRecordDigest, /^sha256:[a-f0-9]{64}$/);
+  assert.match(recovery.successorRecordDigest, /^sha256:[a-f0-9]{64}$/);
+  assert.notEqual(recovery.ancestorRecordDigest, recovery.successorRecordDigest);
+  assert.equal(child.status, "builder_review");
+  assert.equal(child.operatorIntake.candidate.commitSha, f.request.candidate.commitSha);
+  assert.deepEqual(child.operatorIntake.dispositions[0].failureRecovery, recovery);
+  for (const task of after.tasks) assert.ok(task.stateVersion > before.tasks.find((item) => item.id === task.id).stateVersion);
+  assert.deepEqual(after.runs, before.runs);
+  const incidents = await readFailureIncidents({ taskId: f.dependency.id });
+  const old = incidents.find((item) => item.incidentId === f.ancestor.incidentId);
+  const current = incidents.find((item) => item.incidentId === successor.incidentId);
+  assert.equal(old.state, "superseded"); assert.equal(old.paidAttempts, 2);
+  assert.deepEqual(old.history, f.ancestor.history);
+  assert.equal(current.state, "active"); assert.equal(current.paidAttempts, 0); assert.equal(current.cheapProbeAttempts, 1);
+});
+
+test("open unchanged or unsuccessful prerequisite failures cannot authorize atomic adoption", async (t) => {
+  for (const scenario of ["still_open", "unchanged_evidence", "failed_activity"]) {
+    await t.test(scenario, async (t) => {
+      const f = await prerequisiteFailureFixture(t);
+      if (scenario === "unchanged_evidence") await f.recover({ evidence: f.input.evidence,
+        verifier: { id: "policy_probe", outcome: "passed", evidenceDigest: f.ancestor.evidenceDigest } });
+      if (scenario === "failed_activity") await f.recover({ outcome: "failed" });
+      const before = await prerequisiteTasksSnapshot(f);
+      await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority), /adoption_prerequisite_/);
+      assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
+    });
+  }
+});
+
+test("a wrong-task or forged stale prerequisite pointer cannot borrow genuine recovery evidence", async (t) => {
+  for (const scenario of ["wrong_task", "wrong_evidence", "wrong_generation", "wrong_incident"]) {
+    await t.test(scenario, async (t) => {
+      const f = await prerequisiteFailureFixture(t, { wrongTask: scenario === "wrong_task" });
+      const successor = await f.recover();
+      if (scenario !== "wrong_task") {
+        await mutateState((state) => {
+          const blocker = state.tasks.find((item) => item.id === f.dependency.id).automationBlocker;
+          if (scenario === "wrong_evidence") blocker.evidenceDigest = `sha256:${"0".repeat(64)}`;
+          if (scenario === "wrong_generation") blocker.incidentGeneration += 1;
+          if (scenario === "wrong_incident") blocker.incidentId = successor.incidentId;
+        });
+        await f.refreshRequestVersions();
+      }
+      const before = await prerequisiteTasksSnapshot(f);
+      await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority), /adoption_prerequisite_/);
+      assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
+    });
+  }
+});
+
+test("a new fault or consumed held successor keeps both adoption tasks unchanged", async (t) => {
+  for (const scenario of ["unrelated_fault", "successor_open", "successor_backoff", "successor_paid", "new_verified_generation", "open_compatibility_circuit"]) {
+    await t.test(scenario, async (t) => {
+      const f = await prerequisiteFailureFixture(t);
+      await f.recover();
+      const current = { ...f.input, evidence: f.changed.value, now: "2026-10-01T00:02:00.000Z" };
+      if (scenario === "unrelated_fault") await recordFailureContainmentActivity({ ...current, reasonCode: "configuration_invalid", type: "cheap_probe", outcome: "failed" });
+      if (scenario === "successor_open") await openFailureContainmentCircuit(current);
+      if (scenario === "successor_backoff") await scheduleFailureContainmentBackoff({ ...current, delayMs: 1000 });
+      if (scenario === "successor_paid") assert.equal((await claimFailureContainmentPaidAttempt(current)).admitted, true);
+      if (scenario === "new_verified_generation") {
+        const evidence = failureEvidence({ ...f.changed.value, configurationDigest: `sha256:${"4".repeat(64)}` });
+        await recordFailureContainmentActivity({ ...current, evidence: evidence.value, type: "cheap_probe", outcome: "passed",
+          verifier: { id: "policy_probe", outcome: "passed", evidenceDigest: evidence.digest } });
+      }
+      if (scenario === "open_compatibility_circuit") {
+        await mutateState((state) => applyFailureIncidentCompatibilityReadModelInState(state,
+          state.tasks.find((item) => item.id === f.dependency.id), f.ancestor, { snapshot: { status: "blocked" } }));
+        await f.refreshRequestVersions();
+      }
+      const before = await prerequisiteTasksSnapshot(f);
+      await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority), /adoption_prerequisite_/);
+      assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
+    });
+  }
+});
+
+test("a public failure-ledger change during owner confirmation invalidates recovery without task-version changes", async (t) => {
+  const f = await prerequisiteFailureFixture(t);
+  const successor = await f.recover();
+  const before = await prerequisiteTasksSnapshot(f);
+  let confirmations = 0;
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => {
+    confirmations += 1;
+    await openFailureContainmentCircuit({ ...f.input, evidence: f.changed.value, now: "2026-10-01T00:02:00.000Z" });
+    assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
+    return "local-os:fixture";
+  } }), /adoption_prerequisite_|operator_prerequisite_failure_(?:unresolved|changed)/);
+  assert.equal(confirmations, 1);
+  assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
+  assert.equal((await readFailureIncidents({ taskId: f.dependency.id })).find((item) => item.incidentId === successor.incidentId).state, "open");
+});
+
+test("recovery still respects prerequisite state CAS and active ownership", async (t) => {
+  const f = await prerequisiteFailureFixture(t);
+  await f.recover();
+  let expected;
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => {
+    await updateTask(f.dependency.id, { assignedThreadId: "competing-prerequisite-owner" });
+    expected = await prerequisiteTasksSnapshot(f);
+    assert.ok(expected.tasks.find((item) => item.id === f.dependency.id).stateVersion > f.request.prerequisites[0].expectedStateVersion);
+    return "local-os:fixture";
+  } }), /adoption_prerequisite_stale/);
+  assert.deepEqual(await prerequisiteTasksSnapshot(f), expected);
+  const g = await prerequisiteFailureFixture(t);
+  await g.recover();
+  await mutateState((state) => { state.tasks.find((item) => item.id === g.dependency.id).assignmentClaim = {
+    ownerId: "another-fixture-owner", expiresAt: "2099-01-01T00:00:00.000Z" }; });
+  await g.refreshRequestVersions();
+  const before = await prerequisiteTasksSnapshot(g);
+  await assert.rejects(adoptOperatorCandidate(g.task.id, g.request, g.authority), /adoption_active_assignment/);
+  assert.deepEqual(await prerequisiteTasksSnapshot(g), before);
+});
+
+test("caller recovery flags cannot replace authoritative prerequisite ledger proof", async (t) => {
+  const f = await prerequisiteFailureFixture(t);
+  const before = await prerequisiteTasksSnapshot(f);
+  await assert.rejects(adoptOperatorCandidate(f.task.id, { ...f.request,
+    failureRecovery: { verified: true, paidAttempts: 0, state: "active" } }, f.authority), /adoption_.*fields_invalid/);
+  const nested = structuredClone(f.request);
+  nested.prerequisites[0].failureRecovery = { verified: true, state: "superseded" };
+  await assert.rejects(adoptOperatorCandidate(f.task.id, nested, f.authority), /adoption_.*fields_invalid/);
+  assert.deepEqual(await prerequisiteTasksSnapshot(f), before);
 });
 
 test("local CLI previews real candidate but denies noninteractive or spoofed owner commit", async (t) => {
