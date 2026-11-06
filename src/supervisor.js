@@ -5,6 +5,7 @@ import {
   candidateIdentityForTask,
   candidateIdentityIsComplete,
   cycleLimitLeadReviewApplies,
+  cycleLimitOwnerReviewApplies,
   currentReviewCandidateCycle,
   earliestIncompleteRequiredReviewStage,
   latestCurrentReviewForStage,
@@ -321,6 +322,7 @@ function taskActions(state, task, options = {}) {
     task.reviewSubjectSha
     && earliestRequiredStage
     && !cycleLimitLeadReview
+    && !cycleLimitOwnerReviewApplies(state, project, task)
     && (
       (currentStage && currentStageIndex > earliestRequiredIndex)
       || (!currentStage && laterReviewStatuses.has(task.status))

@@ -14,6 +14,7 @@ import {
 import { createSupervisorReport } from "../src/supervisor.js";
 import {
   candidateReviewEvidenceForTask,
+  cycleLimitLeadReviewApplies,
   generatePrompt,
   normalizeReviewPipeline,
   recordReviewInState,
@@ -698,4 +699,24 @@ test("candidate cycle supersedes a reviewer run even when the SHA later reverts"
     reviewerRunSupersessionReason(originalCandidateRun, revertedTask),
     "review_candidate_superseded",
   );
+});
+
+
+test("an optional-only rejection cannot authorize a final lead over missing required evidence", () => {
+  const state = fixtureState({ status: "lead_review", assignedAgentRole: "lead-reviewer",
+    reviewCycle: 2, reviewSubjectCycle: 2, reviewSubjectSha: REVIEWER_FIX_SHA }, [{
+    id: "optional_change", taskId: "task_1", stageKey: "optional", status: "frontend_review",
+    role: "frontend-reviewer", candidateCycle: 2, subjectSha: REVIEWER_FIX_SHA,
+    outcome: "changes_requested", createdAt: "2026-11-06T10:00:00.000Z",
+  }]);
+  state.projects[0].reviewPipeline = [
+    { key: "backend", status: "backend_review", role: "backend-reviewer", required: true },
+    { key: "optional", status: "frontend_review", role: "frontend-reviewer", required: false },
+    { key: "lead", status: "lead_review", role: "lead-reviewer", required: true },
+  ];
+  state.projects[0].reviewPolicy = { maxBuilderReviewCycles: 2, leadOwnsFinalDecisionAtLimit: true };
+  const lead = normalizeReviewPipeline(state.projects[0].reviewPipeline).find(stage => stage.key === "lead");
+  assert.equal(cycleLimitLeadReviewApplies(state, state.projects[0], state.tasks[0], lead), false);
+  assert.throws(() => recordReviewInState(state, "task_1", { stage: "lead", outcome: "approved",
+    candidateCycle: 2, subjectSha: REVIEWER_FIX_SHA }), /backend.*before.*lead/i);
 });

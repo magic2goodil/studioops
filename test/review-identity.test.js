@@ -12,8 +12,10 @@ import {
   recordReview,
   updateRun,
   updateTask,
+  updateProject,
 } from "../src/store.js";
-import { dispatchSupervisorActions } from "../src/dispatcher.js";
+import { dispatchSupervisorActions, planDispatches } from "../src/dispatcher.js";
+import { createSupervisorReport } from "../src/supervisor.js";
 
 async function reviewCandidateFixture(t, key, reviewPipeline) {
   const root = await mkdtemp(path.join(os.tmpdir(), "review-identity-"));
@@ -270,3 +272,45 @@ test("reviewer commits restart required lanes without consuming a builder review
     ["backend", "frontend", "accessibility", "lead"],
   );
 });
+
+
+for (const outcome of ["approved", "changes_requested"]) {
+  test("persistent cycle-limit lead " + outcome + " preserves specialist rejection and stable owner triage", async (t) => {
+    const pipeline = [
+      { key: "backend", label: "Backend", role: "backend-reviewer", status: "backend_review", required: true },
+      { key: "lead", label: "Lead", role: "lead-reviewer", status: "lead_review", required: true },
+    ];
+    const f = await reviewCandidateFixture(t, "final-lead-" + outcome.replaceAll("_", "-"), pipeline);
+    await updateProject(f.project.id, { reviewPolicy: { maxBuilderReviewCycles: 1, leadOwnsFinalDecisionAtLimit: true } });
+    await recordReview(f.task.id, { stage: "backend", outcome: "changes_requested", candidateCycle: 1,
+      subjectSha: f.identity.commitSha, body: "A concrete specialist concern remains unresolved." });
+    let state = await readState();
+    let task = state.tasks.find(item => item.id === f.task.id);
+    assert.equal(task.status, "lead_review");
+    assert.equal(task.assignedAgentRole, "lead-reviewer");
+    await recordReview(f.task.id, { stage: "lead", outcome, candidateCycle: 1,
+      subjectSha: f.identity.commitSha, body: "Explicit final decision for human triage." });
+    state = await readState(); task = state.tasks.find(item => item.id === f.task.id);
+    assert.equal(task.status, "user_review");
+    assert.equal(task.assignedAgentRole, "owner");
+    const reviews = state.reviews.filter(item => item.taskId === task.id);
+    assert.equal(reviews.length, 2);
+    assert.equal(reviews.find(item => item.stageKey === "backend").outcome, "changes_requested");
+    assert.equal(reviews.find(item => item.stageKey === "lead").outcome, outcome);
+    assert.equal(candidateReviewEvidenceForTask(state, task).ok, false);
+    const report = createSupervisorReport(state);
+    const actions = report.actions.filter(action => action.taskId === task.id);
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].type, "notify_owner");
+    const options = { failureIncidents: [], creditPolicy: { enabled: false } };
+    assert.equal(planDispatches(state, actions, options).selected.length, 1);
+    const qa = planDispatches(state, [{ ...actions[0], id: task.id + ":notify_qa_review", type: "notify_qa_review" }], options);
+    assert.equal(qa.selected.length, 0);
+    assert.match(qa.skipped[0].reason, /earlier_review_incomplete:backend/);
+    for (const patch of [{ reviewSubjectCycle: 2 }, { reviewSubjectSha: "f".repeat(40) }, { assignedAgentRole: "builder" }]) {
+      const changed = structuredClone(state);
+      Object.assign(changed.tasks.find(item => item.id === task.id), patch);
+      assert.equal(planDispatches(changed, [{ ...actions[0] }], options).selected.length, 0);
+    }
+  });
+}

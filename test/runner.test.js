@@ -35,6 +35,7 @@ import {
   runWorkspaceCleanup,
   runQueuedRuns,
   sdkClientOptions,
+  successfulHandoffFailure,
 } from "../src/runner.js";
 import {
   claimPaidFailureAttempt,
@@ -2139,4 +2140,23 @@ test("runner claims after recoverable pressure cleanup but pauses for persistent
   });
   assert.equal(incident.paused, true);
   assert.equal(incident.pauseReason, "disk_recovery_in_progress");
+});
+
+
+test("review handoff requires the admitted stage, cycle and SHA even after the task advances", () => {
+  const run = { id: "run_review_identity", taskId: "task_review_identity", group: "reviewer", role: "qa-reviewer",
+    reviewStageKey: "backend", reviewStageStatus: "backend_review", candidateCycle: 2,
+    reviewSubjectSha: "a".repeat(40), startedAt: "2026-11-06T10:00:00.000Z" };
+  const task = { id: run.taskId, status: "frontend_review", reviewSubjectCycle: 2 };
+  const review = { taskId: run.taskId, role: run.role, stageKey: "backend", status: "backend_review",
+    candidateCycle: 2, subjectSha: run.reviewSubjectSha, outcome: "approved", createdAt: "2026-11-06T10:00:01.000Z" };
+  assert.equal(successfulHandoffFailure({ reviews: [review] }, run, task), "");
+  for (const patch of [
+    { subjectSha: "b".repeat(40) }, { candidateCycle: 1 },
+    { stageKey: "frontend", status: "frontend_review" }, { status: "regression_review" },
+    { role: "other-reviewer" }, { outcome: "pending" }, { createdAt: "2026-11-06T09:59:00.000Z" },
+  ]) assert.equal(successfulHandoffFailure({ reviews: [{ ...review, ...patch }] }, run, task), "review_outcome_missing");
+  for (const patch of [{ candidateCycle: 0 }, { reviewSubjectSha: "" }, { reviewStageKey: "" }, { reviewStageStatus: "" }, { startedAt: "" }]) {
+    assert.equal(successfulHandoffFailure({ reviews: [review] }, { ...run, ...patch }, task), "review_outcome_missing");
+  }
 });

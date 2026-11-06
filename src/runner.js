@@ -1860,8 +1860,19 @@ function restoreTaskStatusForRun(run, task) {
 
 function reviewerRecordedOutcome(state, run) {
   const startedAt = Date.parse(run.startedAt || "");
+  const candidateCycle = Number(run.candidateCycle);
+  const subjectSha = run.reviewSubjectSha;
+  if (!Number.isFinite(startedAt) || !Number.isSafeInteger(candidateCycle) || candidateCycle < 1
+    || typeof subjectSha !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(subjectSha)
+    || typeof run.reviewStageKey !== "string" || !run.reviewStageKey
+    || typeof run.reviewStageStatus !== "string" || !run.reviewStageStatus) return false;
   return (state.reviews || []).some((review) => {
-    if (review.taskId !== run.taskId || review.role !== run.role) return false;
+    if (review.taskId !== run.taskId || review.role !== run.role
+      || Number(review.candidateCycle) !== candidateCycle
+      || review.subjectSha !== subjectSha
+      || review.stageKey !== run.reviewStageKey
+      || review.status !== run.reviewStageStatus
+      || !["approved", "changes_requested", "skipped"].includes(review.outcome)) return false;
     const createdAt = Date.parse(review.createdAt || "");
     return !Number.isFinite(startedAt) || (Number.isFinite(createdAt) && createdAt >= startedAt - 1_000);
   });

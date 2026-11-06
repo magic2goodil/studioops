@@ -4375,7 +4375,7 @@ export function recordReviewInState(state, taskId, input = {}) {
     if (
       earliestRequiredStage
       && stageIndex > earliestRequiredIndex
-      && !cycleLimitLeadReviewApplies(state, project, task, stage)
+      && !cycleLimitLeadReviewApplies(state, project, task, stage, { recording: true })
     ) {
       throw new Error(
         `${earliestRequiredStage.label || earliestRequiredStage.key} must approve candidate cycle ${candidateCycle} at ${subjectSha} before ${stage.label || stage.key} can continue.`,
@@ -5503,21 +5503,33 @@ export function earliestIncompleteRequiredReviewStage(state, project, task) {
     }) || null;
 }
 
-export function cycleLimitLeadReviewApplies(state, project, task, targetStage) {
+export function cycleLimitLeadReviewApplies(state, project, task, targetStage, options = {}) {
   const policy = reviewPolicyForProject(project);
   const stages = reviewStagesForTask(project, task);
   const leadStage = stages.find(isLeadReviewStage) || stages[stages.length - 1] || null;
-  if (
-    !policy.leadOwnsFinalDecisionAtLimit
-    || !leadStage
-    || !targetStage
+  if (!policy.leadOwnsFinalDecisionAtLimit || !leadStage || !targetStage
     || targetStage.key !== leadStage.key
     || currentReviewCycle(task) < policy.maxBuilderReviewCycles
-  ) {
-    return false;
-  }
-  return stages
-    .filter((stage) => stage.key !== leadStage.key)
+    || (options.recording && (task.status !== leadStage.status || task.assignedAgentRole !== leadStage.role))) return false;
+  return stages.slice(0, stages.indexOf(leadStage))
+    .filter((stage) => stage.required !== false)
+    .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested");
+}
+
+// Owner triage is not QA approval. Its exact final decision must survive a
+// supervisor sweep without minting a replacement specialist or paid builder.
+export function cycleLimitOwnerReviewApplies(state, project, task) {
+  const policy = reviewPolicyForProject(project);
+  if (task.status !== "user_review" || task.assignedAgentRole !== "owner"
+    || !policy.leadOwnsFinalDecisionAtLimit
+    || currentReviewCycle(task) < policy.maxBuilderReviewCycles) return false;
+  const stages = reviewStagesForTask(project, task);
+  const lead = stages.find(isLeadReviewStage) || stages[stages.length - 1];
+  if (!lead) return false;
+  const finalReview = latestCurrentReviewForStage(state, task, lead);
+  if (finalReview?.outcome === "changes_requested") return true;
+  return finalReview?.outcome === "approved" && stages.slice(0, stages.indexOf(lead))
+    .filter((stage) => stage.required !== false)
     .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested");
 }
 
@@ -5753,11 +5765,21 @@ function restartReviewsForSubjectChange(state, task, project, previousSha, subje
 
 function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLabel = "ready for owner review", transitionOptions = {}) {
   if (task.status !== "user_review" || task.assignedAgentRole !== "owner") {
-    setTaskWorkflowState(state, task, {
-      status: "user_review",
-      assignedAgentRole: "owner",
-      reviewerThreadId: "",
-    }, now, transitionOptions);
+    if (transitionOptions.action === "escalate_cycle_limit_owner_review") {
+      // Validate the exact final lead and its current assignment before the
+      // destination owner assignment is applied, in this same transaction.
+      applyStoreLifecycleTransition(state, task, "user_review", {
+        ...transitionOptions, now,
+        evidence: { ...(transitionOptions.evidence || {}), targetStatus: "user_review" },
+      });
+      Object.assign(task, { assignedAgentRole: "owner", reviewerThreadId: "", updatedAt: now });
+    } else {
+      setTaskWorkflowState(state, task, {
+        status: "user_review",
+        assignedAgentRole: "owner",
+        reviewerThreadId: "",
+      }, now, transitionOptions);
+    }
   }
   addAutomationComment(state, task, body, now, author);
   state.events.push({
@@ -5831,7 +5853,7 @@ function routeChangesRequestedInState(state, task, project, stage, now, author, 
 
   if (policy.leadOwnsFinalDecisionAtLimit && reviewCycleAtLimit(project, task)) {
     const leadStage = leadReviewStageForProject(project, task);
-    if (leadStage && !isLeadReviewStage(stage)) {
+    if (leadStage && !isLeadReviewStage(stage) && stage.required !== false) {
       setTaskWorkflowState(state, task, {
         status: leadStage.status,
         assignedAgentRole: leadStage.role,
@@ -6010,18 +6032,17 @@ function routeToNextReviewStage(state, task, stages, now, author, actions) {
   }
   if (
     project
+    && reviewPolicyForProject(project).leadOwnsFinalDecisionAtLimit
     && reviewCycleAtLimit(project, task)
-    && changeRequestedReviewsForCycle(state, task).length
     && leadReviewCompleteForCycle(state, task, project)
+    && stages.filter((stage) => stage.required !== false && !isLeadReviewStage(stage))
+      .some((stage) => latestCurrentReviewForStage(state, task, stage)?.outcome === "changes_requested")
   ) {
-    return moveTaskAfterReviewsComplete(
-      state,
-      task,
-      project,
-      now,
-      author,
-      "Lead review finalized this task after the configured review-cycle limit. Residual risk should be captured in review comments.",
-      actions,
+    return moveTaskToOwnerReview(
+      state, task, now, author,
+      "Lead finalized the cycle-limit decision while required specialist changes remain unresolved. Owner triage is required; no QA or release approval was granted.",
+      actions, "lead requested owner triage for unresolved required review evidence",
+      { action: "escalate_cycle_limit_owner_review" },
     );
   }
 

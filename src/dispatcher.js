@@ -1,6 +1,7 @@
 import {
   architectureIsCompleteInState,
   cycleLimitLeadReviewApplies,
+  cycleLimitOwnerReviewApplies,
   currentReviewCandidateCycle,
   diskPressureIncidentIsActive,
   earliestIncompleteRequiredReviewStage,
@@ -796,6 +797,7 @@ function reviewDispatchSafetyReason(state, task, action) {
   if (!project) return "missing_project";
   const earliestRequiredStage = earliestIncompleteRequiredReviewStage(state, project, task);
   if (REVIEW_HANDOFF_ACTIONS.has(action.type)) {
+    if (action.type === "notify_owner" && cycleLimitOwnerReviewApplies(state, project, task)) return "";
     return earliestRequiredStage
       ? `earlier_review_incomplete:${earliestRequiredStage.key}`
       : "";
@@ -940,6 +942,10 @@ function makeRun(state, task, action, options, now, assessment = {}) {
     : requestedThreadId;
   const profile = laneProfile(task, action);
   const project = findProject(state, task.projectId) || {};
+  const reviewStage = group === "reviewer"
+    ? resolveReviewTargetStage(reviewStagesForTask(project, task), task, action).stage
+    : null;
+  if (group === "reviewer" && !reviewStage) throw new Error("Reviewer dispatch requires an exact configured stage.");
   const impactPlan = resolveProjectImpactPlan({
     project,
     task,
@@ -1008,6 +1014,10 @@ function makeRun(state, task, action, options, now, assessment = {}) {
       recordedAt: now,
     },
     reviewerIdentity: action.reviewerIdentity || "",
+    ...(reviewStage ? {
+      reviewStageKey: reviewStage.key,
+      reviewStageStatus: reviewStage.status,
+    } : {}),
     creditAdmission: creditAdmission.fallbackUsed ? sanitizedCreditAdmission(creditAdmission) : {
       code: creditAdmission.code,
       tier: creditAdmission.tier,
