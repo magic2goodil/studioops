@@ -51,7 +51,7 @@ import {
   ensureStateDatabase,
   mutateCandidateQaDecisionState,
   mutateDatabaseState,
-  mutateOperatorCandidateState,
+  commitOperatorCandidateAdoption,
   mutateScopeDispatchState as mutateScopeDispatchDatabaseState,
   mutateHostedRcAggregate,
   readHostedRcAggregate,
@@ -2598,12 +2598,19 @@ export async function adoptOperatorCandidate(taskId, input, authority = {}, opti
         candidate: request.candidate, mapDigest: candidate.manifestDigest, scopeDigest, reviewedFiles: candidate.changedFiles,
         unresolvedDependencies: incomplete.map((item) => item.id), held: incomplete.length > 0 || Boolean(task.automationBlocker), status: "builder_review" } };
   };
-  const initial = await prepare(await readStateReadOnly());
-  if (options.preview === true) return initial.preview;
-  if (initial.replay) return { ...initial.preview, replay: true };
-  const principal = await authority.confirm(Object.freeze(structuredClone(initial.preview)));
-  if (typeof principal !== "string" || !principal || principal.length > 160 || /[\x00-\x1f\x7f]/.test(principal)) adoptionError("adoption_owner_confirmation_invalid");
-  return mutateOperatorCandidateState(prepare, async (state, verified) => {
+  if (options.preview === true) return (await prepare(await readStateReadOnly())).preview;
+  let principal;
+  return commitOperatorCandidateAdoption(taskId, async (state) => {
+    const confirmed = await prepare(state);
+    if (confirmed.replay) return confirmed;
+    principal = await authority.confirm(Object.freeze(structuredClone(confirmed.preview)));
+    if (typeof principal !== "string" || !principal || principal.length > 160 || /[\x00-\x1f\x7f]/.test(principal)) adoptionError("adoption_owner_confirmation_invalid");
+    // Recheck real Git refs, metadata and receipt bytes after the owner's wait,
+    // without holding SQLite. Relevant native rows are compared at SQL commit.
+    const verified = await prepare(state);
+    if (!isDeepStrictEqual(confirmed, verified)) adoptionError("adoption_confirmation_stale");
+    return verified;
+  }, async (state, verified) => {
     const task = findTask(state, taskId);
     if (verified.replay) return { ...verified.preview, replay: true };
     const now = new Date().toISOString();
@@ -2643,7 +2650,7 @@ export async function adoptOperatorCandidate(taskId, input, authority = {}, opti
       message: "Verified operator source entered normal candidate review intake.", createdAt: now,
       requestDigest, principal, candidate: verified.candidate, scopeDigest: verified.scopeDigest, held: verified.preview.held });
     return verified.preview;
-  }, { operationName: "task.adopt_operator_candidate", idempotent: true });
+  });
 }
 
 export async function updateTask(taskId, patch) {
