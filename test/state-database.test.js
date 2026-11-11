@@ -4014,3 +4014,33 @@ test("hosted RC persistence fences writes, preserves legacy history, survives re
     assert.match(restarted.stdout, /restart-and-revocation-passed/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("stale linked PR remediation persists append-only review invalidation", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-stale-pr-persist-"));
+  try {
+    const state = baseState();
+    Object.assign(state.tasks[0], { status: "in_progress", branchName: "codex/old", prUrl: "https://github.com/example/demo/pull/1",
+      reviewSubjectSha: "a".repeat(40), reviewSubjectCycle: 1, reviewCycle: 1 });
+    state.runs = [{ id: "run_1", projectId: "project_1", taskId: "task_1", status: "running", branchName: "codex/old", prUrl: state.tasks[0].prUrl }];
+    const review = { id: "review_1", taskId: "task_1", projectId: "project_1", outcome: "approved", author: "Independent reviewer",
+      subjectSha: "a".repeat(40), cycle: 1, createdAt: "2026-08-17T00:00:00.000Z" };
+    state.reviews = [review];
+    await writeLegacyState(root, state);
+    const runnerUrl = pathToFileURL(path.join(process.cwd(), "src/runner.js")).href;
+    await runStoreScript(root, `
+      import { mutateState } from ${JSON.stringify(storeModuleUrl)};
+      import { remediateStaleLinkedPrInState } from ${JSON.stringify(runnerUrl)};
+      await mutateState(state => remediateStaleLinkedPrInState(state, structuredClone(state.runs[0]), {
+        expectedPrUrl: "https://github.com/example/demo/pull/1", expectedBranch: "codex/old", newBranch: "codex/old-r1",
+        baseSha: "b".repeat(40), defaultBranch: "main", branchGeneration: 1, prState: "merged", observationSource: "local_git",
+        now: "2026-08-18T00:00:00.000Z"
+      }), { operationName: "runner.remediate_stale_pull_request" });
+    `);
+    const persisted = readPersistedState(root);
+    assert.equal(persisted.tasks[0].branchName, "codex/old-r1");
+    assert.equal(persisted.tasks[0].prUrl, "");
+    const actual = persisted.reviews.find(item => item.id === review.id);
+    assert.deepEqual(actual, { ...review, invalidatedAt: "2026-08-18T00:00:00.000Z",
+      invalidation: { action: "stale_pull_request_remediation", reasonCode: "stale_pull_request", invalidatedAt: "2026-08-18T00:00:00.000Z" } });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

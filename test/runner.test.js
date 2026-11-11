@@ -908,15 +908,15 @@ test("stale linked PR remediation atomically clears exact candidate and reviewer
       reviewCycle: 2,
       reviewSubjectCycle: 2,
       reviewSubjectSha: "a".repeat(40),
-      candidateId: "candidate_old",
-      qaBundleId: "bundle_old",
+      candidateId: "",
+      qaBundleId: "",
       reviewerThreadId: "thread_old",
       reviewerThreadIds: { backend: "thread_backend" },
       candidateIdentity: { commitSha: "a".repeat(40), branch: run.branchName, candidateCycle: 2 },
     }],
     runs: [run],
     reviews: [{ id: "review_old", taskId: run.taskId, subjectSha: "a".repeat(40), outcome: "changes_requested" }],
-    candidates: [{ id: "candidate_old", status: "qa_pending" }],
+    candidates: [],
     events: [],
   };
 
@@ -940,8 +940,7 @@ test("stale linked PR remediation atomically clears exact candidate and reviewer
   assert.deepEqual(state.tasks[0].reviewerThreadIds, {});
   assert.equal(state.tasks[0].remediationHandoff.status, "open");
   assert.equal(state.runs[0].preflightBaseCommit, "b".repeat(40));
-  assert.equal(state.reviews[0].invalidationReason, "stale_pull_request");
-  assert.equal(state.candidates[0].status, "invalidated");
+  assert.equal(state.reviews[0].invalidation.reasonCode, "stale_pull_request");
   assert.equal(state.events[0].type, "stale_pull_request_remediated");
 });
 
@@ -2164,4 +2163,25 @@ test("review handoff requires the admitted stage, cycle and SHA even after the t
   for (const patch of [{ candidateCycle: 0 }, { reviewSubjectSha: "" }, { reviewStageKey: "" }, { reviewStageStatus: "" }, { startedAt: "" }]) {
     assert.equal(successfulHandoffFailure({ reviews: [review] }, { ...run, ...patch }, task), "review_outcome_missing");
   }
+});
+
+test("stale PR recovery preserves unsettled candidate authority without mutation", () => {
+  for (const binding of [ { candidateId: "candidate_old" }, { qaBundleId: "bundle_old" }, { qaDecision: { outcome: "approved" } }, {} ]) {
+    const run = builderRun({ status: "running" });
+    const state = { tasks: [{ id: run.taskId, branchName: run.branchName, prUrl: run.prUrl, ...binding }],
+      runs: [run], reviews: [], events: [], candidates: Object.keys(binding).length ? [] : [
+        { id: "candidate_old", status: "qa_passed", manifest: { sources: [{ taskId: run.taskId }] } }
+      ] };
+    const before = structuredClone(state);
+    assert.throws(() => remediateStaleLinkedPrInState(state, run, {
+      expectedPrUrl: run.prUrl, expectedBranch: run.branchName, newBranch: "codex/demo-r1", baseSha: "b".repeat(40), defaultBranch: "main",
+    }), /candidate authority reconciliation/);
+    assert.deepEqual(state, before);
+  }
+});
+
+test("local stale PR authority failures are not classified as provider outages", () => {
+  assert.equal(classifyRunFailureReason({}, "sdk_error", "Review review_1 history is immutable."), "execution_failed");
+  assert.equal(classifyRunFailureReason({}, "sdk_error", "Stale-PR remediation requires candidate authority reconciliation before branch recovery."), "execution_failed");
+  assert.equal(classifyRunFailureReason({}, "sdk_error", "Connection temporarily unavailable"), "provider_unavailable");
 });
