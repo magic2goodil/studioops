@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { readFile, mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFile, execFileSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { loadProjectComponentImpactMapAtCommit, sha256Digest } from "../src/component-impact-map.js";
 import { normalizeOperatorAdoptionRequest, verifyAdoptionCandidate } from "../src/impact-planner.js";
+import { createCandidateEnvelope } from "../src/candidate-manifest.js";
 import test from "node:test";
 import {
   createRemediationHandoff,
@@ -16,6 +19,8 @@ import {
 } from "../src/remediation-handoff.js";
 import {
   addProject,
+  addComment,
+  completeArchitecture,
   addTask,
   adoptOperatorCandidate,
   applyFailureIncidentCompatibilityReadModelInState,
@@ -32,6 +37,9 @@ import {
   updateProject,
 } from "../src/store.js";
 import {
+  DATABASE_FILE,
+  reconcileStateIntegrity,
+  withStateDatabaseConnection,
   claimFailureContainmentPaidAttempt,
   openFailureContainmentCircuit,
   readFailureIncidents,
@@ -282,6 +290,298 @@ async function operatorFixture(t) {
   const authority = { assertNoConflicts: () => {}, confirm: async () => "local-os:fixture" };
   return { root, git, project, task, request, authority };
 }
+
+test("real public adoption keeps Git off-lock and commits after more than four unrelated process writes", async (t) => {
+  const f = await operatorFixture(t);
+  const other = await addTask({ projectId: f.project.id, title: "Independent metadata record", type: "bug", status: "blocked", architectureRequired: false, workAreas: ["test/catalog.test.js"] });
+  await mutateState(state => state.events.push({ id: "event_0x10000", type: "unrelated_gap", message: "Current active ID gap", createdAt: new Date().toISOString() }));
+  let enter, resume;
+  const entered = new Promise(resolve => { enter = resolve; });
+  const paused = new Promise(resolve => { resume = resolve; });
+  let confirmations = 0, verifications = 0, gitReads = 0, versionBeforeCommit;
+  const actualGit = childProcess.execFileSync;
+  childProcess.execFileSync = (binary, args, options) => {
+    if (binary === "/usr/bin/git" && args.includes(f.root)) {
+      const db = new DatabaseSync(DATABASE_FILE); db.exec("PRAGMA busy_timeout = 1");
+      try { db.exec("BEGIN IMMEDIATE"); db.exec("ROLLBACK"); gitReads++; }
+      finally { db.close(); }
+    }
+    return actualGit(binary, args, options);
+  };
+  syncBuiltinESMExports();
+  let result;
+  try {
+    const pending = adoptOperatorCandidate(f.task.id, f.request, { ...f.authority,
+      assertNoConflicts: async () => { if (++verifications === 1) { enter(); await paused; } },
+      confirm: async () => { confirmations++; return "local-os:fixture"; } });
+    await entered;
+    const writer = `
+      import { addComment, mutateState, updateTask } from ${JSON.stringify(new URL("../src/store.js", import.meta.url).href)};
+      for (let index=0; index<6; index++) {
+        await addComment(${JSON.stringify(other.id)}, "Concurrent unrelated comment " + index, "Fixture writer");
+        await mutateState(state => { state.meta.adoptionCounter = (state.meta.adoptionCounter || 0) + 1; });
+      }
+      await updateTask(${JSON.stringify(other.id)}, { prUrl: "https://example.invalid/pull/1" });
+    `;
+    try {
+      await Promise.race([new Promise((resolve, reject) => execFile(process.execPath, ["--input-type=module", "-e", writer], { env: process.env }, (error) => error ? reject(error) : resolve())),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Off-lock adoption blocked unrelated writer")), 5000))]);
+      const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+      try { versionBeforeCommit = db.prepare("SELECT version FROM state_meta").get().version; } finally { db.close(); }
+    } finally { resume(); }
+    result = await pending;
+  } finally { childProcess.execFileSync = actualGit; syncBuiltinESMExports(); }
+  const state = await readStateReadOnly(), task = state.tasks.find(item => item.id === f.task.id);
+  assert.equal(confirmations, 1); assert.equal(verifications, 2); assert.ok(gitReads > 0);
+  assert.equal(state.meta.adoptionCounter, 6); assert.equal(state.comments.filter(item => item.taskId === other.id).length, 6);
+  assert.equal(state.tasks.find(item => item.id === other.id).prUrl, "https://example.invalid/pull/1");
+  assert.equal(task.status, "builder_review"); assert.equal(task.reviewCycle, 1); assert.equal(result.held, false);
+  const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+  try { assert.equal(db.prepare("SELECT version FROM state_meta").get().version, versionBeforeCommit + 1); } finally { db.close(); }
+  const adoptionEvents = state.events.filter(item => item.taskId === task.id && ["operator_candidate_adopted", "lifecycle_transition"].includes(item.type));
+  assert.equal(adoptionEvents.length, 2); assert.equal(new Set(state.events.map(item => item.id)).size, state.events.length);
+  assert.ok(adoptionEvents.every(item => Number(item.id.split("_")[1]) > 0x10000 + 6));
+});
+
+test("real public adoption bounds its complete writer at retained payload scale", async (t) => {
+  const f = await operatorFixture(t);
+  const padded = (value, bytes, label) => ({ ...value, neutralMetadata: label.repeat(Math.max(0, bytes - Buffer.byteLength(JSON.stringify(value)))) });
+  const seeded = {}, sizes = {}, currentTaskId = f.task.id;
+  let writer, originalPrepare, originalExec, recording = false, beganAt, writerMs = 0, returnedPayloadBytes = 0;
+  const statements = [];
+  await withStateDatabaseConnection((db) => {
+    writer = db;
+    const seed = (table, prefix, count, bytes, make) => {
+      const used = db.prepare(`SELECT id FROM ${table}`).all().map(row => Number(row.id.split("_")[1])).filter(Number.isFinite);
+      const base = Math.max(1000000, ...used) + 1, rows = [];
+      const columns = Object.keys(db.prepare(`PRAGMA table_info(${table})`).all().reduce((all, row) => ({ ...all, [row.name]: true }), {}));
+      const insert = db.prepare(`INSERT INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
+      for (let index = 0; index < count; index++) {
+        const id = `${prefix}_${base + index}`, value = padded(make(id, index), bytes, "x"), payload = JSON.stringify(value);
+        const row = { id, sequence: base + index, project_id: value.projectId || "", task_id: value.taskId || "", key: value.key || "",
+          status: value.status || "", state_version: value.stateVersion || 1, assigned_role: value.assignedRole || "",
+          role: value.role || "", outcome: value.outcome || "", type: value.type || "", manifest_digest: value.manifestDigest || "",
+          integration_commit: value.integrationCommit || "", created_at: value.createdAt || "", updated_at: value.updatedAt || "", payload };
+        insert.run(...columns.map(column => row[column])); rows.push(id);
+        sizes[table] = (sizes[table] || 0) + Buffer.byteLength(payload);
+      }
+      seeded[table] = rows; return rows;
+    };
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const projectIds = seed("projects", "project", 15, 2400, (id, i) => ({ id, key: `neutral-${i}`, repoPath: `/nonexistent/neutral-${i}`, repoUrl: `https://example.invalid/neutral-${i}` }));
+      const taskIds = seed("tasks", "task", 1159, 9000, (id, i) => ({ ...f.task, id, projectId: projectIds[i % projectIds.length],
+        title: "Independent retained task", status: "blocked", stateVersion: 1, dependsOnTaskIds: [], parentTaskId: "", architectureParentTaskId: "",
+        architectureDecisionTaskIds: [], candidateId: "", qaBundleId: "", workAreas: ["test/catalog.test.js"] }));
+      seed("runs", "run", 2502, 14500, id => ({ id, projectId: projectIds[0], taskId: taskIds[0], role: "builder", group: "builder", status: "completed" }));
+      const candidateIds = seed("candidates", "candidate", 107, 20400, id => ({
+        ...createCandidateEnvelope({ candidateId: id, projectId: projectIds[0],
+          base: { branch: "main", sha: f.request.candidate.baseSha },
+          sources: [{ taskId: taskIds[0], sourceRef: "refs/heads/feature/operator", headSha: f.request.candidate.commitSha, candidateCycle: 1,
+            reviews: [{ id: `review_${id}`, stageKey: "lead", role: "lead-reviewer", outcome: "approved", subjectSha: f.request.candidate.commitSha,
+              candidateCycle: 1, reviewedAt: "2026-01-01T00:00:00.000Z" }] }],
+          assembly: { mode: "atomic", requestedTaskIds: [taskIds[0]], includedTaskIds: [taskIds[0]], excludedTaskIds: [] },
+          integration: { branch: "qa/neutral", sha: f.request.candidate.commitSha },
+          checks: [{ id: `check_${id}`, kind: "local-validation", name: "Neutral retained fixture", outcome: "passed", subjectSha: f.request.candidate.commitSha, evidenceDigest: sha256Digest(id) }],
+          preview: { url: "http://127.0.0.1:4174/", status: "healthy", commitSha: f.request.candidate.commitSha,
+            verifiedAt: "2026-01-01T00:00:00.000Z", attestation: { kind: "header", key: "x-studioops-commit", observedSha: f.request.candidate.commitSha } } }),
+        status: "invalidated", invalidation: { reason: "Neutral retained fixture", observedAt: "2026-01-01T00:00:00.000Z", expected: "", observed: "" },
+      }));
+      seed("qa_bundles", "qa_bundle", 115, 21000, id => ({ id, projectId: projectIds[0], status: "invalidated", candidateId: candidateIds[0], integrationCommit: "", tasks: [{ id: taskIds[0] }] }));
+      seed("reviews", "review", 2546, 1200, id => ({ id, taskId: taskIds[0], projectId: projectIds[0], role: "backend-reviewer", outcome: "changes_requested" }));
+      seed("events", "event", 29549, 320, id => ({ id, taskId: taskIds[0], projectId: projectIds[0], type: "neutral_metadata", machineGenerated: true }));
+      // Use the real owner normalization for retained inactive records, rather
+      // than inventing a candidate/bundle schema or bypassing its later guards.
+      const fixtureState = { meta: {}, notificationOutbox: [] };
+      for (const [key, table] of Object.entries({ projects: "projects", tasks: "tasks", candidates: "candidates", qaBundles: "qa_bundles" })) {
+        fixtureState[key] = db.prepare(`SELECT payload FROM ${table}`).all().map(row => JSON.parse(row.payload));
+      }
+      reconcileStateIntegrity(fixtureState);
+      for (const [key, table] of Object.entries({ tasks: "tasks", candidates: "candidates", qaBundles: "qa_bundles" })) {
+        const ids = new Set(seeded[table]), update = db.prepare(`UPDATE ${table} SET payload = ?, status = ? WHERE id = ?`);
+        for (const row of fixtureState[key]) if (ids.has(row.id)) update.run(JSON.stringify(row), row.status, row.id);
+      }
+      const insert = db.prepare("INSERT INTO events (id,sequence,project_id,task_id,type,created_at,payload) VALUES (?,?,?,?,?,?,?)");
+      for (let index = 0; index < 55; index++) {
+        const id = `event_${2000000 + index}`, event = { id, taskId: currentTaskId, projectId: f.project.id,
+          type: "lifecycle_transition", machineGenerated: true, createdAt: "2026-01-01T00:00:00.000Z", message: "Retained transition metadata" };
+        insert.run(id, 2000000 + index, f.project.id, currentTaskId, event.type, event.createdAt, JSON.stringify(event));
+      }
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    originalPrepare = db.prepare; originalExec = db.exec;
+    db.exec = function(sql) {
+      if (sql === "BEGIN IMMEDIATE") { recording = true; beganAt = performance.now(); }
+      try { return originalExec.call(this, sql); }
+      finally { if (["COMMIT", "ROLLBACK"].includes(sql) && recording) { writerMs = performance.now() - beganAt; recording = false; } }
+    };
+    db.prepare = function(sql) {
+      const statement = originalPrepare.call(this, sql);
+      if (!recording) return statement;
+      statements.push(sql);
+      const observe = row => { if (typeof row?.payload === "string") returnedPayloadBytes += Buffer.byteLength(row.payload); return row; };
+      return new Proxy(statement, { get(target, key) {
+        if (key === "all") return (...args) => target.all(...args).map(observe);
+        if (key === "get") return (...args) => observe(target.get(...args));
+        if (key === "iterate") return function*(...args) { for (const row of target.iterate(...args)) yield observe(row); };
+        const value = target[key]; return typeof value === "function" ? value.bind(target) : value;
+      } });
+    };
+  });
+  t.after(async () => {
+    if (writer && originalPrepare) { writer.prepare = originalPrepare; writer.exec = originalExec; }
+    await withStateDatabaseConnection(db => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const [table, ids] of Object.entries(seeded)) {
+          const remove = db.prepare(`DELETE FROM ${table} WHERE id = ?`); for (const id of ids) remove.run(id);
+        }
+        const removeArchive = db.prepare("DELETE FROM operational_archive WHERE entity_type = 'events' AND entity_id = ?");
+        for (const id of seeded.events || []) removeArchive.run(id);
+        db.exec("COMMIT");
+      } catch (error) { db.exec("ROLLBACK"); throw error; }
+    });
+  });
+  let result;
+  try { result = await adoptOperatorCandidate(f.task.id, f.request, f.authority); }
+  finally { writer.prepare = originalPrepare; writer.exec = originalExec; }
+  assert.equal(result.status, "builder_review");
+  const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+  try {
+    const task = JSON.parse(db.prepare("SELECT payload FROM tasks WHERE id = ?").get(f.task.id).payload);
+    assert.equal(task.status, "builder_review"); assert.equal(task.reviewCycle, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND type = 'operator_candidate_adopted'").get(f.task.id).n, 1);
+    assert.ok(db.prepare("SELECT COUNT(*) AS n FROM operational_archive WHERE task_id = ? AND entity_type = 'events'").get(f.task.id).n > 0, "actual retained transition group was archived");
+    const event = db.prepare("SELECT id FROM events WHERE task_id = ? AND type = 'operator_candidate_adopted'").get(f.task.id);
+    assert.ok(Number(event.id.split("_")[1]) > 2000054, "events use the actual current active namespace");
+  } finally { db.close(); }
+  assert.ok(sizes.tasks > 10000000 && sizes.runs > 36000000 && sizes.candidates > 2000000 && sizes.qa_bundles > 2300000);
+  assert.ok(writerMs > 0 && writerMs < 1000, `complete writer took ${writerMs.toFixed(1)}ms`);
+  assert.ok(returnedPayloadBytes < 1000000, "unrelated large payload bodies stay outside the lock-held current read set");
+  assert.ok(!statements.some(sql => /SUM\(length\(CAST\(payload AS BLOB\)/.test(sql)), "no duplicate whole-payload byte scan");
+  assert.ok(!statements.some(sql => /SELECT \*.*FROM (?:candidates|qa_bundles) LIMIT/.test(sql)), "proof bodies use current related selectors");
+  t.diagnostic(JSON.stringify({ seededPayloadBytes: sizes, lockHeldMs: writerMs, lockHeldReturnedPayloadBytes: returnedPayloadBytes, queries: statements.length }));
+});
+
+test("projected adoption directories retain typed absence and new graph-child semantics", async (t) => {
+  for (const variant of ["missing-to-null", "array-to-string", "repository-false", "existing-child"]) await t.test(variant, async () => {
+    const f = await operatorFixture(t);
+    const project = await addProject({ key: `neutral-${variant}-${f.task.id}`, name: "Independent directory fixture", workflowMode: "local" });
+    const other = await addTask({ projectId: project.id, title: "Independent directory member", status: "blocked", type: "bug", architectureRequired: false, workAreas: ["test/catalog.test.js"] });
+    const change = (table, id, mutate) => withStateDatabaseConnection(db => {
+      const row = JSON.parse(db.prepare(`SELECT payload FROM ${table} WHERE id = ?`).get(id).payload);
+      mutate(row); db.prepare(`UPDATE ${table} SET payload = ? WHERE id = ?`).run(JSON.stringify(row), id);
+    });
+    if (variant === "missing-to-null") await change("tasks", other.id, row => { delete row.description; });
+    if (variant === "repository-false") await change("projects", project.id, row => { delete row.remoteUrl; });
+    await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => {
+      if (variant === "missing-to-null") await change("tasks", other.id, row => { row.description = null; });
+      if (variant === "array-to-string") await change("tasks", other.id, row => { row.workAreas = "test/catalog.test.js"; });
+      if (variant === "repository-false") await change("projects", project.id, row => { row.remoteUrl = false; });
+      if (variant === "existing-child") await change("tasks", other.id, row => { row.architectureParentTaskId = f.task.id; });
+      return "local-os:fixture";
+    } }), /adoption_preimage_stale/);
+    const task = (await readStateReadOnly()).tasks.find(row => row.id === f.task.id);
+    assert.equal(task.operatorIntake, undefined); assert.equal(task.status, "blocked"); assert.equal(task.stateVersion, f.request.expectedStateVersion);
+  });
+});
+
+test("adoption rejects changed relevant footprints and new conflict-directory membership atomically", async (t) => {
+  for (const scenario of ["project_policy", "scope", "new_task", "new_queue", "failed_material", "material_history", "repository_alias", "dependency"]) {
+    await t.test(scenario, async (t) => {
+      const f = await operatorFixture(t);
+      const peer = await addTask({ projectId: f.project.id, title: "Existing separate owner", type: "bug", status: "blocked", architectureRequired: false, workAreas: ["test/catalog.test.js"] });
+      if (scenario === "dependency") { await updateTask(f.task.id, { dependsOnTaskIds: [peer.id] });
+        f.request.expectedStateVersion = (await readStateReadOnly()).tasks.find(item => item.id === f.task.id).stateVersion; }
+      let changed;
+      await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => {
+        if (scenario === "project_policy") await updateProject(f.project.id, { standards: ["changed-review-standard"] });
+        if (scenario === "scope") await updateTask(peer.id, { workAreas: ["src/catalog.js"] });
+        if (scenario === "new_task") await addTask({ projectId: f.project.id, title: "New overlapping task", type: "bug", status: "blocked", architectureRequired: false, workAreas: ["src/catalog.js"] });
+        if (scenario === "new_queue") await mutateState(state => state.runs.push({ id: `run_concurrent_${peer.id}`, projectId: f.project.id, taskId: peer.id, role: "builder", status: "queued" }));
+        if (scenario === "failed_material") await mutateState(state => state.runs.push({ id: `run_failed_${f.task.id}`, projectId: f.project.id, taskId: f.task.id, role: "builder", status: "failed", candidateIdentity: f.request.candidate }));
+        if (scenario === "material_history") await mutateState(state => state.events.push({ id: `event_other_${f.task.id}`, projectId: f.project.id, taskId: f.task.id, type: "operator_candidate_adopted", candidate: f.request.candidate }));
+        if (scenario === "repository_alias") await updateProject(f.project.id, { sourceRepoPath: path.join(f.root, "changed-root") });
+        if (scenario === "dependency") await updateTask(peer.id, { assignedThreadId: "new-dependency-owner" });
+        changed = await readStateReadOnly(); return "local-os:fixture";
+      } }), /adoption_(?:preimage|task|prerequisite)_stale|operator_candidate_active_run/);
+      const after = await readStateReadOnly();
+      assert.deepEqual(after.tasks, changed.tasks); assert.deepEqual(after.events, changed.events); assert.deepEqual(after.runs, changed.runs);
+      assert.equal(after.tasks.find(item => item.id === f.task.id).operatorIntake, undefined);
+    });
+  }
+});
+
+test("adoption reads the real inherited architecture graph before confirmation", async (t) => {
+  const f = await operatorFixture(t);
+  const parent = await addTask({ projectId: f.project.id, title: "Architecture gate", type: "architecture", status: "architecture_pending", architectureRequired: true });
+  const contract = { architectureRequired: true, architectureApproved: true, architectureParentTaskId: parent.id,
+    parentTaskId: parent.id, lane: "backend", userStory: "As a fixture owner I need a bounded implementation.",
+    expectedOutcome: "A reviewable exact source candidate.", acceptanceCriteria: ["Canonical scope is retained."], description: "Existing architecture constraints.", workAreas: ["src/catalog.js"] };
+  await updateTask(f.task.id, { ...contract, status: "architecture_pending" });
+  const sibling = await addTask({ ...contract, projectId: f.project.id, title: "Related graph child", type: "bug", status: "idea", architectureApproved: true });
+  await completeArchitecture(parent.id, { taskIds: [f.task.id, sibling.id], summary: "Keep one canonical catalog owner and immutable review coordinates. Each child preserves existing scope and completes its registered focused and full regression before release." });
+  f.request.expectedStateVersion = (await readStateReadOnly()).tasks.find(item => item.id === f.task.id).stateVersion;
+  let changed;
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => {
+    await updateTask(sibling.id, { acceptanceCriteria: [] }); changed = await readStateReadOnly(); return "local-os:fixture";
+  } }), /adoption_preimage_stale/);
+  const after = await readStateReadOnly(); assert.deepEqual(after.tasks, changed.tasks); assert.deepEqual(after.events, changed.events);
+});
+
+test("public adoption keeps its authoritative late coordination fence", async (t) => {
+  const f = await operatorFixture(t);
+  const { claimResourceLease } = await import("../src/coordination.js");
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => {
+    const result = await claimResourceLease({ resourceKey: `adoption:${f.task.id}`, aggregateType: "task", aggregateId: f.task.id,
+      ownerProcessIdentity: "fixture:competing-owner", expectedStateVersion: f.request.expectedStateVersion, leaseTtlMs: 10000 });
+    assert.equal(result.acquired, true); return "local-os:fixture";
+  } }), /operator_candidate_coordination_lease_active/);
+  assert.equal((await readStateReadOnly()).tasks.find(item => item.id === f.task.id).operatorIntake, undefined);
+});
+
+test("new related proof membership without a task version change invalidates adoption", async (t) => {
+  for (const kind of ["review", "candidate", "bundle"]) await t.test(kind, async (t) => {
+    const f = await operatorFixture(t); let expected;
+    t.after(async () => withStateDatabaseConnection(db => {
+      const table = {review: "reviews", candidate: "candidates", bundle: "qa_bundles"}[kind];
+      // Remove only the row introduced by this isolated negative fixture.
+      db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(`${kind}_race_${f.task.id}`);
+    }));
+    await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => {
+      // Isolated storage race: an independent authority row can appear without
+      // changing the task/global version. No QA grant or fake scope is minted.
+      await withStateDatabaseConnection(db => {
+        if (kind === "review") {
+          const row = { id: `review_race_${f.task.id}`, taskId: f.task.id, outcome: "changes_requested" };
+          db.prepare("INSERT INTO reviews(id, sequence, task_id, outcome, created_at, payload) VALUES (?, 900000, ?, ?, '', ?)").run(row.id, f.task.id, row.outcome, JSON.stringify(row));
+        } else if (kind === "candidate") {
+          const row = { id: `candidate_race_${f.task.id}`, projectId: f.project.id, status: "frozen", manifestDigest: "sha256:" + "a".repeat(64), manifest: { sources: [{taskId: f.task.id}] } };
+          db.prepare("INSERT INTO candidates(id, sequence, project_id, status, manifest_digest, updated_at, payload) VALUES (?, 900000, ?, ?, ?, '', ?)").run(row.id, row.projectId, row.status, row.manifestDigest, JSON.stringify(row));
+        } else {
+          const row = { id: `bundle_race_${f.task.id}`, projectId: f.project.id, status: "ready", tasks: [{id: f.task.id}] };
+          db.prepare("INSERT INTO qa_bundles(id, sequence, project_id, status, integration_commit, updated_at, payload) VALUES (?, 900000, ?, ?, '', '', ?)").run(row.id, row.projectId, row.status, JSON.stringify(row));
+        }
+      });
+      expected = await readStateReadOnly(); return "local-os:fixture";
+    } }), /adoption_preimage_stale/);
+    const after = await readStateReadOnly(); assert.deepEqual(after.tasks, expected.tasks); assert.deepEqual(after.events, expected.events);
+    assert.equal(after.tasks.find(item => item.id === f.task.id).operatorIntake, undefined);
+  });
+});
+
+test("concurrent same-digest confirmations create one intake and later exact replay stays read-only", async (t) => {
+  const f = await operatorFixture(t); let confirmed = 0, release;
+  const both = new Promise(resolve => { release = resolve; });
+  const authority = { ...f.authority, confirm: async () => { if (++confirmed === 2) release(); await both; return "local-os:fixture"; } };
+  const results = await Promise.allSettled([adoptOperatorCandidate(f.task.id, f.request, authority), adoptOperatorCandidate(f.task.id, f.request, authority)]);
+  assert.equal(confirmed, 2); assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+  assert.match(results.find(result => result.status === "rejected").reason.code, /adoption_task_stale/);
+  const before = await readStateReadOnly();
+  assert.equal(before.events.filter(event => event.taskId === f.task.id && event.type === "operator_candidate_adopted").length, 1);
+  const replay = await adoptOperatorCandidate(f.task.id, f.request, { ...f.authority, confirm: async () => { throw new Error("Replay must not confirm again"); } });
+  assert.equal(replay.replay, true); assert.deepEqual(await readStateReadOnly(), before);
+});
 
 test("operator adoption strictly validates request data before authority or mutation", async (t) => {
   const f = await operatorFixture(t);

@@ -3510,6 +3510,286 @@ export async function recordCurrentTaskOperation(input) {
   }
 }
 
+// Fixed adoption read footprint. No caller supplies selectors, preimage digests,
+// SQL callbacks or permission flags. Directory projections include membership so
+// new/missing conflict owners cannot borrow an earlier no-conflict observation.
+const OPERATOR_ADOPTION_MAX_ROWS = 10000;
+const OPERATOR_ADOPTION_MAX_BYTES = 64 * 1024 * 1024;
+const ADOPTION_TASK_DIRECTORY_FIELDS = ["id", "projectId", "lane", "type", "area", "title", "description", "userStory", "expectedOutcome", "workAreas"];
+const ADOPTION_PROJECT_DIRECTORY_FIELDS = ["id", "repoUrl", "repositoryUrl", "repository", "remoteUrl", "sourceRepoPath", "repoPath"];
+const ADOPTION_MATERIAL_EVENTS = ["operator_candidate_adopted", "operator_candidate_superseded"];
+
+function adoptionProjection(value, fields) {
+  return Object.fromEntries(fields.filter((key) => Object.hasOwn(value, key)).map((key) => [key, value[key]]));
+}
+
+function adoptionFootprint(state, verification, check = () => {}) {
+  const byId = new Map(), childrenByParent = new Map();
+  for (const task of state.tasks) {
+    check(); byId.set(task.id, task);
+    if (task.architectureParentTaskId) {
+      const children = childrenByParent.get(task.architectureParentTaskId) || [];
+      children.push(task.id); childrenByParent.set(task.architectureParentTaskId, children);
+    }
+  }
+  const roots = [verification.taskId, ...verification.dispositionTaskIds, ...(verification.conflictTaskIds || [])];
+  const ids = new Set(roots), pending = [...roots];
+  while (pending.length) {
+    check(); const id = pending.pop(), task = byId.get(id);
+    if (!task) continue; // Absence is part of the footprint, never dropped.
+    const links = [...(task.dependsOnTaskIds || []), ...(task.architectureDecisionTaskIds || []),
+      ...(childrenByParent.get(id) || []), task.architectureParentTaskId, task.parentTaskId];
+    for (const link of links.filter(Boolean)) if (!ids.has(link)) {
+      ids.add(link); pending.push(link);
+      if (ids.size > 4096) operatorCandidateError("adoption_preimage_bound_exceeded");
+    }
+  }
+  const sorted = (rows) => rows.slice().sort((a, b) => a.id.localeCompare(b.id));
+  const linkedCandidateIds = new Set([...ids].map((id) => byId.get(id)?.candidateId).filter(Boolean));
+  const linkedBundleIds = new Set([...ids].map((id) => byId.get(id)?.qaBundleId).filter(Boolean));
+  const candidates = state.candidates.filter((candidate) => { check(); return linkedCandidateIds.has(candidate.id)
+    || (candidate.manifest?.sources || []).some((source) => ids.has(source.taskId)); });
+  const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+  const task = byId.get(verification.taskId);
+  return {
+    taskDirectory: sorted(state.tasks).map((item) => adoptionProjection(item, ADOPTION_TASK_DIRECTORY_FIELDS)),
+    projectDirectory: sorted(state.projects).map((item) => adoptionProjection(item, ADOPTION_PROJECT_DIRECTORY_FIELDS)),
+    tasks: [...ids].sort().map((id) => ({ id, value: byId.get(id) || null })),
+    project: state.projects.find((item) => item.id === task?.projectId) || null,
+    activeRuns: sorted(state.runs.filter((run) => ["queued", "running"].includes(run.status)))
+      .map((run) => adoptionProjection(run, ["id", "taskId", "projectId", "status", "role", "group"])),
+    runs: sorted(state.runs.filter((run) => ids.has(run.taskId))),
+    reviews: sorted(state.reviews.filter((review) => ids.has(review.taskId))),
+    candidates: sorted(candidates),
+    qaBundles: sorted(state.qaBundles.filter((bundle) => { check(); return candidateIds.has(bundle.candidateId)
+      || linkedBundleIds.has(bundle.id) || (bundle.tasks || []).some((item) => ids.has(item.id)); })),
+    materialHistory: sorted(state.events.filter((event) => event.taskId === verification.taskId && ADOPTION_MATERIAL_EVENTS.includes(event.type))),
+    promotionClaims: [...candidateIds].sort().map((id) => ({ id, value: state.meta?.promotionAttemptClaims?.[id] || null })),
+  };
+}
+
+// Stream each fixed selector once. A byte-count aggregate followed by a second
+// full payload query doubled cold-page work while the writer was held.
+function* boundedAdoptionRows(db, query, args, check) {
+  let count = 0, bytes = 0;
+  for (const row of db.prepare(query).iterate(...args)) {
+    check(); bytes += Number(row.payload_bytes);
+    if (++count > OPERATOR_ADOPTION_MAX_ROWS || !Number.isSafeInteger(bytes) || bytes > OPERATOR_ADOPTION_MAX_BYTES) {
+      operatorCandidateError("adoption_preimage_bound_exceeded");
+    }
+    yield row;
+  }
+}
+
+function readAdoptionRows(db, table, check, where = "", args = []) {
+  const query = `SELECT *, length(CAST(payload AS BLOB)) AS payload_bytes FROM ${table} ${where} LIMIT ${OPERATOR_ADOPTION_MAX_ROWS + 1}`;
+  const values = [];
+  for (const row of boundedAdoptionRows(db, query, args, check)) {
+    const value = parsePayload(row.payload, null);
+    if (!value || value.id !== row.id) operatorCandidateError("adoption_preimage_invalid");
+    for (const [column, key] of [["project_id", "projectId"], ["task_id", "taskId"], ["status", "status"], ["role", "role"], ["key", "key"], ["manifest_digest", "manifestDigest"], ["integration_commit", "integrationCommit"]]) {
+      if (Object.hasOwn(row, column) && String(value[key] || "") !== row[column]) operatorCandidateError("adoption_preimage_invalid");
+    }
+    if (Object.hasOwn(row, "state_version") && Number(value.stateVersion || 1) !== row.state_version) operatorCandidateError("adoption_preimage_invalid");
+    values.push(value);
+  }
+  return values;
+}
+
+function readAdoptionDirectory(db, table, fields, check) {
+  const keys = [...new Set([...fields, ...(table === "tasks" ? ["architectureParentTaskId", "status", "stateVersion"] : ["key"])])];
+  const paths = keys.map((key) => `'$.${key}'`).join(", ");
+  const types = keys.map((key) => `json_type(payload, '$.${key}')`).join(", ");
+  const bytes = "length(CAST(payload AS BLOB))";
+  const query = `SELECT id, ${table === "tasks" ? "project_id, status, state_version" : "key"}, ${bytes} AS payload_bytes,
+    CASE WHEN ${bytes} <= ${OPERATOR_ADOPTION_MAX_BYTES} THEN json_extract(payload, ${paths}) END AS projection,
+    CASE WHEN ${bytes} <= ${OPERATOR_ADOPTION_MAX_BYTES} THEN json_array(${types}) END AS types
+    FROM ${table} LIMIT ${OPERATOR_ADOPTION_MAX_ROWS + 1}`;
+  const values = [];
+  for (const row of boundedAdoptionRows(db, query, [], check)) {
+    const data = parsePayload(row.projection, null), present = parsePayload(row.types, null);
+    if (!Array.isArray(data) || !Array.isArray(present) || data.length !== keys.length || present.length !== keys.length) operatorCandidateError("adoption_preimage_invalid");
+    // json_type distinguishes an absent key from an explicit JSON null. Preserve
+    // that distinction along with arrays, booleans and raw directory field types.
+    const value = Object.fromEntries(keys.flatMap((key, index) => present[index] === null ? [] : [[key, data[index]]]));
+    if (value.id !== row.id || (table === "tasks" ? (String(value.projectId || "") !== row.project_id
+      || String(value.status || "") !== row.status || Number(value.stateVersion || 1) !== row.state_version) : String(value.key || "") !== row.key)) {
+      operatorCandidateError("adoption_preimage_invalid");
+    }
+    values.push(value);
+  }
+  return values;
+}
+
+function readAdoptionLinkedIds(db, table, taskIds, directIds, candidateIds, check) {
+  const candidate = table === "candidates", links = candidate ? "$.manifest.sources" : "$.tasks";
+  const field = candidate ? "taskId" : "id", bytes = "length(CAST(payload AS BLOB))";
+  const material = candidate ? "manifestDigest" : "integrationCommit", column = candidate ? "manifest_digest" : "integration_commit";
+  const query = `SELECT id, project_id, status, ${column}, ${bytes} AS payload_bytes,
+    json_extract(payload, '$.id', '$.projectId', '$.status', '$.${material}') AS identity,
+    json_type(payload, '${links}') AS links_type, json_extract(payload, '$.candidateId') AS candidate_id,
+    CASE WHEN ${bytes} <= ${OPERATOR_ADOPTION_MAX_BYTES} AND json_type(payload, '${links}') = 'array' THEN
+      (SELECT json_object('ids', json_group_array(json_extract(entry.value, '$.${field}')),
+        'nulls', COALESCE(SUM(entry.type = 'null'), 0)) FROM json_each(payload, '${links}') AS entry)
+      ELSE '{"ids":[],"nulls":0}' END AS linked FROM ${table} LIMIT ${OPERATOR_ADOPTION_MAX_ROWS + 1}`;
+  const result = [];
+  for (const row of boundedAdoptionRows(db, query, [], check)) {
+    const identity = parsePayload(row.identity, null), linked = parsePayload(row.linked, null);
+    if (!identity || identity[0] !== row.id || String(identity[1] || "") !== row.project_id
+      || String(identity[2] || "") !== row.status || String(identity[3] || "") !== row[column]
+      || ![null, "null", "array"].includes(row.links_type) || !Array.isArray(linked?.ids) || linked.nulls) operatorCandidateError("adoption_preimage_invalid");
+    if (directIds.has(row.id) || candidateIds.has(row.candidate_id) || linked.ids.some((id) => taskIds.has(id))) result.push(row.id);
+  }
+  return result;
+}
+
+function currentAdoptionFootprint(db, verification, meta, check) {
+  // Only conflict/ownership fields and graph-child membership require a global
+  // task directory. Full task records are loaded by primary key for the current
+  // transitive graph, including missing-row/child/parent/dependency races.
+  const tasks = readAdoptionDirectory(db, "tasks", ADOPTION_TASK_DIRECTORY_FIELDS, check);
+  const projects = readAdoptionDirectory(db, "projects", ADOPTION_PROJECT_DIRECTORY_FIELDS, check);
+  const byId = new Map(tasks.map((task) => [task.id, task])), children = new Map();
+  for (const task of tasks) if (task.architectureParentTaskId) {
+    const ids = children.get(task.architectureParentTaskId) || [];
+    ids.push(task.id); children.set(task.architectureParentTaskId, ids);
+  }
+  const ids = new Set([verification.taskId, ...verification.dispositionTaskIds, ...(verification.conflictTaskIds || [])]);
+  let pending = [...ids];
+  while (pending.length) {
+    check(); if (ids.size > 4096) operatorCandidateError("adoption_preimage_bound_exceeded");
+    const placeholders = pending.map(() => "?").join(",");
+    const rows = readAdoptionRows(db, "tasks", check, `WHERE id IN (${placeholders})`, pending);
+    pending = [];
+    for (const task of rows) {
+      byId.set(task.id, task);
+      const links = [...(task.dependsOnTaskIds || []), ...(task.architectureDecisionTaskIds || []),
+        ...(children.get(task.id) || []), task.architectureParentTaskId, task.parentTaskId];
+      for (const id of links.filter(Boolean)) if (!ids.has(id)) { ids.add(id); pending.push(id); }
+    }
+  }
+  const graph = [...ids].map((id) => byId.get(id)).filter(Boolean);
+  const projectId = byId.get(verification.taskId)?.projectId;
+  const project = readAdoptionRows(db, "projects", check, "WHERE id = ?", [projectId || ""])[0];
+  const candidateIds = readAdoptionLinkedIds(db, "candidates", ids, new Set(graph.map((task) => task.candidateId).filter(Boolean)), new Set(), check);
+  const bundleIds = readAdoptionLinkedIds(db, "qa_bundles", ids, new Set(graph.map((task) => task.qaBundleId).filter(Boolean)), new Set(candidateIds), check);
+  const selectIds = (table, selected) => selected.length ? readAdoptionRows(db, table, check, `WHERE id IN (${selected.map(() => "?").join(",")})`, selected) : [];
+  const placeholders = [...ids].map(() => "?").join(",");
+  const state = { meta, tasks: tasks.map((task) => byId.get(task.id)), projects: projects.map((item) => item.id === project?.id ? project : item),
+    candidates: selectIds("candidates", candidateIds), qaBundles: selectIds("qa_bundles", bundleIds),
+    runs: readAdoptionRows(db, "runs", check, `WHERE task_id IN (${placeholders}) OR status IN ('queued','running')`, [...ids]),
+    reviews: readAdoptionRows(db, "reviews", check, `WHERE task_id IN (${placeholders})`, [...ids]),
+    events: readAdoptionRows(db, "events", check, "WHERE task_id = ? AND type IN ('operator_candidate_adopted','operator_candidate_superseded')", [verification.taskId]) };
+  check(); return adoptionFootprint(state, verification, check);
+}
+
+function assertAdoptionPreimage(expected, current, verification) {
+  const before = new Map(expected.tasks.map((item) => [item.id, item.value]));
+  const after = new Map(current.tasks.map((item) => [item.id, item.value]));
+  if (canonicalJson(before.get(verification.taskId)) !== canonicalJson(after.get(verification.taskId))) operatorCandidateError("adoption_task_stale");
+  for (const id of verification.dispositionTaskIds) if (canonicalJson(before.get(id)) !== canonicalJson(after.get(id))) operatorCandidateError("adoption_prerequisite_stale");
+  if (canonicalJson(expected) !== canonicalJson(current)) operatorCandidateError("adoption_preimage_stale");
+}
+
+/** Audited adoption delta only. All executable verification/confirmation and
+ * lifecycle transformation run before BEGIN IMMEDIATE; SQL accepts no callback.
+ * Unrelated global writes do not invalidate these exact relevant preimages.
+ */
+export async function commitOperatorCandidateAdoption(taskId, verifySnapshot, mutator) {
+  if (typeof taskId !== "string" || !taskId || typeof verifySnapshot !== "function" || typeof mutator !== "function") {
+    throw new Error("Operator adoption requires a task and executable off-lock verification and transformation.");
+  }
+  await ensureStateDatabase();
+  const startedAt = Date.now(), operationName = "task.adopt_operator_candidate";
+  const state = (await withStateDatabaseRead(readStateSnapshot)).state;
+  assertMaintenanceWriteAllowed(state);
+  const before = structuredClone(state), snapshot = mutationSnapshot(state);
+  const verification = freezeOperatorVerification(await verifySnapshot(state));
+  if (verification.taskId !== taskId) operatorCandidateError("operator_candidate_verification_invalid");
+  assertOperatorCandidateIdle(state, verification);
+  const result = await mutator(state, verification);
+  const authority = { operatorCandidateCapability: OPERATOR_CANDIDATE_WRITE, operatorCandidateVerification: verification };
+  assertNativeWorkspaceIngress(state, snapshot, authority);
+  assertOperatorCandidateIngress(state, snapshot, authority, true);
+  assertProposedQaAuthorityPreserved(state, snapshot, authority);
+  reconcileStateIntegrity(state);
+  const plan = prepareMutationWrite(state, snapshot, authority);
+  const footprint = JSON.parse(canonicalJson(adoptionFootprint(before, verification)));
+  const taskIds = new Set([taskId, ...verification.dispositionTaskIds]);
+  const allowed = { tasks: taskIds, reviews: new Set(footprint.reviews.map((row) => row.id)),
+    candidates: new Set(footprint.candidates.map((row) => row.id)), qaBundles: new Set(footprint.qaBundles.map((row) => row.id)) };
+  if (plan.deletes.length || plan.metaPayload !== snapshot.meta) operatorCandidateError("adoption_delta_invalid");
+  const updates = [], events = [];
+  for (const row of plan.upserts) {
+    if (row.table === "events") {
+      if (snapshot.tables.events.has(row.item.id) || !taskIds.has(row.item.taskId)
+        || !["lifecycle_transition", ...ADOPTION_MATERIAL_EVENTS].includes(row.item.type)) operatorCandidateError("adoption_delta_invalid");
+      const { id: _preparedId, ...event } = row.item; events.push(event);
+    } else {
+      if (!allowed[row.table]?.has(row.item.id) || !snapshot.tables[row.table].has(row.item.id)) operatorCandidateError("adoption_delta_invalid");
+      updates.push({ table: row.table, item: JSON.parse(row.payload), payload: row.payload });
+    }
+  }
+  if (verification.replay) {
+    if (updates.length || events.length) operatorCandidateError("adoption_delta_invalid");
+    return result;
+  }
+  if (!updates.some((row) => row.table === "tasks" && row.item.id === taskId)
+    || events.filter((event) => event.type === "operator_candidate_adopted" && event.taskId === taskId).length !== 1
+    || events.length > 2 * taskIds.size + 1) operatorCandidateError("adoption_delta_invalid");
+  // Detach every prevalidated payload before waiting for SQLite ownership.
+  const write = structuredClone({ updates, events }), lockDeadlineAt = Date.now() + SERIALIZED_REPLAY_LOCK_DEADLINE_MS;
+  let retryCount = 0, lockWaitMs = 0;
+  try {
+    while (true) {
+      const lockStartedAt = Date.now(); let acquired = false;
+      try {
+        const committed = await withStateDatabaseConnection((db) => {
+          let transactionStarted = false;
+          try {
+            beginSerializedReplayTransaction(db, operationName, lockDeadlineAt, retryCount);
+            transactionStarted = true; acquired = true; lockWaitMs += Date.now() - lockStartedAt;
+            const check = () => recordingDeadline(transactionDeadlineAt, operationName), transactionDeadlineAt = Date.now() + TASK_RECORDING_TRANSACTION_MS;
+            const meta = parsePayload(db.prepare("SELECT payload FROM state_meta WHERE singleton_id = 1").get()?.payload, {});
+            assertMaintenanceWriteAllowed({ meta }); check();
+            assertAdoptionPreimage(footprint, currentAdoptionFootprint(db, verification, meta, check), verification); check();
+            assertOperatorCandidateCommitFence(db, verification); check();
+            for (const row of write.updates) {
+              check(); const table = TABLE_NAME[row.table] || row.table;
+              const current = db.prepare(`SELECT sequence FROM ${table} WHERE id = ?`).get(row.item.id);
+              if (!current) operatorCandidateError("adoption_preimage_stale");
+              upsertEntity(db, row.table, row.item, current.sequence, row.payload);
+            }
+            let eventNumber = Number(recordingNextId(db, "events", "event", check).slice("event_".length));
+            let sequence = Number(db.prepare("SELECT COALESCE(MAX(sequence), -1) + 1 AS value FROM events").get().value);
+            const now = new Date().toISOString();
+            for (const template of write.events) {
+              check(); const event = { ...template, id: `event_${eventNumber++}` };
+              upsertEntity(db, "events", event, sequence++);
+              retainRecordedEventGroup(db, event, meta, now, check);
+            }
+            meta.updatedAt = now; meta.storageBackend = "sqlite"; check();
+            db.prepare("UPDATE state_meta SET payload = ?, version = version + 1, updated_at = ? WHERE singleton_id = 1").run(JSON.stringify(meta), now);
+            recordContentionEvent(db, { operationName, outcome: "adoption_preimage_committed", waitMs: lockWaitMs, durationMs: Date.now() - startedAt, retryCount });
+            check(); db.exec("COMMIT"); transactionStarted = false; cachedReadSnapshot = null;
+            return result;
+          } catch (error) { if (transactionStarted) db.exec("ROLLBACK"); throw error; }
+        }, { operationName, deadlineAt: lockDeadlineAt }).finally(() => { if (!acquired) lockWaitMs += Date.now() - lockStartedAt; });
+        await secureStoragePaths(); return committed;
+      } catch (error) {
+        // Only an unavailable SQL lock may wait. A relevant change requires a
+        // fresh request/owner confirmation, never hidden global replay.
+        if (!isSqliteBusy(error) || Date.now() >= lockDeadlineAt) throw error;
+        retryCount++; await sleep(Math.min(retryDelayMs(retryCount), Math.max(1, lockDeadlineAt - Date.now())));
+      }
+    }
+  } catch (error) {
+    error.operationName = operationName; error.retryCount = retryCount;
+    await recordFailedContentionEvent({ operationName, waitMs: lockWaitMs, durationMs: Date.now() - startedAt, retryCount }, error);
+    throw error;
+  }
+}
+
 /** Executable, replayed verification is required before any operator intake. */
 export async function mutateOperatorCandidateState(verifySnapshot, mutator, options = {}) {
   if (typeof verifySnapshot !== "function" || typeof mutator !== "function") {
