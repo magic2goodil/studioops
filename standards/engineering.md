@@ -37,7 +37,7 @@ For non-trivial work, identify the shared architecture before implementation:
 
 If several builders will work in parallel, the foundation task should define these boundaries first.
 
-Broad apps, platforms, epics, and mockup-driven product work must use the StudioOps `systems-architect` gate before builders. Architecture must select the smallest system justified by the workload, record rejected alternatives, inventory canonical supplied assets, and flow into dependency-linked implementation tasks. Infrastructure such as caches, queues, fanout, or extra services requires a stated performance, consistency, durability, isolation, or operating reason.
+Broad apps, platforms, epics, and mockup-driven product work require a documented architecture review before builders. In StudioOps, use the `systems-architect` gate; outside it, record the same decisions and independent review in the repository or project handoff. Architecture must select the smallest system justified by the workload, record rejected alternatives, inventory canonical supplied assets, and flow into dependency-linked implementation tasks. Infrastructure such as caches, queues, fanout, or extra services requires a stated performance, consistency, durability, isolation, or operating reason.
 
 ## Functional Product Gate
 

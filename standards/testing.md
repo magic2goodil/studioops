@@ -46,3 +46,19 @@ Run Lighthouse, WebPageTest, browser performance tools, or a project-approved eq
 ## Backend Work
 
 Backend tasks should include relevant unit, integration, migration, or smoke checks. If full testing is not practical, record the smallest meaningful validation performed and the remaining risk.
+
+## Regression And Risk Selection
+
+Bug fixes require a test that reproduces the original failure and passes with the fix. If automation is not practical, record precise reproduction steps, before/after evidence, the coverage gap, and the reviewer's rationale for the alternative.
+
+Record a risk matrix mapping changed behavior to unit, integration/contract, browser/end-to-end, and manual checks. Cover authorization and tenant boundaries, persistence/migrations, failure and recovery paths, and critical user journeys where affected. Preserve all full-regression triggers in the modular architecture standard and project-specific safety gates; a risk matrix cannot waive them.
+
+Use isolated deterministic fixtures, controlled time/randomness where relevant, semantic locators, and assertions that wait for observable conditions rather than arbitrary sleeps. Test browser engines separately from responsive viewport sizes: a mobile-width Chromium run is not WebKit or Firefox coverage. Document the project's supported browser/device matrix, selected checks, and explicit gaps.
+
+## Failures, Retries, And Quarantine
+
+Preserve original failure evidence and all retry outcomes. A retry-pass is flaky, not a clean first-pass result. Bound retries explicitly; retries must not hide deterministic regressions or substitute for diagnosis. Quarantining a test requires an owner, reason, review/expiry date, lost-coverage statement, and replacement evidence or explicit risk decision. Quarantine does not silently satisfy a required gate. Review unresolved failures independently before acceptance.
+
+Bind validation records to the exact commit SHA and relevant environment/dependency contract. Include command, result, duration, retry/skip state, and evidence references. Separate checks that passed, failed, were skipped, and were never run.
+
+References: [Playwright best practices](https://playwright.dev/docs/best-practices) and [retry semantics](https://playwright.dev/docs/test-retries). Equivalent tools may satisfy the same requirements.

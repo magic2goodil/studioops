@@ -65,3 +65,14 @@ Do not send emails, SMS, push notifications, webhooks, production deploys, or ex
 ## Review Requirement
 
 Reviewers should fail work that broadens data exposure, weakens auth, logs sensitive data, stores prototype session state where durable secure storage is required, adds sensitive data collection without a consent path, or makes it hard for a user to revoke consent.
+
+## Application Security Verification
+
+Select and record risk-appropriate OWASP ASVS 5.0 controls for the changed surface. A checklist or scanner does not establish full ASVS verification. At minimum, applicable changes must address:
+
+- Deny access by default and enforce resource ownership, role, and tenant authorization on every entry path, including APIs, background jobs, and alternate routes. Add negative tests for unauthenticated, wrong-role, wrong-owner, and cross-tenant access where applicable.
+- Use parameterized database queries, context-appropriate output encoding, and vetted sanitization when rendering intentionally permitted HTML. Validate input type, shape, range, and size on the trusted boundary; client validation alone is insufficient.
+- Protect session cookies with appropriate Secure, HttpOnly, and SameSite settings; rotate sessions at authentication/privilege changes and invalidate them on logout or revocation. Protect cookie-authenticated state-changing requests against CSRF; do not rely on SameSite alone where it is insufficient.
+- Grant least privilege to service identities and credentials. Review dependency advisories for reachability and impact; fix or record an accountable, time-bounded mitigation with owner and review date rather than ignoring alerts or treating every alert as proof of exploitability.
+
+References: [ASVS](https://asvs.owasp.org/), [authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html), [XSS prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html), and [session management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).
