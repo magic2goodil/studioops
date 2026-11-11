@@ -1099,9 +1099,16 @@ export function remediateStaleLinkedPrInState(state, run, input = {}) {
   if (task.prUrl !== input.expectedPrUrl || task.branchName !== input.expectedBranch) {
     throw new Error("Stale-PR remediation lost its compare-and-set binding; the task changed concurrently.");
   }
+  // Candidate/QA authority must be settled through the existing fenced lifecycle,
+  // never detached by the pre-provider branch-recovery shortcut.
+  if (task.candidateId || task.qaBundleId || task.qaDecision || (state.candidates || []).some((candidate) =>
+    !candidate.invalidation && (candidate.manifest?.sources || []).some((source) => source.taskId === task.id))) {
+    const error = new Error("Stale-PR remediation requires candidate authority reconciliation before branch recovery.");
+    error.code = "stale_pr_candidate_authority_unsettled";
+    throw error;
+  }
   const now = input.now || new Date().toISOString();
   const oldSubjectSha = String(task.reviewSubjectSha || task.candidateIdentity?.commitSha || "").trim().toLowerCase();
-  const oldCandidateId = String(task.candidateId || "");
   for (const review of state.reviews || []) {
     if (
       review.taskId === task.id
@@ -1109,15 +1116,11 @@ export function remediateStaleLinkedPrInState(state, run, input = {}) {
       && (!oldSubjectSha || String(review.subjectSha || "").toLowerCase() === oldSubjectSha)
     ) {
       review.invalidatedAt = now;
-      review.invalidationReason = "stale_pull_request";
-    }
-  }
-  if (oldCandidateId) {
-    const candidate = (state.candidates || []).find((item) => item.id === oldCandidateId);
-    if (candidate && candidate.status !== "merged") {
-      candidate.status = "invalidated";
-      candidate.invalidationReason = "stale_pull_request";
-      candidate.updatedAt = now;
+      review.invalidation = {
+        action: "stale_pull_request_remediation",
+        reasonCode: "stale_pull_request",
+        invalidatedAt: now,
+      };
     }
   }
   const nextCycle = Math.max(Number(task.reviewSubjectCycle || 0), Number(task.reviewCycle || 0)) + 1;
@@ -2074,6 +2077,7 @@ export function applyFailedRunToTask(task, run, reason, now) {
 
 export function classifyRunFailureReason(run = {}, code = "", notes = "") {
   const value = `${code} ${notes}`.toLowerCase();
+  if (/review .+ history is immutable|stale-pr remediation requires candidate authority reconciliation/.test(value)) return "execution_failed";
   if (/output.*budget|command_output|raw_context/.test(value)) return "output_guard_exceeded";
   if (/validation|test_failed|check_failed/.test(value)) return "validation_failed";
   if (/rate.?limit|quota|too many requests|\b429\b/.test(value)) return "provider_rate_limited";
