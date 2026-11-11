@@ -16,7 +16,9 @@ import { recordFailureContainmentActivity } from "./state-database.js";
 const execFileAsync = promisify(execFile);
 const ACTIVE_BUNDLE_STATUSES = new Set(["ready", "partially_reviewed"]);
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
-const DEFAULT_COMMAND_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(path.delimiter);
+// Docker Desktop supports an application-only CLI install. Keep lookup fixed;
+// do not inherit caller PATH or add a project/user home bin directory.
+const DEFAULT_COMMAND_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/Applications/Docker.app/Contents/Resources/bin"].join(path.delimiter);
 
 function boundedText(value, limit = 4_000) {
   return String(value || "")
