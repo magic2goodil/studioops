@@ -76,3 +76,12 @@ Deployment work should leave a clear audit trail:
 - known follow-up work
 
 For content publishing, store version history so a bad CMS edit can be reverted without a code rollback.
+
+## CI Supply-Chain Boundaries
+
+- Set workflow/job token permissions to the minimum required; do not grant broad write access by default.
+- Pin third-party GitHub Actions to full commit SHAs and maintain reviewed updates to those pins.
+- Never run untrusted pull-request code with privileged secrets or write-capable credentials. In particular, privileged workflow contexts must not check out and execute an untrusted PR head. Treat artifacts and caches from untrusted jobs as untrusted inputs.
+- Keep validation separate from explicitly authorized production release, retaining all existing protected-branch, actor, environment, and human approval gates.
+
+Reference: [GitHub Actions secure use](https://docs.github.com/en/actions/reference/security/secure-use).

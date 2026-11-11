@@ -71,3 +71,9 @@ For consent-sensitive work, reviewers should specifically ask:
 - Can the user turn it off later?
 - Is the consent copy specific enough to understand?
 - Is business-facing analytics aggregated unless identity is truly required?
+
+## Evidence And Portable Review
+
+Apply this checklist to direct repository work as well as StudioOps-managed work. Require exact-SHA validation, applicable specialist findings, and independent lead review; scheduling labels or board transitions cannot substitute for evidence. Preserve configured human and release gates.
+
+Check the modern accessibility and security requirements in their respective standards, including manual accessibility coverage and negative authorization tests. Reject unsupported conformance claims. Verify the risk-based regression matrix, browser-engine versus viewport coverage, original failures and retries, and accountable quarantine records. A retry-pass must remain visible as flaky. Review CI credential boundaries and third-party action pins for workflow changes.
