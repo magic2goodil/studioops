@@ -157,6 +157,18 @@ test("stopped dependency is recovered and exact candidate health clears the inci
   assert.deepEqual(executed[1].slice(-5), ["up", "--detach", "--no-deps", "--no-recreate", "postgres"]);
   assert.equal(executionOptions.every((options) => options.timeout === 1_000), true);
   assert.equal(executionOptions.every((options) => options.maxBuffer === 2_000), true);
+  for (const { env } of executionOptions) {
+    assert.deepEqual(Object.keys(env).sort(), ["HOME", "TMPDIR"].filter((key) => process.env[key] !== undefined).concat("PATH").sort());
+    assert.deepEqual(env.PATH.split(path.delimiter), [
+      "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+      "/Applications/Docker.app/Contents/Resources/bin",
+    ]);
+    assert.equal(env.DOCKER_HOST, undefined);
+    assert.equal(env.DOCKER_CONTEXT, undefined);
+    assert.equal(env.DOCKER_CONFIG, undefined);
+    assert.equal(env.NODE_OPTIONS, undefined);
+  }
+
   assert.equal(state.qaBundles[0].techOps.state, "healthy");
   assert.equal(state.qaBundles[0].techOps.health.observedSha, SHA);
   assert.deepEqual(
