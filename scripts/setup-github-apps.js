@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
-import { URL } from "node:url";
+import { URL, fileURLToPath } from "node:url";
 import { defaultStudioOpsCredentialsRoot, expandLocalPath } from "../src/runtime-paths.js";
 
 const DEFAULT_PORT = 4328;
@@ -61,6 +61,12 @@ const ROLE_SETS = {
       role: "promotion-worker",
       name: "MC Promotion Worker",
       description: "Promotes owner-QA-passed work into protected target branches after validation.",
+    },
+    {
+      key: "qa-integration-worker",
+      role: "qa-integration-worker",
+      name: "StudioOps QA Integration Worker",
+      description: "Publishes immutable QA candidate branches and inspects protected checks without merging them.",
     },
   ],
 };
@@ -121,7 +127,18 @@ function appEndpoint({ owner, org }) {
   return "https://github.com/settings/apps/new";
 }
 
-function appManifest(app, baseUrl) {
+export function appManifest(app, baseUrl) {
+  const permissions = {
+    actions: "read",
+    checks: "read",
+    contents: "write",
+    issues: "write",
+    metadata: "read",
+    pull_requests: "write",
+  };
+  if (["default", "builder", "qa-integration-worker"].includes(app.role)) permissions.statuses = "read";
+  if (app.role === "builder") permissions.workflows = "write";
+  if (app.role === "qa-integration-worker") delete permissions.actions;
   return {
     name: app.name,
     url: REPO_URL,
@@ -129,14 +146,7 @@ function appManifest(app, baseUrl) {
     callback_urls: [`${baseUrl}/callback`],
     description: app.description,
     public: false,
-    default_permissions: {
-      actions: "read",
-      checks: "read",
-      contents: "write",
-      issues: "write",
-      metadata: "read",
-      pull_requests: "write",
-    },
+    default_permissions: permissions,
     request_oauth_on_install: false,
     setup_on_update: false,
   };
@@ -349,7 +359,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}

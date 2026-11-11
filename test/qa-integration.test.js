@@ -30,6 +30,9 @@ import {
   githubAppLocalFallbackEnabled,
   isGitAuthenticationFailure,
   isGitHubAppPermissionError,
+  integrationPrBlocker,
+  integrationPrCheckState,
+  integrationPrStatus,
   planQaIntegrations,
   projectPlanHasWork,
   qaClaimOwnerState,
@@ -584,6 +587,11 @@ if (args[0] === "pr" && args[1] === "close") {
   process.exit(0);
 }
 if (args[0] === "pr" && args[1] === "list") {
+  if (process.env.FAKE_GH_PERMISSION_DENIED === "1") {
+    appendFileSync(process.env.FAKE_GH_PERMISSION_LOG, "inspection\\n");
+    console.error("GraphQL: Resource not accessible by integration ghs_synthetic_denied_secret");
+    process.exit(1);
+  }
   const head = args[args.indexOf("--head") + 1];
   const base = args[args.indexOf("--base") + 1];
   const record = readPrs()
@@ -893,9 +901,9 @@ test("project-level force does not re-integrate already-ready QA tasks", () => {
   assert.deepEqual(explicitForce.projects[0].tasks.map((task) => task.id), ["task_ready"]);
 });
 
-test("GitHub App local fallback is opt-in and limited to permission failures", () => {
+test("GitHub App permission failures cannot opt into a different local credential identity", () => {
   assert.equal(githubAppLocalFallbackEnabled({}), false);
-  assert.equal(githubAppLocalFallbackEnabled({ githubAppFallbackToLocalAuth: true }), true);
+  assert.equal(githubAppLocalFallbackEnabled({ githubAppFallbackToLocalAuth: true }), false);
   assert.equal(
     isGitHubAppPermissionError(new Error("GraphQL: Resource not accessible by integration")),
     true,
@@ -909,6 +917,69 @@ test("GitHub App local fallback is opt-in and limited to permission failures", (
   assert.equal(isGitAuthenticationFailure("fatal: could not read Username for 'https://github.com'"), true);
   assert.equal(isGitAuthenticationFailure("git@github.com: Permission denied (publickey)."), true);
   assert.equal(isGitAuthenticationFailure("reviewed source differs from expected SHA"), false);
+});
+
+test("protected PR inspection retains CheckRun and legacy StatusContext decisions without merging", () => {
+  const passed = [
+    { name: "checks", status: "COMPLETED", conclusion: "SUCCESS" },
+    { context: "legacy", state: "SUCCESS", targetUrl: "https://example.test/legacy" },
+  ];
+  const pr = { state: "OPEN", reviewDecision: "APPROVED", statusCheckRollup: passed };
+  assert.equal(integrationPrCheckState(pr).state, "passed");
+  assert.equal(integrationPrStatus(pr, integrationPrCheckState(pr)), "pr_waiting");
+  assert.match(integrationPrBlocker(pr, integrationPrCheckState(pr)), /authorized human/);
+  for (const [legacyState, expected] of [["PENDING", "pending"], ["FAILURE", "failed"], ["ERROR", "failed"]]) {
+    const mixed = { ...pr, statusCheckRollup: [passed[0], { context: "legacy", state: legacyState }] };
+    assert.equal(integrationPrCheckState(mixed).state, expected);
+  }
+  const required = { ...pr, reviewDecision: "REVIEW_REQUIRED" };
+  assert.match(integrationPrBlocker(required, integrationPrCheckState(required)), /required human review/);
+  const closed = { ...pr, state: "CLOSED" };
+  assert.equal(integrationPrStatus(closed, integrationPrCheckState(closed)), "pr_closed");
+  const merged = { ...pr, state: "MERGED" };
+  assert.equal(integrationPrStatus(merged, integrationPrCheckState(merged)), "merged");
+});
+
+test("denied protected check inspection preserves exact handoff and does not retry another identity", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-qa-permission-handoff-"));
+  try {
+    const fixture = await createProtectedBranchFixture(root);
+    const pending = await runQaIntegrationFixture(root, { env: fixture.env });
+    assert.equal(pending.projects[0].status, "pr_waiting");
+    const before = readPersistedState(root).tasks[0];
+
+    await git(fixture.repoPath, ["checkout", "feature/task"]);
+    await writeFile(path.join(fixture.repoPath, "feature.txt"), "new reviewed source after protected handoff\n");
+    await git(fixture.repoPath, ["commit", "-am", "advance reviewed source"]);
+    const correctedSha = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "feature/task"]);
+    await advanceReviewedQaTask(root, "task_1", correctedSha);
+    const permissionLog = path.join(root, "permission-inspection.log");
+    const denied = await runQaIntegrationFixture(root, {
+      input: { force: true, githubAppFallbackToLocalAuth: true },
+      env: { ...fixture.env, FAKE_GH_PERMISSION_DENIED: "1", FAKE_GH_PERMISSION_LOG: permissionLog },
+    });
+    const result = denied.projects[0];
+    assert.equal(result.status, "authentication_failed");
+    assert.equal(result.commit, before.integrationCandidateCommit);
+    assert.equal(result.integrationPr.url, before.integrationPrUrl);
+    assert.match(result.integrationBlocker, /checks:read and statuses:read/);
+    assert.match(result.integrationBlocker, /fresh token/);
+    assert.match(result.integrationBlocker, /npm run qa-integrate -- --project demo --force/);
+    assert.doesNotMatch(JSON.stringify(result), /ghs_synthetic_denied_secret/);
+    assert.equal((await readFile(permissionLog, "utf8")).trim().split("\n").length, 1);
+    assert.equal((await readFile(fixture.prCreateLog, "utf8")).trim().split("\n").length, 1);
+
+    const after = readPersistedState(root).tasks[0];
+    for (const field of ["integrationCandidateBranch", "integrationCandidateCommit", "integrationPrUrl", "integrationPrNumber", "integrationPrHeadSha", "integrationSourceHeadSha", "integrationSourceCandidateCycle"]) {
+      assert.equal(after[field], before[field], field);
+    }
+    assert.notEqual(after.reviewSubjectSha, after.integrationSourceHeadSha);
+    assert.equal(after.assignedAgentRole, "qa-integration-worker");
+    assert.deepEqual(after.integrationValidation.commands, before.integrationValidation.commands);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("QA integration plans only an explicitly authorized partial candidate subset", () => {

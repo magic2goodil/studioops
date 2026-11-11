@@ -14,6 +14,10 @@ const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
 const GITHUB_API_TIMEOUT_MS = 30_000;
 const TOKEN_REDACTION = "[REDACTED_GITHUB_APP_TOKEN]";
+const WORKFLOW_SCOPE_ROOT = ".github/workflows";
+const BRANCH_WRITING_ACTIONS = new Set([
+  "start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task",
+]);
 
 const ROLE_PERMISSIONS = {
   builder: {
@@ -57,6 +61,13 @@ const ROLE_PERMISSIONS = {
     issues: "write",
     pull_requests: "write",
   },
+  "qa-integration-worker": {
+    checks: "read",
+    statuses: "read",
+    contents: "write",
+    issues: "write",
+    pull_requests: "write",
+  },
   default: {
     contents: "write",
     issues: "write",
@@ -87,6 +98,7 @@ function resolvePath(value, fallback) {
 
 function normalizeRole(value) {
   const normalized = String(value || "").trim().toLowerCase().replaceAll("_", "-");
+  if (["qa-integration", "qa-integration-worker"].includes(normalized)) return "qa-integration-worker";
   if (normalized.includes("backend")) return "backend-reviewer";
   if (normalized.includes("frontend")) return "frontend-reviewer";
   if (normalized.includes("accessibility") || normalized.includes("a11y")) return "accessibility-reviewer";
@@ -94,6 +106,70 @@ function normalizeRole(value) {
   if (normalized.includes("lead")) return "lead-reviewer";
   if (normalized.includes("builder")) return "builder";
   return normalized || "builder";
+}
+
+export function isBranchWritingAction(value) {
+  return BRANCH_WRITING_ACTIONS.has(String(value || "").trim().toLowerCase().replaceAll("-", "_"));
+}
+
+function declaredPermissionScopes(value, label) {
+  if (!Array.isArray(value) || !value.length || value.length > 1_000) {
+    return { ok: false, reason: `${label}_missing_or_unbounded` };
+  }
+  const scopes = [];
+  for (const item of value) {
+    if (typeof item !== "string" || item.length > 1_024) return { ok: false, reason: `${label}_ambiguous` };
+    let scope = item.trim();
+    while (scope.startsWith("./")) scope = scope.slice(2);
+    scope = scope.replace(/\/+$/, "");
+    if (!scope || scope.startsWith("/") || /^[a-z]:/i.test(scope) || /[\\\x00-\x1f\x7f]/.test(scope)) {
+      return { ok: false, reason: `${label}_ambiguous` };
+    }
+    const segments = scope.split("/");
+    if (segments.some((segment) => !segment || segment === "." || segment === "..")) {
+      return { ok: false, reason: `${label}_traversal` };
+    }
+    const workflowScope = scope === WORKFLOW_SCOPE_ROOT || scope.startsWith(`${WORKFLOW_SCOPE_ROOT}/`);
+    const wildcard = /[*?[\]{}]/.test(scope);
+    const lookalike = !workflowScope && /(?:^|\/)\.github\/workflows?/i.test(scope);
+    const broadGitHub = scope === ".github" || (!workflowScope && scope.startsWith(".github/") && wildcard);
+    const rootWildcard = segments[0].search(/[*?[\]{}]/);
+    const rootPrefix = rootWildcard < 0 ? "" : segments[0].slice(0, rootWildcard).toLowerCase();
+    const broadRoot = rootWildcard >= 0 && (!rootPrefix || ".github".startsWith(rootPrefix));
+    if (lookalike || broadGitHub || broadRoot || (workflowScope && wildcard)) {
+      return { ok: false, reason: `${label}_ambiguous` };
+    }
+    scopes.push(scope);
+  }
+  return { ok: true, scopes: unique(scopes).sort() };
+}
+
+function workflowScopes(scopes) {
+  return scopes.filter((scope) => scope === WORKFLOW_SCOPE_ROOT || scope.startsWith(`${WORKFLOW_SCOPE_ROOT}/`));
+}
+
+/** The caller supplies current authoritative task workAreas, not worker text. */
+export function classifyWorkflowWritePermission(run = {}) {
+  if (String(run.role || "").trim().toLowerCase().replaceAll("_", "-") !== "builder") {
+    return { granted: false, reason: "role_not_builder" };
+  }
+  if (!isBranchWritingAction(run.actionType)) return { granted: false, reason: "action_not_branch_writing" };
+  const declared = declaredPermissionScopes(run.workAreas, "work_areas");
+  if (!declared.ok) return { granted: false, reason: declared.reason };
+  const effective = declaredPermissionScopes(run.fileScope, "file_scope");
+  if (!effective.ok) return { granted: false, reason: effective.reason };
+  const approvedWorkflows = workflowScopes(declared.scopes);
+  const effectiveWorkflows = workflowScopes(effective.scopes);
+  if (!approvedWorkflows.length || !effectiveWorkflows.length) {
+    return { granted: false, reason: "workflow_scope_not_declared" };
+  }
+  // Impact planning may add supporting/non-workflow paths. Those do not grant
+  // workflow access; every effective workflow path must still be explicitly
+  // covered by a current task declaration. No wildcard can grant this scope.
+  if (effectiveWorkflows.some((scope) => !approvedWorkflows.some((approved) => (
+    scope === approved || (approved === WORKFLOW_SCOPE_ROOT && scope.startsWith(`${approved}/`))
+  )))) return { granted: false, reason: "workflow_scopes_mismatch" };
+  return { granted: true, reason: "declared_workflow_builder_run" };
 }
 
 function unique(values) {
@@ -365,7 +441,7 @@ async function loadConfiguredApp(credentialsDir, role, appOptions = {}) {
     if (!isMissingPathError(error)) throw error;
   }
 
-  const fallbackCandidates = unique([defaultRole, "default"]);
+  const fallbackCandidates = unique([defaultRole, role === "qa-integration-worker" ? "builder" : "", "default"]);
   for (const key of fallbackCandidates) {
     const app = await loadAppAt(credentialsDir, key);
     if (app) return app;
@@ -376,8 +452,11 @@ async function loadConfiguredApp(credentialsDir, role, appOptions = {}) {
   );
 }
 
-function permissionsForRole(role) {
-  return { ...(ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.default) };
+function permissionsForRun(run, role) {
+  const permissions = { ...(ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.default) };
+  const workflowPermission = classifyWorkflowWritePermission(run);
+  if (workflowPermission.granted) permissions.workflows = "write";
+  return { permissions, workflowPermission };
 }
 
 async function createRuntimeAskpass(runId, runtimeDir = DEFAULT_RUNTIME_DIR) {
@@ -563,19 +642,31 @@ export async function prepareGitHubAppAuth(run, input = {}) {
     }
     throw error;
   }
-  const permissions = permissionsForRole(role);
-  const accessToken = await githubJson(
-    `/app/installations/${encodeURIComponent(installation.id)}/access_tokens`,
-    {
-      method: "POST",
-      token: jwt,
-      timeoutMs: requestTimeoutMs,
-      body: {
-        repositories: [repo.name],
-        permissions,
+  const { permissions, workflowPermission } = permissionsForRun(run, role);
+  let accessToken;
+  try {
+    accessToken = await githubJson(
+      `/app/installations/${encodeURIComponent(installation.id)}/access_tokens`,
+      {
+        method: "POST",
+        token: jwt,
+        timeoutMs: requestTimeoutMs,
+        body: {
+          repositories: [repo.name],
+          permissions,
+        },
       },
-    },
-  );
+    );
+  } catch (error) {
+    if (Number(error?.status) === 403) {
+      const permissionError = new Error(
+        `github_app_permissions_not_approved: GitHub rejected the requested ${role} installation token permissions for ${repo.owner}/${repo.name}. Verify the App's permission ceiling and approve any pending installation permission update, then mint a fresh token. Personal credentials and cached-token fallback are disabled.`,
+      );
+      permissionError.code = "github_app_permissions_not_approved";
+      throw permissionError;
+    }
+    throw error;
+  }
   if (!accessToken.token) throw new Error(`GitHub App installation ${installation.id} did not return an access token.`);
   if (!accessToken.expires_at || Date.parse(accessToken.expires_at) <= Date.now()) {
     throw new Error(`GitHub App installation ${installation.id} returned an expired or invalid token.`);
@@ -589,6 +680,7 @@ export async function prepareGitHubAppAuth(run, input = {}) {
     token: accessToken.token,
     expiresAt: accessToken.expires_at,
     permissions,
+    workflowPermission,
     installationId: installation.id,
     askpassPath: await createRuntimeAskpass(run.id, input.githubAppRuntimeDir || DEFAULT_RUNTIME_DIR),
   };

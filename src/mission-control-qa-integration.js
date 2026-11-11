@@ -93,8 +93,11 @@ sandbox fails closed before project code or push. It does not merge to
 production, deploy, or force-push.
 
 For GitHub repositories, the worker uses short-lived GitHub App installation
-tokens by default. If no dedicated qa-integration-worker app exists, it falls
-back to the builder app identity.
+tokens with the qa-integration-worker permission profile, including read access
+to protected checks and commit statuses. A configured fallback App identity
+(normally builder) must have those grants approved too. A permission denial
+preserves the candidate and requires a fresh installation token after approval;
+it never retries with personal gh, PAT or SSH credentials.
 `);
     return;
   }

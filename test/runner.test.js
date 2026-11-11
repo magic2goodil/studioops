@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -28,6 +28,7 @@ import {
   readPrePushValidationAttestation,
   remediateStaleLinkedPrInState,
   preflightRun,
+  prepareRunAuth,
   prepareRunWorkspace,
   withExecutionImpactPlan,
   resolveProjectWorkflowMode,
@@ -43,6 +44,7 @@ import {
   failureFingerprint,
 } from "../src/failure-containment.js";
 import { materializeLocalCandidate } from "../src/workspace.js";
+import { classifyWorkflowWritePermission, cleanupGitHubAppAuth, prepareGitHubAppAuth } from "../src/github-app-auth.js";
 import { eligibleRunWorkspaceSnapshotsInState, resumeBudgetPauseInState } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
@@ -570,6 +572,173 @@ function builderRun(patch = {}) {
     ...patch,
   };
 }
+
+function workflowAuthState(actionType = "start_builder") {
+  const state = fixtureState({
+    status: actionType === "qa_integration_blocked" ? "qa_review" : "in_progress",
+    integrationStatus: actionType === "qa_integration_blocked" ? "blocked" : "",
+    assignedAgentRole: "builder",
+    workAreas: [".github/workflows/validate.yml", "src/feature.js"],
+  }, {
+    actionType,
+    integrationStatus: actionType === "qa_integration_blocked" ? "blocked" : "",
+    fileScope: [".github/workflows/validate.yml", "src/**", "package*.json"],
+    branchName: "codex/workflow-repair",
+  });
+  Object.assign(state.projects[0], { repoUrl: "https://github.com/example/demo.git", workflowMode: "github" });
+  return state;
+}
+
+test("runner auth refreshes task scope at every token mint and ignores snapshot declarations", async () => {
+  const state = workflowAuthState();
+  const run = {
+    ...structuredClone(state.runs[0]),
+    project: structuredClone(state.projects[0]),
+    workflowMode: "github",
+    workAreas: [".github/workflows/unapproved.yml"],
+    task: { id: "untrusted_snapshot", workAreas: [".github/workflows/unapproved.yml"] },
+  };
+  let reads = 0;
+  let prepared;
+  const options = {
+    readState: async () => { reads += 1; return state; },
+    prepareGitHubAppAuth: async (authRun) => {
+      prepared = authRun;
+      return classifyWorkflowWritePermission(authRun);
+    },
+  };
+  assert.equal((await prepareRunAuth(run, options)).granted, true);
+  assert.deepEqual(prepared.workAreas, state.tasks[0].workAreas);
+  assert.deepEqual(prepared.fileScope, state.runs[0].fileScope);
+  assert.equal(run.workAreas[0], ".github/workflows/unapproved.yml");
+  state.tasks[0].workAreas = ["src/**"];
+  assert.equal((await prepareRunAuth(run, options)).granted, false);
+  assert.equal(reads, 2);
+});
+
+test("runner auth denies workflow elevation for stale or inconsistent durable identities and scopes", async () => {
+  const mutations = [
+    (state) => { state.runs = []; },
+    (state) => { state.tasks = []; },
+    (state) => { state.projects = []; },
+    (state) => { state.tasks[0].projectId = "project_other"; },
+    (state) => { state.runs[0].taskId = "task_other"; },
+    (state) => { state.runs[0].role = "backend-reviewer"; },
+    (state) => { state.runs[0].actionType = "start_review"; },
+    (state) => { state.runs[0].branchName = "codex/replacement"; },
+    (state) => { state.projects[0].repoUrl = "https://github.com/example/other.git"; },
+    (state) => { state.projects[0].repoPath = "/tmp/other-checkout"; },
+    (state) => { state.runs[0].status = "cancelled"; },
+    (state) => { state.runs[0].completedAt = new Date().toISOString(); },
+    (state) => { state.tasks[0].status = "builder_review"; },
+    (state) => { state.tasks[0].assignedAgentRole = "owner"; },
+    (state) => { state.tasks[0].assignedAgentRole = ""; },
+    (state) => { delete state.tasks[0].assignedAgentRole; },
+    (state, run) => { state.runs[0].group = run.group = "reviewer"; },
+    (state) => { state.runs[0].fileScope = [".github/workflows/other.yml"]; },
+    (state) => { state.tasks[0].workAreas = [".github/workflows/other.yml"]; },
+    (_state, run) => { run.fileScope.push(".github/workflows/unapproved.yml"); },
+    (_state, run) => { run.project.id = "project_other"; },
+  ];
+  for (const mutate of mutations) {
+    const state = workflowAuthState();
+    const run = { ...structuredClone(state.runs[0]), project: structuredClone(state.projects[0]), workflowMode: "github" };
+    // A caller cannot rescue a stale binding with its own old approval text.
+    run.workAreas = [".github/workflows/validate.yml"];
+    mutate(state, run);
+    let calls = 0;
+    const permission = await prepareRunAuth(run, {
+      state,
+      prepareGitHubAppAuth: async (authRun) => { calls += 1; return classifyWorkflowWritePermission(authRun); },
+    });
+    assert.equal(permission.granted, false, String(mutate));
+    assert.equal(calls, 1);
+  }
+});
+
+test("both mint paths require current builder assignment for every elevated action without dropping base permissions", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-assignee-auth-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    const repoPath = await createRepository(root);
+    await git(repoPath, ["remote", "add", "origin", "https://github.com/example/demo.git"]);
+    const credentialsDir = path.join(root, "credentials");
+    const appDir = path.join(credentialsDir, "builder");
+    await mkdir(appDir, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(appDir, "app.json"), JSON.stringify({
+      appId: "12345", name: "Synthetic Builder", key: "builder", role: "builder",
+    }), { mode: 0o600 });
+    const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    await writeFile(path.join(appDir, "private-key.pem"), privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+    const bodies = [];
+    globalThis.fetch = async (url, request = {}) => {
+      if (String(url) === "https://api.github.com/repos/example/demo/installation") {
+        return { ok: true, text: async () => JSON.stringify({ id: 123 }) };
+      }
+      assert.equal(String(url), "https://api.github.com/app/installations/123/access_tokens");
+      bodies.push(JSON.parse(request.body));
+      return { ok: true, text: async () => JSON.stringify({
+        token: "ghs_synthetic_assignee_token", expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      }) };
+    };
+    for (const action of ["start_builder", "start_builder_fix", "return_to_builder", "qa_integration_blocked", "unblock_task"]) {
+      for (const mintPath of ["preflight", "execution"]) {
+        for (const assignee of ["builder", "owner", "", undefined]) {
+          await t.test(`${action} / ${mintPath} / current assignment ${assignee === undefined ? "missing" : assignee || "empty"}`, async () => {
+            const state = workflowAuthState(action);
+            state.projects[0].repoPath = repoPath;
+            state.runs[0].status = mintPath === "execution" ? "running" : "queued";
+            const run = {
+              ...structuredClone(state.runs[0]), project: structuredClone(state.projects[0]), workflowMode: "github",
+              // This earlier snapshot remains assigned to builder after the
+              // authoritative state is cleared/reassigned before minting.
+              task: structuredClone(state.tasks[0]), workAreas: [...state.tasks[0].workAreas],
+            };
+            if (assignee === undefined) delete state.tasks[0].assignedAgentRole;
+            else state.tasks[0].assignedAgentRole = assignee;
+            let reads = 0;
+            const options = {
+              readState: async () => { reads += 1; return state; },
+              githubAppAuth: true, githubAppCredentialsDir: credentialsDir,
+              githubAppRuntimeDir: path.join(root, "runtime"), githubAppRoleMap: {}, githubAppDefaultRole: "default",
+              prepareGitHubAppAuth,
+              checkGitHubRemote: async () => {},
+            };
+            const previousMints = bodies.length;
+            let auth = null;
+            try {
+              if (mintPath === "preflight") assert.equal((await preflightRun(run, options)).ok, true);
+              else auth = await prepareRunAuth(run, options);
+              assert.equal(reads, 1);
+              assert.equal(bodies.length, previousMints + 1);
+              assert.deepEqual(bodies.at(-1), {
+                repositories: ["demo"],
+                permissions: {
+                  contents: "write", issues: "write", pull_requests: "write",
+                  ...(assignee === "builder" ? { workflows: "write" } : {}),
+                },
+              });
+            } finally {
+              await cleanupGitHubAppAuth(auth);
+            }
+          });
+        }
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runner auth does not read state or mint tokens for local and inherited SSH execution", async () => {
+  for (const patch of [{ workflowMode: "local" }, { gitAuthStrategy: "inherited-ssh" }]) {
+    assert.equal(await prepareRunAuth({ ...builderRun(), ...patch }, {
+      readState: async () => { throw new Error("Unexpected state read"); },
+      prepareGitHubAppAuth: async () => { throw new Error("Unexpected token mint"); },
+    }), null);
+  }
+});
 
 test("stale QA remediation runs are skipped before runner launch", () => {
   const report = planRunnableRuns(fixtureState(), { limit: 1 });
@@ -1307,6 +1476,37 @@ test("github preflight validates credentials and remote access without using a r
     assert.equal(authCalls, 1);
     assert.equal(remoteCalls, 1);
     assert.equal(cleanupCalls, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitHub preflight uses fresh authoritative workflow scope even after an old SSH strategy", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-workflow-auth-"));
+  try {
+    const state = workflowAuthState();
+    state.projects[0].repoPath = await createRepository(root);
+    await git(state.projects[0].repoPath, ["remote", "add", "origin", state.projects[0].repoUrl]);
+    const run = {
+      ...structuredClone(state.runs[0]),
+      project: structuredClone(state.projects[0]),
+      gitAuthStrategy: "inherited-ssh",
+      workAreas: [".github/workflows/unapproved.yml"],
+    };
+    const grants = [];
+    const options = {
+      state,
+      prepareGitHubAppAuth: async (authRun) => {
+        grants.push(classifyWorkflowWritePermission(authRun).granted);
+        return { token: "synthetic-token", askpassPath: "" };
+      },
+      checkGitHubRemote: async () => {},
+      cleanupGitHubAppAuth: async () => {},
+    };
+    assert.equal((await preflightRun(run, options)).ok, true);
+    state.tasks[0].workAreas = ["src/**"];
+    assert.equal((await preflightRun(run, options)).ok, true);
+    assert.deepEqual(grants, [true, false]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

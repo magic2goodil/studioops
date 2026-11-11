@@ -6,8 +6,15 @@ import path from "node:path";
 import test from "node:test";
 import {
   cleanupGitHubAppAuth,
+  classifyWorkflowWritePermission,
+  formatGitHubAppAuthForLog,
+  formatGitHubAppAuthForPrompt,
+  githubAppAuthSecrets,
   prepareGitHubAppAuth,
+  redactSecrets,
 } from "../src/github-app-auth.js";
+import { appManifest } from "../scripts/setup-github-apps.js";
+import { prepareQaIntegrationAuth } from "../src/qa-integration.js";
 
 function privateKeyPem() {
   const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -37,6 +44,160 @@ function runFixture(role = "backend-reviewer") {
     },
   };
 }
+
+function workflowRun(patch = {}) {
+  return {
+    ...runFixture("builder"),
+    actionType: "start_builder",
+    workAreas: [".github/workflows/validate.yml"],
+    fileScope: [".github/workflows/validate.yml"],
+    ...patch,
+  };
+}
+
+async function withPermissionMint(run, options, inspect) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-gh-permission-"));
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const token = "ghs_synthetic_scoped_token";
+  let jwt = "";
+  let auth = null;
+  let error = null;
+  try {
+    await writeApp(root, options.credentialRole || run.role, { role: options.credentialRole || run.role });
+    globalThis.fetch = async (url, input = {}) => {
+      requests.push({ url: String(url), body: input.body ? JSON.parse(input.body) : null });
+      jwt = String(input.headers?.Authorization || "").slice("Bearer ".length);
+      if (String(url).endsWith("/repos/example/repo/installation")) {
+        return { ok: true, text: async () => JSON.stringify({ id: 123 }) };
+      }
+      assert.ok(String(url).endsWith("/app/installations/123/access_tokens"));
+      if (options.denied) {
+        return { ok: false, status: 403, text: async () => JSON.stringify({ message: `Permission missing ${jwt}` }) };
+      }
+      return { ok: true, text: async () => JSON.stringify({ token, expires_at: new Date(Date.now() + 3600000).toISOString() }) };
+    };
+    try {
+      auth = await (options.prepareAuth || prepareGitHubAppAuth)(run, {
+        githubAppCredentialsDir: root,
+        githubAppRuntimeDir: path.join(root, "runtime"),
+        githubAppRoleMap: {},
+        githubAppDefaultRole: options.defaultRole || "default",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    await inspect({ auth, error, requests, token, jwt });
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanupGitHubAppAuth(auth);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("workflow permission accepts exact approved paths and non-workflow impact expansion", () => {
+  assert.equal(classifyWorkflowWritePermission(workflowRun()).granted, true);
+  assert.equal(classifyWorkflowWritePermission(workflowRun({
+    workAreas: ["./.github/workflows/validate.yml", "src/feature.js"],
+    fileScope: ["src/**", "package*.json", ".github/workflows/validate.yml"],
+  })).granted, true);
+  assert.equal(classifyWorkflowWritePermission(workflowRun({
+    workAreas: [".github/workflows"],
+    fileScope: [".github/workflows/validate.yml", "src/support.js"],
+  })).granted, true);
+});
+
+test("workflow permission denies role, action, broad, missing, lookalike and mismatched scope authority", () => {
+  for (const patch of [
+    { role: "backend-reviewer" }, { role: "builder-reviewer" }, { role: "qa-integration-worker" },
+    { role: "promotion-worker" }, { role: "" }, { actionType: "start_review" }, { actionType: "start_architecture" },
+    { workAreas: [] }, { fileScope: [] }, { workAreas: undefined },
+    { workAreas: ["src/**"] }, { fileScope: ["src/**"] },
+    { fileScope: [".github/**"] }, { workAreas: [".github/**"] },
+    { fileScope: ["**/*"] }, { fileScope: [".g*/**"] },
+    { fileScope: [".github/workflows/**"] }, { workAreas: [".github/workflows/*.yml"] },
+    { fileScope: [".github/workflows-ci/validate.yml"] },
+    { fileScope: [".GitHub/workflows/validate.yml"] },
+    { fileScope: ["nested/.github/workflows/validate.yml"] },
+    { fileScope: [".github/workflows/../secret.yml"] },
+    { fileScope: ["/work/.github/workflows/validate.yml"] },
+    { fileScope: [".github\\workflows\\validate.yml"] },
+    { fileScope: [".github/workflows/other.yml"] },
+    { fileScope: [".github/workflows"] },
+    { fileScope: [".github/workflows/validate.yml", ".github/workflows/other.yml"] },
+  ]) {
+    assert.equal(classifyWorkflowWritePermission(workflowRun(patch)).granted, false, JSON.stringify(patch));
+  }
+});
+
+test("QA integration fallback App identity mints only the dedicated protected-check token profile", async () => {
+  await withPermissionMint(runFixture("qa-integration-worker"), { credentialRole: "builder", defaultRole: "builder" }, ({ auth, error, requests, token, jwt }) => {
+    assert.ifError(error);
+    assert.equal(auth.app.key, "builder");
+    assert.equal(auth.role, "qa-integration-worker");
+    assert.deepEqual(requests[1].body, {
+      repositories: ["repo"],
+      permissions: { checks: "read", statuses: "read", contents: "write", issues: "write", pull_requests: "write" },
+    });
+    const displayed = formatGitHubAppAuthForLog(auth) + formatGitHubAppAuthForPrompt(auth);
+    assert.equal(displayed.includes(token), false);
+    assert.equal(displayed.includes(jwt), false);
+    assert.equal(redactSecrets(`${token} ${jwt}`, githubAppAuthSecrets(auth)).includes(token), false);
+  });
+});
+
+test("ordinary builder token does not inherit QA or workflow permissions", async () => {
+  await withPermissionMint(workflowRun({ workAreas: ["src/**"], fileScope: ["src/feature.js"] }), {}, ({ auth, error, requests }) => {
+    assert.ifError(error);
+    assert.deepEqual(requests[1].body, { repositories: ["repo"], permissions: { contents: "write", issues: "write", pull_requests: "write" } });
+    assert.equal(auth.workflowPermission.granted, false);
+  });
+});
+
+test("QA adapter pins its permission profile when the configured identity fallback is a builder App", async () => {
+  await withPermissionMint(runFixture("qa-integration-worker"), {
+    credentialRole: "builder",
+    defaultRole: "builder",
+    prepareAuth: (run, input) => prepareQaIntegrationAuth({
+      projectId: "project_test", projectKey: "example", repoUrl: "https://github.com/example/repo",
+    }, { ...input, githubAppRole: "builder" }),
+  }, ({ auth, error, requests }) => {
+    assert.ifError(error);
+    assert.equal(auth.role, "qa-integration-worker");
+    assert.equal(auth.app.key, "builder");
+    assert.deepEqual(requests[1].body.permissions, { checks: "read", statuses: "read", contents: "write", issues: "write", pull_requests: "write" });
+  });
+});
+
+test("only a scoped builder mint requests workflows write and remains one-repository scoped", async () => {
+  await withPermissionMint(workflowRun({ fileScope: [".github/workflows/validate.yml", "package*.json"] }), {}, ({ auth, error, requests }) => {
+    assert.ifError(error);
+    assert.deepEqual(requests[1].body, { repositories: ["repo"], permissions: { contents: "write", issues: "write", pull_requests: "write", workflows: "write" } });
+    assert.equal(auth.workflowPermission.granted, true);
+  });
+});
+
+test("unapproved installation permissions fail once without leaking JWT or changing credential identity", async () => {
+  await withPermissionMint(workflowRun(), { denied: true }, ({ auth, error, requests, jwt }) => {
+    assert.equal(auth, null);
+    assert.equal(requests.length, 2);
+    assert.equal(error.code, "github_app_permissions_not_approved");
+    assert.match(error.message, /approve any pending installation permission update/i);
+    assert.match(error.message, /fresh token/);
+    assert.equal(error.message.includes(jwt), false);
+  });
+});
+
+test("setup ceilings separate QA inspection and Builder workflow authority", () => {
+  const make = (role) => appManifest({ role, name: "Synthetic App", description: "Synthetic" }, "http://127.0.0.1:4328").default_permissions;
+  assert.deepEqual(make("qa-integration-worker"), { checks: "read", contents: "write", issues: "write", metadata: "read", pull_requests: "write", statuses: "read" });
+  assert.equal(make("builder").workflows, "write");
+  assert.equal(make("builder").statuses, "read");
+  assert.equal(make("default").statuses, "read");
+  for (const role of ["default", "backend-reviewer", "frontend-reviewer", "lead-reviewer", "promotion-worker", "qa-integration-worker"]) {
+    assert.equal(make(role).workflows, undefined);
+  }
+});
 
 test("malformed role-specific GitHub App credentials fail before default fallback", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-gh-app-auth-"));
