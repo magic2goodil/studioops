@@ -14,7 +14,7 @@
 - Focus state must be visible.
 - Tab order must follow the visible and logical reading order.
 - Modals must support Escape to close when appropriate.
-- Modals should keep focus within the modal while open when practical.
+- Modal dialogs must contain keyboard focus while open and restore focus appropriately when closed.
 
 ## Images And Icons
 
@@ -45,3 +45,16 @@
 
 - Dynamic state changes should be exposed through semantic state, focus movement, or live regions where appropriate.
 - Custom menus, tabs, dialogs, and disclosure controls need screen-reader understandable names, roles, states, and keyboard behavior.
+
+## Conformance Target And Verification
+
+Target WCAG 2.2 Level AA for web interfaces, including applicable Level A criteria. This checklist supplements rather than replaces the complete applicable success criteria.
+
+- Text contrast must be at least 4.5:1, or 3:1 for large text as defined by WCAG. Applicable UI component and graphical-object contrast must be at least 3:1. Apply only the exceptions allowed by the relevant success criterion, such as inactive controls, and document their applicability.
+- Support text resizing to 200% without loss of content or functionality. Verify reflow at 320 CSS pixels wide without two-dimensional scrolling, except content whose usage or meaning requires a two-dimensional layout.
+- Keyboard focus must be visible and not entirely obscured by author-created content. Modal dialogs must contain keyboard focus while open and restore it to the invoking control or a logical next location when closed; users must have an operable way to dismiss them.
+- Pointer targets must be at least 24 by 24 CSS pixels or meet a WCAG 2.2 target-size exception, such as sufficient spacing or an equivalent control. Document exceptions rather than silently skipping the check.
+- Provide a single-pointer alternative to dragging where required. Authentication must not require a cognitive function test without an allowed alternative or assistance mechanism; support password managers and paste.
+- Combine automated checks with manual keyboard, zoom/reflow, focus, contrast, and relevant screen-reader checks on representative flows. Record tested surfaces, tools, findings, and gaps. A clean scanner report alone is not a conformance claim.
+
+References: [WCAG 2.2](https://www.w3.org/TR/WCAG22/) and [WAI evaluation guidance](https://www.w3.org/WAI/test-evaluate/).

@@ -35,3 +35,11 @@ Budgets are targets, not excuses to avoid measurement. If a task affects initial
 
 Reviewers should flag changes that feel slow, block rendering, cause avoidable layout shift, or load too much upfront.
 
+
+## Measurement Evidence
+
+Evaluate Core Web Vitals using field data at the 75th percentile, segmented separately for mobile and desktop. Record measurement source, collection window, sample limitations, and affected routes. Retain the budgets above; FCP is a useful additional metric, not a Core Web Vital.
+
+Use lab measurements to diagnose regressions and validate changes before sufficient field data exists. A lab score or synthetic interaction is not proof of field INP compliance. If field data is unavailable, report that gap and the lab conditions rather than claiming a field pass.
+
+Reference: [Web Vitals](https://web.dev/articles/vitals).
