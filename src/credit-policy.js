@@ -560,6 +560,12 @@ export function freshHealthyCreditEvidence(snapshot, input = {}, evaluation = {}
     && ["available", "recovered"].includes(evidence.snapshotStatus) };
 }
 
+/** Recovery must follow every retained block, not just its original cause. */
+export function creditExhaustionBarrierMs(observation) {
+  return Math.max(Date.parse(observation?.observedAt || "") || 0,
+    Date.parse(observation?.latestBlockingObservedAt || "") || 0);
+}
+
 function fallbackDecision(snapshotStatus, rule) {
   if (rule.invalidReasonCode) {
     return {
@@ -660,7 +666,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     && EXHAUSTION_CODES.has(prior.reasonCode)
     && Number.isFinite(Date.parse(prior.observedAt || ""));
   const newerFresh = healthyCapacity
-    && Date.parse(snapshotEvidence.snapshotObservedAt || "") > Date.parse(prior?.observedAt || "");
+    && Date.parse(snapshotEvidence.snapshotObservedAt || "") > creditExhaustionBarrierMs(prior);
   if (priorValid && !newerFresh) {
     const code = prior.reasonCode === "rate_limit_reached" && !prior.classificationVersion
       ? "prior_exhaustion_unverified" : prior.reasonCode;

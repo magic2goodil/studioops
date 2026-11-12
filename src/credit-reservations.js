@@ -2,7 +2,7 @@ import { sanitizedCreditAdmission } from "./credit-admission-evidence.js";
 export { sanitizedCreditAdmission } from "./credit-admission-evidence.js";
 import { createHash } from "node:crypto";
 import { failureWorkIdentity, normalizeFailureProvider } from "./failure-containment.js";
-import { freshHealthyCreditEvidence, creditExhaustionObservation } from "./credit-policy.js";
+import { freshHealthyCreditEvidence, creditExhaustionObservation, creditExhaustionBarrierMs } from "./credit-policy.js";
 
 const TIERS = new Set(["mechanical", "economy", "balanced", "critical", "frontier"]);
 const digest = value => `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
@@ -12,21 +12,25 @@ export function updateCreditExhaustionState(state, snapshot, { policy = {}, now 
   const observation = creditExhaustionObservation(snapshot, now);
   const prior = state.meta?.creditObservedExhaustion;
   if (observation) {
-    const latestEvidenceAt = Math.max(Date.parse(prior?.observedAt || "") || 0,
+    const latestEvidenceAt = Math.max(creditExhaustionBarrierMs(prior),
       Date.parse(prior?.clearedByFreshSnapshotAt || "") || 0);
-    // An unresolved included/overage observation cannot erase a historical
-    // hard block, including legacy evidence whose original cause is unknown.
+    // Replays cannot regress ordering or change an active block's provenance.
+    // A denial tied with prior clearance is a conflict: fail closed again.
+    const observedMs = Date.parse(observation.observedAt);
+    if (prior && (observedMs < latestEvidenceAt || (prior.active && observedMs === latestEvidenceAt))) return;
+    // Retain the original hard refusal (including unclassified legacy cause),
+    // while recording every newer block as a separate recovery barrier.
     const unresolved = ["overage_eligibility_unverified", "included_usage_permission_unknown"];
-    if (prior?.active && !unresolved.includes(prior.reasonCode) && unresolved.includes(observation.reasonCode)) return;
-    if (!prior || Date.parse(observation.observedAt) >= latestEvidenceAt) {
-      state.meta ||= {}; state.meta.creditObservedExhaustion = observation;
-    }
+    state.meta ||= {};
+    state.meta.creditObservedExhaustion = prior?.active && !unresolved.includes(prior.reasonCode)
+      ? { ...prior, latestBlockingObservedAt: observation.observedAt }
+      : observation;
     return;
   }
   if (!prior?.active) return;
   const evidence = freshHealthyCreditEvidence(snapshot, policy, { evaluatedAt: now });
   if (evidence.healthyCapacity
-    && Date.parse(evidence.snapshotObservedAt || "") > Date.parse(prior.observedAt)) {
+    && Date.parse(evidence.snapshotObservedAt || "") > creditExhaustionBarrierMs(prior)) {
     state.meta.creditObservedExhaustion = { ...prior, active: false, clearedByFreshSnapshotAt: evidence.snapshotObservedAt };
   }
 }

@@ -296,7 +296,8 @@ test("partial telemetry and status labels cannot invent measured capacity or cle
     updateCreditExhaustionState(state, prior, { policy: configured });
     const before = structuredClone(state.meta.creditObservedExhaustion);
     updateCreditExhaustionState(state, incoming, { policy: configured });
-    assert.deepEqual(state.meta.creditObservedExhaustion, before);
+    assert.deepEqual(state.meta.creditObservedExhaustion, incoming === partial
+      ? { ...before, latestBlockingObservedAt: incoming.observedAt } : before);
     const assessed = assessCreditAdmission(incoming, { modelTier: "balanced" }, configured, { knownExhaustion: before });
     assert.equal(assessed.allowed, false);
     assert.equal(assessed.code, "prior_exhaustion_unverified");
@@ -455,4 +456,52 @@ test("50 compatible actions and terminal reservations plan within the bounded lo
   const result = planDispatches(state, actions, { ...options, builderConcurrency: 60, maxDispatchesPerSweep: 60 });
   assert.equal(result.selected.length, 50);
   assert.ok(performance.now() - started < 200, "bounded planning should not rescan historical state per action");
+});
+
+test("dispatch and claim retain newer denials until strictly later healthy evidence", async () => {
+  const now = Date.now();
+  const times = [4, 3, 2, 1].map(seconds => new Date(now - seconds * 1000).toISOString());
+  const normalized = (observedAt, ordinaryUsageAllowed, reachedType, usedPercent) => normalizeCreditSnapshot({
+    ordinaryUsageAllowed, rateLimits: { limitId: "codex", primary: { usedPercent },
+      rateLimitReachedType: reachedType, spendControlReached: false, credits: { hasCredits: false } },
+  }, { observedAt });
+  for (const mode of ["dispatch", "claim"]) {
+    const { state, actions, options } = fixture();
+    updateCreditExhaustionState(state, normalized(times[0], false, "workspace_owner_usage_limit_reached", 100));
+    const original = structuredClone(state.meta.creditObservedExhaustion);
+    updateCreditExhaustionState(state, normalized(times[2], false, "rate_limit_reached", 100));
+    state.meta.creditObservedExhaustion = JSON.parse(JSON.stringify(state.meta.creditObservedExhaustion));
+    const marker = { ...original, latestBlockingObservedAt: times[2] };
+    assert.deepEqual(state.meta.creditObservedExhaustion, marker);
+    let preflights = 0, probes = 0;
+    options.creditSnapshotProbe = async () => { probes++; throw new Error("Unexpected credit probe"); };
+    const run = mode === "claim" ? queued(state, state.tasks[0], "run_ordering") : null;
+    const invoke = async () => mode === "dispatch"
+      ? dispatchSupervisorActions([actions[0]], options)
+      : claimRuns({ ...options, limit: 1, preflightRun: async () => { preflights++; return { ok: true, workflowMode: "local" }; } });
+    for (const observedAt of [times[1]]) {
+      options.creditSnapshot = normalized(observedAt, true, null, 20);
+      const blocked = await invoke();
+      assert.equal(mode === "dispatch" ? blocked.runs.length : blocked.length, 0);
+      assert.deepEqual(state.meta.creditObservedExhaustion, marker);
+      if (mode === "claim") {
+        assert.equal(preflights, 0);
+        assert.equal(run.status, "queued");
+        assert.equal(run.startedAt, undefined);
+        assert.equal(run.creditClaimBlocker.code, "rate_limit_reached");
+        assert.equal(run.creditClaimBlocker.fallbackUsed, false);
+      } else {
+        assert.equal(blocked.skipped[0].reason, "credit_gate:rate_limit_reached");
+      }
+    }
+    options.creditSnapshot = normalized(times[3], true, null, 20);
+    const recovered = await invoke();
+    assert.equal(mode === "dispatch" ? recovered.runs.length : recovered.length, 1);
+    assert.deepEqual(state.meta.creditObservedExhaustion, { ...marker, active: false, clearedByFreshSnapshotAt: times[3] });
+    const admission = mode === "dispatch" ? recovered.runs[0].creditAdmission : run.creditClaimAdmission;
+    assert.equal(admission.code, "included_quota_available");
+    assert.equal(admission.fallbackUsed === true, false);
+    assert.equal(probes, 0);
+    if (mode === "claim") assert.equal(preflights, 1);
+  }
 });

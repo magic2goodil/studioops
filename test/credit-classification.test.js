@@ -72,7 +72,7 @@ test("unresolved telemetry persists conservatively and cannot clear or replace h
   ]) {
     const state = { meta: { creditObservedExhaustion: structuredClone(prior) } };
     updateCreditExhaustionState(state, mixed, { policy, now: evaluation.evaluatedAt });
-    assert.deepEqual(state.meta.creditObservedExhaustion, prior);
+    assert.deepEqual(state.meta.creditObservedExhaustion, { ...prior, latestBlockingObservedAt: mixed.observedAt });
     assert.equal(assess(mixed, { knownExhaustion: prior }).allowed, false);
     assert.equal(assess(mixed, { knownExhaustion: prior }).code,
       prior.classificationVersion ? "spend_control_reached" : "prior_exhaustion_unverified");
@@ -124,7 +124,7 @@ test("successful no-bucket responses preserve permission and fail closed through
   assert.equal(assess({ status: "unknown", source: "codex-app-server", observedAt }).mode, "bounded");
 });
 
-test("legacy replay cannot upgrade historical provenance; fresh classified evidence can", () => {
+test("legacy refusal provenance survives until recovery; a new episode retains its own classification", () => {
   const prior = { active: true, reasonCode: "rate_limit_reached", observedAt };
   const state = { meta: { creditObservedExhaustion: structuredClone(prior) } };
   for (const at of ["2026-11-12T02:59:00.000Z", observedAt, "2026-11-12T03:00:10.000Z"]) {
@@ -139,11 +139,101 @@ test("legacy replay cannot upgrade historical provenance; fresh classified evide
   const refusal = snapshot({ reachedType: "workspace_owner_usage_limit_reached" });
   refusal.observedAt = "2026-11-12T03:00:20.000Z";
   updateCreditExhaustionState(state, refusal, { policy, now: evaluation.evaluatedAt });
-  assert.equal(state.meta.creditObservedExhaustion.classificationVersion, 2);
-  assert.equal(assess(refusal, { knownExhaustion: state.meta.creditObservedExhaustion }).code, "rate_limit_reached");
+  assert.deepEqual(state.meta.creditObservedExhaustion, { ...prior, latestBlockingObservedAt: refusal.observedAt });
+  assert.equal(assess(refusal, { knownExhaustion: state.meta.creditObservedExhaustion }).code, "prior_exhaustion_unverified");
   const healthy = snapshot({ ordinaryUsageAllowed: true, reachedType: null, usedPercent: 20 });
   healthy.observedAt = "2026-11-12T03:00:30.000Z";
   updateCreditExhaustionState(state, healthy, { policy, now: evaluation.evaluatedAt });
   assert.equal(state.meta.creditObservedExhaustion.active, false);
   assert.equal(state.meta.creditObservedExhaustion.clearedByFreshSnapshotAt, healthy.observedAt);
+  refusal.observedAt = "2026-11-12T03:00:40.000Z";
+  updateCreditExhaustionState(state, refusal, { policy, now: evaluation.evaluatedAt });
+  assert.equal(state.meta.creditObservedExhaustion.classificationVersion, 2);
+  assert.equal(assess(refusal, { knownExhaustion: state.meta.creditObservedExhaustion }).code, "rate_limit_reached");
+});
+
+test("latest blocking evidence fences delayed recovery without replacing refusal provenance", () => {
+  const times = [0, 1, 2, 3].map(minute => `2026-11-12T03:0${minute}:00.000Z`);
+  const now = "2026-11-12T03:04:00.000Z";
+  const hardBlocks = [
+    { active: true, reasonCode: "rate_limit_reached", observedAt: times[0] },
+    { active: true, reasonCode: "rate_limit_reached", observedAt: times[0], classificationVersion: 2 },
+    { active: true, reasonCode: "spend_control_reached", observedAt: times[0], classificationVersion: 2 },
+  ];
+  const blockingSnapshots = [snapshot(), snapshot({ ordinaryUsageAllowed: null, usedPercent: 20, reachedType: null })];
+  assert.deepEqual(blockingSnapshots.map(value => creditExhaustionObservation(value).reasonCode),
+    ["overage_eligibility_unverified", "included_usage_permission_unknown"]);
+  const healthy = snapshot({ ordinaryUsageAllowed: true, usedPercent: 20, reachedType: null });
+  for (const original of hardBlocks) {
+    for (const blocking of blockingSnapshots) {
+      const state = { meta: { creditObservedExhaustion: structuredClone(original) } };
+      updateCreditExhaustionState(state, { ...blocking, observedAt: times[2] }, { policy, now });
+      const marker = { ...original, latestBlockingObservedAt: times[2] };
+      assert.deepEqual(state.meta.creditObservedExhaustion, marker);
+      const assessment = value => assess(value, { evaluatedAt: now, knownExhaustion: state.meta.creditObservedExhaustion });
+      // Stale/equal replays, including another classified hard refusal, cannot
+      // replace the original cause or lower the latest blocking timestamp.
+      for (const observedAt of [times[0], times[1], times[2]]) {
+        for (const replay of [...blockingSnapshots, snapshot({ spendControlReached: true })]) {
+          updateCreditExhaustionState(state, { ...replay, observedAt }, { policy, now });
+          assert.deepEqual(state.meta.creditObservedExhaustion, marker);
+        }
+      }
+      for (const observedAt of [times[1], times[2]]) {
+        const incoming = { ...healthy, observedAt };
+        assert.equal(assessment(incoming).allowed, false);
+        assert.equal(assessment(incoming).fallbackUsed, false);
+        assert.equal(assessment(incoming).code, original.classificationVersion ? original.reasonCode : "prior_exhaustion_unverified");
+        updateCreditExhaustionState(state, incoming, { policy, now });
+        assert.deepEqual(state.meta.creditObservedExhaustion, marker);
+        assert.equal(assessment(incoming).allowed, false);
+      }
+      const laterHealthy = { ...healthy, observedAt: times[3] };
+      assert.equal(assessment(laterHealthy).allowed, true);
+      updateCreditExhaustionState(state, laterHealthy, { policy, now });
+      const cleared = { ...marker, active: false, clearedByFreshSnapshotAt: times[3] };
+      assert.deepEqual(state.meta.creditObservedExhaustion, cleared);
+      assert.equal(assessment(laterHealthy).allowed, true);
+      for (const observedAt of [times[2]]) {
+        updateCreditExhaustionState(state, { ...blocking, observedAt }, { policy, now });
+        assert.deepEqual(state.meta.creditObservedExhaustion, cleared);
+      }
+    }
+  }
+});
+
+test("denial tied with prior clearance blocks fallback and same-time healthy evidence", () => {
+  const state = {};
+  const now = "2026-11-12T03:04:00.000Z";
+  const hard = snapshot({ reachedType: "workspace_owner_usage_limit_reached" });
+  const healthy = { ...snapshot({ ordinaryUsageAllowed: true, usedPercent: 20, reachedType: null }),
+    observedAt: "2026-11-12T03:02:00.000Z" };
+  updateCreditExhaustionState(state, hard, { policy, now });
+  updateCreditExhaustionState(state, healthy, { policy, now });
+  assert.equal(state.meta.creditObservedExhaustion.active, false);
+  updateCreditExhaustionState(state, { ...hard, observedAt: healthy.observedAt }, { policy, now });
+  const marker = structuredClone(state.meta.creditObservedExhaustion);
+  assert.equal(marker.active, true);
+  assert.equal(marker.observedAt, healthy.observedAt);
+  const assessment = value => assess(value, { evaluatedAt: now, knownExhaustion: state.meta.creditObservedExhaustion });
+  for (const incoming of [{ status: "unknown", observedAt: "2026-11-12T03:03:00.000Z" }, healthy]) {
+    assert.equal(assessment(incoming).allowed, false);
+    assert.equal(assessment(incoming).fallbackUsed, false);
+    updateCreditExhaustionState(state, incoming, { policy, now });
+    assert.deepEqual(state.meta.creditObservedExhaustion, marker);
+  }
+  const later = { ...healthy, observedAt: "2026-11-12T03:03:00.000Z" };
+  updateCreditExhaustionState(state, later, { policy, now });
+  assert.equal(state.meta.creditObservedExhaustion.active, false);
+  assert.equal(assessment(later).allowed, true);
+});
+
+test("newer hard refusals advance the barrier while preserving the first hard cause", () => {
+  const state = {};
+  const original = snapshot({ reachedType: "workspace_owner_usage_limit_reached" });
+  updateCreditExhaustionState(state, original);
+  const provenance = structuredClone(state.meta.creditObservedExhaustion);
+  const newer = { ...snapshot({ spendControlReached: true }), observedAt: "2026-11-12T03:02:00.000Z" };
+  updateCreditExhaustionState(state, newer);
+  assert.deepEqual(state.meta.creditObservedExhaustion, { ...provenance, latestBlockingObservedAt: newer.observedAt });
 });
