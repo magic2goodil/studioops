@@ -14,6 +14,10 @@ export function updateCreditExhaustionState(state, snapshot, { policy = {}, now 
   if (observation) {
     const latestEvidenceAt = Math.max(Date.parse(prior?.observedAt || "") || 0,
       Date.parse(prior?.clearedByFreshSnapshotAt || "") || 0);
+    // An unresolved included/overage observation cannot erase a historical
+    // hard block, including legacy evidence whose original cause is unknown.
+    const unresolved = ["overage_eligibility_unverified", "included_usage_permission_unknown"];
+    if (prior?.active && !unresolved.includes(prior.reasonCode) && unresolved.includes(observation.reasonCode)) return;
     if (!prior || Date.parse(observation.observedAt) >= latestEvidenceAt) {
       state.meta ||= {}; state.meta.creditObservedExhaustion = observation;
     }

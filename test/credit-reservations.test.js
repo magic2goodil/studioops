@@ -230,7 +230,7 @@ test("observed global exhaustion survives unknown ticks/new tasks until newer fr
   options.creditSnapshot = unknown();
   const blocked = await dispatchSupervisorActions([actions[1]], options);
   assert.equal(blocked.runs.length, 0);
-  assert.equal(blocked.skipped[0].reason, "credit_gate:rate_limit_reached");
+  assert.equal(blocked.skipped[0].reason, "credit_gate:prior_exhaustion_unverified");
   assert.equal(probes, 0);
   options.creditSnapshot = { status: "available", source: "studioops", observedAt: new Date().toISOString(), remainingPercent: 80 };
   const recovered = await dispatchSupervisorActions([actions[1]], options);
@@ -273,7 +273,7 @@ test("configured freshness preserves observed exhaustion at dispatch and atomic 
       let preflights = 0;
       assert.equal((await claimRuns({ ...options, preflightRun: async () => { preflights++; return { ok: true }; } })).length, 0);
       assert.equal(preflights, 0);
-      assert.equal(run.creditClaimBlocker.code, "rate_limit_reached");
+      assert.equal(run.creditClaimBlocker.code, "prior_exhaustion_unverified");
     }
     assert.deepEqual(state.meta.creditObservedExhaustion, marker);
     const assessed = assessCreditAdmission(incoming, { modelTier: "balanced" }, options.creditPolicy,
@@ -299,11 +299,11 @@ test("partial telemetry and status labels cannot invent measured capacity or cle
     assert.deepEqual(state.meta.creditObservedExhaustion, before);
     const assessed = assessCreditAdmission(incoming, { modelTier: "balanced" }, configured, { knownExhaustion: before });
     assert.equal(assessed.allowed, false);
-    assert.equal(assessed.code, "rate_limit_reached");
+    assert.equal(assessed.code, "prior_exhaustion_unverified");
     const noPrior = assessCreditAdmission(incoming, { modelTier: "balanced" }, configured);
     assert.equal(noPrior.snapshotStatus, "unknown");
     assert.equal(noPrior.allowed, false);
-    assert.equal(noPrior.fallbackUsed, true);
+    assert.equal(noPrior.fallbackUsed, incoming === partial ? false : true);
   }
   const bounded = assessCreditAdmission({ status: "available", observedAt, remainingPercent: null },
     { modelTier: "balanced" }, policy());

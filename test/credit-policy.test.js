@@ -80,7 +80,11 @@ test("Codex rate-limit responses are reduced to a sanitized admission snapshot",
     remainingPercent: 78,
     resetsAt: 1785850510,
     reached: false,
+    classificationVersion: 2,
     reachedType: "",
+    ordinaryUsageAllowed: null,
+    spendControlReached: null,
+    overageEligibility: "unverified",
     credits: {
       available: true,
       unlimited: false,
@@ -99,7 +103,7 @@ test("normalized provider bucket diagnostics use allowlisted identifiers", () =>
   }, { observedAt: "2026-08-16T12:00:00.000Z" });
 
   assert.equal(snapshot.bucketId, "unclassified");
-  assert.equal(snapshot.reachedType, "rate_limit_reached");
+  assert.equal(snapshot.reachedType, "unclassified");
 });
 
 test("legacy fail-closed tiers normalize while ordinary degraded work is bounded", () => {

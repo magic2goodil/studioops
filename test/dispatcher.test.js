@@ -10,6 +10,7 @@ import {
   resolveDispatcherProvider,
 } from "../src/dispatcher.js";
 import { createSupervisorReport } from "../src/supervisor.js";
+import { normalizeCreditSnapshot } from "../src/credit-policy.js";
 import { fileScopesMayOverlap } from "../src/work-lanes.js";
 import { createHermeticTestEnvironment } from "../scripts/test-environment.js";
 import { claimRuns, planRunnableRuns } from "../src/runner.js";
@@ -1853,15 +1854,12 @@ test("a retry that reports a real limit opens one circuit without another probe 
   let probes = 0;
   options.creditSnapshotProbe = async () => {
     probes += 1;
-    return {
-      status: "available",
-      source: "sanitized-test-probe",
-      observedAt: new Date().toISOString(),
-      remainingPercent: 0,
-      reached: true,
-      reachedType: "usage_limit",
-      credits: { available: false, unlimited: false, balance: null },
-    };
+    return normalizeCreditSnapshot({ ordinaryUsageAllowed: false, rateLimits: {
+      primary: { usedPercent: 100 },
+      rateLimitReachedType: "workspace_owner_usage_limit_reached",
+      spendControlReached: false,
+      credits: { hasCredits: false, unlimited: false, balance: null },
+    } });
   };
 
   const report = await dispatchSupervisorActions([action], options);
@@ -1875,15 +1873,12 @@ test("a retry that reports a real limit opens one circuit without another probe 
 
 test("a real rate limit fails closed without a retry or quality downgrade", async () => {
   const { state, action, options } = criticalCreditFixture();
-  options.creditSnapshot = {
-    status: "available",
-    source: "sanitized-test-probe",
-    observedAt: new Date().toISOString(),
-    remainingPercent: 0,
-    reached: true,
-    reachedType: "usage_limit",
-    credits: { available: false, unlimited: false, balance: null },
-  };
+  options.creditSnapshot = normalizeCreditSnapshot({ ordinaryUsageAllowed: false, rateLimits: {
+    primary: { usedPercent: 100 },
+    rateLimitReachedType: "workspace_owner_usage_limit_reached",
+    spendControlReached: false,
+    credits: { hasCredits: false, unlimited: false, balance: null },
+  } });
   let probes = 0;
   options.creditSnapshotProbe = async () => {
     probes += 1;
