@@ -18,6 +18,7 @@ export const PROJECT_VALIDATION_SANDBOX_ISOLATION = Object.freeze({
   detachedDescendantTermination: false,
 });
 export const DEFAULT_PROJECT_VALIDATION_PATH = [
+  path.dirname(process.execPath),
   "/usr/bin",
   "/bin",
   "/usr/sbin",

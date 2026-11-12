@@ -38,6 +38,7 @@ import {
 import { formatRunnerPlan, formatRunnerReport, planRunnableRuns, runQueuedRuns } from "./runner.js";
 import { formatNotificationReport, sendPendingNotifications } from "./notifier.js";
 import { formatQaIntegrationReport, planQaIntegrations, runQaIntegration } from "./qa-integration.js";
+import { recoverAbandonedQaClaim } from "./qa-claim-recovery.js";
 import { resolveQaIntegrationOptions } from "./qa-integration-options.js";
 import { formatPromotionReport, planPromotions, runPromotion } from "./promotion.js";
 import { formatSelfUpdateReport, runSelfUpdate } from "./self-update.js";
@@ -469,6 +470,7 @@ Commands:
   dispatcher                    Create durable dispatch runs from supervisor actions
   runner                        Run queued builder/reviewer dispatches with Codex
   qa-integrate                  Assemble reviewed commits into immutable local QA candidates
+  qa-recover-claim               Recover one exact QA claim whose local owner is absent
   qa-pass TASK_ID|--bundle BUNDLE_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --owner-qa-packet-digest DIGEST --body NOTES
                                 Approve the exact immutable candidate tested in local QA
   qa-fail TASK_ID|--bundle BUNDLE_ID --candidate ID --manifest-digest DIGEST --integration-sha SHA --owner-qa-packet-digest DIGEST --body NOTES
@@ -1327,6 +1329,17 @@ Automation:
     });
     if (args.json) console.log(JSON.stringify(report, null, 2));
     else console.log(formatSelfUpdateReport(report));
+    return;
+  }
+
+  if (command === "qa-recover-claim") {
+    if (args.apply !== undefined && args.apply !== true) throw new Error("--apply is a flag and does not accept a value.");
+    const report = await recoverAbandonedQaClaim({
+      projectId: args["project-id"], claimId: args["claim-id"], fence: args.fence,
+      ownerPid: args["owner-pid"], ownerHost: args["owner-host"],
+      dryRun: !args.apply || Boolean(args.plan || args["dry-run"]),
+    });
+    console.log(JSON.stringify(report, null, 2));
     return;
   }
 

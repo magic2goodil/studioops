@@ -123,6 +123,12 @@ test("project validation uses a disposable no-network sandbox and cannot reach s
     const npmRuntime = await runProjectValidationCommand(sandbox, "npm --version");
     assert.equal(npmRuntime.ok, true, npmRuntime.output);
 
+    const nodeIdentity = await runProjectValidationCommand(
+      sandbox, "node -p 'JSON.stringify({executable:process.execPath,version:process.version})'",
+    );
+    assert.equal(nodeIdentity.ok, true, nodeIdentity.output);
+    assert.deepEqual(JSON.parse(nodeIdentity.stdout), { executable: process.execPath, version: process.version });
+
     const frameworkPython = "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3";
     const frameworkPythonAvailable = await readFile(frameworkPython)
       .then(() => true)
