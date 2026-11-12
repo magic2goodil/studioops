@@ -91,13 +91,50 @@ function finiteNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+const REACHED_TYPES = new Set([
+  "rate_limit_reached", "workspace_owner_credits_depleted", "workspace_member_credits_depleted",
+  "workspace_owner_usage_limit_reached", "workspace_member_usage_limit_reached",
+]);
+const EXHAUSTION_CODES = new Set([
+  "rate_limit_reached", "insufficient_credit_balance", "spend_control_reached",
+  "overage_eligibility_unverified", "included_usage_permission_unknown",
+]);
+
+function snapshotBlocker(snapshot) {
+  if (snapshot?.spendControlReached === true) return "spend_control_reached";
+  // Legacy reached records remain blocking, but percentages and the generic
+  // backend included-limit signal are not evidence of a provider refusal.
+  if (snapshot?.reached === true) return "rate_limit_reached";
+  const remaining = finiteNumber(snapshot?.remainingPercent);
+  if (snapshot?.ordinaryUsageAllowed === false || (remaining !== null && remaining <= 0)
+    || snapshot?.reachedType === "rate_limit_reached" || snapshot?.reachedType === "unclassified") {
+    return "overage_eligibility_unverified";
+  }
+  if (snapshot?.classificationVersion === 2 && (snapshot.ordinaryUsageAllowed !== true
+    || snapshot.spendControlReached !== false)) return "included_usage_permission_unknown";
+  if (snapshot?.credits?.available === true && snapshot.credits.unlimited !== true
+    && finiteNumber(snapshot.credits.balance) !== null && finiteNumber(snapshot.credits.balance) <= 0) {
+    return "insufficient_credit_balance";
+  }
+  return "";
+}
+
+function blockerReason(code) {
+  return {
+    rate_limit_reached: "Codex reports that the active usage limit has been reached.",
+    spend_control_reached: "The backend reports an active spend-control block.",
+    overage_eligibility_unverified: "Included usage is unavailable or exhausted. Paid overage eligibility and an approved spending budget are not established.",
+    included_usage_permission_unknown: "Included-usage permission or spend-control status is unavailable; admission remains closed.",
+    insufficient_credit_balance: "The observed credit balance is exhausted.",
+  }[code];
+}
+
 function creditCapacity(snapshot) {
   const remaining = finiteNumber(snapshot?.remainingPercent);
   const remainingPercent = remaining !== null && remaining >= 0 && remaining <= 100 ? remaining : null;
   const balance = snapshot?.credits?.available === true ? finiteNumber(snapshot.credits.balance) : null;
   const unlimited = snapshot?.credits?.unlimited === true;
-  const exhausted = snapshot?.reached === true || (remaining !== null && remaining <= 0)
-    || (!unlimited && balance !== null && balance <= 0);
+  const exhausted = Boolean(snapshotBlocker(snapshot));
   return { remainingPercent, balance, unlimited, exhausted,
     measured: remainingPercent !== null || balance !== null || unlimited };
 }
@@ -233,6 +270,10 @@ export function normalizeCreditSnapshot(result, input = {}) {
       source: "codex-app-server",
       observedAt,
       reason: "Codex did not return a rate-limit bucket.",
+      classificationVersion: 2,
+      ordinaryUsageAllowed: typeof result?.ordinaryUsageAllowed === "boolean" ? result.ordinaryUsageAllowed : null,
+      spendControlReached: null,
+      overageEligibility: "unverified",
     };
   }
 
@@ -243,8 +284,9 @@ export function normalizeCreditSnapshot(result, input = {}) {
   const usedPercent = usedPercents.length ? Math.max(...usedPercents) : null;
   const credits = bucket.credits || null;
   const balance = finiteNumber(credits?.balance);
-  const reached = Boolean(bucket.rateLimitReachedType)
-    || (usedPercent !== null && usedPercent >= 100);
+  const reachedType = bucket.rateLimitReachedType
+    ? (REACHED_TYPES.has(bucket.rateLimitReachedType) ? bucket.rateLimitReachedType : "unclassified") : "";
+  const reached = REACHED_TYPES.has(reachedType) && reachedType !== "rate_limit_reached";
 
   return {
     status: reached || usedPercent !== null || (credits?.hasCredits === true && balance !== null)
@@ -259,7 +301,11 @@ export function normalizeCreditSnapshot(result, input = {}) {
       ...windows.map((window) => Number(window.resetsAt || 0)).filter(Number.isFinite),
     ) || null,
     reached,
-    reachedType: bucket.rateLimitReachedType ? "rate_limit_reached" : "",
+    classificationVersion: 2,
+    reachedType,
+    ordinaryUsageAllowed: typeof result.ordinaryUsageAllowed === "boolean" ? result.ordinaryUsageAllowed : null,
+    spendControlReached: typeof bucket.spendControlReached === "boolean" ? bucket.spendControlReached : null,
+    overageEligibility: "unverified",
     credits: {
       available: credits?.hasCredits === true,
       unlimited: credits?.unlimited === true,
@@ -514,6 +560,12 @@ export function freshHealthyCreditEvidence(snapshot, input = {}, evaluation = {}
     && ["available", "recovered"].includes(evidence.snapshotStatus) };
 }
 
+/** Recovery must follow every retained block, not just its original cause. */
+export function creditExhaustionBarrierMs(observation) {
+  return Math.max(Date.parse(observation?.observedAt || "") || 0,
+    Date.parse(observation?.latestBlockingObservedAt || "") || 0);
+}
+
 function fallbackDecision(snapshotStatus, rule) {
   if (rule.invalidReasonCode) {
     return {
@@ -611,28 +663,25 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       snapshotStatus: "stale", fallbackUsed: true };
   }
   const priorValid = prior?.active === true
-    && ["rate_limit_reached", "insufficient_credit_balance"].includes(prior.reasonCode)
+    && EXHAUSTION_CODES.has(prior.reasonCode)
     && Number.isFinite(Date.parse(prior.observedAt || ""));
   const newerFresh = healthyCapacity
-    && Date.parse(snapshotEvidence.snapshotObservedAt || "") > Date.parse(prior?.observedAt || "");
+    && Date.parse(snapshotEvidence.snapshotObservedAt || "") > creditExhaustionBarrierMs(prior);
   if (priorValid && !newerFresh) {
-    return { ...base, allowed: false, code: prior.reasonCode, mode: "normal",
-      reasonCode: prior.reasonCode, fallbackUsed: false, remainingPercent,
-      reason: "Previously observed exhaustion requires a newer fresh snapshot before admission." };
+    const code = prior.reasonCode === "rate_limit_reached" && !prior.classificationVersion
+      ? "prior_exhaustion_unverified" : prior.reasonCode;
+    return { ...base, allowed: false, code, mode: "normal",
+      reasonCode: code, fallbackUsed: false, remainingPercent,
+      reason: "Previously observed exhaustion requires newer explicit healthy evidence; legacy records do not distinguish included limits from provider refusal." };
   }
   // Observed exhaustion cannot become permission merely because its telemetry
   // later ages or a caller cannot refresh it. Only a new healthy snapshot may
   // replace that evidence.
-  if (snapshot?.reached === true || (finiteNumber(snapshot?.remainingPercent) !== null && finiteNumber(snapshot.remainingPercent) <= 0)) {
-    return { ...base, allowed: false, code: "rate_limit_reached", mode: "normal",
-      reasonCode: "rate_limit_reached", fallbackUsed: false, remainingPercent,
-      reason: "Codex reports that the active usage limit has been reached." };
-  }
-  if (snapshot?.credits?.available === true && snapshot.credits.unlimited !== true
-    && finiteNumber(snapshot.credits.balance) !== null && finiteNumber(snapshot.credits.balance) <= 0) {
-    return { ...base, allowed: false, code: "insufficient_credit_balance", mode: "normal",
-      reasonCode: "insufficient_credit_balance", fallbackUsed: false, remainingPercent,
-      reason: "The observed credit balance is exhausted." };
+  const blocker = snapshotBlocker(snapshot);
+  if (blocker) {
+    return { ...base, allowed: false, code: blocker, mode: "normal",
+      reasonCode: blocker, fallbackUsed: false, remainingPercent,
+      reason: blockerReason(blocker) };
   }
   if (["unknown", "stale"].includes(snapshotEvidence.snapshotStatus)) {
     const decision = fallbackDecision(snapshotEvidence.snapshotStatus, fallbackRule);
@@ -699,13 +748,13 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
 
 /** Dated control evidence only: no account identity, balance, or raw payload. */
 export function creditExhaustionObservation(snapshot, checkedAt = new Date().toISOString()) {
-  let reasonCode = "";
-  if (snapshot?.reached === true || (finiteNumber(snapshot?.remainingPercent) !== null && finiteNumber(snapshot.remainingPercent) <= 0)) reasonCode = "rate_limit_reached";
-  else if (snapshot?.credits?.available === true && snapshot.credits.unlimited !== true
-    && finiteNumber(snapshot.credits.balance) !== null && finiteNumber(snapshot.credits.balance) <= 0) reasonCode = "insufficient_credit_balance";
+  const reasonCode = snapshotBlocker(snapshot);
   if (!reasonCode) return null;
   const observedAt = Number.isFinite(Date.parse(snapshot.observedAt || "")) ? new Date(snapshot.observedAt).toISOString() : checkedAt;
-  return { active: true, reasonCode, observedAt };
+  // Classification belongs to the source observation, not this persistence
+  // adapter. Replaying a legacy snapshot cannot manufacture provider proof.
+  return { active: true, reasonCode, observedAt,
+    ...(snapshot.classificationVersion === 2 ? { classificationVersion: 2 } : {}) };
 }
 
 export function clearCreditSnapshotCache() {
