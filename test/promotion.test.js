@@ -13,6 +13,7 @@ import { environmentForTestControlRoot } from "../scripts/test-environment.js";
 import { canonicalJson, createCandidateEnvelope } from "../src/candidate-manifest.js";
 import { buildOwnerQaPacket } from "../src/owner-qa-packet.js";
 import { planPromotions, promotionSweepHealthPatch, truncateOutput } from "../src/promotion.js";
+import { promotionWorkerHealth } from "../src/watchdog.js";
 import { promotionProjectPolicyBinding, validPromotionRecoveryReceipt } from "../src/promotion-attempt-claim.js";
 import { promotionValidationPolicyDigest } from "../src/promotion-validation-evidence.js";
 import {
@@ -473,20 +474,20 @@ function productionOwnerQaPacketV1(state, candidate) {
   return { ...base, packetDigest: sha256(canonicalJson(base)) };
 }
 
-function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen", projectId = "project_1", taskId = "task_1", candidateId = "candidate_1", bundleId = "qa_bundle_1" }) {
+function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen", projectId = "project_1", taskId = "task_1", taskIds = [taskId], candidateId = "candidate_1", bundleId = "qa_bundle_1" }) {
   const candidate = createCandidateEnvelope({
     qaBundleId: bundleId,
     manifest: {
       candidateId,
       projectId,
       base: { branch: "main", sha: baseSha },
-      sources: [{
+      sources: taskIds.map((taskId, index) => ({
         taskId,
         sourceRef: "refs/heads/feature/task",
         headSha: sourceSha,
         candidateCycle: 1,
         reviews: [{
-          id: "review_1",
+          id: `review_${index + 1}`,
           stageKey: "lead",
           role: "lead-reviewer",
           outcome: "approved",
@@ -494,7 +495,7 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
           candidateCycle: 1,
           reviewedAt: "2026-07-25T11:00:00.000Z",
         }],
-      }],
+      })),
       integration: { branch: "qa/candidate-demo", sha: integrationSha },
       checks: [{
         id: "check_1",
@@ -517,8 +518,8 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
       },
       assembly: {
         mode: "atomic",
-        requestedTaskIds: [taskId],
-        includedTaskIds: [taskId],
+        requestedTaskIds: taskIds,
+        includedTaskIds: taskIds,
         excludedTaskIds: [],
       },
     },
@@ -532,7 +533,7 @@ function candidateFixture({ baseSha, sourceSha, integrationSha, status = "frozen
       candidateId: candidate.id,
       manifestDigest: candidate.manifestDigest,
       integrationSha,
-      taskIds: [taskId],
+      taskIds,
       author: "Owner QA",
       notes: "",
       repositoryVerifiedAt: "2026-07-25T12:29:59.000Z",
@@ -724,12 +725,96 @@ test("promotion planning blocks an atomic candidate until external dependencies 
   assert.equal(blocked.projects[0].dependencyBlocked, true);
   assert.deepEqual(blocked.projects[0].tasks, []);
   assert.deepEqual(blocked.projects[0].blockedTasks.map((task) => task.taskId), ["task_1"]);
+  assert.equal(blocked.projects[0].dependencyWait.kind, "waiting");
+  assert.deepEqual(blocked.projects[0].dependencyWait.prerequisites, [
+    { taskId: "task_1", dependencyId: "task_dependency", status: "needs_changes" },
+  ]);
+  const observed = (plan) => plan.projects.map((project) => ({ ...project, status: "dependency_blocked", tasks: project.blockedTasks }));
+  const previous = { lastSuccessAt: "2026-01-01T00:00:00.000Z", lastFailure: { fingerprint: "historical", failureCount: 1, failures: [{ code: "dependency_blocked" }] } };
+  const waiting = promotionSweepHealthPatch(previous, { projects: observed(blocked) });
+  assert.equal(waiting.status, "waiting");
+  assert.equal(waiting.activeFailureCount, 0);
+  assert.equal(waiting.activeWaitingCount, 1);
+  assert.deepEqual(waiting.lastFailure, previous.lastFailure, "waiting must not pretend the prerequisite was resolved");
+  assert.equal(waiting.lastSuccessAt, previous.lastSuccessAt);
+  assert.deepEqual(waiting.dependencyWaits[0].prerequisites, blocked.projects[0].dependencyWait.prerequisites);
+
+  dependency.dependsOnTaskIds = ["task_owner"];
+  state.tasks.push({ id: "task_owner", projectId: "project_1", status: "user_review", assignedAgentRole: "owner" });
+  const chained = planPromotions(state);
+  assert.deepEqual(chained.projects[0].dependencyWait.ownerReviewTaskIds, ["task_owner"]);
+  assert.equal(chained.projects[0].dependencyBlocked, true);
+  assert.deepEqual(chained.projects[0].tasks, [], "diagnostics cannot admit a blocked candidate");
+  const mixed = promotionSweepHealthPatch(previous, { projects: [...observed(chained), { projectId: "project_2", status: "validation_failed", output: "token=private-secret" }] });
+  assert.equal(mixed.status, "degraded");
+  assert.equal(mixed.activeFailureCount, 1);
+  assert.equal(mixed.activeWaitingCount, 1);
+  assert.doesNotMatch(JSON.stringify(mixed), /private-secret/);
+
+  for (const [change, issue] of [
+    [() => { dependency.dependsOnTaskIds = ["task_missing"]; }, "missing_dependency"],
+    [() => { dependency.dependsOnTaskIds = ["task_1"]; }, "dependency_cycle"],
+    [() => { dependency.dependsOnTaskIds = []; dependency.status = "not_a_status"; }, "invalid_dependency_status"],
+  ]) {
+    change();
+    const invalid = planPromotions(state);
+    assert.equal(invalid.projects[0].dependencyWait.kind, "invalid");
+    assert.ok(invalid.projects[0].dependencyWait.issues.includes(issue));
+    const health = promotionSweepHealthPatch({}, { projects: observed(invalid) });
+    assert.equal(health.status, "degraded");
+    assert.equal(health.activeWaitingCount, 0);
+    assert.equal(health.activeFailureCount, 1);
+  }
+  for (const evidence of [undefined, { schemaVersion: 1, kind: "waiting", issues: [], prerequisites: [] }]) {
+    const health = promotionSweepHealthPatch({}, { projects: [{ ...observed(blocked)[0], dependencyWait: evidence }] });
+    assert.equal(health.activeFailureCount, 1, "an uncorroborated dependency label remains a failure");
+  }
 
   dependency.status = "merged";
+  dependency.dependsOnTaskIds = [];
   dependency.stateVersion += 1;
   const released = planPromotions(state);
   assert.equal(released.projects[0].dependencyBlocked, false);
   assert.deepEqual(released.projects[0].tasks.map((task) => task.id), ["task_1"]);
+});
+
+test("promotion dependency waiting retains late blockers in candidates over the display limit", () => {
+  const taskIds = Array.from({ length: 51 }, (_, i) => `task_${String(i + 1).padStart(3, "0")}`);
+  const candidate = candidateFixture({
+    baseSha: "a".repeat(40), sourceSha: "b".repeat(40), integrationSha: "b".repeat(40), status: "qa_passed", taskIds,
+  });
+  const state = baseState({
+    projects: [{
+      id: "project_1", key: "demo", name: "Demo", repoPath: "/tmp/demo", repoUrl: GITHUB_REPO_URL,
+      defaultBranch: "main", validationCommands: ["npm run check"], promotion: { enabled: true, targetBranch: "main" },
+    }],
+    tasks: [
+      ...taskIds.map((id) => ({
+        id, projectId: "project_1", title: id, status: "approved_for_main", stateVersion: 3,
+        candidateId: candidate.id, qaBundleId: candidate.qaBundleId,
+        reviewSubjectSha: candidate.manifest.integration.sha, reviewSubjectCycle: 1,
+        dependsOnTaskIds: id === "task_051" ? ["task_999"] : [],
+      })),
+      { id: "task_999", projectId: "project_1", title: "Owner prerequisite", status: "user_review", assignedAgentRole: "owner" },
+    ],
+    candidates: [candidate],
+  });
+  const plan = planPromotions(state);
+  assert.equal(plan.projects[0].blockedTasks.length, 51);
+  assert.deepEqual(plan.projects[0].tasks, [], "the entire atomic candidate remains blocked");
+  const nowMs = Date.parse("2026-11-12T00:00:00Z");
+  const patch = promotionSweepHealthPatch({}, {
+    projects: plan.projects.map((project) => ({ ...project, status: "dependency_blocked" })),
+  }, { nowMs });
+  assert.equal(patch.dependencyWaits[0].taskIds.length, 50);
+  assert.equal(patch.dependencyWaits[0].taskIds[0], "task_051");
+  assert.equal(patch.dependencyWaits[0].omittedCount, 1);
+  const health = promotionWorkerHealth([{
+    worker: "promotion", dataDir: "/tmp/demo", updatedAt: new Date(nowMs).toISOString(), ...patch,
+  }], { nowMs, dataDir: "/tmp/demo" });
+  assert.equal(health.ok, true);
+  assert.equal(health.status, "waiting");
+  assert.deepEqual(health.dependencyWaits[0].prerequisites, [{ taskId: "task_051", dependencyId: "task_999", status: "user_review" }]);
 });
 
 test("promotion validation policy binds the canonical effective PATH and executable provenance", () => {

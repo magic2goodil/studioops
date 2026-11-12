@@ -4498,13 +4498,17 @@ export async function automationTick(input = {}) {
       }
     }
 
-    state.events.push({
-      id: nextId(state.events, "event"),
-      type: "automation_tick",
-      projectId: project?.id || "",
-      message: `Automation tick completed with ${actions.length} action(s).`,
-      createdAt: now,
-    });
+    // Empty polling must not invalidate every other worker's state snapshot.
+    // Reconciliation changes and their own events still persist normally.
+    if (actions.length) {
+      state.events.push({
+        id: nextId(state.events, "event"),
+        type: "automation_tick",
+        projectId: project?.id || "",
+        message: `Automation tick completed with ${actions.length} action(s).`,
+        createdAt: now,
+      });
+    }
     return { actions };
   }, { operationName: "automation.tick" });
 }

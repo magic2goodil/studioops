@@ -11,6 +11,7 @@ import {
   recoverDiskPressureIncidentInState,
   updateDiskPressureIncident,
   updateDiskPressureIncidentInState,
+  VALID_STATUSES,
 } from "./store.js";
 import { activeRunStaleReason, planRunnableRuns, runWorkspaceCleanup } from "./runner.js";
 import { loadConfig } from "./config.js";
@@ -235,16 +236,43 @@ export function managedWorkerHealth(heartbeats, input = {}) {
 
 // Scheduled promotion is observable separately from managed builder workers:
 // one project's invalid toolchain must not close the global automation gate.
+function validPromotionDependencyWait(wait) {
+  const id = (value) => typeof value === "string" && /^[a-zA-Z0-9_-]{1,160}$/.test(value);
+  const ids = (values) => Array.isArray(values) && values.length <= 50 && values.every(id);
+  return wait && typeof wait === "object" && !Array.isArray(wait)
+    && id(wait.projectId) && id(wait.candidateId)
+    && ids(wait.taskIds) && wait.taskIds.length > 0
+    && Array.isArray(wait.prerequisites) && wait.prerequisites.length > 0 && wait.prerequisites.length <= 50
+    && wait.prerequisites.every((item) => item && typeof item === "object" && !Array.isArray(item)
+      && id(item.taskId) && wait.taskIds.includes(item.taskId) && id(item.dependencyId)
+      && typeof item.status === "string" && VALID_STATUSES.has(item.status)
+      && !["approved", "merged", "deployed", "done", "closed"].includes(item.status))
+    && ids(wait.ownerReviewTaskIds)
+    && Number.isSafeInteger(wait.omittedCount) && wait.omittedCount >= 0;
+}
+
 export function promotionWorkerHealth(heartbeats, input = {}) {
   const heartbeat = (heartbeats || []).find((item) => item.worker === "promotion");
   const nowMs = Number(input.nowMs || Date.now());
   const intervalMs = Math.max(1_000, Number(heartbeat?.intervalSeconds || 300) * 1000);
   const staleAfterMs = heartbeat?.status === "busy" ? 3 * 60_000 : Math.max(3 * 60_000, intervalMs * 2);
+  const dependencyWaits = (Array.isArray(heartbeat?.dependencyWaits) ? heartbeat.dependencyWaits : [])
+    .slice(0, 50).filter(validPromotionDependencyWait);
+  const activeWaitingCount = Number.isSafeInteger(heartbeat?.activeWaitingCount) && heartbeat.activeWaitingCount >= 0
+    ? heartbeat.activeWaitingCount : 0;
+  const omittedWaitingCount = Number.isSafeInteger(heartbeat?.omittedWaitingCount) && heartbeat.omittedWaitingCount >= 0
+    ? heartbeat.omittedWaitingCount : 0;
+  const corroboratedWaiting = activeWaitingCount > 0
+    && Array.isArray(heartbeat?.dependencyWaits)
+    && heartbeat.dependencyWaits.length === Math.min(50, activeWaitingCount)
+    && dependencyWaits.length === heartbeat.dependencyWaits.length
+    && heartbeat.omittedWaitingCount === activeWaitingCount - dependencyWaits.length;
   let reason = "";
   if (!heartbeat) reason = "heartbeat_missing";
   else if (heartbeat.invalid || !Number.isFinite(Date.parse(heartbeat.updatedAt || ""))) reason = "heartbeat_invalid";
   else if (nowMs - Date.parse(heartbeat.updatedAt) > staleAfterMs) reason = "heartbeat_stale";
-  else if (Number(heartbeat.activeFailureCount || 0) > 0 || !["busy", "idle"].includes(heartbeat.status)) reason = "promotion_sweep_failed";
+  else if (Number(heartbeat.activeFailureCount || 0) > 0 || !["busy", "idle", "waiting"].includes(heartbeat.status)
+    || (heartbeat.status === "waiting" && !corroboratedWaiting)) reason = "promotion_sweep_failed";
   else if (path.resolve(String(heartbeat.dataDir || ".")) !== path.resolve(input.dataDir || missionControlDataDir())) reason = "worker_data_root_mismatch";
   return {
     worker: "promotion",
@@ -255,6 +283,20 @@ export function promotionWorkerHealth(heartbeats, input = {}) {
     lastSweepCompletedAt: heartbeat?.lastSweepCompletedAt || "",
     lastSuccessAt: heartbeat?.lastSuccessAt || "",
     activeFailureCount: Number(heartbeat?.activeFailureCount || 0),
+    activeWaitingCount,
+    dependencyWaits: dependencyWaits.map((wait) => {
+      return {
+        projectId: wait.projectId,
+        candidateId: wait.candidateId,
+        taskIds: [...wait.taskIds],
+        prerequisites: wait.prerequisites.map((item) => ({
+          taskId: item.taskId, dependencyId: item.dependencyId, status: item.status,
+        })),
+        ownerReviewTaskIds: [...wait.ownerReviewTaskIds],
+        omittedCount: wait.omittedCount,
+      };
+    }),
+    omittedWaitingCount,
     lastFailure: heartbeat?.lastFailure ? {
       fingerprint: heartbeat.lastFailure.fingerprint,
       firstSeenAt: heartbeat.lastFailure.firstSeenAt,

@@ -406,6 +406,62 @@ test("promotion health tracks scheduled failures without globally restarting or 
   assert.equal(promotionWorkerHealth(heartbeats, { nowMs }).reason, "heartbeat_stale");
 });
 
+test("promotion dependency waiting remains visible without disguising failed or stale workers", () => {
+  const nowMs = Date.parse("2026-11-12T00:00:00.000Z");
+  const heartbeat = {
+    worker: "promotion", status: "waiting", intervalSeconds: 300, dataDir: "/tmp/studioops-data",
+    updatedAt: new Date(nowMs).toISOString(), activeFailureCount: 0, activeWaitingCount: 1, omittedWaitingCount: 0,
+    dependencyWaits: [{
+      projectId: "project_1", candidateId: "candidate_1", taskIds: ["task_2"],
+      prerequisites: [{ taskId: "task_2", dependencyId: "task_1", status: "user_review", title: "token=secret" }],
+      ownerReviewTaskIds: ["task_1"], omittedCount: 0, output: "/Users/private/person token=secret",
+    }],
+  };
+  const health = promotionWorkerHealth([heartbeat], { nowMs, dataDir: heartbeat.dataDir });
+  assert.equal(health.ok, true);
+  assert.equal(health.status, "waiting");
+  assert.equal(health.activeWaitingCount, 1);
+  assert.deepEqual(health.dependencyWaits[0].ownerReviewTaskIds, ["task_1"]);
+  assert.deepEqual(health.dependencyWaits[0].prerequisites, [{ taskId: "task_2", dependencyId: "task_1", status: "user_review" }]);
+  assert.doesNotMatch(JSON.stringify(health), /private|person|secret/);
+  assert.equal(promotionWorkerHealth([{ ...heartbeat, activeFailureCount: 1 }], { nowMs }).reason, "promotion_sweep_failed");
+  assert.equal(promotionWorkerHealth([{ ...heartbeat, activeWaitingCount: 0 }], { nowMs }).reason, "promotion_sweep_failed");
+  assert.equal(promotionWorkerHealth([heartbeat], { nowMs: nowMs + 11 * 60_000 }).reason, "heartbeat_stale");
+  assert.equal(promotionWorkerHealth([heartbeat], { nowMs, dataDir: "/tmp/other" }).reason, "worker_data_root_mismatch");
+  const wait = heartbeat.dependencyWaits[0];
+  const invalidEvidence = [
+    { dependencyWaits: undefined }, { dependencyWaits: [] }, { dependencyWaits: [null] },
+    { activeWaitingCount: "1" }, { activeWaitingCount: 2 }, { omittedWaitingCount: undefined },
+    { omittedWaitingCount: 1 }, { omittedWaitingCount: -1 },
+    { dependencyWaits: [{ ...wait, projectId: "private/path" }] },
+    { dependencyWaits: [{ ...wait, candidateId: "" }] },
+    { dependencyWaits: [{ ...wait, taskIds: [] }] },
+    { dependencyWaits: [{ ...wait, prerequisites: [] }] },
+    { dependencyWaits: [{ ...wait, prerequisites: [null] }] },
+    { dependencyWaits: [{ ...wait, prerequisites: [{ ...wait.prerequisites[0], taskId: "task_unrelated" }] }] },
+    ...[["user_review"], "unknown", "merged"].map((status) => ({
+      dependencyWaits: [{ ...wait, prerequisites: [{ ...wait.prerequisites[0], status }] }],
+    })),
+    { dependencyWaits: [{ ...wait, ownerReviewTaskIds: "task_1" }] },
+    { dependencyWaits: [{ ...wait, omittedCount: Infinity }] },
+  ];
+  for (const invalid of invalidEvidence) {
+    const result = promotionWorkerHealth([{ ...heartbeat, ...invalid }], { nowMs, dataDir: heartbeat.dataDir });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "promotion_sweep_failed");
+    assert.ok(result.dependencyWaits.every((item) => item.prerequisites.every((prerequisite) => typeof prerequisite.status === "string")));
+  }
+  const bounded = {
+    ...heartbeat, activeWaitingCount: 51, omittedWaitingCount: 1,
+    dependencyWaits: Array.from({ length: 50 }, (_, i) => ({ ...wait, candidateId: `candidate_${i}` })),
+  };
+  assert.equal(promotionWorkerHealth([bounded], { nowMs, dataDir: heartbeat.dataDir }).ok, true);
+  assert.equal(promotionWorkerHealth([{ ...bounded, dependencyWaits: [...bounded.dependencyWaits, wait], omittedWaitingCount: 0 }], { nowMs }).ok, false);
+  const mixed = promotionWorkerHealth([{ ...heartbeat, status: "degraded", activeFailureCount: 1 }], { nowMs });
+  assert.equal(mixed.ok, false);
+  assert.equal(mixed.dependencyWaits.length, 1);
+});
+
 test("watchdog recovers once after cleanup, database, and worker checks while preserving owner pause", async () => {
   const nowMs = Date.parse("2026-08-17T00:00:00.000Z");
   const dataDir = "/tmp/studioops-data";

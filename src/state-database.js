@@ -479,9 +479,9 @@ function readStateSnapshot(db) {
   }
 }
 
-function serializedReplayDeadlineError(operationName, retryCount) {
+function serializedReplayDeadlineError(operationName, retryCount, phase = "lock") {
   const error = new Error(
-    `StudioOps serialized mutation lock deadline exceeded during ${operationName}.`,
+    `StudioOps mutation retry deadline exceeded during ${operationName} (${phase}).`,
   );
   error.code = "STUDIOOPS_SERIALIZED_REPLAY_TIMEOUT";
   error.operationName = operationName;
@@ -2942,14 +2942,21 @@ function releaseDatabaseConnection() {
   connectionLeased = false;
 }
 
-function acquireDatabaseConnection(operationName, deadlineAt) {
+function acquireDatabaseConnection(operationName, deadlineAt, optimisticRetryCount = 0) {
   if (connectionLeaseContext.getStore()) {
     const error = new Error("State mutators must not start another database write while holding a transaction.");
     error.code = "STUDIOOPS_DATABASE_TRANSACTION_REENTRY";
     throw error;
   }
   const remainingMs = deadlineAt - Date.now();
-  if (remainingMs <= 0) throw connectionWaitError(operationName);
+  if (remainingMs <= 0) {
+    // Initialization may have yielded after the caller checked its retry budget.
+    // No connection wait has started yet; queued waiters retain their own error.
+    if (Number.isSafeInteger(optimisticRetryCount) && optimisticRetryCount > 0) {
+      throw serializedReplayDeadlineError(operationName, optimisticRetryCount, "preparation");
+    }
+    throw connectionWaitError(operationName);
+  }
   if (!connectionLeased) {
     connectionLeased = true;
     return Promise.resolve(releaseDatabaseConnection);
@@ -2971,6 +2978,7 @@ export async function withStateDatabaseConnection(callback, input = {}) {
   const release = await acquireDatabaseConnection(
     boundedOperationName(input.operationName),
     input.deadlineAt || Date.now() + SERIALIZED_REPLAY_LOCK_DEADLINE_MS,
+    input.optimisticRetryCount,
   );
   try {
     return await connectionLeaseContext.run(true, () => callback(db));
@@ -3156,6 +3164,11 @@ export async function mutateDatabaseState(mutator, options = {}) {
         expectedVersion = snapshot.version;
         prepared = await prepareDatabaseMutation(snapshot.state, mutator, options);
       }
+      // Rebuilding a conflicted plan consumes the same finite retry budget.
+      // Expiry here is not evidence that the write connection was queued/busy.
+      if (retryDeadlineAt && Date.now() >= retryDeadlineAt) {
+        throw serializedReplayDeadlineError(operationName, retryCount, "preparation");
+      }
       const lockAttemptStartedAt = Date.now();
       let acquired = false;
       const result = await withStateDatabaseConnection((db) => {
@@ -3204,7 +3217,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
         }
       }, {
         operationName,
-        ...(retryDeadlineAt ? { deadlineAt: retryDeadlineAt } : {}),
+        ...(retryDeadlineAt ? { deadlineAt: retryDeadlineAt, optimisticRetryCount: retryCount } : {}),
       }).finally(() => {
         if (!acquired) lockWaitMs += Date.now() - lockAttemptStartedAt;
       });
