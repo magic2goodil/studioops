@@ -28,6 +28,7 @@ import {
   mutateState,
   readState,
   reconcilePendingQaRevocations,
+  VALID_STATUSES,
   workflowSnapshotForTask,
 } from "./store.js";
 import {
@@ -1308,6 +1309,49 @@ function orderPromotionTasks(projectTasks, candidates) {
   return { ordered, blocked };
 }
 
+// Read-only diagnostics. This never changes dependency ordering or admission.
+function promotionDependencyWait(projectTasks, candidateTasks) {
+  const byId = new Map(projectTasks.map((task) => [task.id, task]));
+  const selected = new Set(candidateTasks.map((task) => task.id));
+  const visited = new Set(), visiting = new Set(), owners = new Set();
+  const prerequisites = [], issues = [];
+  const safeId = (id) => typeof id === "string" && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
+  let edges = 0;
+  const issue = (code) => { if (!issues.includes(code)) issues.push(code); };
+  function visit(id, depth = 0) {
+    if (!safeId(id)) { issue("invalid_dependency_id"); return; }
+    if (visiting.has(id)) { issue("dependency_cycle"); return; }
+    if (visited.has(id)) return;
+    if (depth > 100 || visited.size + visiting.size >= 5000) { issue("dependency_graph_limit"); return; }
+    const task = byId.get(id);
+    if (!task) { issue("missing_dependency"); return; }
+    if (!VALID_STATUSES.has(task.status)) issue("invalid_dependency_status");
+    if (task.status === "user_review" && task.assignedAgentRole === "owner") owners.add(id);
+    const dependencies = task.dependsOnTaskIds ?? [];
+    if (!Array.isArray(dependencies)) { issue("invalid_dependency_list"); return; }
+    visiting.add(id);
+    for (const dependencyId of dependencies) {
+      if (++edges > 20000) { issue("dependency_graph_limit"); break; }
+      const dependency = byId.get(dependencyId);
+      if (selected.has(id) && !selected.has(dependencyId) && dependency && !PROMOTION_DEPENDENCY_COMPLETE_STATUSES.has(dependency.status)) {
+        prerequisites.push({ taskId: id, dependencyId, status: dependency.status });
+      }
+      visit(dependencyId, depth + 1);
+    }
+    visiting.delete(id); visited.add(id);
+  }
+  for (const task of candidateTasks) visit(task.id);
+  const incomplete = prerequisites.filter((item) => safeId(item.dependencyId) && VALID_STATUSES.has(item.status));
+  return {
+    schemaVersion: 1,
+    kind: !issues.length && incomplete.length ? "waiting" : "invalid",
+    prerequisites: incomplete.slice(0, 50),
+    ownerReviewTaskIds: [...owners].sort().slice(0, 50),
+    omittedCount: Math.max(0, incomplete.length - 50) + Math.max(0, owners.size - 50),
+    issues,
+  };
+}
+
 export function planPromotions(state, input = {}) {
   const planningFailures = [];
   const projectPlans = (state.projects || [])
@@ -1437,6 +1481,7 @@ export function planPromotions(state, input = {}) {
           const candidateTaskPlans = taskPlans(candidate);
           const ordered = orderPromotionTasks([...projectTasks.values()], candidateTaskPlans);
           const dependencyBlocked = ordered.blocked.length > 0;
+          const dependencyWait = dependencyBlocked ? promotionDependencyWait([...projectTasks.values()], candidateTaskPlans) : null;
           const dependencyOutput = dependencyBlocked
             ? `Atomic candidate ${candidate.id} is waiting for complete, acyclic promotion dependencies: ${ordered.blocked.map((item) => item.taskId).join(", ")}.`
             : "";
@@ -1512,6 +1557,7 @@ export function planPromotions(state, input = {}) {
               },
             })),
           dependencyBlocked,
+          dependencyWait,
           dependencyOutput,
           tasks: dependencyBlocked ? [] : ordered.ordered,
           blockedTasks: dependencyBlocked
@@ -3515,6 +3561,34 @@ export function promotionSweepHealthPatch(previous = {}, report = {}, input = {}
     "no_tasks", "skipped", "pending", "merged", "pr_ready", "pr_merged_detected",
     "claim_busy", "claim_retry_deferred", "claim_terminal", "claim_stale", "stale_result_discarded",
   ]);
+  const safeId = (id) => typeof id === "string" && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
+  const dependencyWaiting = (project) => {
+    const evidence = project.dependencyWait;
+    return project.status === "dependency_blocked" && project.dependencyBlocked === true
+      && evidence?.schemaVersion === 1 && evidence.kind === "waiting"
+      && Array.isArray(evidence.issues) && evidence.issues.length === 0
+      && Array.isArray(evidence.prerequisites) && evidence.prerequisites.length > 0 && evidence.prerequisites.length <= 50
+      && evidence.prerequisites.every((item) => item && safeId(item.taskId) && safeId(item.dependencyId) && VALID_STATUSES.has(item.status) && !PROMOTION_DEPENDENCY_COMPLETE_STATUSES.has(item.status))
+      && Array.isArray(evidence.ownerReviewTaskIds) && evidence.ownerReviewTaskIds.length <= 50 && evidence.ownerReviewTaskIds.every(safeId)
+      && Number.isSafeInteger(evidence.omittedCount) && evidence.omittedCount >= 0;
+  };
+  const waitingProjects = (report.projects || []).filter(dependencyWaiting);
+  const dependencyWaits = waitingProjects.slice(0, 50).map((project) => {
+    // Preserve the task IDs that explain the retained blockers before filling
+    // the remaining display slots with other atomically blocked tasks.
+    const allTaskIds = [...new Set([
+      ...project.dependencyWait.prerequisites.map((item) => item.taskId),
+      ...(project.blockedTasks || []).map((task) => task.taskId),
+    ].filter(safeId))];
+    return {
+      projectId: project.projectId,
+      candidateId: project.candidate?.id || "",
+      taskIds: allTaskIds.slice(0, 50),
+      prerequisites: project.dependencyWait.prerequisites.map(({ taskId, dependencyId, status }) => ({ taskId, dependencyId, status })),
+      ownerReviewTaskIds: [...project.dependencyWait.ownerReviewTaskIds],
+      omittedCount: project.dependencyWait.omittedCount + Math.max(0, allTaskIds.length - 50),
+    };
+  });
   const recoveryFailures = (stage, observations, completedStatuses) => (observations || [])
     .filter((observation) => !completedStatuses.includes(observation.status))
     .map((observation) => ({
@@ -3530,7 +3604,7 @@ export function promotionSweepHealthPatch(previous = {}, report = {}, input = {}
     ...(report.planningFailures || []),
     ...recoveryFailures("qa_revocation", report.qaRevocations, ["revoked", "already_invalidated", "merged", "completed"]),
     ...recoveryFailures("merged_admission", report.mergedAdmissionRecoveries, ["recovered", "already_safe"]),
-    ...(report.projects || []).filter((project) => !waitingOrSuccessful.has(project.status)).map((project) => ({
+    ...(report.projects || []).filter((project) => !waitingOrSuccessful.has(project.status) && !dependencyWaiting(project)).map((project) => ({
       projectId: project.projectId,
       projectKey: project.projectKey,
       candidateId: project.candidate?.id || "",
@@ -3555,17 +3629,20 @@ export function promotionSweepHealthPatch(previous = {}, report = {}, input = {}
     failureCount: failures.length,
     failures: failures.slice(0, 50),
     omittedCount: Math.max(0, failures.length - 50),
-  } : previous.lastFailure ? {
+  } : previous.lastFailure && waitingProjects.length ? previous.lastFailure : previous.lastFailure ? {
     ...previous.lastFailure,
     resolvedAt: previous.lastFailure.resolvedAt || now,
   } : null;
   return {
-    status: failures.length ? "degraded" : "idle",
+    status: failures.length ? "degraded" : waitingProjects.length ? "waiting" : "idle",
     lastError: failures.map((failure) => `${failure.projectKey || "sweep"}: ${failure.reason}`).join("; ").slice(0, MAX_OUTPUT_CHARS),
     lastSweepCompletedAt: now,
-    lastSuccessAt: failures.length ? previous.lastSuccessAt || "" : now,
+    lastSuccessAt: failures.length || waitingProjects.length ? previous.lastSuccessAt || "" : now,
     failureFingerprint: fingerprint,
     activeFailureCount: failures.length,
+    activeWaitingCount: waitingProjects.length,
+    dependencyWaits,
+    omittedWaitingCount: Math.max(0, waitingProjects.length - dependencyWaits.length),
     lastFailure,
     projectCount: (report.projects || []).length,
     taskCount: Number(report.taskCount || 0),

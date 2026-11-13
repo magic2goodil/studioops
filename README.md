@@ -20,7 +20,7 @@ The [GitHub repository](https://github.com/magic2goodil/studioops) is the curren
 - Transactional SQLite state with short compare-and-swap writes; unchanged routine sweeps do not advance the state version.
 - Configured model and usage policies, bounded failure recovery, operator pauses and stale-worker detection.
 - Commit-bound component mapping and structural context retrieval. Retrieved context is advisory and does not expand task scope or release authority.
-- Optional local QA assembly and preview refresh for lead-approved work.
+- Optional local QA assembly and preview refresh for lead-approved work; [exact dead-owner claim recovery](docs/QA_CLAIM_RECOVERY.md) and suppression of unchanged failed empty-queue synchronizations.
 - Release-candidate PR preparation after owner QA, without directly pushing the protected branch.
 
 ## Workflow and UML

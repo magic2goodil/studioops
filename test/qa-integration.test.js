@@ -46,6 +46,133 @@ const localhostPreviewTest = OUTER_VALIDATION_SANDBOX
   ? { skip: "The verified outer release sandbox intentionally denies localhost preview listeners." }
   : {};
 
+test("empty-queue QA holds unchanged failed sync but changed refs and queued work remain eligible", { timeout: 120000 }, async () => {
+  const root = await mkdtemp(path.join(process.env.STUDIOOPS_TEST_ROOT, "qa-sync-failure-"));
+  try {
+    const fixture = await createSandboxedQaValidationFixture(root, [`${JSON.stringify(process.execPath)} -e "process.exit(1)"`]);
+    const file = path.join(root, "data", "mission-control.json");
+    const state = JSON.parse(await readFile(file, "utf8"));
+    state.tasks = []; state.reviews = [];
+    state.projects[0].qaIntegration = { syncDefaultBranchIntoIntegration: true };
+    await writeFile(file, JSON.stringify(state));
+    await writeFile(path.join(fixture.repoPath, "main-update.txt"), "first\n");
+    await git(fixture.repoPath, ["add", "main-update.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "advance main"]);
+    await git(fixture.repoPath, ["push", "origin", "main"]);
+    const first = await runQaIntegrationFixture(root);
+    assert.equal(first.projects[0].status, "validation_failed");
+    const recorded = readPersistedState(root).meta.qaIntegrationSyncFailures.project_1;
+    assert.equal(recorded.failure.exitCode, 1);
+    const repeated = await runQaIntegrationFixture(root);
+    assert.equal(repeated.projects[0].status, "unchanged_sync_failure");
+    assert.deepEqual(repeated.projects[0].validation, []);
+    assert.equal(repeated.projects[0].workspacePath, "");
+    assert.deepEqual(readPersistedState(root).meta.qaIntegrationSyncFailures.project_1, recorded);
+    const changedTimeout = await runQaIntegrationFixture(root, { input: { validationTimeoutMs: 900000 } });
+    assert.equal(changedTimeout.projects[0].status, "validation_failed");
+    const timeoutFailure = readPersistedState(root).meta.qaIntegrationSyncFailures.project_1;
+    assert.equal(timeoutFailure.input.validationTimeoutMs, 900000);
+    assert.notEqual(timeoutFailure.inputDigest, recorded.inputDigest);
+    const repeatedTimeout = await runQaIntegrationFixture(root, { input: { validationTimeoutMs: 900000 } });
+    assert.equal(repeatedTimeout.projects[0].status, "unchanged_sync_failure");
+    await writeFile(path.join(fixture.repoPath, "main-update.txt"), "second\n");
+    await git(fixture.repoPath, ["add", "main-update.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "change failed input"]);
+    await git(fixture.repoPath, ["push", "origin", "main"]);
+    const changed = await runQaIntegrationFixture(root);
+    assert.equal(changed.projects[0].status, "validation_failed");
+    assert.notEqual(readPersistedState(root).meta.qaIntegrationSyncFailures.project_1.inputDigest, recorded.inputDigest);
+    const queuedRoot = path.join(root, "queued-control");
+    await mkdir(queuedRoot, { recursive: true });
+    await createSandboxedQaValidationFixture(queuedRoot, [`${JSON.stringify(process.execPath)} -e "process.exit(1)"`]);
+    const queuedFile = path.join(queuedRoot, "data", "mission-control.json");
+    const queuedState = JSON.parse(await readFile(queuedFile, "utf8"));
+    queuedState.meta.qaIntegrationSyncFailures = readPersistedState(root).meta.qaIntegrationSyncFailures;
+    await writeFile(queuedFile, JSON.stringify(queuedState));
+    const queued = await runQaIntegrationFixture(queuedRoot);
+    assert.notEqual(queued.projects[0].status, "unchanged_sync_failure");
+    assert.ok(queued.projects[0].tasks.length > 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("empty-queue QA binds a moving default branch to the fetched revision actually validated", { timeout: 60000 }, async () => {
+  const root = await mkdtemp(path.join(process.env.STUDIOOPS_TEST_ROOT, "qa-sync-moving-ref-"));
+  try {
+    const fixture = await createSandboxedQaValidationFixture(root, [
+      `${JSON.stringify(process.execPath)} -e "console.log(require('node:fs').readFileSync('moved.txt', 'utf8')); process.exit(1)"`,
+    ]);
+    const file = path.join(root, "data", "mission-control.json");
+    const state = JSON.parse(await readFile(file, "utf8"));
+    state.tasks = []; state.reviews = [];
+    state.projects[0].qaIntegration = { syncDefaultBranchIntoIntegration: true };
+    await writeFile(file, JSON.stringify(state));
+    await writeFile(path.join(fixture.repoPath, "moved.txt"), "fetched-revision-B\n");
+    await git(fixture.repoPath, ["add", "moved.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "prepare next main"]);
+    const nextSha = await git(fixture.repoPath, ["rev-parse", "HEAD"]);
+    await git(fixture.repoPath, ["push", "origin", "main:next-main"]);
+    const report = await runQaIntegrationFixture(root, { setupScript: `
+      const { execFileSync } = await import('node:child_process');
+      const { createCandidateRepositoryTestGitRunner } = await import(${JSON.stringify(new URL("../src/candidate-repository.js", import.meta.url).href)});
+      let moved = false;
+      fixtureGitRunner = createCandidateRepositoryTestGitRunner(${JSON.stringify(fixture.remotePath)}, ${JSON.stringify(GITHUB_REPO_URL)}, ({ args }) => {
+        if (!moved && args.includes('fetch') && args.includes('refs/heads/main:refs/remotes/origin/main')) {
+          execFileSync('/usr/bin/git', ['--git-dir', ${JSON.stringify(fixture.remotePath)}, 'update-ref', 'refs/heads/main', ${JSON.stringify(nextSha)}, ${JSON.stringify(fixture.baseSha)}]);
+          moved = true;
+        }
+      });
+    ` });
+    assert.equal(report.projects[0].status, "validation_failed");
+    assert.match(report.projects[0].validation[0].output, /fetched-revision-B/);
+    const recorded = readPersistedState(root).meta.qaIntegrationSyncFailures.project_1;
+    assert.equal(recorded.input.mainSha, nextSha);
+    assert.equal(report.projects[0].baseSha, nextSha);
+    assert.equal(recorded.input.integrationSha, fixture.baseSha);
+    const repeated = await runQaIntegrationFixture(root);
+    assert.equal(repeated.projects[0].status, "unchanged_sync_failure");
+    assert.deepEqual(repeated.projects[0].validation, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("empty-queue QA preserves offline dependency failure diagnostics", { timeout: 60000 }, async () => {
+  const root = await mkdtemp(path.join(process.env.STUDIOOPS_TEST_ROOT, "qa-sync-install-failure-"));
+  try {
+    const fixture = await createSandboxedQaValidationFixture(root, ["must-not-run"]);
+    const file = path.join(root, "data", "mission-control.json");
+    const state = JSON.parse(await readFile(file, "utf8"));
+    state.tasks = []; state.reviews = [];
+    state.projects[0].qaIntegration = { syncDefaultBranchIntoIntegration: true };
+    await writeFile(file, JSON.stringify(state));
+    await writeFile(path.join(fixture.repoPath, "main-update.txt"), "new main\n");
+    await git(fixture.repoPath, ["add", "main-update.txt"]);
+    await git(fixture.repoPath, ["commit", "-m", "advance main"]);
+    await git(fixture.repoPath, ["push", "origin", "main"]);
+    const report = await runQaIntegrationFixture(root, { setupScript: `
+      const { consumeIsolatedTestAuthority, registerIsolatedTestAdapter } = await import(${JSON.stringify(new URL("../src/test-authority-realm.js", import.meta.url).href)});
+      fixtureValidationAdapter = consumeIsolatedTestAuthority(authority => registerIsolatedTestAdapter(authority, 'qa-outer-validation-sandbox', () => ({
+        prepare: async () => ({ strategy: 'synthetic-diagnostic-fixture' }),
+        prepareDependencies: async () => ({ applicable: true }),
+        installDependencies: async () => ({ ok: false, timedOut: true, code: null, output: 'offline install timed out' }),
+        run: async () => { throw new Error('Validation must not follow failed dependency installation'); },
+        verify: async () => ({ fixture: true }),
+        cleanup: async () => {},
+      })));
+    ` });
+    assert.equal(report.projects[0].status, "validation_failed");
+    assert.equal(report.projects[0].validation.length, 1);
+    const recorded = readPersistedState(root).meta.qaIntegrationSyncFailures.project_1;
+    assert.deepEqual(recorded.failure, {
+      command: "[offline dependency installation]", timedOut: true, exitCode: null, diagnostic: "offline install timed out",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("QA claim owner liveness fails closed except for a verified absent same-host PID", () => {
   const ownerHost = "studioops-test-host";
   const claim = { ownerHost, ownerPid: 41001 };
@@ -292,14 +419,17 @@ async function runQaIntegrationFixture(root, options = {}) {
     const outerAdapter = process.env.STUDIOOPS_PROJECT_VALIDATION_SANDBOX
       ? createQaOuterSandboxTestAdapter()
       : null;
+    let fixtureGitRunner = null;
+    let fixtureValidationAdapter = null;
+    ${options.setupScript || ""}
     const report = await runQaIntegration({
       ...${JSON.stringify({
       workspaceRoot: path.join(root, "qa-workspaces"),
       ...(options.env ? { env: options.env } : {}),
       ...options.input,
     })},
-      testGitRunner: createQaTestGitRunner(${JSON.stringify(remotePath)}, ${JSON.stringify(GITHUB_REPO_URL)}),
-      ...(outerAdapter ? { projectValidationSandboxAdapter: outerAdapter } : {}),
+      testGitRunner: fixtureGitRunner || createQaTestGitRunner(${JSON.stringify(remotePath)}, ${JSON.stringify(GITHUB_REPO_URL)}),
+      ...((fixtureValidationAdapter || outerAdapter) ? { projectValidationSandboxAdapter: fixtureValidationAdapter || outerAdapter } : {}),
     });
     console.log(JSON.stringify(report));
   `;

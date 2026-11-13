@@ -22,6 +22,7 @@ import {
   candidateReviewEvidenceForTask,
   mutateState,
   readState,
+  readStateReadOnly,
 } from "./store.js";
 import { buildOwnerQaPacket, candidateCompletenessGate } from "./owner-qa-packet.js";
 import { enqueueOwnerQaNotificationsInState } from "./notifier.js";
@@ -1453,17 +1454,22 @@ async function mergeDefaultBranchIntoIntegration(repoPath, projectPlan, options 
 
   const before = await branchHead(repoPath, "HEAD", options);
   const remoteDefaultRef = `refs/remotes/origin/${baseBranch}`;
-  const ancestor = await git(repoPath, ["merge-base", "--is-ancestor", remoteDefaultRef, "HEAD"], { ...options, allowFailure: true });
+  const mainSha = await branchHead(repoPath, remoteDefaultRef, options);
+  if (!/^[a-f0-9]{40}$/.test(mainSha)) {
+    return { ok: false, status: "blocked", output: "Could not resolve the fetched default-branch revision." };
+  }
+  const ancestor = await git(repoPath, ["merge-base", "--is-ancestor", mainSha, "HEAD"], { ...options, allowFailure: true });
   if (ancestor.ok) {
     return {
       ok: true,
       status: "unchanged",
       changed: false,
+      mainSha,
       output: `Integration branch already contains origin/${baseBranch}.`,
     };
   }
 
-  const merge = await git(repoPath, ["merge", "--no-ff", "--no-edit", remoteDefaultRef], { ...options, allowFailure: true });
+  const merge = await git(repoPath, ["merge", "--no-ff", "--no-edit", mainSha], { ...options, allowFailure: true });
   if (!merge.ok) {
     const conflicts = await conflictFiles(repoPath, options);
     await git(repoPath, ["merge", "--abort"], { ...options, allowFailure: true });
@@ -1479,6 +1485,7 @@ async function mergeDefaultBranchIntoIntegration(repoPath, projectPlan, options 
   return {
     ok: true,
     status: "merged",
+    mainSha,
     changed: before && after && before !== after,
     output: truncateOutput(merge.output || `Merged origin/${baseBranch}.`),
   };
@@ -1878,6 +1885,17 @@ async function mergeTaskSource(repoPath, task, options = {}) {
   };
 }
 
+function validationCommandResult(command, result, options) {
+  return {
+    command,
+    ok: result.ok,
+    timedOut: result.timedOut === true,
+    exitCode: Number.isInteger(result.code) ? result.code : null,
+    diagnostic: truncateOutput(redactPromotionValidationText(redactCommandOutput(String(result.output || "").slice(-1000), options)), 1000),
+    output: truncateOutput(redactPromotionValidationText(redactCommandOutput(result.output, options))),
+  };
+}
+
 async function runValidationCommands(sandbox, commands, options) {
   const sandboxOperations = validationSandboxAdapter(options);
   const results = [];
@@ -1890,7 +1908,7 @@ async function runValidationCommands(sandbox, commands, options) {
       const install = await sandboxOperations.installDependencies(sandbox, {
         validationTimeoutMs: options.validationTimeoutMs,
       });
-      results.push({ command: "[offline dependency installation]", ok: install.ok, output: truncateOutput(install.output) });
+      results.push(validationCommandResult("[offline dependency installation]", install, options));
       if (!install.ok) return results;
     }
   }
@@ -1899,13 +1917,7 @@ async function runValidationCommands(sandbox, commands, options) {
     const result = await sandboxOperations.run(sandbox, command, {
       timeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
     });
-    results.push({
-      command,
-      ok: result.ok,
-      output: truncateOutput(redactPromotionValidationText(
-        redactCommandOutput(result.output, options),
-      )),
-    });
+    results.push(validationCommandResult(command, result, options));
     if (!result.ok) break;
   }
   return results;
@@ -2681,6 +2693,25 @@ async function inspectPendingProtectedHandoff(repoPath, projectPlan, handoff, op
   };
 }
 
+function syncInputIdentity(projectPlan, options, mainSha, integrationSha) {
+  return {
+    schemaVersion: "studioops.qa-sync-input.v1",
+    projectId: projectPlan.projectId,
+    authorityDigest: projectPlan.qaAuthorityDigest,
+    mainSha,
+    integrationSha,
+    nodeExecutable: process.execPath,
+    nodeVersion: process.version,
+    validationTimeoutMs: Number(options.validationTimeoutMs || VALIDATION_TIMEOUT_MS),
+    validationPath: options.projectValidationPath || options.path
+      || process.env.MISSION_CONTROL_QA_INTEGRATION_PATH || DEFAULT_PROJECT_VALIDATION_PATH,
+  };
+}
+
+function syncInputDigest(identity) {
+  return `sha256:${createHash("sha256").update(canonicalJson(identity)).digest("hex")}`;
+}
+
 async function integrateProject(projectPlan, options = {}) {
   const candidatePlan = {
     ...projectPlan,
@@ -2827,6 +2858,30 @@ async function integrateProject(projectPlan, options = {}) {
   let preparedHead = "";
   let pushed = false;
   try {
+    // Empty-queue synchronization must not rebuild the same failed input on every
+    // timer tick. Observe real remote refs; a new task, ref, policy or runtime can
+    // make progress. This is a held failure, never successful QA evidence.
+    if (!assemblingCandidate && !pendingHandoff && shouldSyncDefaultBranch) {
+      const policy = await qaRemotePolicy(repoPath, candidatePlan, options);
+      const observationOptions = qaGitOptions({ ...options, remoteTransportUrl: policy.transportUrl });
+      const main = await remoteRefHead(repoPath, `refs/heads/${normalizeBranchName(candidatePlan.defaultBranch)}`, observationOptions);
+      const integration = await remoteRefHead(repoPath, `refs/heads/${normalizeBranchName(candidatePlan.integrationBranch)}`, observationOptions);
+      if (!main.ok || !integration.ok || !/^[a-f0-9]{40}$/.test(main.head)
+        || (integration.head && !/^[a-f0-9]{40}$/.test(integration.head))) {
+        throw new Error("Could not observe exact remote refs for empty-queue QA synchronization.");
+      }
+      result.syncInput = syncInputIdentity(candidatePlan, options, main.head, integration.head);
+      const currentState = await readStateReadOnly();
+      const previous = currentState.meta?.qaIntegrationSyncFailures?.[candidatePlan.projectId];
+      if (!options.force && previous?.schemaVersion === "studioops.qa-sync-failure.v1"
+        && previous.input && typeof previous.input === "object"
+        && previous.inputDigest === syncInputDigest(result.syncInput)
+        && previous.inputDigest === syncInputDigest(previous.input)) {
+        result.status = "unchanged_sync_failure";
+        result.output = "The same empty-queue branch synchronization already failed validation. Waiting for changed refs, policy or runtime; no validation or preview work was restarted.";
+        return result;
+      }
+    }
     workspace = await prepareQaWorkspace(repoPath, candidatePlan, options);
     executionRepoPath = workspace.executionRepoPath;
     result.workspacePath = workspace.workspacePath;
@@ -2846,7 +2901,6 @@ async function integrateProject(projectPlan, options = {}) {
       throw new Error(`Could not resolve the exact default-branch base for the QA candidate: ${defaultBranchHead.output || "remote ref is missing"}`);
     }
     result.baseSha = defaultBranchHead.head;
-
     let branchChanged = false;
     if (!mergedHandoff && shouldSyncDefaultBranch) {
       result.defaultBranchSync = await mergeDefaultBranchIntoIntegration(executionRepoPath, candidatePlan, gitOptions);
@@ -2857,6 +2911,13 @@ async function integrateProject(projectPlan, options = {}) {
           ? result.tasks
           : allTaskResults(candidatePlan.tasks, result.status, result.output);
         return result;
+      }
+      result.baseSha = result.defaultBranchSync.mainSha;
+      if (result.syncInput) {
+        // Use the fetched commit actually merged, not an earlier remote
+        // observation. An absent integration ref remains absent after failure.
+        result.syncInput = syncInputIdentity(candidatePlan, options, result.baseSha,
+          prepared === "created_branch" ? "" : preparedHead);
       }
       branchChanged = Boolean(result.defaultBranchSync.changed);
     }
@@ -3506,6 +3567,23 @@ async function recordProjectResult(projectResult, projectPlan = null, claim = nu
     state.events = state.events || [];
     state.qaBundles = state.qaBundles || [];
     state.candidates = state.candidates || [];
+
+    if (projectResult.syncInput && !projectPlan?.tasks?.length
+      && projectResult.status !== "unchanged_sync_failure") {
+      state.meta.qaIntegrationSyncFailures = state.meta.qaIntegrationSyncFailures || {};
+      if (projectResult.status === "validation_failed") {
+        const failure = projectResult.validation.find((item) => !item.ok);
+        state.meta.qaIntegrationSyncFailures[projectResult.projectId] = {
+          schemaVersion: "studioops.qa-sync-failure.v1",
+          input: projectResult.syncInput,
+          inputDigest: syncInputDigest(projectResult.syncInput),
+          recordedAt: now,
+          failure: { command: failure.command, timedOut: failure.timedOut, exitCode: failure.exitCode, diagnostic: failure.diagnostic },
+        };
+      } else if (["no_changes", "ready", "preview_ready"].includes(projectResult.status)) {
+        delete state.meta.qaIntegrationSyncFailures[projectResult.projectId];
+      }
+    }
 
     for (const taskResult of projectResult.tasks || []) {
       const task = (state.tasks || []).find((item) => item.id === taskResult.taskId);

@@ -2120,6 +2120,128 @@ test("mutation validation and serialization do not hold the SQLite writer", asyn
   }
 });
 
+test("unpaused idle automation preserves versions and historical audit rows", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-idle-audit-"));
+  try {
+    const state = baseState();
+    state.tasks = [];
+    state.events = [{ id: "event_1", type: "automation_tick", message: "Historical empty tick", createdAt: "2026-01-01T00:00:00.000Z" }];
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { DatabaseSync } from "node:sqlite";
+      import { automationTick, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { DATABASE_FILE } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      const before = await readState();
+      const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+      const version = db.prepare("SELECT version FROM state_meta").get().version;
+      for (let i = 0; i < 3; i++) assert.deepEqual((await automationTick()).actions, []);
+      assert.equal(db.prepare("SELECT version FROM state_meta").get().version, version);
+      assert.deepEqual((await readState()).events, before.events);
+      assert.deepEqual((await readState()).meta, before.meta);
+      db.close();
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("concurrent idle automation does not compete with a genuine metadata write", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-idle-concurrent-"));
+  try {
+    const state = baseState(); state.tasks = [];
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { DatabaseSync } from "node:sqlite";
+      import { automationTick, mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { DATABASE_FILE } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await readState();
+      const db = new DatabaseSync(DATABASE_FILE, { readOnly: true });
+      const before = db.prepare("SELECT version FROM state_meta").get().version;
+      const ticks = Array.from({ length: 6 }, () => automationTick());
+      const results = await Promise.all([...ticks, mutateState(s => { s.meta.realObservation = "preserved"; })]);
+      assert.ok(results.slice(0, 6).every(x => x.actions.length === 0));
+      assert.equal(db.prepare("SELECT version FROM state_meta").get().version, before + 1);
+      const after = await readState();
+      assert.equal(after.meta.realObservation, "preserved");
+      assert.equal(after.events.filter(e => e.type === "automation_tick").length, 0);
+      db.close();
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("automation retains real reconciliation changes and their audit events", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-real-tick-"));
+  try {
+    const state = baseState(); state.tasks = [];
+    state.projects[0].wipPolicy = { maxRunsPerWindow: 3 };
+    await writeLegacyState(root, state);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { automationTick, readState } from ${JSON.stringify(storeModuleUrl)};
+      const result = await automationTick();
+      assert.ok(result.actions.length > 0);
+      const saved = await readState();
+      assert.ok(saved.events.some(e => e.type === "run_window_policy_deprecated"));
+      assert.equal(saved.events.filter(e => e.type === "automation_tick").length, 1);
+      assert.deepEqual((await automationTick()).actions, []);
+      assert.equal((await readState()).events.filter(e => e.type === "automation_tick").length, 1);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("slow optimistic preparation reports its exhausted retry budget without a connection wait", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-replay-budget-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { mutateState, readState } from ${JSON.stringify(storeModuleUrl)};
+      import { withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      let ready, resume, calls = 0;
+      const started = new Promise(resolve => { ready = resolve; });
+      const pause = new Promise(resolve => { resume = resolve; });
+      const mutation = mutateState(async state => {
+        if (++calls === 1) { ready(); await pause; }
+        else await new Promise(resolve => setTimeout(resolve, 10_100));
+        state.meta.mustNotCommit = true;
+      }, { operationName: "test.expired_preparation" });
+      const rejection = assert.rejects(mutation, { code: "STUDIOOPS_SERIALIZED_REPLAY_TIMEOUT" });
+      await started;
+      await mutateState(state => { state.meta.concurrentObservation = true; });
+      resume(); await rejection;
+      assert.equal(calls, 2);
+      assert.equal(await withStateDatabaseConnection(() => "free"), "free");
+      const saved = await readState();
+      assert.equal(saved.meta.concurrentObservation, true);
+      assert.equal(saved.meta.mustNotCommit, undefined);
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("retry budget expiry during connection initialization is not a queued connection timeout", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-retry-initialization-"));
+  try {
+    await writeLegacyState(root);
+    await runStoreScript(root, `
+      import assert from "node:assert/strict";
+      import { withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      await withStateDatabaseConnection(() => {});
+      const realNow = Date.now;
+      let clock = realNow(), called = false;
+      try {
+        Date.now = () => clock;
+        const pending = withStateDatabaseConnection(() => { called = true; }, {
+          operationName: "test.initialization_expiry", deadlineAt: clock + 1, optimisticRetryCount: 1,
+        });
+        clock += 2;
+        await assert.rejects(pending, { code: "STUDIOOPS_SERIALIZED_REPLAY_TIMEOUT", retryCount: 1 });
+      } finally { Date.now = realNow; }
+      assert.equal(called, false);
+      assert.equal(await withStateDatabaseConnection(() => "free"), "free");
+    `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("idle sweeps preserve state versions while real metadata changes persist", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "mc-sqlite-noop-"));
   try {
@@ -2241,22 +2363,24 @@ test("connection ownership cannot grant an expired waiter after a stalled event 
     await runStoreScript(root, `
       import assert from "node:assert/strict";
       import { withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
-      let entered, resume;
-      const ready = new Promise((resolve) => { entered = resolve; });
-      const pause = new Promise((resolve) => { resume = resolve; });
-      const owner = withStateDatabaseConnection(async () => {
-        entered();
-        await pause;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60);
-      });
-      await ready;
-      let called = false;
-      const rejected = assert.rejects(withStateDatabaseConnection(() => { called = true; }, { deadlineAt: Date.now() + 25 }), { code: "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT" });
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      resume();
-      await Promise.all([owner, rejected]);
-      assert.equal(called, false);
-      await withStateDatabaseConnection(() => {});
+      for (const optimisticRetryCount of [0, 1]) {
+        let entered, resume;
+        const ready = new Promise((resolve) => { entered = resolve; });
+        const pause = new Promise((resolve) => { resume = resolve; });
+        const owner = withStateDatabaseConnection(async () => {
+          entered();
+          await pause;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60);
+        });
+        await ready;
+        let called = false;
+        const rejected = assert.rejects(withStateDatabaseConnection(() => { called = true; }, { deadlineAt: Date.now() + 25, optimisticRetryCount }), { code: "STUDIOOPS_DATABASE_CONNECTION_TIMEOUT" });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        resume();
+        await Promise.all([owner, rejected]);
+        assert.equal(called, false);
+        await withStateDatabaseConnection(() => {});
+      }
     `);
   } finally {
     await rm(root, { recursive: true, force: true });
