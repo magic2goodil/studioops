@@ -201,6 +201,8 @@
         "test/credit-classification.test.js",
         "test/credit-policy.test.js",
         "test/credit-reservations.test.js",
+        "test/credit-prepaid.test.js",
+        "docs/PREPAID_ADMISSION.md",
         "test/product-tiers.test.js",
         "test/execution-policy.test.js",
         "test/supervisor.test.js",
@@ -210,7 +212,7 @@
       "services": ["supervisor planner", "dispatcher admission"],
       "publicContracts": ["bundled hosted RC default policy reference and CLI setup/collect/status presentation; policy semantics delegated to qa-release","dispatch admission decision", "monotonic latest blocking-evidence recovery barrier shared by admission and persistence; original hard-refusal provenance retained", "lane-safe immutable run snapshot", "interactive local-owner candidate adoption CLI; held dependency intake and stale dispatch rejection"],
       "workflows": ["architecture builder reviewer and owner dispatch"],
-      "tests": [{ "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-classification.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js --test-file test/work-lanes.test.js --test-file test/credit-reservations.test.js", "layer": "unit-contract" }],
+      "tests": [{ "command": "node scripts/run-tests.js --test-file test/automation-blocker.test.js --test-file test/config.test.js --test-file test/credit-classification.test.js --test-file test/credit-prepaid.test.js --test-file test/credit-policy.test.js --test-file test/dispatcher.test.js --test-file test/execution-policy.test.js --test-file test/product-tiers.test.js --test-file test/supervisor.test.js --test-file test/work-lanes.test.js --test-file test/credit-reservations.test.js", "layer": "unit-contract" }],
       "reviewOwners": ["backend-reviewer"],
       "fullRegressionPaths": [
         "standards/hosted-release-candidate-qa.md",

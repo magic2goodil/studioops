@@ -39,6 +39,7 @@ import {
   findProject,
   findTask,
   mutateState,
+  mutateRunClaimState,
   readState,
   renewGitHubRemoteRecoveryProbeLease,
   scheduleGitHubRemoteRecoveryProbeInState,
@@ -55,7 +56,7 @@ import {
 } from "./config.js";
 import { assessCreditAdmission, getCodexCreditSnapshot } from "./credit-policy.js";
 import { createCreditReservationPlan, creditFallbackAttemptKey, assessCreditReservation,
-  releaseQueuedCreditReservation, recordCreditClaim, sanitizedCreditAdmission, updateCreditExhaustionState } from "./credit-reservations.js";
+  releaseQueuedCreditReservation, recordCreditClaim, commitPrepaidCreditClaimInState, sanitizedCreditAdmission, updateCreditExhaustionState } from "./credit-reservations.js";
 import { laneProfile, laneProfilesConflict, repositoryConflictIdentity } from "./work-lanes.js";
 import { DEFAULT_EXECUTION_POLICY, normalizeExecutionUsage, resolveExecutionPolicy } from "./execution-policy.js";
 import { readDiskAvailability } from "./worker-heartbeat.js";
@@ -1712,8 +1713,10 @@ export function planRunnableRuns(state, input = {}) {
   const runnable = [];
   const skipped = [];
   const plannedRuns = [];
-  const creditPlan = input.creditPolicy?.enabled ? createCreditReservationPlan(state,
-    run => runConsumesExecutionCapacity(state, run, input), input.failureIncidents) : null;
+  const creditPlan = input.creditPolicy?.enabled || state.meta?.creditObservedExhaustion?.clearanceFundingMode === "prepaid"
+    || (state.runs || []).some(run => run.status === "queued" && run.creditAdmission?.fundingMode === "prepaid") ? createCreditReservationPlan(state,
+    run => runConsumesExecutionCapacity(state, run, input), input.failureIncidents,
+    run => runConsumesExecutionCapacity(state, run, { ...input, project: undefined, projects: undefined })) : null;
 
   for (const [index, run] of (state.runs || []).entries()) {
     if (!RUNNABLE_STATUSES.has(run.status)) continue;
@@ -2557,12 +2560,17 @@ function creditClaimAssessment(state, run, plan, input, index) {
   const admission = assessCreditAdmission(input.creditSnapshot,
     { ...policy, modelTier: run.modelTier || policy.modelTier, labels: task?.labels }, input.creditPolicy,
     { knownExhaustion: state.meta?.creditObservedExhaustion });
+  if (run.creditAdmission?.fundingMode === "prepaid" && (admission.code === "disabled" || admission.fallbackUsed)) {
+    return sanitizedCreditAdmission({ ...admission, allowed: false,
+      code: admission.fallbackUsed ? "prepaid_evidence_unverified" : "prepaid_authorization_revoked",
+      reasonCode: admission.fallbackUsed ? "prepaid_evidence_unverified" : "prepaid_authorization_revoked" });
+  }
   const binding = run.creditAdmission?.reservationBinding || {};
   if ((binding.taskId && binding.taskId !== run.taskId) || (binding.runId && binding.runId !== run.id)) {
     return sanitizedCreditAdmission({ ...admission, allowed: false,
       code: "fallback_reservation_binding_invalid", reasonCode: "fallback_reservation_binding_invalid" });
   }
-  if (!admission.fallbackUsed) return admission;
+  if (!admission.fallbackUsed && admission.fundingMode !== "prepaid") return admission;
   return assessCreditReservation({ ...admission,
     maxAttempts: Math.min(policy.maxAttempts, admission.maxAttempts || policy.maxAttempts),
   }, plan, {
@@ -2617,7 +2625,7 @@ export async function claimRuns(input = {}) {
   }
   const mutate = input.state
     ? async (mutator) => mutator(input.state)
-    : mutateState;
+    : mutateRunClaimState;
 
   return mutate(async (state) => {
     state.runs = state.runs || [];
@@ -2635,7 +2643,8 @@ export async function claimRuns(input = {}) {
 
     const claimed = [];
     const plannedRuns = [];
-    const creditPlan = createCreditReservationPlan(state, run => runConsumesExecutionCapacity(state, run, input), input.failureIncidents);
+    const creditPlan = createCreditReservationPlan(state, run => runConsumesExecutionCapacity(state, run, input), input.failureIncidents,
+      run => runConsumesExecutionCapacity(state, run, { ...input, project: undefined, projects: undefined }));
     for (const [runIndex, run] of state.runs.entries()) {
       if (claimed.length >= available) break;
       const project = findProject(state, run.projectId);
@@ -2690,7 +2699,7 @@ export async function claimRuns(input = {}) {
       }
 
       delete run.creditClaimBlocker;
-      run.creditClaimAdmission = sanitizedCreditAdmission(creditAdmission);
+      run.creditClaimAdmission = sanitizedCreditAdmission(commitPrepaidCreditClaimInState(state, run, creditAdmission, now));
       if (creditAdmission.fallbackUsed) {
         run.maxFallbackAttempts = creditAdmission.maxAttempts;
         run.fallbackAttempt = Number(creditAdmission.observedCounters?.attemptsConsumed || 0) + 1;
@@ -2751,6 +2760,7 @@ export async function claimRuns(input = {}) {
         type: "run_claimed",
         projectId: run.projectId,
         taskId: run.taskId,
+        ...(run.creditClaimAdmission.fundingMode === "prepaid" ? { creditAdmission: structuredClone(run.creditClaimAdmission) } : {}),
         message: `${run.id} claimed by StudioOps runner`,
         createdAt: now,
       });

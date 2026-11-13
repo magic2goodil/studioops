@@ -1,5 +1,6 @@
 import { backup, DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
+import { validPrepaidCreditLedger } from "./credit-admission-evidence.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -86,6 +87,7 @@ const MERGED_PROMOTION_RECOVERY_WRITE = Symbol("studioops.merged-promotion-recov
 const STATE_INTEGRITY_MIGRATION_WRITE = Symbol("studioops.state-integrity-migration-write");
 const OPERATOR_CANDIDATE_WRITE = Symbol("studioops.operator-candidate-write");
 const SCOPED_DISPATCH_WRITE = Symbol("studioops.scoped-dispatch-write");
+const PREPAID_RUN_CLAIM_WRITE = Symbol("studioops.prepaid-run-claim-write");
 const NATIVE_WORKSPACE_WRITE = Symbol("studioops.native-workspace-write");
 const NATIVE_WORKSPACE_FIELDS = ["workspacePath", "executionRepoPath", "workspaceStrategy", "gitHooksPath"];
 const NATIVE_WORKSPACE_AUTHORITY_FIELDS = [...NATIVE_WORKSPACE_FIELDS, "workspaceProvenanceUntrusted"];
@@ -467,6 +469,7 @@ async function readFailedContentionEvents() {
 }
 
 const completedReviewCreditAdmissions = new WeakMap();
+const prepaidCreditRetirementAdmissions = new WeakMap();
 
 function taskHasUnresolvedFailureIncident(db, taskId) {
   return Boolean(db.prepare("SELECT 1 FROM failure_incidents WHERE task_id = ? AND state NOT IN ('closed', 'superseded') LIMIT 1").get(taskId));
@@ -482,6 +485,13 @@ export function admitCompletedReviewCreditRetirement(state, taskId) {
   return true;
 }
 
+export function admitPrepaidCreditRetirement(state, taskId) {
+  const admission = prepaidCreditRetirementAdmissions.get(state);
+  if (!admission?.eligible.has(taskId)) return false;
+  admission.retirements.add(taskId);
+  return true;
+}
+
 function readStateSnapshot(db) {
   db.exec("BEGIN");
   try {
@@ -492,6 +502,11 @@ function readStateSnapshot(db) {
       && task.automationCircuit.reasonCode === "credit_budget_insufficient"
       && !taskHasUnresolvedFailureIncident(db, task.id)).map(task => task.id));
     if (state) completedReviewCreditAdmissions.set(state, { eligible, retirements: new Set() });
+    const prepaidEligible = new Set((state?.tasks || []).filter(task => task.status === "blocked"
+      && task.automationCircuit?.state === "open" && task.automationCircuit.reasonCode === "credit_budget_insufficient"
+      && task.automationCircuit.attemptsConsumed === 0 && task.automationCircuit.maxAttempts === 0
+      && !taskHasUnresolvedFailureIncident(db, task.id)).map(task => task.id));
+    if (state) prepaidCreditRetirementAdmissions.set(state, { eligible: prepaidEligible, retirements: new Set() });
     db.exec("COMMIT");
     return { state, version };
   } catch (error) {
@@ -3114,6 +3129,7 @@ export async function writeDatabaseState(state) {
       const previousState = readStateFromOpenDatabase(db);
       assertMaintenanceWriteAllowed(previousState);
       const snapshot = mutationSnapshot(previousState);
+      assertPrepaidLedgerTransition(state, snapshot);
       assertNativeWorkspaceIngress(state, snapshot);
       assertOperatorCandidateIngress(state, snapshot);
       assertProposedQaAuthorityPreserved(state, snapshot);
@@ -3145,6 +3161,7 @@ async function prepareDatabaseMutation(state, mutator, options) {
   // Mutators must only transform the supplied snapshot or perform retry-safe
   // reads. External writes belong in the fenced operation-intent workflow.
   const result = await mutator(state);
+  assertPrepaidLedgerTransition(state, snapshot, options);
   assertNativeWorkspaceIngress(state, snapshot, options);
   assertOperatorCandidateIngress(state, snapshot, options, true);
   assertProposedQaAuthorityPreserved(state, snapshot, options);
@@ -3164,9 +3181,65 @@ async function prepareDatabaseMutation(state, mutator, options) {
   }
   const operatorVerification = options.operatorCandidateCapability === OPERATOR_CANDIDATE_WRITE
     ? options.operatorCandidateVerification : null;
-  const reviewCreditRetirements = [...(completedReviewCreditAdmissions.get(state)?.retirements || [])];
+  const reviewCreditRetirements = [...new Set([...(completedReviewCreditAdmissions.get(state)?.retirements || []),
+    ...(prepaidCreditRetirementAdmissions.get(state)?.retirements || [])])];
   return { result, plan, archiveRows, operatorVerification, reviewCreditRetirements };
 }
+
+function assertPrepaidLedgerTransition(state, snapshot, options = {}) {
+  const previousMeta = JSON.parse(snapshot.meta || "{}");
+  const previous = previousMeta.prepaidCreditLedger;
+  const next = state.meta?.prepaidCreditLedger;
+  const reject = () => { throw new Error("Prepaid cumulative ledger changes require the native bounded run claim; history cannot be reset."); };
+  const retained = new Map((state.runs || []).map(run => [run.id, run]));
+  for (const [id, row] of snapshot.tables.runs) {
+    const prior = JSON.parse(row.payload);
+    if (prior.creditClaimAdmission?.fundingMode !== "prepaid") continue;
+    const current = retained.get(id);
+    if (!current) {
+      if (!["completed", "failed", "cancelled"].includes(prior.status)) reject();
+      continue; // Terminal archive compaction keeps its cumulative charge in meta.
+    }
+    if (current.taskId !== prior.taskId || current.projectId !== prior.projectId || current.startedAt !== prior.startedAt
+      || current.status === "queued" || canonicalJson(current.creditClaimAdmission ?? null) !== canonicalJson(prior.creditClaimAdmission)) reject();
+  }
+  const claims = (state.runs || []).filter(run => {
+    if (run.creditClaimAdmission?.fundingMode !== "prepaid") return false;
+    const prior = snapshot.tables.runs.get(run.id);
+    const oldRun = prior ? JSON.parse(prior.payload) : null;
+    return !oldRun || (oldRun.status !== "running" && run.status === "running")
+      || (oldRun.startedAt !== run.startedAt)
+      || canonicalJson(oldRun.creditClaimAdmission ?? null) !== canonicalJson(run.creditClaimAdmission);
+  }).sort((a, b) => a.creditClaimAdmission.prepaidClaimSequence - b.creditClaimAdmission.prepaidClaimSequence);
+  if (!claims.length && Object.hasOwn(previousMeta, "prepaidCreditLedger") === Object.hasOwn(state.meta || {}, "prepaidCreditLedger")
+    && canonicalJson(previous ?? null) === canonicalJson(next ?? null)) return;
+  if (options.prepaidRunClaimCapability !== PREPAID_RUN_CLAIM_WRITE || !claims.length
+    || (Object.hasOwn(previousMeta, "prepaidCreditLedger") && !validPrepaidCreditLedger(previous)) || !validPrepaidCreditLedger(next)) reject();
+  let total = previous?.committedEstimatedCredits || 0, count = previous?.claimCount || 0;
+  for (const run of claims) {
+    const oldRun = JSON.parse(snapshot.tables.runs.get(run.id)?.payload || "null");
+    const evidence = run.creditClaimAdmission;
+    if (!oldRun || oldRun.status !== "queued" || oldRun.creditClaimAdmission?.fundingMode === "prepaid"
+      || run.status !== "running" || oldRun.taskId !== run.taskId
+      || evidence.allowed !== true || evidence.fallbackUsed !== false || evidence.ruleId !== "authorized-prepaid-v1"
+      || evidence.reservationBinding?.taskId !== run.taskId || evidence.reservationBinding?.runId !== run.id
+      || evidence.prepaidClaimSequence !== count + 1 || typeof evidence.estimatedCredits !== "number"
+      || !Number.isFinite(evidence.estimatedCredits) || evidence.estimatedCredits <= 0
+      || !Number.isFinite(Date.parse(run.startedAt || ""))) reject();
+    const updated = total + evidence.estimatedCredits;
+    if (!Number.isFinite(updated) || updated <= total || updated > evidence.prepaidCreditLimit
+      || evidence.prepaidCreditLimit > evidence.maxEstimatedCredits
+      || !Number.isFinite(evidence.prepaidCreditLimit) || !Number.isFinite(evidence.maxEstimatedCredits)
+      || evidence.prepaidCommittedCreditsAfterClaim !== updated) reject();
+    total = updated; count++;
+  }
+  if (next.committedEstimatedCredits !== total || next.claimCount !== count
+    || next.lastClaimedAt !== claims.at(-1).startedAt) reject();
+}
+
+/** The existing atomic run claim is the only cumulative prepaid writer. */
+export const mutateRunClaimState = (mutator, options = {}) => mutateDatabaseState(mutator,
+  { idempotent: true, ...options, prepaidRunClaimCapability: PREPAID_RUN_CLAIM_WRITE });
 
 export async function mutateDatabaseState(mutator, options = {}) {
   await ensureStateDatabase();
@@ -3223,7 +3296,7 @@ export async function mutateDatabaseState(mutator, options = {}) {
           assertOperatorCandidateCommitFence(db, prepared.operatorVerification);
           for (const taskId of prepared.reviewCreditRetirements) {
             if (!taskHasUnresolvedFailureIncident(db, taskId)) continue;
-            const conflict = new Error("A durable failure incident appeared during completed-review reconciliation.");
+            const conflict = new Error("A durable failure incident appeared during credit-hold reconciliation.");
             conflict.code = "STUDIOOPS_STATE_CONFLICT";
             throw conflict;
           }

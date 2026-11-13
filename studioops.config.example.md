@@ -84,6 +84,7 @@ The app reads the first fenced `json studioops-config` block in this file.
       "snapshotMaxAgeMs": 900000,
       "probeTimeoutMs": 20000,
       "reserveCredits": 5,
+      "prepaid": { "enabled": false },
       "tierBudgets": {
         "mechanical": { "estimatedCredits": 2, "minRemainingPercent": 2 },
         "economy": { "estimatedCredits": 8, "minRemainingPercent": 5 },

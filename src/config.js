@@ -495,6 +495,13 @@ by stable execution risk tiers and explicit labels, never model IDs. Existing
 \`failClosedTiers\` and \`tierBudgets\` inputs remain readable for one compatibility
 release; newly generated configuration uses the canonical fallback contract.
 
+Optional prepaid admission is separate from degraded telemetry fallback:
+\`defaults.creditPolicy.prepaid.enabled\` must be literal \`true\`, with a
+finite positive numeric \`maxEstimatedCredits\` and positive integer
+\`maxConcurrentRuns\`. It defaults off. The allowance is shared across tiers
+and cumulative across completed runs; it never replenishes automatically.
+These are estimated admission limits, not a guaranteed provider billing cap.
+
 ## Machine-Readable Config
 
 \`\`\`json studioops-config
