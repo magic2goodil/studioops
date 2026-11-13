@@ -466,11 +466,32 @@ async function readFailedContentionEvents() {
   }
 }
 
+const completedReviewCreditAdmissions = new WeakMap();
+
+function taskHasUnresolvedFailureIncident(db, taskId) {
+  return Boolean(db.prepare("SELECT 1 FROM failure_incidents WHERE task_id = ? AND state NOT IN ('closed', 'superseded') LIMIT 1").get(taskId));
+}
+
+// Only this executable snapshot reader can establish ledger absence. The
+// independent failure ledger does not advance state_meta.version, so every
+// admitted retirement is also checked inside the eventual writer transaction.
+export function admitCompletedReviewCreditRetirement(state, taskId) {
+  const admission = completedReviewCreditAdmissions.get(state);
+  if (!admission?.eligible.has(taskId)) return false;
+  admission.retirements.add(taskId);
+  return true;
+}
+
 function readStateSnapshot(db) {
   db.exec("BEGIN");
   try {
     const state = readStateFromOpenDatabase(db);
     const version = Number(db.prepare("SELECT version FROM state_meta WHERE singleton_id = 1").get()?.version || 0);
+    const eligible = new Set((state?.tasks || []).filter(task => task.operatorIntake
+      && task.status === "blocked" && task.automationCircuit?.state === "open"
+      && task.automationCircuit.reasonCode === "credit_budget_insufficient"
+      && !taskHasUnresolvedFailureIncident(db, task.id)).map(task => task.id));
+    if (state) completedReviewCreditAdmissions.set(state, { eligible, retirements: new Set() });
     db.exec("COMMIT");
     return { state, version };
   } catch (error) {
@@ -3143,7 +3164,8 @@ async function prepareDatabaseMutation(state, mutator, options) {
   }
   const operatorVerification = options.operatorCandidateCapability === OPERATOR_CANDIDATE_WRITE
     ? options.operatorCandidateVerification : null;
-  return { result, plan, archiveRows, operatorVerification };
+  const reviewCreditRetirements = [...(completedReviewCreditAdmissions.get(state)?.retirements || [])];
+  return { result, plan, archiveRows, operatorVerification, reviewCreditRetirements };
 }
 
 export async function mutateDatabaseState(mutator, options = {}) {
@@ -3199,6 +3221,12 @@ export async function mutateDatabaseState(mutator, options = {}) {
           );
           assertMaintenanceWriteAllowed({ meta: currentMeta });
           assertOperatorCandidateCommitFence(db, prepared.operatorVerification);
+          for (const taskId of prepared.reviewCreditRetirements) {
+            if (!taskHasUnresolvedFailureIncident(db, taskId)) continue;
+            const conflict = new Error("A durable failure incident appeared during completed-review reconciliation.");
+            conflict.code = "STUDIOOPS_STATE_CONFLICT";
+            throw conflict;
+          }
           writeArchiveRows(db, archiveRows);
           applyMutationWrite(db, plan);
           recordContentionEvent(db, {
