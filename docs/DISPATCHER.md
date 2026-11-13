@@ -15,6 +15,10 @@ It can:
 - store a prompt snapshot on each run
 - enforce builder, reviewer, and owner handoff concurrency
 
+Explicit opt-in [prepaid admission](PREPAID_ADMISSION.md) can fund authorized
+work when included usage is exhausted. It requires fresh, verified balance and
+spend-control evidence plus a finite shared allowance. It defaults off.
+
 It does not:
 
 - merge PRs

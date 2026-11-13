@@ -70,6 +70,8 @@ export const DEFAULT_CREDIT_POLICY = Object.freeze({
   snapshotMaxAgeMs: 15 * 60 * 1000,
   probeTimeoutMs: 20 * 1000,
   reserveCredits: 5,
+  // Opt-in, cumulative estimated-credit allowance; never an automatic top-up.
+  prepaid: Object.freeze({ enabled: false }),
   // Deprecated compatibility input. Canonical fallback policy lives in
   // degradedTelemetryFallback and defaults ordinary critical work to bounded.
   failClosedTiers: ["frontier"],
@@ -100,11 +102,13 @@ const EXHAUSTION_CODES = new Set([
   "overage_eligibility_unverified", "included_usage_permission_unknown",
 ]);
 
-function snapshotBlocker(snapshot) {
+function snapshotBlocker(snapshot, prepaidQualified = false) {
   if (snapshot?.spendControlReached === true) return "spend_control_reached";
   // Legacy reached records remain blocking, but percentages and the generic
   // backend included-limit signal are not evidence of a provider refusal.
-  if (snapshot?.reached === true) return "rate_limit_reached";
+  if (snapshot?.reached === true || (REACHED_TYPES.has(snapshot?.reachedType)
+    && snapshot.reachedType !== "rate_limit_reached")) return "rate_limit_reached";
+  if (prepaidQualified) return "";
   const remaining = finiteNumber(snapshot?.remainingPercent);
   if (snapshot?.ordinaryUsageAllowed === false || (remaining !== null && remaining <= 0)
     || snapshot?.reachedType === "rate_limit_reached" || snapshot?.reachedType === "unclassified") {
@@ -221,6 +225,7 @@ export function normalizeCreditPolicy(input = {}) {
       ...DEFAULT_CREDIT_POLICY.tierBudgets,
       ...(policy.tierBudgets || {}),
     },
+    prepaid: { ...(policy.prepaid || {}), enabled: policy.prepaid?.enabled === true },
     degradedTelemetryFallback: normalizeFallbackContract(input),
   };
 }
@@ -284,16 +289,19 @@ export function normalizeCreditSnapshot(result, input = {}) {
   const usedPercent = usedPercents.length ? Math.max(...usedPercents) : null;
   const credits = bucket.credits || null;
   const balance = finiteNumber(credits?.balance);
-  const reachedType = bucket.rateLimitReachedType
-    ? (REACHED_TYPES.has(bucket.rateLimitReachedType) ? bucket.rateLimitReachedType : "unclassified") : "";
+  const reachedType = bucket.rateLimitReachedType == null || bucket.rateLimitReachedType === ""
+    ? "" : (REACHED_TYPES.has(bucket.rateLimitReachedType) ? bucket.rateLimitReachedType : "unclassified");
   const reached = REACHED_TYPES.has(reachedType) && reachedType !== "rate_limit_reached";
+  const bucketIdentity = Object.hasOwn(bucket, "limitId")
+    ? (typeof bucket.limitId === "string" ? bucket.limitId : "")
+    : (buckets.codex === bucket ? "codex" : "");
 
   return {
     status: reached || usedPercent !== null || (credits?.hasCredits === true && balance !== null)
       || credits?.unlimited === true ? "available" : "unknown",
     source: "codex-app-server",
     observedAt,
-    bucketId: sanitizedBucketId(bucket.limitId || "codex"),
+    bucketId: sanitizedBucketId(bucketIdentity),
     usedPercent,
     remainingPercent: usedPercent === null ? null : Math.max(0, 100 - usedPercent),
     resetsAt: Math.max(
@@ -308,7 +316,7 @@ export function normalizeCreditSnapshot(result, input = {}) {
     overageEligibility: "unverified",
     credits: {
       available: credits?.hasCredits === true,
-      unlimited: credits?.unlimited === true,
+      unlimited: typeof credits?.unlimited === "boolean" ? credits.unlimited : null,
       balance: credits?.hasCredits === true ? balance : null,
     },
   };
@@ -517,7 +525,7 @@ function sanitizedSnapshotEvidence(snapshot, policy, evaluation = {}) {
     || (
       ["available", "recovered"].includes(rawStatus)
       && (
-        snapshotAgeMs === null
+        snapshotAgeMs === null || observedMs > evaluatedMs
         || snapshotAgeMs > Number(policy.snapshotMaxAgeMs)
       )
     );
@@ -552,12 +560,42 @@ function sanitizedSnapshotEvidence(snapshot, policy, evaluation = {}) {
   };
 }
 
+/** Explicit prepaid evidence is independent of included-usage permission. */
+function prepaidFundingEvidence(snapshot, policy, evaluation = {}) {
+  const configured = policy.prepaid || {};
+  const maxEstimatedCredits = finiteNumber(configured.maxEstimatedCredits);
+  const maxConcurrentRuns = finiteNumber(configured.maxConcurrentRuns);
+  const reserve = finiteNumber(policy.reserveCredits);
+  const balance = finiteNumber(snapshot?.credits?.balance);
+  const maxAge = finiteNumber(policy.snapshotMaxAgeMs);
+  const evidence = sanitizedSnapshotEvidence(snapshot, policy, evaluation);
+  const qualified = policy.enabled === true && configured.enabled === true
+    && typeof configured.maxEstimatedCredits === "number" && maxEstimatedCredits !== null && maxEstimatedCredits > 0
+    && typeof configured.maxConcurrentRuns === "number" && Number.isSafeInteger(maxConcurrentRuns) && maxConcurrentRuns > 0
+    && reserve !== null && reserve >= 0 && maxAge !== null && maxAge > 0
+    && snapshot?.classificationVersion === 2 && snapshot.bucketId === "codex"
+    && CREDIT_SNAPSHOT_SOURCES.has(snapshot.source)
+    && ["available", "recovered"].includes(evidence.snapshotStatus)
+    && snapshot.reached === false && ["", "rate_limit_reached"].includes(snapshot.reachedType)
+    && snapshot.spendControlReached === false
+    && snapshot.credits?.available === true && snapshot.credits.unlimited === false
+    && balance !== null && balance > reserve;
+  return { qualified, maxEstimatedCredits, maxConcurrentRuns,
+    prepaidCreditLimit: qualified ? Math.min(maxEstimatedCredits, balance - reserve) : null };
+}
+
 /** Shared dated proof for clearance; a status label alone is never capacity. */
 export function freshHealthyCreditEvidence(snapshot, input = {}, evaluation = {}) {
-  const evidence = sanitizedSnapshotEvidence(snapshot, mergedCreditPolicy(input), evaluation);
+  const policy = mergedCreditPolicy(input);
+  const evidence = sanitizedSnapshotEvidence(snapshot, policy, evaluation);
   const capacity = creditCapacity(snapshot);
-  return { ...evidence, healthyCapacity: capacity.measured && !capacity.exhausted
-    && ["available", "recovered"].includes(evidence.snapshotStatus) };
+  const prepaid = prepaidFundingEvidence(snapshot, policy, evaluation);
+  const healthyCapacity = capacity.measured && (!capacity.exhausted || prepaid.qualified)
+    && ["available", "recovered"].includes(evidence.snapshotStatus);
+  return { ...evidence, fundingMode: capacity.exhausted && prepaid.qualified ? "prepaid" : "included",
+    healthyCapacity, verifiedIncludedCapacity: healthyCapacity && !capacity.exhausted
+      && snapshot?.classificationVersion === 2 && snapshot.bucketId === "codex" && CREDIT_SNAPSHOT_SOURCES.has(snapshot.source)
+      && snapshot.ordinaryUsageAllowed === true && snapshot.spendControlReached === false };
 }
 
 /** Recovery must follow every retained block, not just its original cause. */
@@ -616,7 +654,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     nowMs: input.nowMs,
     recovered: input.recovered,
   };
-  const { healthyCapacity, ...snapshotEvidence } = freshHealthyCreditEvidence(snapshot, policy, evaluationInput);
+  const { healthyCapacity, verifiedIncludedCapacity, fundingMode: _healthyFundingMode, ...snapshotEvidence } = freshHealthyCreditEvidence(snapshot, policy, evaluationInput);
   const budget = {
     estimatedCredits: 0,
     minRemainingPercent: 0,
@@ -625,6 +663,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
   const estimatedCredits = Math.max(0, Number(budget.estimatedCredits || 0));
   const minRemainingPercent = Math.max(0, Number(budget.minRemainingPercent || 0));
   const { remainingPercent, balance, unlimited } = creditCapacity(snapshot);
+  const prepaid = prepaidFundingEvidence(snapshot, policy, evaluationInput);
   const base = {
     enabled: Boolean(policy.enabled),
     tier,
@@ -642,6 +681,19 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     ...snapshotEvidence,
   };
 
+  const prior = evaluationInput.knownExhaustion;
+  let prepaidProvenanceRequired = false;
+  if (prior?.clearanceFundingMode === "prepaid") {
+    const barrier = Math.max(creditExhaustionBarrierMs(prior), Date.parse(prior.clearedByFreshSnapshotAt || "") || 0);
+    const observed = Date.parse(snapshotEvidence.snapshotObservedAt || "");
+    const includedRecovery = verifiedIncludedCapacity && observed > barrier;
+    prepaidProvenanceRequired = !includedRecovery;
+    if (!(prepaid.qualified && observed >= barrier) && !includedRecovery) {
+      const code = snapshotBlocker(snapshot) || "prepaid_funding_unverified";
+      return { ...base, allowed: false, code, reasonCode: code, mode: "prepaid", fundingMode: "prepaid", fallbackUsed: false,
+        reason: "Known included exhaustion was funded by prepaid admission; fresh qualifying funding remains required." };
+    }
+  }
   if (!policy.enabled) {
     return {
       ...base,
@@ -653,7 +705,6 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
     };
   }
 
-  const prior = evaluationInput.knownExhaustion;
   const obsoleteObservation = prior?.active === false
     && Date.parse(prior.clearedByFreshSnapshotAt || "") > Date.parse(snapshotEvidence.snapshotObservedAt || "");
   if (obsoleteObservation) {
@@ -677,7 +728,7 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
   // Observed exhaustion cannot become permission merely because its telemetry
   // later ages or a caller cannot refresh it. Only a new healthy snapshot may
   // replace that evidence.
-  const blocker = snapshotBlocker(snapshot);
+  const blocker = snapshotBlocker(snapshot, prepaid.qualified);
   if (blocker) {
     return { ...base, allowed: false, code: blocker, mode: "normal",
       reasonCode: blocker, fallbackUsed: false, remainingPercent,
@@ -690,6 +741,17 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
       ...decision,
       fallbackUsed: true,
     };
+  }
+
+  if (prepaid.qualified && (prepaidProvenanceRequired || snapshotBlocker(snapshot))) {
+    const validEstimate = finiteNumber(budget.estimatedCredits) !== null && estimatedCredits > 0;
+    const allowed = tier !== "unclassified" && validEstimate && estimatedCredits <= prepaid.prepaidCreditLimit;
+    const code = allowed ? "authorized_prepaid_available" : "prepaid_estimate_exceeds_allowance";
+    return { ...base, allowed, code, reasonCode: code, mode: "prepaid", fundingMode: "prepaid",
+      fallbackUsed: false, policyVersion: 1, ruleId: "authorized-prepaid-v1",
+      maxEstimatedCredits: prepaid.maxEstimatedCredits, prepaidCreditLimit: prepaid.prepaidCreditLimit,
+      maxConcurrentRuns: prepaid.maxConcurrentRuns,
+      reason: "Explicit cumulative prepaid estimate allowance; account-wide reservation and atomic claim remain required." };
   }
 
   if (unlimited) {
@@ -747,8 +809,9 @@ export function assessCreditAdmission(snapshot, execution = {}, input = {}, eval
 }
 
 /** Dated control evidence only: no account identity, balance, or raw payload. */
-export function creditExhaustionObservation(snapshot, checkedAt = new Date().toISOString()) {
-  const reasonCode = snapshotBlocker(snapshot);
+export function creditExhaustionObservation(snapshot, checkedAt = new Date().toISOString(), policy = {}) {
+  const prepaid = prepaidFundingEvidence(snapshot, mergedCreditPolicy(policy), { evaluatedAt: checkedAt });
+  const reasonCode = snapshotBlocker(snapshot, prepaid.qualified);
   if (!reasonCode) return null;
   const observedAt = Number.isFinite(Date.parse(snapshot.observedAt || "")) ? new Date(snapshot.observedAt).toISOString() : checkedAt;
   // Classification belongs to the source observation, not this persistence

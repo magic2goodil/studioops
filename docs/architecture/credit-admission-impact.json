@@ -22,10 +22,10 @@
       "owner": "backend-credit-admission",
       "paths": ["src/credit-policy.js"],
       "ownsData": [],
-      "publicContracts": ["credit admission decision and sanitized evidence DTO"],
+      "publicContracts": ["credit admission decision and sanitized evidence DTO", "default-off explicit bounded prepaid funding independent of included usage permission"],
       "allowedDependencies": ["node-runtime"],
       "testLayers": {
-        "unit": ["test/credit-policy.test.js"],
+        "unit": ["test/credit-policy.test.js", "test/credit-classification.test.js", "test/credit-prepaid.test.js"],
         "contract": ["test/dispatcher.test.js"],
         "persistence": [],
         "adapter": [],
@@ -52,14 +52,14 @@
       "id": "credit-admission-orchestration-state-consumers",
       "classification": "orchestration-state-consumer",
       "owner": "backend-automation",
-      "paths": ["src/dispatcher.js", "src/store.js"],
-      "ownsData": ["additive task, run, event, and comment JSON payload fields"],
-      "publicContracts": ["dispatcher admission consumption", "store public mutation contracts"],
+      "paths": ["src/dispatcher.js", "src/store.js", "src/runner.js", "src/credit-reservations.js", "src/credit-admission-evidence.js"],
+      "ownsData": ["additive task, run, event, and comment JSON payload fields", "versioned cumulative prepaid estimated-usage ledger committed by the native run claim"],
+      "publicContracts": ["dispatcher admission consumption", "store public mutation contracts", "account-wide prepaid reservation and atomic cumulative claim"],
       "allowedDependencies": ["credit-admission-policy", "state-database"],
       "testLayers": {
         "unit": ["test/dispatcher.test.js"],
         "contract": ["test/dispatcher.test.js"],
-        "persistence": ["test/state-database.test.js"],
+        "persistence": ["test/state-database.test.js", "test/credit-prepaid.test.js"],
         "adapter": [],
         "composition": ["npm run check"]
       }

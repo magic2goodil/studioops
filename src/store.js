@@ -51,6 +51,7 @@ import {
   ensureStateDatabase,
   mutateCandidateQaDecisionState,
   mutateDatabaseState,
+  mutateRunClaimState as mutateRunClaimDatabaseState,
   commitOperatorCandidateAdoption,
   mutateScopeDispatchState as mutateScopeDispatchDatabaseState,
   mutateHostedRcAggregate,
@@ -65,6 +66,7 @@ import {
   readPrerequisiteFailureRecovery,
   writeDatabaseState,
   admitCompletedReviewCreditRetirement,
+  admitPrepaidCreditRetirement,
 } from "./state-database.js";
 import {
   assertQaRevocationIntent,
@@ -787,6 +789,7 @@ export async function writeState(state) {
 
 /** Scheduling composition root is the sole native initial-scope writer. */
 export const mutateScopeDispatchState = (mutator, options = {}) => mutateScopeDispatchDatabaseState(mutator, { idempotent: true, ...options });
+export const mutateRunClaimState = (mutator, options = {}) => mutateRunClaimDatabaseState(mutator, options);
 
 export async function mutateState(mutator, options = {}) {
   // This public state-transform API is retry-safe by contract. Callers that
@@ -4791,12 +4794,17 @@ function creditAdmissionPauseFingerprint(task, input = {}) {
 
 function creditAdmissionAuditBody(prefix, evidence = {}) {
   const observed = evidence.observedCounters || {};
+  const reservations = evidence.fundingMode === "prepaid"
+    ? `Prepaid reservations at admission: ${Number(observed.reservedRuns || 0)} outstanding runs, `
+      + `${Number(observed.reservedEstimatedCredits || 0)} committed or queued estimated credits. `
+      + "Estimated credits are admission controls, not measured provider charges or a guaranteed bill cap."
+    : `Fallback reservations at admission: ${Number(observed.reservedRuns || 0)} runs, `
+      + `${Number(observed.reservedEstimatedTokens || 0)} estimated tokens. `
+      + "Estimated tokens are admission reservations, not provider output limits.";
   return `${prefix} Decision: ${evidence.code || "unknown"} (${evidence.reasonCode || "unclassified"}). `
     + `Tier/rule: ${evidence.tier || "unclassified"}/${evidence.ruleId || "unclassified"}. `
     + `Snapshot: ${evidence.snapshotStatus || "unknown"}; probe attempts: ${Number(evidence.retryEvidence?.attemptCount || 0)}. `
-    + `Fallback reservations at admission: ${Number(observed.reservedRuns || 0)} runs, `
-    + `${Number(observed.reservedEstimatedTokens || 0)} estimated tokens. `
-    + "Estimated tokens are admission reservations, not provider output limits.";
+    + reservations;
 }
 
 export function persistCreditAdmissionPauseInState(state, task, input = {}) {
@@ -4884,6 +4892,37 @@ export function recoverCreditAdmissionPauseInState(state, task, input = {}) {
     createdAt: now,
   });
   return { recovered: true, pause: task.creditAdmissionPause };
+}
+
+/** A zero-attempt admission hold is not a repaired provider failure or a new epoch. */
+export function recoverPrepaidCreditCircuitInState(state, task, input = {}) {
+  const circuit = task.automationCircuit, blocker = task.automationBlocker;
+  const admission = sanitizedCreditAdmission(input.creditAdmission);
+  const now = input.now || new Date().toISOString();
+  if (task.status !== "blocked" || circuit?.state !== "open" || circuit.reasonCode !== "credit_budget_insufficient"
+    || circuit.attemptsConsumed !== 0 || circuit.maxAttempts !== 0 || !circuit.snapshot
+    || blocker?.type !== "circuit" || blocker.blockedAt !== circuit.openedAt
+    || !["overage_eligibility_unverified", "included_usage_permission_unknown", "prior_exhaustion_unverified", "insufficient_quota_headroom", "insufficient_credit_balance"].includes(blocker.reason)
+    || !taskAutomationCircuitIsCurrent(task) || !VALID_STATUSES.has(circuit.snapshot.status)
+    || !admission.allowed || admission.fundingMode !== "prepaid" || admission.fallbackUsed !== false
+    || admission.ruleId !== "authorized-prepaid-v1" || admission.reservationBinding?.taskId !== task.id
+    || !(Date.parse(admission.snapshotObservedAt) > Date.parse(circuit.openedAt))) return false;
+  if (!admitPrepaidCreditRetirement(state, task.id)) return false;
+  task.automationCircuit = { ...circuit, state: "closed", closedAt: now, closedBy: "StudioOps Budget Controller",
+    closeReason: "Explicit bounded prepaid admission now funds the unchanged workflow; execution attempts are unchanged.",
+    recoveryEvidence: admission };
+  task.assignedAgentRole = circuit.snapshot.assignedAgentRole || "";
+  task.retryNotBefore = "";
+  delete task.automationBlocker;
+  applyStoreLifecycleTransition(state, task, circuit.snapshot.status, { action: "resume_workflow", now });
+  task.updatedAt = now;
+  state.comments ||= [];
+  addAutomationComment(state, task, task.automationCircuit.closeReason, now, task.automationCircuit.closedBy);
+  state.events ||= [];
+  state.events.push({ id: nextId(state.events, "event"), type: "credit_admission_recovered",
+    projectId: task.projectId, taskId: task.id, creditAdmission: admission,
+    message: `${task.id}: bounded prepaid admission retired a zero-attempt credit hold without resetting execution history.`, createdAt: now });
+  return true;
 }
 
 export function taskAutomationCircuitIsCurrent(task = {}) {
