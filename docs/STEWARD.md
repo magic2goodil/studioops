@@ -11,6 +11,10 @@ It runs `automation-tick`, which advances task state when the rules are satisfie
 
 It intentionally leaves `ready` and `queued` tasks in place. The dispatcher owns turning those tasks into durable builder runs. This prevents the steward from moving tasks to `in_progress` before a builder has actually been launched.
 
+An operator-adopted candidate can finish its independent reviews while an automated reviewer remains blocked before launch by credit admission. The next tick, or the final recorded approval, can supersede that specific review-credit hold when every required current-candidate review is approved. The blocked review's approval must postdate the hold, stage ordering must be consistent, and contradictory simultaneous evidence is rejected. Optional lanes retain their explicit skip policy. Missing dependencies, other holds, active work, and unresolved durable failure incidents prevent this reconciliation.
+
+This uses the existing owner/QA routing policy in one state transition. It preserves the original circuit, blocker, review records, failure history, and attempt epoch. A task-scoped failure-ledger check runs again inside the database commit so a newly recorded incident cannot be missed by a concurrent workflow update. No model run, credit verification, attempt reset, QA approval, or release is implied. Existing completed reviews need not be recorded again; use the normal project-scoped `automation-tick` below.
+
 It does not:
 
 - run Codex

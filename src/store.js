@@ -64,6 +64,7 @@ import {
   validateTaskRelationshipsInState,
   readPrerequisiteFailureRecovery,
   writeDatabaseState,
+  admitCompletedReviewCreditRetirement,
 } from "./state-database.js";
 import {
   assertQaRevocationIntent,
@@ -5773,7 +5774,7 @@ function moveTaskToOwnerReview(state, task, now, author, body, actions, actionLa
   return actions;
 }
 
-function moveTaskToQaReview(state, task, project, now, author, body, actions, actionLabel = "ready for QA review") {
+function moveTaskToQaReview(state, task, project, now, author, body, actions, actionLabel = "ready for QA review", transitionOptions = {}) {
   const integrationBranch = integrationBranchName(project);
   const integrationBranchUrl = branchWebUrl(project, integrationBranch);
   if (task.status !== "qa_review" || task.assignedAgentRole !== "owner") {
@@ -5784,7 +5785,7 @@ function moveTaskToQaReview(state, task, project, now, author, body, actions, ac
       integrationStatus: task.integrationStatus || "pending",
       integrationBranch,
       integrationBranchUrl,
-    }, now);
+    }, now, transitionOptions);
   }
   addAutomationComment(
     state,
@@ -5805,9 +5806,9 @@ function moveTaskToQaReview(state, task, project, now, author, body, actions, ac
   return actions;
 }
 
-function moveTaskAfterReviewsComplete(state, task, project, now, author, body, actions) {
+function moveTaskAfterReviewsComplete(state, task, project, now, author, body, actions, transitionOptions = {}) {
   if (projectUsesTrustLeadQa(project)) {
-    return moveTaskToQaReview(state, task, project, now, author, body, actions, "ready for QA integration");
+    return moveTaskToQaReview(state, task, project, now, author, body, actions, "ready for QA integration", transitionOptions);
   }
 
   if (trustLeadApprovalsEnabled(project)) {
@@ -5823,7 +5824,7 @@ function moveTaskAfterReviewsComplete(state, task, project, now, author, body, a
     }
   }
 
-  return moveTaskToOwnerReview(state, task, now, author, body, actions);
+  return moveTaskToOwnerReview(state, task, now, author, body, actions, "ready for owner review", transitionOptions);
 }
 
 function routeChangesRequestedInState(state, task, project, stage, now, author, actions) {
@@ -5875,6 +5876,74 @@ function routeChangesRequestedInState(state, task, project, stage, now, author, 
   return actions;
 }
 
+function retireCompletedReviewCreditHoldInState(state, task, project, now, author) {
+  const circuit = task.automationCircuit;
+  const blocker = task.automationBlocker;
+  if (!task.operatorIntake || task.status !== "blocked" || task.adoptionHeld
+    || circuit?.state !== "open" || circuit.scope !== "task"
+    || circuit.reasonCode !== "credit_budget_insufficient"
+    || circuit.attemptsConsumed !== 0 || circuit.maxAttempts !== 0
+    || circuit.incidentId || blocker?.incidentId || blocker?.type !== "circuit"
+    || !["start_review", "continue_review"].includes(blocker.actionType)
+    || blocker.blockedAt !== circuit.openedAt || blocker.retryAt || task.retryNotBefore
+    || task.budgetPause || task.creditAdmissionPause?.active
+    || state.meta?.operatorPause?.active || diskPressureIncidentIsActive(state.meta?.diskPressureIncident)
+    || project.automationCircuit?.state === "open" || incompleteDependencies(state, task).length
+    || (task.dependsOnTaskIds || []).some(id => !(state.tasks || []).some(dependency => dependency.id === id))
+    || taskHasActiveRun(state, task.id)
+    || [task.workflowLease, task.assignmentClaim].some(claim => claim
+      && (!Number.isFinite(Date.parse(claim.expiresAt)) || Date.parse(claim.expiresAt) > Date.parse(now)))) return false;
+
+  const snapshot = circuit.snapshot;
+  if (!snapshot || snapshot.status !== blocker.resumeStatus
+    || !isDeepStrictEqual(snapshot, workflowSnapshotForTask(task, {
+      status: blocker.resumeStatus, assignedAgentRole: snapshot.assignedAgentRole,
+    })) || !candidateIdentityIsComplete(candidateIdentityForTask(task))
+    || task.candidateIdentity.commitSha !== task.reviewSubjectSha
+    || task.candidateIdentity.candidateCycle !== currentReviewCandidateCycle(task)) return false;
+  const stages = reviewStagesForTask(project, task);
+  const heldStage = stages.find(stage => stage.status === snapshot.status);
+  if (!heldStage || heldStage.role !== snapshot.assignedAgentRole) return false;
+  const evidence = candidateReviewEvidenceForTask(state, task);
+  if (!evidence.ok || !stages.some(stage => stage.required !== false && isLeadReviewStage(stage))) return false;
+  const openedAt = Date.parse(circuit.openedAt);
+  if (!Number.isFinite(openedAt) || openedAt > Date.parse(now)) return false;
+  let priorReviewedAt = 0;
+  for (const stage of stages) {
+    const review = latestCurrentReviewForStage(state, task, stage);
+    const reviewedAt = Date.parse(review?.createdAt);
+    if (!review || !(stage.required === false ? REVIEW_COMPLETE_OUTCOMES.has(review.outcome) : review.outcome === "approved") || !Number.isFinite(reviewedAt)
+      || reviewedAt < priorReviewedAt || reviewedAt > Date.parse(now)
+      || (stage === heldStage && reviewedAt <= openedAt)) return false;
+    // Existing readers use timestamp ordering. A tied contradictory record is
+    // ambiguous, never evidence that a newer rejection can be ignored.
+    if ((state.reviews || []).some(other => other.taskId === task.id
+      && reviewMatchesCurrentCandidate(task, other)
+      && (other.stageKey ? other.stageKey === stage.key : other.status === stage.status)
+      && Date.parse(other.createdAt) === reviewedAt && other.outcome !== review.outcome)) return false;
+    priorReviewedAt = reviewedAt;
+  }
+  if (!admitCompletedReviewCreditRetirement(state, task.id)) return false;
+
+  task.automationCircuit = {
+    ...circuit, state: "superseded", closedAt: now, closedBy: author,
+    closeReason: "The suppressed review work is complete for this exact candidate; no credit recovery or new attempt was authorized.",
+    supersededBy: { kind: "completed_candidate_reviews", reviewCycle: currentReviewCycle(task),
+      subjectSha: evidence.subjectSha, candidateCycle: evidence.candidateCycle,
+      reviewIds: evidence.reviews.map(review => review.id) },
+    supersededBlocker: structuredClone(blocker),
+  };
+  delete task.automationBlocker;
+  state.events.push({
+    id: nextId(state.events, "event"), type: "review_credit_hold_superseded",
+    taskId: task.id, projectId: task.projectId, createdAt: now,
+    circuitOpenedAt: circuit.openedAt, subjectSha: evidence.subjectSha,
+    candidateCycle: evidence.candidateCycle, reviewIds: evidence.reviews.map(review => review.id),
+    message: "Completed candidate reviews superseded their unstarted review credit hold; no model run or quota recovery was inferred.",
+  });
+  return true;
+}
+
 function advanceTaskWorkflowInState(state, task, options = {}) {
   const now = options.now || new Date().toISOString();
   const author = options.author || "StudioOps Automation";
@@ -5885,6 +5954,15 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
   if (task.type === "epic" || hasChildren) return actions;
 
+  if (retireCompletedReviewCreditHoldInState(state, task, project, now, author)) {
+    actions.push(`${task.id}: completed candidate reviews superseded unstarted review credit hold`);
+    // One canonical transition preserves the aggregate's single version step.
+    // The exact complete reviews above select the existing owner/QA route; no
+    // intermediate reviewer assignment can become visible to dispatch.
+    return moveTaskAfterReviewsComplete(state, task, project, now, author,
+      "All required reviews for the exact candidate are complete; the unstarted review credit hold is obsolete.",
+      actions, { action: "resume_workflow" });
+  }
   if (task.operatorIntake && (incompleteDependencies(state, task).length || task.automationBlocker)) return actions;
   if (task.operatorIntake && task.adoptionHeld) task.adoptionHeld = false;
   const missingDependencies = incompleteDependencies(state, task);
