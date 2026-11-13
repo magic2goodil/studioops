@@ -3686,12 +3686,21 @@ function adoptionFootprint(state, verification, check = () => {}) {
 // full payload query doubled cold-page work while the writer was held.
 function* boundedAdoptionRows(db, query, args, check) {
   let count = 0, bytes = 0;
-  for (const row of db.prepare(query).iterate(...args)) {
-    check(); bytes += Number(row.payload_bytes);
-    if (++count > OPERATOR_ADOPTION_MAX_ROWS || !Number.isSafeInteger(bytes) || bytes > OPERATOR_ADOPTION_MAX_BYTES) {
-      operatorCandidateError("adoption_preimage_bound_exceeded");
+  // Older native iterators do not retain their statement. A local alone can be
+  // optimized away across yield; keep ownership on the iterator until it closes.
+  const statement = db.prepare(query);
+  const rows = statement.iterate(...args), owner = Symbol("adoptionStatement");
+  Object.defineProperty(rows, owner, { value: statement, configurable: true });
+  try {
+    for (const row of rows) {
+      check(); bytes += Number(row.payload_bytes);
+      if (++count > OPERATOR_ADOPTION_MAX_ROWS || !Number.isSafeInteger(bytes) || bytes > OPERATOR_ADOPTION_MAX_BYTES) {
+        operatorCandidateError("adoption_preimage_bound_exceeded");
+      }
+      yield row;
     }
-    yield row;
+  } finally {
+    delete rows[owner];
   }
 }
 

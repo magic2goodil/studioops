@@ -484,7 +484,7 @@ async function writeLegacyState(root, state = baseState()) {
 
 async function runStoreScript(root, source, options = {}) {
   const env = await environmentForTestControlRoot(root);
-  return execFileAsync(process.execPath, ["--input-type=module", "-e", source], {
+  return execFileAsync(process.execPath, [...(options.nodeArgs || []), "--input-type=module", "-e", source], {
     cwd: root,
     env: { ...env, ...(options.env || {}) },
     timeout: 30_000,
@@ -752,6 +752,60 @@ test("verified writer rejects mismatched candidate, scope and another task's int
       });
       assert.deepEqual((await readDatabaseState()).tasks[0].impactPlan, frozenScopePlan);
     `);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("adoption retains its native statement across yielded rows and garbage collection", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-adoption-statement-"));
+  try {
+    const initial = baseState();
+    initial.tasks.push({ id: "task_2", projectId: "project_1", title: "Unrelated task", status: "ready" });
+    await writeLegacyState(root, initial);
+    await runStoreScript(root, operatorCandidateTestScript() + `
+      import { commitOperatorCandidateAdoption, withStateDatabaseConnection } from ${JSON.stringify(stateDatabaseModuleUrl)};
+      assert.equal(typeof global.gc, "function");
+      const commit = () => commitOperatorCandidateAdoption("task_1", async () => verification, (state, verified) => {
+        adopt(state, verified);
+        state.events.push({ id: "event_prepared", taskId: "task_1", projectId: "project_1",
+          type: "operator_candidate_adopted", requestDigest: verified.requestDigest, candidate: verified.candidate });
+      });
+      const before = await readDatabaseState();
+      let version;
+      await withStateDatabaseConnection(db => {
+        version = db.prepare("SELECT version FROM state_meta").get().version;
+        db.exec("CREATE TRIGGER reject_gc_adoption BEFORE INSERT ON events WHEN NEW.type = 'operator_candidate_adopted' BEGIN SELECT RAISE(ABORT, 'late GC adoption rejection'); END");
+      });
+      const parse = JSON.parse;
+      let collections = 0;
+      JSON.parse = function(value, ...args) {
+        // Collect while the native row generator is suspended at yield. Do not
+        // wrap the statement/iterator: a closure could conceal its lifetime bug.
+        if (typeof value === "string" && value.startsWith('["task_')) {
+          collections++; global.gc();
+        }
+        return parse(value, ...args);
+      };
+      try {
+        // Warm the real generator too: retaining only a local statement can
+        // appear safe before optimization and still fail after repeated scans.
+        for (let attempt = 0; attempt < 100; attempt++) await assert.rejects(commit(), /late GC adoption rejection/);
+        assert.ok(collections >= 200, "Directory consumption must collect across multiple yielded rows and warmed scans");
+        assert.deepEqual(await readDatabaseState(), before);
+        await withStateDatabaseConnection(db => {
+          assert.equal(db.prepare("SELECT version FROM state_meta").get().version, version);
+          db.exec("DROP TRIGGER reject_gc_adoption");
+        });
+        const failedCollections = collections;
+        await commit();
+        assert.ok(collections >= failedCollections + 2);
+      } finally { JSON.parse = parse; }
+      const after = await readDatabaseState();
+      assert.equal(after.tasks[0].operatorIntake.candidate.commitSha, candidate.commitSha);
+      assert.equal(after.tasks[0].status, "builder_review");
+      assert.deepEqual(after.tasks[1], before.tasks[1]);
+      assert.equal(after.events.filter(event => event.type === "operator_candidate_adopted").length, 1);
+      await withStateDatabaseConnection(db => assert.equal(db.prepare("SELECT version FROM state_meta").get().version, version + 1));
+    `, { nodeArgs: ["--expose-gc"] });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
