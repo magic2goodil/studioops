@@ -1842,10 +1842,10 @@ Automation rules:
 - The runner will mark this run completed or failed based on your process exit code.
 Bounded inspection rules:
 - Use the precomputed scoped/repository context packets already supplied. They are advisory, but unchanged context does not need to be printed again.
-- Inspect component maps by the required component or JSON keys. Read one targeted excerpt from one file per command, normally at most 80 lines and 8,000 output characters; explicitly cap search results and summaries.
+- Inspect component maps by the required component or JSON keys. Batch independent targeted searches and file excerpts in one command when practical; keep each excerpt focused (normally at most 80 lines) and cap the command's combined output at 8,000 characters. Check every result; run dependent or adaptive steps sequentially.
 - Do not concatenate full source, test, standard, README, state, task, or log files into one command. Redirect noisy validation output to a private local log and print only exit status plus a short relevant excerpt.
 - The first oversized command is guidance and the same worker continues. Use the output already returned; do not repeat an equivalent broad command or output. Preserved discovery artifacts are digest-bound evidence for targeted excerpts, not an instruction to print the artifact again.
-- The cumulative output limit is a hard stop; split decisions into focused reads rather than spending that limit on repeated discovery.
+- The cumulative output limit is a hard stop; batch independent focused reads and proceed to the concrete handoff once the necessary evidence is available rather than repeating discovery.
 ${run.workflowMode === "local"
     ? "- Local mode forbids pushes and pull requests; leave the local branch, exact full subject SHA, validation evidence, and builder comment recorded on the task."
     : "- A successful process is not enough by itself: builders must leave the task linked to a branch and PR and move it to builder_review; reviewers must record an explicit review outcome. StudioOps verifies this handoff after the process exits."}
