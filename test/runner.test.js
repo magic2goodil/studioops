@@ -44,7 +44,7 @@ import {
   failureFingerprint,
 } from "../src/failure-containment.js";
 import { materializeLocalCandidate } from "../src/workspace.js";
-import { eligibleRunWorkspaceSnapshotsInState, resumeBudgetPauseInState } from "../src/store.js";
+import { claimRunWorkspaceCandidatesInState, eligibleRunWorkspaceSnapshotsInState, resumeBudgetPauseInState } from "../src/store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1911,13 +1911,6 @@ test("runner cleanup removes worktree, clone, and local-clone fixtures without t
       readDiskAvailability: cleanupDiskReader([
         { availableBytes: 100_000, availablePercent: 10, pressure: false },
       ]),
-      git: async (args, options) => {
-        if (args[0] === "worktree" && args[1] === "remove") {
-          await rm(args.at(-1), { recursive: true, force: true });
-          return { stdout: "", stderr: "" };
-        }
-        return execFileAsync("git", args, options);
-      },
       nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
     });
     assert.equal(report.selectedCount, 3, JSON.stringify(report));
@@ -1929,6 +1922,251 @@ test("runner cleanup removes worktree, clone, and local-clone fixtures without t
     assert.equal((await git(sourceRepo, ["worktree", "list", "--porcelain"])).split("worktree ").length - 1, 1);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("runner cleanup uses a capable absolute Git when PATH selects legacy Git", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-cleanup-legacy-git-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const sourceRepo = await createRepository(root, { name: "source" });
+    const workspaceRoot = path.join(root, "workspaces");
+    const target = path.join(workspaceRoot, "demo", "run_legacy-cleanup-legacy");
+    await git(sourceRepo, ["worktree", "add", "-b", "cleanup-legacy", target, "main"]);
+    const legacyBin = path.join(root, "legacy-bin");
+    const calls = path.join(root, "legacy-calls");
+    await mkdir(legacyBin);
+    await writeFile(path.join(legacyBin, "git"), `#!/bin/sh
+printf '%s\\n' "$*" >> '${calls.replaceAll("'", "'\\''")}'
+printf '%s\\n' 'usage: git worktree add [options]' '   or: git worktree list [options]' >&2
+exit 129
+`);
+    await chmod(path.join(legacyBin, "git"), 0o700);
+    const state = {
+      meta: {}, projects: [{ id: "project_1", key: "demo", repoPath: sourceRepo }],
+      runs: [{ id: "run_legacy", projectId: "project_1", projectKey: "demo", status: "failed", completedAt: "2026-08-01T00:00:00.000Z", branchName: "cleanup-legacy", workspaceStrategy: "worktree", workspacePath: target }],
+    };
+    const report = await runWorkspaceCleanup({
+      state, workspaceRoot, dataPath: path.join(root, "data"), path: legacyBin,
+      workspaceRetention: { retainForHours: { failed: 1 } },
+      readDiskAvailability: cleanupDiskReader([{ availableBytes: 100_000, availablePercent: 10, pressure: false }]),
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    });
+    assert.equal(report.selectedCount, 1, JSON.stringify(report));
+    assert.equal(report.failures.length, 0);
+    assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), ["worktree -h"]);
+    await assert.rejects(() => lstat(target), { code: "ENOENT" });
+    assert.equal(await readFile(path.join(sourceRepo, "README.md"), "utf8"), "test\n");
+    assert.equal(await git(sourceRepo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("runner cleanup rejects unsupported Git once before claiming a cleanup batch", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-cleanup-git-unavailable-"));
+  try {
+    const workspaceRoot = path.join(root, "workspaces");
+    const runs = Array.from({ length: 25 }, (_, index) => ({
+      id: `run_${index}`, projectId: "project_1", projectKey: "demo", status: "failed",
+      completedAt: "2026-08-01T00:00:00.000Z", branchName: `branch-${index}`,
+      workspaceStrategy: "worktree", workspacePath: path.join(workspaceRoot, "demo", `run_${index}-branch-${index}`),
+    }));
+    await mkdir(runs[0].workspacePath, { recursive: true });
+    const evidence = path.join(runs[0].workspacePath, "keep.txt");
+    await writeFile(evidence, "unchanged evidence\n");
+    const state = { meta: {}, projects: [{ id: "project_1", key: "demo", repoPath: path.join(root, "source") }], runs };
+    const original = structuredClone(state);
+    const calls = [];
+    let claims = 0;
+    const report = await runWorkspaceCleanup({
+      state, workspaceRoot, dataPath: path.join(root, "data"),
+      eligibleRunWorkspaceSnapshots: async () => runs.map((run) => ({ runId: run.id, workspacePath: run.workspacePath, workspaceStrategy: run.workspaceStrategy })),
+      claimRunWorkspaceCandidates: async () => { claims += 1; throw new Error("must not claim"); },
+      readDiskAvailability: cleanupDiskReader([{ availableBytes: 100, availablePercent: 0.1, pressure: true }]),
+      git: async (args) => {
+        calls.push(args);
+        const error = new Error("legacy Git usage");
+        error.code = 129;
+        error.stderr = "usage: git worktree add [options]\n   or: git worktree list [options]\n";
+        throw error;
+      },
+    });
+    assert.equal(report.failureCount, 1);
+    assert.equal(report.failures[0].code, "WORKSPACE_CLEANUP_GIT_UNSUPPORTED");
+    assert.equal(report.selectedCount, 0);
+    assert.deepEqual(calls, [["worktree", "-h"]]);
+    assert.equal(claims, 0);
+    assert.deepEqual(state, original);
+    assert.equal(await readFile(evidence, "utf8"), "unchanged evidence\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unsupported cleanup Git leaves healthy runner admission available and preserves the disk gate", async () => {
+  const state = {
+    meta: {}, projects: [{ id: "project_1", key: "demo" }],
+    runs: [{ id: "run_cleanup_unsupported", projectId: "project_1", workspaceStrategy: "worktree", workspacePath: "/unused-fixture/run_cleanup_unsupported" }],
+  };
+  let cleanupClaims = 0;
+  let runClaims = 0;
+  const options = {
+    state, workspaceRoot: "/unused-fixture", dataPath: "/unused-fixture-data",
+    eligibleRunWorkspaceSnapshots: async () => [{ runId: state.runs[0].id, workspacePath: state.runs[0].workspacePath, workspaceStrategy: "worktree" }],
+    claimRunWorkspaceCandidates: async () => { cleanupClaims += 1; throw new Error("must not claim cleanup"); },
+    git: async () => ({ stdout: "usage: git worktree add [options]\n", stderr: "" }),
+    reconcileStaleRuns: async () => [],
+    claimRuns: async () => { runClaims += 1; return []; },
+    runGitHubRemoteRecoveryProbes: async () => [],
+  };
+  const healthy = await runQueuedRuns({
+    ...options,
+    readDiskAvailability: cleanupDiskReader([{ availableBytes: 100_000, availablePercent: 10, pressure: false }]),
+  });
+  assert.equal(healthy.paused, undefined);
+  assert.equal(healthy.cleanup.failureCount, 1);
+  assert.equal(runClaims, 1);
+  assert.equal(cleanupClaims, 0);
+  const lowDisk = await runQueuedRuns({
+    ...options,
+    readDiskAvailability: cleanupDiskReader([{ availableBytes: 1, availablePercent: 0.1, pressure: true }]),
+  });
+  assert.equal(lowDisk.paused, true);
+  assert.equal(lowDisk.pauseReason, "disk_space_below_safety_threshold");
+  assert.equal(runClaims, 1);
+  assert.equal(cleanupClaims, 0);
+});
+
+test("cleanup claim excludes measured path, strategy or source-repository drift and unmeasured workspaces", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-cleanup-measurement-race-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    for (const drift of ["path", "strategy", "repository", "unmeasured"]) {
+      const sourceRepo = await createRepository(root, { name: `source-${drift}` });
+      const workspaceRoot = path.join(root, `workspaces-${drift}`);
+      const target = path.join(workspaceRoot, "demo", "run_race-race");
+      const replacement = path.join(workspaceRoot, "demo", "run_race-replacement");
+      if (["strategy", "repository"].includes(drift)) await git(sourceRepo, ["worktree", "add", "-b", "race", target, "main"]);
+      else await mkdir(target, { recursive: true });
+      await mkdir(replacement, { recursive: true });
+      await writeFile(path.join(target, "keep.txt"), "original unique evidence\n");
+      await writeFile(path.join(replacement, "keep.txt"), "replacement unique evidence\n");
+      const run = {
+        id: "run_race", projectId: "project_1", projectKey: "demo", status: "failed",
+        completedAt: "2026-08-01T00:00:00.000Z", branchName: "race",
+        workspaceStrategy: drift === "repository" ? "worktree" : "clone", workspacePath: target, workspaceBytesVerified: true, workspaceBytes: 1,
+      };
+      const state = { meta: {}, projects: [{ id: "project_1", key: "demo", repoPath: sourceRepo }], runs: drift === "unmeasured" ? [] : [run] };
+      const originalState = structuredClone(state);
+      const replacementRepo = drift === "repository" ? await createRepository(root, { name: "replacement-source" }) : "";
+      const calls = [];
+      const expectedCalls = drift === "repository" ? [["worktree", "-h"]] : [];
+      let currentState;
+      const report = await runWorkspaceCleanup({
+        state, workspaceRoot, dataPath: path.join(root, "data"),
+        workspaceRetention: { retainForHours: { failed: 1 } },
+        readDiskAvailability: cleanupDiskReader([{ availableBytes: 100_000, availablePercent: 10, pressure: false }]),
+        git: async (args, options) => { calls.push(args); return execFileAsync("/usr/bin/git", args, options); },
+        claimRunWorkspaceCandidates: async (input) => {
+          assert.deepEqual(calls, expectedCalls, "capability must precede a claim of measured worktrees");
+          currentState = structuredClone(state);
+          if (drift === "unmeasured") currentState.runs.push(structuredClone(run));
+          if (drift === "path") {
+            currentState.runs[0].workspacePath = replacement;
+            currentState.runs[0].branchName = "replacement";
+          }
+          if (drift === "strategy") currentState.runs[0].workspaceStrategy = "worktree";
+          if (drift === "repository") currentState.projects[0].repoPath = replacementRepo;
+          return claimRunWorkspaceCandidatesInState(currentState, input);
+        },
+        nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+      });
+      assert.equal(report.selectedCount, 0, `${drift}: ${JSON.stringify(report)}`);
+      assert.equal(report.failureCount, 0);
+      assert.equal(report.selection.excludedByReason[drift === "unmeasured" ? "workspace_not_measured" : "workspace_measurement_changed"], 1);
+      assert.deepEqual(calls, expectedCalls, "no remove or prune after identity drift");
+      assert.equal(currentState.runs[0].workspaceCleanup, undefined);
+      assert.deepEqual(state, originalState);
+      assert.equal(await readFile(path.join(target, "keep.txt"), "utf8"), "original unique evidence\n");
+      assert.equal(await readFile(path.join(replacement, "keep.txt"), "utf8"), "replacement unique evidence\n");
+    }
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("repository drift cannot inflate measured capacity pressure for younger workspaces", async () => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "studioops-cleanup-capacity-binding-"));
+  const root = await realpath(temporaryRoot);
+  try {
+    const workspaceRoot = path.join(root, "workspaces");
+    const projects = [
+      { id: "project_1", key: "large", repoPath: path.join(root, "original-source") },
+      { id: "project_2", key: "young", repoPath: path.join(root, "young-source") },
+    ];
+    const runs = projects.map((project, index) => ({
+      id: `run_${index}`, projectId: project.id, projectKey: project.key,
+      status: "failed", completedAt: "2026-08-15T00:00:00.000Z",
+      branchName: "fixture", workspaceStrategy: "worktree",
+      workspacePath: path.join(workspaceRoot, project.key, `run_${index}-fixture`),
+    }));
+    for (const run of runs) await mkdir(run.workspacePath, { recursive: true });
+    const input = {
+      workspaceRoot, nowMs: Date.parse("2026-08-17T00:00:00.000Z"), withSelectionReport: true,
+      policy: { retainForHours: { failed: 1000 }, pressureMinAgeHours: 24, maxRetainedBytes: 100 },
+      verifiedWorkspaceBytes: { run_0: 1000, run_1: 10 },
+      workspaceMeasurementBindings: Object.fromEntries(runs.map((run, index) => [run.id, {
+        workspacePath: run.workspacePath, workspaceStrategy: run.workspaceStrategy,
+        projectId: run.projectId, sourceRepoPath: projects[index].repoPath,
+      }])),
+    };
+    const state = { meta: {}, projects, runs };
+    const original = eligibleRunWorkspaceSnapshotsInState(state, input);
+    assert.equal(original.capacityPressure, true);
+    assert.equal(original.verifiedRetainedBytes, 1010);
+    assert.equal(original.candidates.some((item) => item.runId === "run_1"), true);
+    const current = structuredClone(state);
+    current.projects[0].repoPath = path.join(root, "replacement-source");
+    const changed = eligibleRunWorkspaceSnapshotsInState(current, input);
+    assert.equal(changed.verifiedRetainedBytes, 10);
+    assert.equal(changed.capacityPressure, false);
+    assert.deepEqual(changed.candidates, []);
+    assert.equal(changed.report.excludedByReason.workspace_measurement_changed, 1);
+    assert.equal(changed.report.excludedUnknownSizeCountByReason.workspace_measurement_changed, 1);
+    assert.equal(changed.report.excludedVerifiedBytesByReason.workspace_measurement_changed, undefined);
+    assert.equal(changed.report.excludedByReason.minimum_age_not_reached, 1);
+    const claimed = claimRunWorkspaceCandidatesInState(current, input);
+    assert.deepEqual(claimed.candidates, []);
+    assert.equal(current.runs.every((run) => !run.workspaceCleanup), true);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("clone-only cleanup does not require Git worktree capability", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "studioops-clone-cleanup-no-git-"));
+  try {
+    const workspaceRoot = path.join(root, "workspaces");
+    const target = path.join(workspaceRoot, "demo", "run_clone-clone");
+    await mkdir(target, { recursive: true });
+    await writeFile(path.join(target, "payload"), "test-owned clone\n");
+    const state = { meta: {}, projects: [{ id: "project_1", key: "demo" }], runs: [{
+      id: "run_clone", projectId: "project_1", projectKey: "demo", status: "failed",
+      completedAt: "2026-08-01T00:00:00.000Z", branchName: "clone", workspaceStrategy: "clone", workspacePath: target,
+    }] };
+    const report = await runWorkspaceCleanup({
+      state, workspaceRoot, dataPath: path.join(root, "data"),
+      workspaceRetention: { retainForHours: { failed: 1 } },
+      readDiskAvailability: cleanupDiskReader([{ availableBytes: 100_000, availablePercent: 10, pressure: false }]),
+      git: async () => { throw new Error("Git is not needed for a clone-only claim"); },
+      nowMs: Date.parse("2026-08-17T00:00:00.000Z"),
+    });
+    assert.equal(report.selectedCount, 1, JSON.stringify(report));
+    assert.equal(report.failureCount, 0);
+    await assert.rejects(() => lstat(target), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
