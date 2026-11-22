@@ -438,11 +438,44 @@ export async function readPrePushValidationAttestation(run = {}, repoPath, root 
   };
 }
 
-async function resolveGitExecutable(searchPath = DEFAULT_RUNNER_PATH) {
-  const { stdout } = await execFileAsync("/bin/sh", ["-c", "command -v git"], {
-    env: { ...process.env, PATH: searchPath },
-  });
-  const executable = String(stdout || "").trim();
+function cleanupGitCapabilityError() {
+  const error = new Error("Workspace cleanup requires Git with worktree remove support; no cleanup was claimed.");
+  error.code = "WORKSPACE_CLEANUP_GIT_UNSUPPORTED";
+  return error;
+}
+
+async function supportsWorktreeRemoval(git) {
+  let output;
+  try {
+    const result = await git(["worktree", "-h"], {
+      env: { ...process.env, LC_ALL: "C" }, timeout: 5000, maxBuffer: 64 * 1024,
+    });
+    output = `${result.stdout || ""}\n${result.stderr || ""}`;
+  } catch (error) {
+    // Git help normally exits 129; checking a version string alone would not
+    // establish that this executable actually provides the required command.
+    if (error.code !== 129) return false;
+    output = `${error.stdout || ""}\n${error.stderr || ""}`;
+  }
+  return /\bgit worktree remove(?:\s|$)/.test(output);
+}
+
+async function resolveGitExecutable(searchPath = DEFAULT_RUNNER_PATH, { worktreeRemove = false } = {}) {
+  let executable = "";
+  try {
+    const { stdout } = await execFileAsync("/bin/sh", ["-c", "command -v git"], {
+      env: { ...process.env, PATH: searchPath },
+    });
+    executable = String(stdout || "").trim();
+  } catch (error) {
+    if (!worktreeRemove) throw error;
+  }
+  if (worktreeRemove) {
+    for (const candidate of new Set([executable, "/usr/bin/git"].filter(path.isAbsolute))) {
+      if (await supportsWorktreeRemoval((args, options) => execFileAsync(candidate, args, options))) return candidate;
+    }
+    throw cleanupGitCapabilityError();
+  }
   if (!path.isAbsolute(executable)) {
     throw new Error("StudioOps could not resolve an absolute git executable for validation-hook enforcement.");
   }
@@ -586,6 +619,29 @@ async function removeClaimedWorkspace(run, input, workspaceRoot) {
   throw new Error("unexpected_workspace_strategy");
 }
 
+async function finishWorkspaceCleanupReport(report, input, dataPath, workspaceRoot, sameVolume, startedMs) {
+  report.after = {
+    data: await diskReport(dataPath, input),
+    workspace: await diskReport(workspaceRoot, input),
+  };
+  report.actualAvailableByteDelta = Math.max(0, report.after.data.availableBytes - report.initial.data.availableBytes)
+    + (sameVolume ? 0 : Math.max(0, report.after.workspace.availableBytes - report.initial.workspace.availableBytes));
+  const dataShortfall = diskShortfall(report.after.data);
+  const workspaceShortfall = diskShortfall(report.after.workspace);
+  report.remainingShortfall = {
+    pressure: dataShortfall.pressure || workspaceShortfall.pressure,
+    bytes: Math.max(dataShortfall.bytes, sameVolume ? 0 : workspaceShortfall.bytes),
+    percentPoints: Math.max(dataShortfall.percentPoints, sameVolume ? 0 : workspaceShortfall.percentPoints),
+    data: dataShortfall,
+    workspace: workspaceShortfall,
+  };
+  report.selectedCount = report.selected.length;
+  report.skippedCount = report.skipped.length + Number(report.selection.excludedCount || 0);
+  report.failureCount = report.failures.length;
+  report.durationMs = Date.now() - startedMs;
+  return report;
+}
+
 export async function runWorkspaceCleanup(input = {}) {
   const startedMs = Date.now();
   const workspaceRoot = path.resolve(input.workspaceRoot || DEFAULT_WORKSPACE_ROOT);
@@ -671,13 +727,40 @@ export async function runWorkspaceCleanup(input = {}) {
     nowMs,
   });
   const discoveredSnapshots = Array.isArray(snapshots) ? snapshots : snapshots.candidates || [];
+  let cleanupGit = input.git;
   const verifiedWorkspaceBytes = {};
+  const workspaceMeasurementBindings = {};
   for (const snapshot of discoveredSnapshots) {
+    const measuredRun = state.runs?.find((run) => run.id === snapshot.runId);
+    const project = state.projects?.find((item) => item.id === measuredRun?.projectId || item.key === measuredRun?.projectKey);
+    const binding = {
+      workspacePath: snapshot.workspacePath,
+      workspaceStrategy: snapshot.workspaceStrategy || measuredRun?.workspaceStrategy,
+      projectId: measuredRun?.projectId || snapshot.projectId || "",
+      sourceRepoPath: project?.repoPath || measuredRun?.sourceRepoPath || "",
+    };
     try {
       const measured = await logicalWorkspaceBytes(snapshot.workspacePath);
       verifiedWorkspaceBytes[snapshot.runId] = measured.bytes;
+      workspaceMeasurementBindings[snapshot.runId] = binding;
     } catch (error) {
       report.skipped.push({ runId: snapshot.runId, reason: safeCleanupError(error) });
+    }
+  }
+  // The fresh claim is restricted to these measured identities. New or changed
+  // worktrees cannot enter a clone-only batch after this capability decision.
+  if (Object.values(workspaceMeasurementBindings).some((binding) => binding.workspaceStrategy === "worktree")) {
+    try {
+      if (cleanupGit) {
+        if (!await supportsWorktreeRemoval(cleanupGit)) throw cleanupGitCapabilityError();
+      } else {
+        const executable = await resolveGitExecutable(input.path || DEFAULT_RUNNER_PATH, { worktreeRemove: true });
+        cleanupGit = (args, options) => execFileAsync(executable, args, options);
+      }
+    } catch (error) {
+      if (error.code !== "WORKSPACE_CLEANUP_GIT_UNSUPPORTED") throw error;
+      report.failures.push({ runId: "", code: error.code, error: safeCleanupError(error) });
+      return finishWorkspaceCleanupReport(report, input, dataPath, workspaceRoot, sameVolume, startedMs);
     }
   }
   const claim = await (input.claimRunWorkspaceCandidates
@@ -689,6 +772,7 @@ export async function runWorkspaceCleanup(input = {}) {
     pressure,
     pressureReason: pressure ? "disk_pressure" : "scheduled_sweep",
     verifiedWorkspaceBytes,
+    workspaceMeasurementBindings,
     limit: WORKSPACE_CLEANUP_LIMIT,
     nowMs,
   });
@@ -696,7 +780,7 @@ export async function runWorkspaceCleanup(input = {}) {
   for (const run of claim.candidates || []) {
     const claimStartedBytes = verifiedWorkspaceBytes[run.id] ?? 0;
     try {
-      await removeClaimedWorkspace(run, { ...input, state }, workspaceRoot);
+      await removeClaimedWorkspace(run, { ...input, state, git: cleanupGit }, workspaceRoot);
       await (input.finalizeRunWorkspaceCleanup
         || (input.state ? (runId, args) => finalizeRunWorkspaceCleanupInState(input.state, runId, args) : finalizeRunWorkspaceCleanup))(run.id, {
         ...input,
@@ -721,26 +805,7 @@ export async function runWorkspaceCleanup(input = {}) {
       report.failures.push({ runId: run.id, error: message });
     }
   }
-  report.after = {
-    data: await diskReport(dataPath, input),
-    workspace: await diskReport(workspaceRoot, input),
-  };
-  report.actualAvailableByteDelta = Math.max(0, report.after.data.availableBytes - report.initial.data.availableBytes)
-    + (sameVolume ? 0 : Math.max(0, report.after.workspace.availableBytes - report.initial.workspace.availableBytes));
-  const dataShortfall = diskShortfall(report.after.data);
-  const workspaceShortfall = diskShortfall(report.after.workspace);
-  report.remainingShortfall = {
-    pressure: dataShortfall.pressure || workspaceShortfall.pressure,
-    bytes: Math.max(dataShortfall.bytes, sameVolume ? 0 : workspaceShortfall.bytes),
-    percentPoints: Math.max(dataShortfall.percentPoints, sameVolume ? 0 : workspaceShortfall.percentPoints),
-    data: dataShortfall,
-    workspace: workspaceShortfall,
-  };
-  report.selectedCount = report.selected.length;
-  report.skippedCount = report.skipped.length + Number(report.selection.excludedCount || 0);
-  report.failureCount = report.failures.length;
-  report.durationMs = Date.now() - startedMs;
-  return report;
+  return finishWorkspaceCleanupReport(report, input, dataPath, workspaceRoot, sameVolume, startedMs);
 }
 
 function nextId(items, prefix) {

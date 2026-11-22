@@ -447,7 +447,24 @@ function cleanupEvidence(run, input, result) {
   };
 }
 
-function verifiedWorkspaceBytes(run, input = {}) {
+function workspaceMeasurementBindingReason(run, input = {}, state = null) {
+  if (!Object.prototype.hasOwnProperty.call(input, "workspaceMeasurementBindings")) return "";
+  const bindings = input.workspaceMeasurementBindings;
+  const binding = bindings instanceof Map ? bindings.get(run.id)
+    : bindings && typeof bindings === "object" && Object.prototype.hasOwnProperty.call(bindings, run.id)
+      ? bindings[run.id] : null;
+  if (!binding) return "workspace_not_measured";
+  if (binding.workspacePath !== run.workspacePath || binding.workspaceStrategy !== run.workspaceStrategy
+    || binding.projectId !== (run.projectId || "")) return "workspace_measurement_changed";
+  if (state) {
+    const project = (state.projects || []).find((item) => item.id === run.projectId || item.key === run.projectKey);
+    if (binding.sourceRepoPath !== (project?.repoPath || run.sourceRepoPath || "")) return "workspace_measurement_changed";
+  }
+  return "";
+}
+
+function verifiedWorkspaceBytes(run, input = {}, state = null) {
+  if (workspaceMeasurementBindingReason(run, input, state)) return null;
   const supplied = input.verifiedWorkspaceBytes;
   const value = supplied instanceof Map
     ? supplied.get(run.id)
@@ -488,7 +505,7 @@ function verifiedRetainedWorkspaceBytesInState(state, input, root, activeReferen
     const project = (state.projects || []).find((item) => item.id === run.projectId || item.key === run.projectKey);
     if (activeReferenceProtectsPath(activeReferences, run.workspacePath)) return total;
     if (workspacePathProtectionReason(run, { workspaceRoot: root, project, sourceRepoPaths })) return total;
-    const bytes = verifiedWorkspaceBytes(run, input);
+    const bytes = verifiedWorkspaceBytes(run, input, state);
     return bytes === null ? total : total + bytes;
   }, 0);
 }
@@ -549,12 +566,14 @@ function retentionSelectionInState(state, input = {}) {
     if (!exclusion && activeReferenceProtectsPath(activeReferences, run.workspacePath)) {
       exclusion = "active_workspace_reference";
     }
+    const measurementExclusion = workspaceMeasurementBindingReason(run, input, state);
+    if (!exclusion && measurementExclusion === "workspace_measurement_changed") exclusion = measurementExclusion;
     if (exclusion) {
-      incrementRetentionReason(report, exclusion, verifiedWorkspaceBytes(run, input));
+      incrementRetentionReason(report, exclusion, verifiedWorkspaceBytes(run, input, state));
       continue;
     }
     const ageHours = (nowMs - completedMs) / 3_600_000;
-    const verifiedBytes = verifiedWorkspaceBytes(run, input);
+    const verifiedBytes = verifiedWorkspaceBytes(run, input, state);
     const retentionEligible = ageHours >= policy.retainForHours[run.status];
     const pressureAgeEligible = ageHours >= policy.pressureMinAgeHours;
     const pressureEligible = verifiedBytes !== null
@@ -571,6 +590,10 @@ function retentionSelectionInState(state, input = {}) {
           : "minimum_age_not_reached",
         verifiedBytes,
       );
+      continue;
+    }
+    if (measurementExclusion) {
+      incrementRetentionReason(report, measurementExclusion, verifiedBytes);
       continue;
     }
     candidates.push({
@@ -690,7 +713,12 @@ export function claimRunWorkspaceCandidatesInState(state, input = {}) {
     const run = (state.runs || []).find((item) => item.id === snapshot.runId);
     if (!run) continue;
     run.workspaceCleanup = { state: "claimed", leaseId, claimedAt: now, leaseExpiresAt: expiresAt };
-    candidates.push(structuredClone(run));
+    const candidate = structuredClone(run);
+    if (Object.prototype.hasOwnProperty.call(input, "workspaceMeasurementBindings")) {
+      const project = (state.projects || []).find((item) => item.id === run.projectId || item.key === run.projectKey);
+      candidate.project = { ...project, repoPath: project?.repoPath || run.sourceRepoPath || "" };
+    }
+    candidates.push(candidate);
   }
   state.meta = state.meta || {};
   state.meta.workspaceRetention = {
