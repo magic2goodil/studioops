@@ -1284,6 +1284,7 @@ function historicalPrerequisiteAdmission(db, task, incidents, ancestor, provider
 
 function prerequisiteFailureRecovery(db, task) {
   const reject = () => operatorCandidateError("operator_prerequisite_failure_unresolved");
+  if (task.workerHandoffBlock) reject();
   // These rows have an independent transaction/version. Never use a task JSON
   // projection, supplied incident or an earlier read as commit authority.
   const rows = db.prepare("SELECT * FROM failure_incidents WHERE task_id = ? ORDER BY generation DESC, incident_id LIMIT 501").all(task.id);

@@ -22,6 +22,7 @@ import {
   readState,
   readStateReadOnly,
   resetAutomationCircuit,
+  resolveWorkerHandoff,
   resumeBudgetPause,
   resumeOperatorAutomation,
   setOperatorPause,
@@ -458,6 +459,7 @@ Commands:
   add-task --project --title    Add a task
   update-task TASK_ID           Update task status, branch, PR, or metadata
   status TASK_ID --status       Mutate task status (builder_review also requires --subject-sha FULL_SHA)
+  resolve-worker-handoff TASK_ID --expected-state-version N --reason TEXT  Resolve an explicit worker block
   comment TASK_ID --body        Add a builder/reviewer comment
   architecture-complete TASK   Record the architecture decision and implementation task graph
   review TASK_ID --stage        Record approved, skipped, or changes_requested
@@ -1061,6 +1063,17 @@ Automation:
     }
     const task = await updateTask(taskId, patch);
     console.log(`Updated ${task.id}: ${task.title}`);
+    return;
+  }
+
+  if (command === "resolve-worker-handoff") {
+    const taskId = args._[1];
+    const version = Number(args["expected-state-version"]);
+    if (!taskId || !Number.isSafeInteger(version) || version < 1 || typeof args.reason !== "string") {
+      throw new Error("Usage: resolve-worker-handoff TASK_ID --expected-state-version N --reason VERIFIED_REASON");
+    }
+    const task = await resolveWorkerHandoff(taskId, { expectedStateVersion: version, reason: args.reason });
+    console.log(`Resolved the handoff for ${task.id}; the task remains blocked until explicitly resumed.`);
     return;
   }
 
