@@ -1,4 +1,4 @@
-import { mutateNativeWorkspaceState } from "./state-database.js";
+import { mutateNativeWorkspaceState, withStateDatabaseRead } from "./state-database.js";
 import { createWriteStream, existsSync } from "node:fs";
 import { chmod, mkdir, readFile, readdir, rm, lstat, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -907,6 +907,7 @@ export function queuedRunExecutionBlocker(state, run, input = {}) {
   const project = findProject(state, run.projectId);
   if (!projectAllowed(run, project, input)) return "project_filter";
   const task = findTask(state, run.taskId);
+  if (task?.workerHandoffBlock) return "worker_handoff_blocked";
   if (task?.budgetPause?.runId) return "budget_pause";
   if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) return "operator_pause";
   if (project?.automationCircuit?.state === "open") return "project_circuit_open";
@@ -2000,9 +2001,9 @@ function applyBudgetExceededToTask(task, run, now) {
   task.updatedAt = now;
 }
 
-function preserveBudgetTelemetryOnTask(state, task, run, now) {
+function preserveBudgetTelemetryOnTask(state, task, run, now, { workerBlocked = false } = {}) {
   if (!task) return;
-  const pausedTasks = run.group === "architect"
+  const pausedTasks = run.group === "architect" && !workerBlocked
     ? [task, ...(state.tasks || []).filter((candidate) => (
       (task.architectureDecisionTaskIds || []).includes(candidate.id)
     ))]
@@ -2011,7 +2012,7 @@ function preserveBudgetTelemetryOnTask(state, task, run, now) {
     pausedTask.budgetTelemetry = {
       ...run.costTelemetry,
       runId: run.id,
-      disposition: "handoff_preserved",
+      disposition: workerBlocked ? "worker_blocked" : "handoff_preserved",
       continuationStopped: true,
       recordedAt: now,
     };
@@ -2020,7 +2021,8 @@ function preserveBudgetTelemetryOnTask(state, task, run, now) {
       reason: run.exitCode,
       resumeStatus: pausedTask.status,
       pausedAt: now,
-      message: "Automatic continuation is paused pending owner review of the preserved handoff.",
+      message: workerBlocked ? "Automatic continuation is paused pending resolution of the worker's block and budget review."
+        : "Automatic continuation is paused pending owner review of the preserved handoff.",
     };
     pausedTask.updatedAt = now;
   }
@@ -2215,25 +2217,32 @@ async function persistFailureClaim(run, claim) {
   }, { operationName: "runner.persist_failure_attempt_claim" });
 }
 
-async function denyPaidFailureAttempt(run, claim) {
-  const now = new Date().toISOString();
-  await mutateState(async (state) => {
+export function denyPaidFailureAttemptInState(state, run, claim, now = new Date().toISOString()) {
     const liveRun = (state.runs || []).find((item) => item.id === run.id);
     const task = findTask(state, run.taskId);
-    if (liveRun?.status === "running") {
+    if (liveRun?.status !== "running") return false;
+    {
       liveRun.status = "cancelled";
       liveRun.exitCode = claim.reason === "backoff" ? "failure_backoff" : "failure_circuit_open";
       liveRun.attemptConsumed = false;
       liveRun.completedAt = now;
       liveRun.updatedAt = now;
+      liveRun.failureAttemptDenial = { reason: claim.reason, incidentId: claim.incident.incidentId,
+        generation: claim.incident.generation, backoffUntil: claim.incident.backoffUntil || "" };
     }
     if (task) {
       const open = claim.incident.state === "open";
-      task.status = open ? "blocked" : restoreTaskStatusForRun(run, task);
-      task.assignedAgentRole = open ? "techops-reliability" : run.group === "reviewer" ? run.role : "builder";
-      task.retryNotBefore = claim.incident.backoffUntil || "";
-      task.automationCircuit = failureIncidentCompatibilityCircuit(claim.incident, { runId: run.id });
-      if (open) {
+      const held = Boolean(task.workerHandoffBlock);
+      task.status = open || held ? "blocked" : restoreTaskStatusForRun(run, task);
+      task.assignedAgentRole = held ? "owner" : open ? "techops-reliability" : run.group === "reviewer" ? run.role : "builder";
+      const priorBackoff = task.retryNotBefore || "";
+      const claimBackoff = claim.incident.backoffUntil || "";
+      task.retryNotBefore = held && priorBackoff && (!claimBackoff || !Number.isFinite(Date.parse(priorBackoff))
+        || Date.parse(priorBackoff) >= Date.parse(claimBackoff)) ? priorBackoff : claimBackoff;
+      // A held task can already have an unrelated blocker/circuit. The durable
+      // incident and the run's denial receipt retain this denial independently.
+      if (!held) task.automationCircuit = failureIncidentCompatibilityCircuit(claim.incident, { runId: run.id });
+      if (open && !held) {
         task.automationBlocker = {
           type: "failure_containment",
           reason: claim.reason,
@@ -2242,12 +2251,17 @@ async function denyPaidFailureAttempt(run, claim) {
           retryAt: "",
           blockedAt: now,
         };
-      } else {
+      } else if (!open && !held) {
         delete task.automationBlocker;
       }
       task.updatedAt = now;
     }
-  }, { operationName: "runner.deny_paid_failure_attempt" });
+    return true;
+}
+
+async function denyPaidFailureAttempt(run, claim) {
+  await mutateState(async (state) => denyPaidFailureAttemptInState(state, run, claim),
+    { operationName: "runner.deny_paid_failure_attempt" });
 }
 
 export async function claimCurrentFailureAttempt(run, input = {}) {
@@ -2461,11 +2475,16 @@ export function automationPauseReason(errorCode, notes) {
   return nonRetryableWorkspaceFailureReason(notes);
 }
 
-async function pauseTaskForAutomationConfig(run, reason, notes) {
+export async function pauseTaskForAutomationConfig(run, reason, notes, completed, input = {}) {
+  if (!completed || completed.completionObservedExisting || completed.status !== "failed" || completed.exitCode !== reason) return false;
   const now = new Date().toISOString();
-  await mutateState(async (state) => {
+  const mutate = input.state ? async (fn) => fn(input.state) : mutateState;
+  return mutate(async (state) => {
     state.events = state.events || [];
     const task = findTask(state, run.taskId);
+    const liveRun = (state.runs || []).find((item) => item.id === run.id);
+    if (!liveRun || liveRun.status !== "failed" || liveRun.exitCode !== reason
+      || liveRun.completedAt !== completed.completedAt || (task?.automationBlocker && task.automationBlocker.runId !== run.id)) return false;
     if (task) {
       const resumeStatus = task.status;
       task.status = "blocked";
@@ -2493,6 +2512,7 @@ async function pauseTaskForAutomationConfig(run, reason, notes) {
       message: `${run.id} paused after non-retryable workspace preparation failure: ${reason}`,
       createdAt: now,
     });
+    return true;
   }, { operationName: "runner.block_configuration" });
 }
 
@@ -2651,7 +2671,7 @@ export async function claimRuns(input = {}) {
       if (!RUNNABLE_STATUSES.has(run.status)) continue;
       const task = findTask(state, run.taskId);
       const executionBlocker = queuedRunExecutionBlocker(state, run, input);
-      if (["not_runner_group", "project_filter", "budget_pause", "operator_pause"].includes(executionBlocker)) {
+      if (["not_runner_group", "project_filter", "budget_pause", "operator_pause", "worker_handoff_blocked"].includes(executionBlocker)) {
         continue;
       }
       if (executionBlocker) {
@@ -2790,9 +2810,13 @@ export async function completeRun(runId, input = {}) {
     if (input.expectedStatus && run.status !== input.expectedStatus) {
       throw new Error(`Run ${runId} changed from expected ${input.expectedStatus} to ${run.status}; completion was not applied.`);
     }
+    const task = findTask(state, run.taskId);
+    const deferredHandoffFailure = task?.workerHandoffBlock
+      && input.validationFailureWhileAttemptingHandoff === true && input.exitCode === "validation_evidence_missing"
+      ? "validation_evidence_missing" : "";
     const now = new Date().toISOString();
-    run.status = input.status || "completed";
-    run.exitCode = String(input.exitCode ?? "");
+    run.status = deferredHandoffFailure ? "completed" : input.status || "completed";
+    run.exitCode = deferredHandoffFailure ? "" : String(input.exitCode ?? "");
     run.completedAt = now;
     run.updatedAt = now;
     run.outputPath = input.outputPath || run.outputPath || "";
@@ -2800,12 +2824,13 @@ export async function completeRun(runId, input = {}) {
     run.notes = String(input.notes || run.notes || "").trim();
     if (input.impactPlan) run.impactPlan = structuredClone(input.impactPlan);
     if (input.contextEvidence) run.contextEvidence = structuredClone(input.contextEvidence);
+    if (deferredHandoffFailure) run.contextEvidence = { ...(run.contextEvidence || {}), deferredHandoffFailure };
     if (input.repositoryContext) run.repositoryContext = repositoryContextEvidence(input.repositoryContext);
     if (input.failureEvidenceConfiguration) run.failureEvidenceConfiguration = structuredClone(input.failureEvidenceConfiguration);
     if (/^[a-f0-9]{40}$/.test(input.executionCommitSha || "")) run.executionCommitSha = input.executionCommitSha;
     const budget = recordRunUsage(run, input.usage, now);
-    const task = findTask(state, run.taskId);
     let handoffFailure = "";
+    let workerBlocked = false;
     if (run.status === "completed") {
       const supersessionReason = reviewerRunSupersessionReason(run, task);
       if (supersessionReason) {
@@ -2814,6 +2839,14 @@ export async function completeRun(runId, input = {}) {
         run.attemptConsumed = false;
         const note = "Reviewer run ended after its candidate was superseded; no review outcome was required.";
         run.notes = run.notes ? `${run.notes}\n\n${note}` : note;
+      } else if (task?.workerHandoffBlock) {
+        workerBlocked = true;
+        task.status = "blocked";
+        run.completionDisposition = "worker_blocked";
+        run.neutralCompletionReason = "explicit_block_requires_resolution";
+        run.notes = [run.notes, "The worker left an explicit blocker; no delivery or architecture completion was inferred."].filter(Boolean).join("\n\n");
+        task.assignedAgentRole = "owner";
+        task.updatedAt = now;
       } else {
         handoffFailure = successfulHandoffFailure(state, run, task);
         if (handoffFailure) {
@@ -2831,11 +2864,13 @@ export async function completeRun(runId, input = {}) {
       run.exitCode = budget.rawContextExceeded
         ? "raw_context_budget_exceeded"
         : budget.tokenExceeded ? "effective_token_budget_exceeded" : "cost_budget_exceeded";
-      run.completionDisposition = "completed_over_budget";
-      run.notes = [run.notes, `StudioOps stopped automatic continuation because ${run.exitCode}; the valid handoff was preserved.`]
+      run.completionDisposition = workerBlocked ? "worker_blocked_over_budget" : "completed_over_budget";
+      run.notes = [run.notes, workerBlocked
+        ? `StudioOps stopped automatic continuation because ${run.exitCode}; the worker's explicit block remains unresolved.`
+        : `StudioOps stopped automatic continuation because ${run.exitCode}; the valid handoff was preserved.`]
         .filter(Boolean)
         .join("\n\n");
-      preserveBudgetTelemetryOnTask(state, task, run, now);
+      preserveBudgetTelemetryOnTask(state, task, run, now, { workerBlocked });
     }
 
     let failureDisposition = null;
@@ -2870,11 +2905,18 @@ export async function completeRun(runId, input = {}) {
         }
       } else {
         failureDisposition = applyFailedRunToTask(task, run, run.exitCode || run.notes || "runner_failed", now);
+        if (task?.workerHandoffBlock?.runIds?.includes(run.id)) {
+          task.status = "blocked";
+          task.assignedAgentRole = "owner";
+          failureDisposition.blocked = true;
+        }
       }
     }
 
     const neutralCompletion = run.status === "completed" && run.completionDisposition === "superseded";
-    const summary = neutralCompletion
+    const summary = workerBlocked
+      ? `${run.id} finished with an explicit blocker requiring resolution. Output: ${run.outputPath || "(not recorded)"}`
+      : neutralCompletion
       ? `${run.id} completed neutrally because its review candidate was superseded. Output: ${run.outputPath || "(not recorded)"}`
       : run.status === "completed"
         ? `${run.id} completed. Output: ${run.outputPath || "(not recorded)"}`
@@ -2923,6 +2965,11 @@ export async function completeRun(runId, input = {}) {
       liveRun.failureContainmentProbe = structuredClone(containment.probe);
       liveRun.updatedAt = now;
       const disposition = applyFailureContainmentToTask(task, liveRun, containment, now);
+      if (task?.workerHandoffBlock?.runIds?.includes(liveRun.id)) {
+        task.status = "blocked";
+        task.assignedAgentRole = "owner";
+        disposition.blocked = true;
+      }
       await appendTaskComment(
         state,
         liveRun,
@@ -2967,6 +3014,23 @@ export async function completeRun(runId, input = {}) {
   }
 }
 
+async function readRunHandoff(runId, state) {
+  if (state) {
+    const run = (state.runs || []).find((item) => item.id === runId);
+    return { run, task: run ? findTask(state, run.taskId) : null };
+  }
+  return withStateDatabaseRead((db) => {
+    const row = db.prepare("SELECT r.payload AS run, t.payload AS task FROM runs r LEFT JOIN tasks t ON t.id = r.task_id WHERE r.id = ?").get(runId);
+    return { run: row?.run ? JSON.parse(row.run) : null, task: row?.task ? JSON.parse(row.task) : null };
+  });
+}
+
+export async function observedDeniedFailureRun(runId, input = {}) {
+  const current = (await readRunHandoff(runId, input.state)).run;
+  if (!current) throw new Error(`Unknown run: ${runId}`);
+  return structuredClone(current);
+}
+
 export async function completeRunAfterExecution(run, input, executionRun = run) {
   input = {
     ...input,
@@ -2974,6 +3038,21 @@ export async function completeRunAfterExecution(run, input, executionRun = run) 
     executionCommitSha: executionRun.executionCommitSha,
     failureEvidenceConfiguration: input.failureEvidenceConfiguration || executionRun.failureEvidenceConfiguration,
   };
+  const current = await readRunHandoff(run.id, input.state);
+  const currentRun = current.run;
+  if (!currentRun) throw new Error(`Unknown run: ${run.id}`);
+  if (currentRun.status !== "running") return { ...structuredClone(currentRun), completionObservedExisting: true };
+  const completeRunning = async (completion) => {
+    try { return await completeRun(run.id, { ...completion, expectedStatus: "running" }); }
+    catch (error) {
+      const terminal = (await readRunHandoff(run.id, input.state)).run;
+      if (terminal && ["completed", "failed", "cancelled"].includes(terminal.status)) {
+        return { ...structuredClone(terminal), completionObservedExisting: true };
+      }
+      throw error;
+    }
+  };
+  if (current.task?.workerHandoffBlock) return completeRunning(input);
   let preserveBuilderReviewCycle = false;
   if (input.status === "completed" && run.workflowMode === "local" && run.group === "builder") {
     try {
@@ -3000,7 +3079,8 @@ export async function completeRunAfterExecution(run, input, executionRun = run) 
       const mutate = input.state ? async (mutator) => mutator(input.state) : mutateState;
       await mutate(async (state) => {
         const task = findTask(state, run.taskId);
-        if (!task) return;
+        const liveRun = (state.runs || []).find((item) => item.id === run.id);
+        if (!task || liveRun?.status !== "running" || task.workerHandoffBlock) return;
         task.branchName = task.branchName || run.branchName || identity.branch;
         task.reviewSubjectSha = identity.commitSha;
         task.reviewSubjectCycle = cycle;
@@ -3016,7 +3096,7 @@ export async function completeRunAfterExecution(run, input, executionRun = run) 
         task.updatedAt = new Date().toISOString();
       });
     } catch (error) {
-      return completeRun(run.id, {
+      return completeRunning({
         ...input,
         status: "failed",
         exitCode: error.code || "local_candidate_materialization_failed",
@@ -3024,7 +3104,36 @@ export async function completeRunAfterExecution(run, input, executionRun = run) 
       });
     }
   }
-  return completeRun(run.id, { ...input, preserveBuilderReviewCycle });
+  return completeRunning({ ...input, preserveBuilderReviewCycle });
+}
+
+/** Recheck after workspace setup, before consuming a failure claim or launching a provider. */
+export async function stopHeldRunBeforeProviderStart(runId, input = {}) {
+  const observed = await readRunHandoff(runId, input.state);
+  if (!observed.run) throw new Error(`Unknown run: ${runId}`);
+  if (observed.run.status !== "running") return structuredClone(observed.run);
+  if (!observed.task?.workerHandoffBlock) return null;
+  const mutate = input.state ? async (fn) => fn(input.state) : mutateState;
+  return mutate(async (state) => {
+    const run = (state.runs || []).find((item) => item.id === runId);
+    if (!run) throw new Error(`Unknown run: ${runId}`);
+    if (run.status !== "running") return structuredClone(run);
+    const task = findTask(state, run.taskId);
+    if (!task?.workerHandoffBlock) return null;
+    const now = new Date().toISOString();
+    run.status = "cancelled";
+    run.exitCode = "worker_handoff_blocked_before_provider_start";
+    run.completedAt = now;
+    run.updatedAt = now;
+    // Provider execution did not start. Previously committed failure/prepaid
+    // claims remain attached and their cumulative ledgers remain unchanged.
+    run.attemptConsumed = false;
+    run.notes = [run.notes, "Provider launch was stopped after an explicit worker handoff block."].filter(Boolean).join("\n\n");
+    state.events ||= [];
+    state.events.push({ id: nextId(state.events, "event"), type: "run_cancelled", projectId: run.projectId,
+      taskId: run.taskId, runId: run.id, message: `${run.id} stopped before provider launch due to an explicit handoff block.`, createdAt: now });
+    return structuredClone(run);
+  }, { operationName: "runner.stop_held_before_provider" });
 }
 
 export async function reconcileStaleRuns(input = {}) {
@@ -3143,6 +3252,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
   let usage = null;
   const discoveryArtifacts = [];
   let validationAttestation = null;
+  let validationFailureWhileAttemptingHandoff = false;
   const outputGuardState = { cumulativeCommandOutputChars: 0 };
   const outputGuard = normalizeRunOutputGuard(input.outputGuard);
 
@@ -3164,17 +3274,15 @@ async function runClaimedRunWithSdk(run, input = {}) {
     executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
     executionRun.failureEvidenceConfiguration = failureExecutionConfiguration(executionRun, input);
     log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
+    const stoppedBeforeClaim = await stopHeldRunBeforeProviderStart(run.id, input);
+    if (stoppedBeforeClaim) { status = stoppedBeforeClaim.status; return stoppedBeforeClaim; }
     const failureClaim = await claimCurrentFailureAttempt(executionRun, input);
     if (!failureClaim.admitted) {
-      status = "cancelled";
-      exitCode = failureClaim.reason === "backoff" ? "failure_backoff" : "failure_circuit_open";
+      const stopped = await observedDeniedFailureRun(run.id, input);
+      status = stopped.status;
+      exitCode = stopped.exitCode || "";
       log.write(`StudioOps skipped provider launch because ${failureClaim.reason} is active for ${failureClaim.incident.incidentId}.\n`);
-      return {
-        ...run,
-        status,
-        exitCode,
-        attemptConsumed: false,
-      };
+      return stopped;
     }
     const prompt = runnerPrompt(executionRun, executionRun.project, authContext);
     log.write(`Repo: ${executionRun.project.repoPath}\n`);
@@ -3191,6 +3299,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
     const thread = run.threadId
       ? codex.resumeThread(run.threadId, options)
       : codex.startThread(options);
+    const stoppedBeforeLaunch = await stopHeldRunBeforeProviderStart(run.id, input);
+    if (stoppedBeforeLaunch) { status = stoppedBeforeLaunch.status; return stoppedBeforeLaunch; }
     const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
 
     for await (const event of events) {
@@ -3256,7 +3366,8 @@ async function runClaimedRunWithSdk(run, input = {}) {
     await cleanupGitHubAppAuth(authContext);
   }
 
-  if (status === "completed" && run.group === "builder" && run.workflowMode !== "local") {
+  if (status === "completed" && run.group === "builder" && run.workflowMode !== "local"
+    && !(await readRunHandoff(run.id, input.state)).task?.workerHandoffBlock) {
     try {
       validationAttestation = await readPrePushValidationAttestation(
         executionRun,
@@ -3266,6 +3377,7 @@ async function runClaimedRunWithSdk(run, input = {}) {
     } catch (error) {
       status = "failed";
       exitCode = "validation_evidence_missing";
+      validationFailureWhileAttemptingHandoff = true;
       notes = `${notes}\n\n${error.message}`.trim();
     }
   }
@@ -3279,9 +3391,10 @@ async function runClaimedRunWithSdk(run, input = {}) {
     usage,
     impactPlan: executionRun.impactPlan,
     contextEvidence: { discoveryArtifacts, validationAttestation },
+    validationFailureWhileAttemptingHandoff,
     workspaceRoot: input.workspaceRoot,
   }, executionRun);
-  if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
+  if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes, completed);
   return completed;
 }
 
@@ -3304,17 +3417,18 @@ async function runClaimedRunWithCli(run, input = {}) {
     executionRun = await withRepositoryContext(executionRun, input.repositoryContext);
     executionRun.failureEvidenceConfiguration = failureExecutionConfiguration(executionRun, input);
     log.write(`Repository context: ${JSON.stringify(executionRun.repositoryContext)}\n`);
+    const stoppedBeforeClaim = await stopHeldRunBeforeProviderStart(run.id, input);
+    if (stoppedBeforeClaim) {
+      log.end();
+      await cleanupGitHubAppAuth(authContext);
+      return stoppedBeforeClaim;
+    }
     const failureClaim = await claimCurrentFailureAttempt(executionRun, input);
     if (!failureClaim.admitted) {
       log.write(`StudioOps skipped provider launch because ${failureClaim.reason} is active for ${failureClaim.incident.incidentId}.\n`);
       log.end();
       await cleanupGitHubAppAuth(authContext);
-      return {
-        ...run,
-        status: "cancelled",
-        exitCode: failureClaim.reason === "backoff" ? "failure_backoff" : "failure_circuit_open",
-        attemptConsumed: false,
-      };
+      return observedDeniedFailureRun(run.id, input);
     }
     prompt = runnerPrompt(executionRun, executionRun.project, authContext);
   } catch (error) {
@@ -3327,16 +3441,22 @@ async function runClaimedRunWithCli(run, input = {}) {
     } catch {
       // Keep the run failure intact even if the summary file cannot be written.
     }
-    const completed = await completeRun(run.id, {
+    const completed = await completeRunAfterExecution(run, {
       status: "failed",
       exitCode: nonRetryableWorkspaceFailureReason(notes) || "workspace_error",
       outputPath,
       lastMessagePath,
       notes,
-    });
+    }, executionRun);
     const pauseReason = nonRetryableWorkspaceFailureReason(notes);
-    if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes);
+    if (pauseReason) await pauseTaskForAutomationConfig(run, pauseReason, notes, completed);
     return completed;
+  }
+  const stoppedBeforeLaunch = await stopHeldRunBeforeProviderStart(run.id, input);
+  if (stoppedBeforeLaunch) {
+    log.end();
+    await cleanupGitHubAppAuth(authContext);
+    return stoppedBeforeLaunch;
   }
   const args = [
     "exec",
@@ -3450,7 +3570,9 @@ async function runClaimedRunWithCli(run, input = {}) {
       let completionStatus = outputBudgetViolation ? "failed" : code === 0 ? "completed" : "failed";
       let completionCode = outputBudgetViolation || code;
       let validationAttestation = null;
-      if (completionStatus === "completed" && run.group === "builder" && run.workflowMode !== "local") {
+      let validationFailureWhileAttemptingHandoff = false;
+      if (completionStatus === "completed" && run.group === "builder" && run.workflowMode !== "local"
+        && !(await readRunHandoff(run.id, input.state)).task?.workerHandoffBlock) {
         try {
           validationAttestation = await readPrePushValidationAttestation(
             executionRun,
@@ -3460,6 +3582,7 @@ async function runClaimedRunWithCli(run, input = {}) {
         } catch (error) {
           completionStatus = "failed";
           completionCode = "validation_evidence_missing";
+          validationFailureWhileAttemptingHandoff = true;
           notes = `${notes}\n\n${error.message}`.trim();
         }
       }
@@ -3471,6 +3594,7 @@ async function runClaimedRunWithCli(run, input = {}) {
         notes,
         impactPlan: executionRun.impactPlan,
         contextEvidence: { validationAttestation },
+        validationFailureWhileAttemptingHandoff,
         workspaceRoot: input.workspaceRoot,
       }, executionRun);
       resolve(completed);

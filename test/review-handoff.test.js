@@ -708,6 +708,34 @@ test("verified prerequisite administrative disposition and adoption commit toget
   assert.equal(after.runs.filter((item) => [f.task.id, dependency.id].includes(item.taskId)).length, 0);
 });
 
+test("operator adoption refuses unresolved worker handoffs on the candidate or its prerequisite", async (t) => {
+  const f = await operatorFixture(t);
+  await mutateState((state) => {
+    state.tasks.find((item) => item.id === f.task.id).workerHandoffBlock = {
+      reason: "explicit_block_requires_resolution", runIds: ["run_old_fixture"], blockedAt: new Date().toISOString() };
+  });
+  let state = await readStateReadOnly();
+  f.request.expectedStateVersion = state.tasks.find((item) => item.id === f.task.id).stateVersion;
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority, { preview: true }), /adoption_worker_handoff_unresolved/);
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority), /adoption_worker_handoff_unresolved/);
+  const dependency = await addTask({ projectId: f.project.id, title: "Blocked prerequisite", status: "blocked", architectureRequired: false });
+  await mutateState((current) => {
+    delete current.tasks.find((item) => item.id === f.task.id).workerHandoffBlock;
+    current.tasks.find((item) => item.id === dependency.id).workerHandoffBlock = {
+      reason: "explicit_block_requires_resolution", runIds: ["run_old_prerequisite"], blockedAt: new Date().toISOString() };
+  });
+  await updateTask(f.task.id, { dependsOnTaskIds: [dependency.id] });
+  state = await readStateReadOnly();
+  f.request.expectedStateVersion = state.tasks.find((item) => item.id === f.task.id).stateVersion;
+  f.request.prerequisites = [{ taskId: dependency.id, expectedStateVersion: state.tasks.find((item) => item.id === dependency.id).stateVersion,
+    evidenceDigest: `sha256:${"a".repeat(64)}`, reason: "Verify the existing prerequisite source artifact." }];
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority, { preview: true }), /adoption_prerequisite_unresolved_incident/);
+  await assert.rejects(adoptOperatorCandidate(f.task.id, f.request, f.authority), /adoption_prerequisite_unresolved_incident/);
+  state = await readStateReadOnly();
+  assert.equal(state.tasks.find((item) => item.id === dependency.id).status, "blocked");
+  assert.equal(state.tasks.find((item) => item.id === f.task.id).operatorIntake, undefined);
+});
+
 async function prerequisiteFailureFixture(t, options = {}) {
   const f = await operatorFixture(t);
   const dependency = await addTask({ projectId: f.project.id, title: "Existing verified prerequisite", description: "Previously produced inventory has immutable source verification.", type: "bug", status: "blocked", architectureRequired: false });

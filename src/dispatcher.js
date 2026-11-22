@@ -501,6 +501,7 @@ function preCreditDispatchSafetyReason(state, task, action, options) {
   }
   const group = runGroupFor(action);
   if (group === "owner") return "";
+  if (task.workerHandoffBlock) return "worker_handoff_blocked";
   if (
     ARCHITECTURE_GATED_ACTIONS.has(action.type)
     && task.architectureRequired
@@ -567,7 +568,7 @@ function recoverStageAttemptCircuitsInState(state, actions, options, now) {
   const loaded = new Set(options.failureIncidentTaskIds || []);
   for (const task of state.tasks || []) {
     const circuit = task.automationCircuit;
-    if (circuit?.state !== "open" || circuit.reasonCode !== "attempt_budget_exhausted"
+    if (task.workerHandoffBlock || circuit?.state !== "open" || circuit.reasonCode !== "attempt_budget_exhausted"
       || !circuit.admissionAction || !taskAutomationCircuitIsCurrent(task)
       || !requested.has(task.id) || !loaded.has(task.id)) continue;
     const action = circuit.admissionAction;
@@ -708,7 +709,8 @@ export function recoverAffordableCreditCircuitsInState(state, options = {}, inpu
     const circuit = task.automationCircuit;
     const blocker = task.automationBlocker;
     if (
-      circuit?.state !== "open"
+      task.workerHandoffBlock
+      || circuit?.state !== "open"
       || circuit.reasonCode !== "credit_budget_insufficient"
       || blocker?.type !== "circuit"
       || !taskAutomationCircuitIsCurrent(task)

@@ -243,6 +243,18 @@ function taskActions(state, task, options = {}) {
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
 
   const missingDependencies = incompleteDependencies(state, task);
+  if (task.workerHandoffBlock) {
+    return [actionBase(
+      state,
+      task,
+      task.workerHandoffBlock.resolvedAt ? "resume_worker_handoff" : "resolve_worker_handoff",
+      "owner",
+      task.workerHandoffBlock.resolvedAt
+        ? "The handoff was resolved. Address any independent failure or budget hold, then explicitly resume the task."
+        : "The worker explicitly blocked this task. Review its latest handoff and any recorded failure before resuming.",
+      options,
+    )];
+  }
   if (task.operatorIntake && (missingDependencies.length || task.automationBlocker)) {
     return [actionBase(state, task, "waiting_operator_candidate", "", "Verified operator candidate is held for its existing dependencies or incident remediation.", options)];
   }
@@ -415,6 +427,9 @@ function taskActions(state, task, options = {}) {
         `Still blocked by: ${missingDependencies.map((dependency) => `${dependency.id} (${dependency.status})`).join(", ")}.`,
         options,
       )];
+    }
+    if ((state.runs || []).some((run) => run.taskId === task.id && run.status === "running")) {
+      return [actionBase(state, task, "waiting_for_worker_handoff", "", "The active worker has not finished its blocked handoff.", options)];
     }
     return [actionBase(state, task, "unblock_task", "builder", "Dependencies are complete; task can return to the builder queue.", {
       ...options,

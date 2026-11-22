@@ -36,6 +36,7 @@ import {
   runQueuedRuns,
   sdkClientOptions,
   successfulHandoffFailure,
+  stopHeldRunBeforeProviderStart,
 } from "../src/runner.js";
 import {
   claimPaidFailureAttempt,
@@ -510,6 +511,7 @@ test("GitHub execution context binds the prepared checkout even when preflight h
 test("run completion retains sanitized repository context and excludes source packets", async () => {
   const state = fixtureState();
   const run = state.runs[0];
+  run.status = "running";
   const executionRun = {...run, executionCommitSha:"a".repeat(40),repositoryContext:{status:"partial",commitSha:"a".repeat(40),cacheHit:true,resultCount:12,bytes:8000,packet:"PRIVATE_SOURCE",reason:"PRIVATE_REASON"}};
   const completed = await completeRunAfterExecution(run, {state,status:"failed",exitCode:"test_failure"}, executionRun);
   assert.equal(completed.repositoryContext.status,"partial");
@@ -1515,6 +1517,19 @@ test("an inaccessible GitHub preflight is retried once after an injectable delay
   assert.equal(claimed.length, 1);
   assert.equal(state.runs[0].status, "running");
   assert.equal(state.tasks[0].automationBlocker, undefined);
+});
+
+test("a claimed run blocked before provider start does not consume a provider attempt", async () => {
+  const state = fixtureState({ status: "in_progress", integrationStatus: "", assignedAgentRole: "builder", branchName: "codex/demo-task" },
+    { actionType: "start_builder", integrationStatus: "", branchName: "codex/demo-task" });
+  const claimed = await claimRuns({ state, limit: 1, preflightRun: async () => ({ ok: true, workflowMode: "github", originUrl: "https://github.com/example/demo.git" }) });
+  assert.equal(claimed.length, 1);
+  assert.ok(state.runs[0].creditClaimAdmission);
+  state.tasks[0].workerHandoffBlock = { reason: "explicit_block_requires_resolution", runIds: ["run_1"], blockedAt: new Date().toISOString() };
+  const stopped = await stopHeldRunBeforeProviderStart("run_1", { state });
+  assert.equal(stopped.status, "cancelled");
+  assert.equal(stopped.attemptConsumed, false);
+  assert.deepEqual(stopped.creditClaimAdmission, state.runs[0].creditClaimAdmission);
 });
 
 test("two inaccessible GitHub preflights cancel before launch and schedule exact recovery", async () => {

@@ -1,6 +1,9 @@
 import { sha256Digest, projectRepositoryIdentity, loadProjectComponentImpactMapAtCommit } from "./component-impact-map.js";
-import { readFile } from "node:fs/promises";
+import { readFile, open, stat } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+import readline from "node:readline/promises";
+import { stdin as terminalInput, stdout as terminalOutput } from "node:process";
 import { sanitizedCreditAdmission } from "./credit-admission-evidence.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
@@ -1117,6 +1120,7 @@ function recoveryProjectMatchesClaim(state, claim) {
 }
 
 function recoverySuppressionReason(state, task, input = {}) {
+  if (task?.workerHandoffBlock) return "worker_handoff_blocked";
   if (state.meta?.operatorPause?.active && !input.ignoreOperatorPause) return "operator_pause";
   if (activeSelfUpdateLease(state, input)) return "self_update_in_progress";
   const project = findProject(state, task?.projectId);
@@ -2347,6 +2351,52 @@ function appendLifecycleAuditEvent(state, task, decision, invalidationIds) {
   });
 }
 
+function captureWorkerHandoffBlock(state, task, now) {
+  if (task.workerHandoffBlock) return;
+  const runIds = (state.runs || [])
+    .filter((run) => run.taskId === task.id && ACTIVE_RUN_STATUSES.has(run.status))
+    .map((run) => run.id).filter((id) => typeof id === "string" && id).sort();
+  if (runIds.length) task.workerHandoffBlock = {
+    reason: "explicit_block_requires_resolution", runIds, blockedAt: now,
+  };
+}
+
+// Explicit resolution cancels only never-started stale queue entries. Their
+// reservation is derived from queued status; no paid claim is removed.
+function resolveWorkerHandoffBlock(state, task, now) {
+  if (!task.workerHandoffBlock) return;
+  if ((state.runs || []).some((run) => run.taskId === task.id && run.status === "running")) {
+    throw new Error("worker_handoff_run_active");
+  }
+  const queued = (state.runs || []).filter((run) => run.taskId === task.id && run.status === "queued");
+  if (queued.some((run) => run.startedAt || run.creditClaimAdmission)) throw new Error("worker_handoff_queued_run_not_pristine");
+  state.events ||= [];
+  for (const run of queued) {
+    Object.assign(run, { status: "cancelled", exitCode: "worker_handoff_superseded", attemptConsumed: false,
+      completedAt: now, updatedAt: now,
+      notes: [run.notes, "Cancelled before launch when the explicit worker handoff was resolved."].filter(Boolean).join("\n\n") });
+    state.events.push({ id: nextId(state.events, "event"), type: "run_cancelled", projectId: run.projectId,
+      taskId: task.id, runId: run.id, message: `${run.id} cancelled before launch after worker handoff resolution.`, createdAt: now });
+  }
+  task.workerHandoffBlock = { ...task.workerHandoffBlock, resolvedAt: now, state: "awaiting_explicit_resume" };
+  state.events.push({ id: nextId(state.events, "event"), type: "worker_handoff_resolved", projectId: task.projectId,
+    taskId: task.id, message: `${task.id}: explicit worker handoff resolved.`, createdAt: now });
+}
+
+function clearResolvedWorkerHandoff(task, { allowLegacyRepair = false, nowMs = Date.now() } = {}) {
+  if (!task.workerHandoffBlock) return;
+  if (!task.workerHandoffBlock.resolvedAt) throw new Error("worker_handoff_resolution_required");
+  const blocker = task.automationBlocker;
+  const explicitConfigurationRepair = allowLegacyRepair && blocker?.type === "configuration";
+  const explicitDueTransientRepair = allowLegacyRepair && ["transient", "execution"].includes(blocker?.type)
+    && transientRecoveryAt(blocker, {}) <= nowMs;
+  if ((blocker && !explicitConfigurationRepair && !explicitDueTransientRepair)
+    || task.budgetPause?.runId || task.automationCircuit?.state === "open") {
+    throw new Error("worker_handoff_independent_blocker");
+  }
+  delete task.workerHandoffBlock;
+}
+
 function applyLifecycleTransitionWithCapability(state, command, input = {}, capability = null) {
   const task = findTask(state, command?.taskId);
   if (!task) throw new Error(`Unknown task: ${command?.taskId || "(missing)"}`);
@@ -2372,6 +2422,7 @@ function applyLifecycleTransitionWithCapability(state, command, input = {}, capa
   };
   const result = evaluateLifecycleTransition(command, task, capability === OPERATOR_ADOPTION_LIFECYCLE
     ? createOperatorAdoptionLifecycleContext(lifecycleContext) : lifecycleContext);
+  if (task.workerHandoffBlock && result.decision.to !== "blocked") throw new Error("worker_handoff_resolution_required");
   const lifecycleOptions = capability === PROMOTION_WORKER_LIFECYCLE
     ? { promotionWorkerLifecycleCapability: capability }
     : {};
@@ -2471,9 +2522,76 @@ export async function transitionTask(command, input = {}) {
   const allowed = ["action", "taskId", "expectedStateVersion", "actorContext", "evidence"];
   const unknown = Object.keys(command).filter((key) => !allowed.includes(key));
   if (unknown.length) throw new Error(`Unknown lifecycle command fields: ${unknown.join(", ")}`);
-  return mutateState(async (state) => applyLifecycleTransitionInState(state, command, input), {
+  return mutateState(async (state) => {
+    const task = findTask(state, command.taskId);
+    if (!task) throw new Error(`Unknown task: ${command.taskId || "(missing)"}`);
+    const now = input.now || new Date().toISOString();
+    if (command.action === "block_workflow") captureWorkerHandoffBlock(state, task, now);
+    else if (task.workerHandoffBlock && !["mutate_assignment", "mutate_evidence"].includes(command.action)) {
+      if (command.action !== "resume_workflow" || command.actorContext?.actorType !== "owner" || command.actorContext?.role !== "owner") {
+        throw new Error("worker_handoff_resolution_required");
+      }
+      clearResolvedWorkerHandoff(task);
+    }
+    return applyLifecycleTransitionInState(state, command, input);
+  }, {
     operationName: `task.transition.${command.action || "unknown"}`,
   });
+}
+
+/** Resolve only the handoff, with a version-bound local terminal confirmation.
+ * This is an operational safeguard, not an identity boundary against same-UID code. */
+export async function resolveWorkerHandoff(taskId, input = {}) {
+  const reason = String(input.reason || "").trim();
+  const expectedStateVersion = Number(input.expectedStateVersion);
+  if (reason.length < 20 || reason.length > 1000 || !Number.isSafeInteger(expectedStateVersion) || expectedStateVersion < 1) {
+    throw new Error("worker_handoff_resolution_authority_required");
+  }
+  const before = await readStateReadOnly();
+  const priorTask = findTask(before, taskId);
+  if (!priorTask || priorTask.status !== "blocked" || !priorTask.workerHandoffBlock) throw new Error("worker_handoff_not_blocked");
+  if (priorTask.workerHandoffBlock.resolvedAt) throw new Error("worker_handoff_already_resolved");
+  if (positiveStateVersion(priorTask.stateVersion) !== expectedStateVersion) throw new Error("worker_handoff_stale_state");
+  const activeRuns = (before.runs || []).filter((run) => run.taskId === taskId && ACTIVE_RUN_STATUSES.has(run.status))
+    .map((run) => ({ id: run.id, status: run.status })).sort((a, b) => a.id.localeCompare(b.id));
+  if (activeRuns.some((run) => run.status === "running")) throw new Error("worker_handoff_run_active");
+  const preview = { taskId, expectedStateVersion, reason, handoff: priorTask.workerHandoffBlock,
+    independentBlocker: priorTask.automationBlocker || null, budgetPause: priorTask.budgetPause || null,
+    openCircuit: priorTask.automationCircuit?.state === "open", activeRuns };
+  if (process.env.MISSION_CONTROL_RUN_ID || process.env.MISSION_CONTROL_RUNNER_PATH || !terminalInput.isTTY || !terminalOutput.isTTY) {
+    throw new Error("worker_handoff_local_confirmation_required");
+  }
+  const tty = await open("/dev/tty", "r+");
+  let principal;
+  try {
+    if (!(await tty.stat()).isCharacterDevice()) throw new Error("worker_handoff_controlling_terminal_required");
+    const owner = os.userInfo();
+    const databaseOwner = await stat(DATABASE_FILE);
+    if (databaseOwner.uid !== owner.uid || owner.uid !== process.geteuid()) throw new Error("worker_handoff_os_owner_mismatch");
+    const terminal = readline.createInterface({ input: terminalInput, output: terminalOutput });
+    try {
+      terminalOutput.write(`${JSON.stringify(preview, null, 2)}\n`);
+      const expected = `RESOLVE ${taskId} ${expectedStateVersion}`;
+      if (await terminal.question(`Confirm by typing ${expected}: `) !== expected) throw new Error("worker_handoff_confirmation_cancelled");
+    } finally { terminal.close(); }
+    principal = `local-os:${owner.uid}:${owner.username}`;
+  } finally { await tty.close(); }
+  return mutateState(async (state) => {
+    const task = findTask(state, taskId);
+    if (!task || task.status !== "blocked" || !task.workerHandoffBlock) throw new Error("worker_handoff_not_blocked");
+    if (task.workerHandoffBlock.resolvedAt) throw new Error("worker_handoff_already_resolved");
+    if (positiveStateVersion(task.stateVersion) !== expectedStateVersion) throw new Error("worker_handoff_stale_state");
+    const currentRuns = (state.runs || []).filter((run) => run.taskId === taskId && ACTIVE_RUN_STATUSES.has(run.status))
+      .map((run) => ({ id: run.id, status: run.status })).sort((a, b) => a.id.localeCompare(b.id));
+    if (!isDeepStrictEqual(currentRuns, activeRuns)) throw new Error("worker_handoff_run_inventory_changed");
+    const now = new Date().toISOString();
+    resolveWorkerHandoffBlock(state, task, now);
+    applyStoreLifecycleTransition(state, task, task.status, { action: "mutate_assignment", force: true, now });
+    const event = state.events.findLast((item) => item.type === "worker_handoff_resolved" && item.taskId === task.id);
+    if (event) { event.reason = reason; event.principal = principal; }
+    task.updatedAt = now;
+    return task;
+  }, { operationName: "task.resolve_worker_handoff" });
 }
 
 export async function repairLegacyTaskStatus(taskId, status, input = {}) {
@@ -2572,6 +2690,7 @@ export async function adoptOperatorCandidate(taskId, input, authority = {}, opti
     const replay = task.operatorIntake?.requestDigest === requestDigest;
     if (!replay && request.expectedStateVersion !== positiveStateVersion(task.stateVersion)) adoptionError("adoption_task_stale");
     if (!replay && !["ready", "queued", "blocked", "needs_changes"].includes(task.status)) adoptionError("adoption_task_state_invalid");
+    if (task.workerHandoffBlock) adoptionError("adoption_worker_handoff_unresolved");
     if (task.architectureRequired && !architectureIsCompleteInState(state, task)) adoptionError("adoption_architecture_incomplete");
     const ids = [taskId, ...request.prerequisites.map((item) => item.taskId)];
     adoptionSnapshotConflicts(state, ids);
@@ -2600,7 +2719,7 @@ export async function adoptOperatorCandidate(taskId, input, authority = {}, opti
       scopeDigest, frozenScopePlan, classification, replay, conflictTaskIds, dispositionTaskIds: dispositions.map((item) => item.taskId), dispositions,
       preview: { schemaVersion: 1, taskId, requestDigest, expectedStateVersion: request.expectedStateVersion,
         candidate: request.candidate, mapDigest: candidate.manifestDigest, scopeDigest, reviewedFiles: candidate.changedFiles,
-        unresolvedDependencies: incomplete.map((item) => item.id), held: incomplete.length > 0 || Boolean(task.automationBlocker), status: "builder_review" } };
+        unresolvedDependencies: incomplete.map((item) => item.id), held: incomplete.length > 0 || Boolean(task.automationBlocker || task.workerHandoffBlock), status: "builder_review" } };
   };
   if (options.preview === true) return (await prepare(await readStateReadOnly())).preview;
   let principal;
@@ -2707,6 +2826,9 @@ export async function updateTask(taskId, patch) {
         }
       }
     }
+    if (Object.hasOwn(patch, "resolveWorkerHandoff")) throw new Error("worker_handoff_local_resolution_required");
+    if (task.workerHandoffBlock && Object.hasOwn(patch, "status") && requestedStatus !== "blocked"
+      && !task.workerHandoffBlock.resolvedAt) throw new Error("worker_handoff_resolution_required");
     const architectureCompletionFields = [
       "architectureStatus",
       "architectureSummary",
@@ -2868,6 +2990,9 @@ export async function updateTask(taskId, patch) {
       })
       : [];
     if (definitionCandidates.length) {
+      if (Object.prototype.hasOwnProperty.call(patch, "status")) {
+        throw new Error("Update task status separately from requirements that invalidate a frozen QA candidate.");
+      }
       if (definitionCandidates.some((candidate) => candidate.status === "release_candidate_ready")) {
         throw new Error("Task QA requirements cannot change while an affected release-candidate pull request is active; revoke that QA approval first.");
       }
@@ -2908,6 +3033,18 @@ export async function updateTask(taskId, patch) {
         createdAt: now,
       });
       return task;
+    }
+    const updatedAt = new Date().toISOString();
+    if (Object.prototype.hasOwnProperty.call(patch, "status") && requestedStatus === "blocked") {
+      captureWorkerHandoffBlock(state, task, updatedAt);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "status") && requestedStatus !== "blocked") {
+      const priorBlocker = task.workerHandoffBlock?.resolvedAt && task.automationBlocker
+        ? structuredClone(task.automationBlocker) : null;
+      clearResolvedWorkerHandoff(task, { allowLegacyRepair: true });
+      if (priorBlocker) state.events.push({ id: nextId(state.events, "event"), type: "worker_handoff_independent_repair",
+        projectId: task.projectId, taskId: task.id, previousBlocker: priorBlocker,
+        message: `${task.id}: explicit status repair followed handoff resolution.`, createdAt: updatedAt });
     }
     if (
       Object.prototype.hasOwnProperty.call(patch, "status")
@@ -3080,7 +3217,6 @@ export async function updateTask(taskId, patch) {
       task.lastAutomationFailureRunId = "";
       task.automationAttemptEpoch = Number(task.automationAttemptEpoch || 0) + 1;
     }
-    const updatedAt = new Date().toISOString();
     supersedeStaleTaskCircuitInState(state, task, { now: updatedAt, author: "StudioOps Workflow" });
     task.updatedAt = updatedAt;
     state.events.push({
@@ -4860,6 +4996,7 @@ export function persistCreditAdmissionPauseInState(state, task, input = {}) {
 
 export function recoverCreditAdmissionPauseInState(state, task, input = {}) {
   const current = task.creditAdmissionPause;
+  if (task.workerHandoffBlock) return { recovered: false, pause: current || null };
   if (current?.active !== true) return { recovered: false, pause: current || null };
   const now = input.now || new Date().toISOString();
   const creditAdmission = sanitizedCreditAdmission(input.creditAdmission || {});
@@ -4896,6 +5033,7 @@ export function recoverCreditAdmissionPauseInState(state, task, input = {}) {
 
 /** A zero-attempt admission hold is not a repaired provider failure or a new epoch. */
 export function recoverPrepaidCreditCircuitInState(state, task, input = {}) {
+  if (task.workerHandoffBlock) return false;
   const circuit = task.automationCircuit, blocker = task.automationBlocker;
   const admission = sanitizedCreditAdmission(input.creditAdmission);
   const now = input.now || new Date().toISOString();
@@ -4989,6 +5127,7 @@ export function applyFailureIncidentCompatibilityReadModelInState(state, task, i
 }
 
 export function supersedeStaleTaskCircuitInState(state, task, input = {}) {
+  if (task?.workerHandoffBlock) return false;
   if (!task?.automationCircuit || taskAutomationCircuitIsCurrent(task)) return false;
   if (task.automationCircuit.state !== "open") return false;
   const now = input.now || new Date().toISOString();
@@ -5051,6 +5190,10 @@ export function reconcileAutomationStateInState(state, input = {}) {
 
   for (const task of state.tasks || []) {
     if (input.project && task.projectId !== input.project.id) continue;
+
+    // An explicit worker handoff is independent of transient recovery and
+    // dependency status; neither may silently clear or bypass that hold.
+    if (task.workerHandoffBlock) continue;
 
     if (supersedeStaleTaskCircuitInState(state, task, { now })) {
       actions.push(`${task.id}: superseded stale automation circuit after workflow recovery`);
@@ -5259,6 +5402,7 @@ export function resetAutomationCircuitInState(state, input = {}) {
   const task = input.task ? findTask(state, input.task) : null;
   const project = input.project ? findProject(state, input.project) : null;
   if (!task && !project) throw new Error("Circuit reset requires --task or --project.");
+  if (task?.workerHandoffBlock && (input.automatic || !task.workerHandoffBlock.resolvedAt)) throw new Error("worker_handoff_resolution_required");
   const target = task || project;
   if (target.automationCircuit?.state !== "open") {
     throw new Error(`${task ? task.id : project.id} does not have an open automation circuit.`);
@@ -5320,10 +5464,12 @@ export function resetAutomationCircuitInState(state, input = {}) {
     task.assignedAgentRole = actual?.assignedAgentRole || "";
     task.retryNotBefore = "";
     delete task.automationBlocker;
-    applyStoreLifecycleTransition(state, task, resumeStatus, {
-      action: task.status === "blocked" ? "resume_workflow" : "recover_workflow",
-      now,
-    });
+    if (!task.workerHandoffBlock) {
+      applyStoreLifecycleTransition(state, task, resumeStatus, {
+        action: task.status === "blocked" ? "resume_workflow" : "recover_workflow",
+        now,
+      });
+    }
     state.comments = state.comments || [];
     addAutomationComment(
       state,
@@ -5990,6 +6136,10 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
   const project = findProject(state, task.projectId);
   if (!project) return actions;
 
+  // This is separate from failure-containment state: a worker may report a
+  // real execution failure after explicitly requesting a scope/owner handoff.
+  if (task.workerHandoffBlock) return actions;
+
   const hasChildren = (state.tasks || []).some((candidate) => candidate.parentTaskId === task.id);
   if (task.type === "epic" || hasChildren) return actions;
 
@@ -6021,6 +6171,11 @@ function advanceTaskWorkflowInState(state, task, options = {}) {
 
   if (task.status === "blocked") {
     if (task.automationBlocker) {
+      return actions;
+    }
+    // A still-running worker may have blocked this task just before its
+    // completion is recorded. Do not race its final handoff.
+    if ((state.runs || []).some((run) => run.taskId === task.id && run.status === "running")) {
       return actions;
     }
     const body = "Dependencies are now complete. Automation returned this task to the builder queue.";

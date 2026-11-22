@@ -164,7 +164,7 @@ export const LIFECYCLE_EVIDENCE_FIELDS = Object.freeze([
   "reviewCycle", "reviewSubjectSha", "reviewSubjectCycle", "impactEvidence", "impactScopePlan", "candidateIdentity", "candidateId",
   "qaBundleId", "qaDecision", "integrationStatus", "promotionStatus", "promotionEvidence",
   "evidenceInvalidations", "architectureStatus", "architectureSummary", "architectureDecisionTaskIds",
-  "architectureCompletedAt", "architectureCompletedBy",
+  "architectureCompletedAt", "architectureCompletedBy", "workerHandoffBlock",
 ]);
 
 export function positiveStateVersion(value) {

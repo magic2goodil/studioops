@@ -1159,6 +1159,17 @@ test("a frozen packet edit invalidates every candidate task before a stale owner
   )));
 });
 
+test("a status change cannot be silently discarded by simultaneous frozen-candidate definition invalidation", async (t) => {
+  const initial = await installFixtureState({ testContext: t });
+  const task = initial.tasks[0];
+  const candidate = initial.candidates[0];
+  await assert.rejects(updateTask(task.id, { status: "blocked", title: "Changed requirements" }), /status separately/);
+  const state = await readState();
+  assert.equal(state.tasks.find((item) => item.id === task.id).status, task.status);
+  assert.equal(state.tasks.find((item) => item.id === task.id).title, task.title);
+  assert.equal(state.candidates.find((item) => item.id === candidate.id).status, candidate.status);
+});
+
 test("project authority changes invalidate frozen QA, while active release candidates require explicit revocation", async (t) => {
   const frozen = await installFixtureState({ testContext: t, taskCount: 2 });
   const frozenCandidate = frozen.candidates[0];
